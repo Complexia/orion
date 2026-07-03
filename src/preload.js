@@ -37,6 +37,11 @@ contextBridge.exposeInMainWorld('orion', {
   updateProviders: (input) => ipcRenderer.invoke('providers:updateAll', input),
   authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
 
+  // Orion account
+  getAccountSession: () => ipcRenderer.invoke('account:getSession'),
+  startAccountAuth: () => ipcRenderer.invoke('account:startAuth'),
+  signOutAccount: () => ipcRenderer.invoke('account:signOut'),
+
   // App updates
   getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
   checkForAppUpdate: () => ipcRenderer.invoke('appUpdate:check'),
@@ -68,5 +73,11 @@ contextBridge.exposeInMainWorld('orion', {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('appUpdate:state', listener);
     return () => ipcRenderer.removeListener('appUpdate:state', listener);
+  },
+
+  onAccountChanged: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('account:changed', listener);
+    return () => ipcRenderer.removeListener('account:changed', listener);
   },
 });

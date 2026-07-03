@@ -33,6 +33,9 @@ import {
   Archive,
   Plug,
   Palette,
+  UserRound,
+  LogIn,
+  LogOut,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -156,7 +159,18 @@ type AppUpdateState = {
   error?: string | null;
 };
 
-type SettingsTab = 'general' | 'providers' | 'cosmetics';
+type OrionAccountState = {
+  authenticated: boolean;
+  user: {
+    id: string;
+    email?: string | null;
+    name?: string | null;
+    imageUrl?: string | null;
+  } | null;
+  expiresAt: string | null;
+};
+
+type SettingsTab = 'account' | 'general' | 'providers' | 'cosmetics';
 
 const gitStatusTitles: Record<GitStatusKind, string> = {
   added: 'Added',
@@ -1008,8 +1022,15 @@ const App: React.FC = () => {
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
   const [authenticatingProviderId, setAuthenticatingProviderId] = useState<string | null>(null);
+  const [accountState, setAccountState] = useState<OrionAccountState>({
+    authenticated: false,
+    user: null,
+    expiresAt: null,
+  });
+  const [accountLoading, setAccountLoading] = useState(true);
+  const [accountBusy, setAccountBusy] = useState(false);
   const [revealedProviderEmails, setRevealedProviderEmails] = useState<Record<string, boolean>>({});
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const branchPickerRef = useRef<HTMLDivElement>(null);
@@ -1161,6 +1182,17 @@ const App: React.FC = () => {
       : appUpdateState?.availableVersion
         ? `Orion ${appUpdateState.availableVersion} is available`
         : appUpdateLabel;
+  const accountName =
+    accountState.user?.name ||
+    accountState.user?.email ||
+    (accountState.authenticated ? 'Orion account' : 'Not signed in');
+  const accountEmail = accountState.user?.email ?? null;
+  const accountInitials = (accountState.user?.name || accountState.user?.email || 'O')
+    .split(/\s+|@/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join('');
 
   const sortedProjects = useMemo(() => {
     if (!selectedProject) return projects;
@@ -1275,6 +1307,34 @@ const App: React.FC = () => {
 
     void window.orion?.checkForAppUpdate?.().catch(() => {
       // The main process publishes the visible error state.
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    void window.orion?.getAccountSession?.()
+      .then((state) => {
+        if (mounted) setAccountState(state);
+      })
+      .catch(() => {
+        if (mounted) {
+          setAccountState({ authenticated: false, user: null, expiresAt: null });
+        }
+      })
+      .finally(() => {
+        if (mounted) setAccountLoading(false);
+      });
+
+    const unsubscribe = window.orion?.onAccountChanged?.((state) => {
+      setAccountState(state);
+      setAccountLoading(false);
+      setAccountBusy(false);
     });
 
     return () => {
@@ -1410,6 +1470,38 @@ const App: React.FC = () => {
       setAppUpdateBusy(false);
     }
   }, [appUpdateBusy, appUpdateState]);
+
+  const handleStartAccountAuth = useCallback(async () => {
+    if (!window.orion?.startAccountAuth || accountBusy) return;
+
+    setAccountBusy(true);
+    try {
+      const result = await window.orion.startAccountAuth();
+      if (!result.ok) {
+        toast.error(result.error ?? 'Could not start Orion sign in');
+        setAccountBusy(false);
+      } else {
+        toast.info('Continue sign in in your browser');
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not start Orion sign in');
+      setAccountBusy(false);
+    }
+  }, [accountBusy]);
+
+  const handleSignOutAccount = useCallback(async () => {
+    if (!window.orion?.signOutAccount || accountBusy) return;
+
+    setAccountBusy(true);
+    try {
+      setAccountState(await window.orion.signOutAccount());
+      toast.success('Signed out of Orion');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not sign out');
+    } finally {
+      setAccountBusy(false);
+    }
+  }, [accountBusy]);
 
   const handleAuthenticateProvider = useCallback(async (providerId: string) => {
     if (!window.orion?.authenticateProvider || authenticatingProviderId) return;
@@ -2420,6 +2512,7 @@ const App: React.FC = () => {
             </div>
             <div className="settings-nav">
               {[
+                { id: 'account', label: 'Account', Icon: UserRound },
                 { id: 'general', label: 'General', Icon: Settings },
                 { id: 'providers', label: 'Providers', Icon: Plug },
                 { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
@@ -2448,12 +2541,87 @@ const App: React.FC = () => {
 
           <div className="settings-content">
             <div className="settings-content-header">
+              {settingsTab === 'account' && 'ACCOUNT'}
               {settingsTab === 'general' && 'GENERAL'}
               {settingsTab === 'providers' && 'PROVIDERS'}
               {settingsTab === 'cosmetics' && 'COSMETICS'}
             </div>
 
             <div className="settings-panel">
+              {settingsTab === 'account' && (
+                <>
+                  <div className="account-row">
+                    <div className="account-card-main">
+                      {accountState.user?.imageUrl ? (
+                        <img
+                          className="account-avatar"
+                          src={accountState.user.imageUrl}
+                          alt=""
+                          aria-hidden
+                        />
+                      ) : (
+                        <div className="account-avatar account-avatar-fallback">
+                          {accountInitials || 'O'}
+                        </div>
+                      )}
+                      <div className="account-card-text">
+                        <div className="account-card-title">{accountName}</div>
+                        <div className="account-card-subtitle">
+                          {accountLoading
+                            ? 'Checking Orion account...'
+                            : accountState.authenticated
+                              ? accountEmail || 'Signed in to Orion Web'
+                              : 'Sign in through Orion Web to authorize this desktop app.'}
+                        </div>
+                      </div>
+                    </div>
+                    <span className={`account-status-chip ${accountState.authenticated ? 'signed-in' : ''}`}>
+                      {accountLoading ? 'Checking' : accountState.authenticated ? 'Signed in' : 'Signed out'}
+                    </span>
+                  </div>
+
+                  {accountState.authenticated && (
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Desktop session</div>
+                        <div className="setting-label-desc">
+                          Authorized by Orion Web{accountState.expiresAt ? ` until ${formatCheckedTime(accountState.expiresAt)}` : ''}.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="provider-auth-button"
+                        onClick={handleSignOutAccount}
+                        disabled={accountBusy}
+                      >
+                        <LogOut size={13} />
+                        Sign out
+                      </button>
+                    </div>
+                  )}
+
+                  {!accountState.authenticated && (
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Authorize Orion Desktop</div>
+                        <div className="setting-label-desc">
+                          Opens Orion Web in your browser and returns here after approval.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="provider-auth-button account-primary-button"
+                        onClick={handleStartAccountAuth}
+                        disabled={accountBusy || accountLoading}
+                      >
+                        <LogIn size={13} />
+                        {accountBusy ? 'Opening...' : 'Sign in'}
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+
               {settingsTab === 'general' && (
                 <>
                   <div className="setting-row">

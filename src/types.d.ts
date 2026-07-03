@@ -14,6 +14,17 @@ type AppUpdateState = {
   error?: string | null;
 };
 
+type OrionAccountState = {
+  authenticated: boolean;
+  user: {
+    id: string;
+    email?: string | null;
+    name?: string | null;
+    imageUrl?: string | null;
+  } | null;
+  expiresAt: string | null;
+};
+
 declare global {
   interface Window {
     orion: {
@@ -211,6 +222,13 @@ declare global {
         ok: boolean;
         error?: string;
       }>;
+      getAccountSession: () => Promise<OrionAccountState>;
+      startAccountAuth: () => Promise<{
+        ok: boolean;
+        url?: string;
+        error?: string;
+      }>;
+      signOutAccount: () => Promise<OrionAccountState>;
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: () => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
@@ -261,6 +279,7 @@ declare global {
       }) => void) => () => void;
       onFileChange?: (cb: (data: any) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
+      onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;
     };
   }
 }

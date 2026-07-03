@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol, safeStorage, shell } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
@@ -16,10 +16,14 @@ app.setAppUserModelId('com.complexia.orion');
 const execFileAsync = promisify(execFile);
 const hiddenSystemDirectories = new Set(['.git']);
 const storageFileName = 'orion-store.json';
+const accountSessionFileName = 'orion-account-session.json';
 const attachmentDirectoryName = 'attachments';
 const attachmentProtocol = 'orion-attachment';
+const appProtocol = 'orion';
 const loginShell = process.env.SHELL || '/bin/zsh';
 const activeAgentRuns = new Map();
+let pendingDesktopAuth = null;
+let inMemoryAccountSession = null;
 let storageSaveQueue = Promise.resolve();
 let appUpdateState = {
   status: 'idle',
@@ -268,6 +272,7 @@ const agentModels = [
 ];
 
 const getStorageFilePath = () => path.join(app.getPath('userData'), storageFileName);
+const getAccountSessionFilePath = () => path.join(app.getPath('userData'), accountSessionFileName);
 const getAttachmentDirectoryPath = () => path.join(app.getPath('userData'), attachmentDirectoryName);
 
 const imageExtensionsByMimeType = {
@@ -322,6 +327,255 @@ const sanitizeStoreValue = (value) => {
 };
 
 const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+
+const base64Url = (value) =>
+  Buffer.from(value)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+
+const randomBase64Url = (byteLength = 32) => base64Url(crypto.randomBytes(byteLength));
+
+const sha256Base64Url = (value) => base64Url(crypto.createHash('sha256').update(value).digest());
+
+const getOrionWebUrl = () => {
+  const rawUrl = process.env.ORION_WEB_URL || 'https://orioncode.xyz';
+  const url = new URL(rawUrl);
+  url.hash = '';
+  url.search = '';
+  return url;
+};
+
+const desktopAccountForRenderer = (session) => {
+  if (!session?.token || !session?.user) {
+    return { authenticated: false, user: null, expiresAt: null };
+  }
+
+  return {
+    authenticated: true,
+    user: session.user,
+    expiresAt: session.expiresAt ?? null,
+  };
+};
+
+const encryptAccountToken = (token) => {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('OS-backed secure storage is not available.');
+  }
+  return {
+    encrypted: true,
+    value: safeStorage.encryptString(token).toString('base64'),
+  };
+};
+
+const decryptAccountToken = (storedToken) => {
+  if (!storedToken || typeof storedToken !== 'object') return null;
+  if (storedToken.encrypted) {
+    return safeStorage.decryptString(Buffer.from(String(storedToken.value || ''), 'base64'));
+  }
+  return typeof storedToken.value === 'string' ? storedToken.value : null;
+};
+
+const readAccountSession = async () => {
+  if (inMemoryAccountSession) return inMemoryAccountSession;
+
+  try {
+    const raw = await fs.readFile(getAccountSessionFilePath(), 'utf-8');
+    const parsed = JSON.parse(raw);
+    const token = decryptAccountToken(parsed.token);
+    if (!token || !parsed.user) return null;
+    return {
+      token,
+      user: parsed.user,
+      expiresAt: parsed.expiresAt ?? null,
+      createdAt: parsed.createdAt ?? null,
+    };
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.error('account:load error', error);
+    }
+    return null;
+  }
+};
+
+const writeAccountSession = async (session) => {
+  inMemoryAccountSession = session;
+
+  // Never persist account tokens without OS-backed encryption.
+  if (!safeStorage.isEncryptionAvailable()) {
+    return;
+  }
+
+  const filePath = getAccountSessionFilePath();
+  const payload = {
+    token: encryptAccountToken(session.token),
+    user: session.user,
+    expiresAt: session.expiresAt ?? null,
+    createdAt: new Date().toISOString(),
+  };
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
+};
+
+const clearAccountSession = async () => {
+  inMemoryAccountSession = null;
+  await fs.rm(getAccountSessionFilePath(), { force: true });
+};
+
+const publishAccountState = async (session) => {
+  const account = desktopAccountForRenderer(session ?? (await readAccountSession()));
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send('account:changed', account);
+  }
+  return account;
+};
+
+const verifyAccountSession = async () => {
+  const session = await readAccountSession();
+  if (!session?.token) return desktopAccountForRenderer(null);
+
+  if (session.expiresAt && Date.parse(session.expiresAt) <= Date.now()) {
+    await clearAccountSession();
+    return publishAccountState(null);
+  }
+
+  try {
+    const response = await fetch(new URL('/api/desktop-auth/session', getOrionWebUrl()), {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${session.token}`,
+      },
+    });
+
+    if (response.status === 401) {
+      await clearAccountSession();
+      return publishAccountState(null);
+    }
+
+    if (!response.ok) {
+      return desktopAccountForRenderer(session);
+    }
+
+    const data = await response.json();
+    const nextSession = {
+      token: session.token,
+      user: data.user ?? session.user,
+      expiresAt: data.expiresAt ?? session.expiresAt ?? null,
+    };
+    await writeAccountSession(nextSession);
+    return publishAccountState(nextSession);
+  } catch {
+    return desktopAccountForRenderer(session);
+  }
+};
+
+const buildDesktopAuthUrl = (state, codeChallenge) => {
+  const url = new URL('/desktop/authorize', getOrionWebUrl());
+  url.searchParams.set('state', state);
+  url.searchParams.set('redirect_uri', `${appProtocol}://auth/callback`);
+  url.searchParams.set('code_challenge', codeChallenge);
+  url.searchParams.set('code_challenge_method', 'S256');
+  url.searchParams.set('app_version', app.getVersion());
+  url.searchParams.set('platform', process.platform);
+  return url;
+};
+
+const startDesktopAuth = async () => {
+  const state = randomBase64Url(24);
+  const codeVerifier = randomBase64Url(48);
+  const codeChallenge = sha256Base64Url(codeVerifier);
+  pendingDesktopAuth = {
+    state,
+    codeVerifier,
+    createdAt: Date.now(),
+  };
+
+  const url = buildDesktopAuthUrl(state, codeChallenge);
+  await shell.openExternal(url.toString());
+  return { ok: true, url: url.toString() };
+};
+
+const isDesktopAuthCallbackUrl = (rawUrl) => {
+  try {
+    const url = new URL(rawUrl);
+    return url.protocol === `${appProtocol}:` && url.hostname === 'auth' && url.pathname === '/callback';
+  } catch {
+    return false;
+  }
+};
+
+const exchangeDesktopAuthCode = async ({ code, state, codeVerifier }) => {
+  const response = await fetch(new URL('/api/desktop-auth/exchange', getOrionWebUrl()), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      code,
+      state,
+      codeVerifier,
+      appVersion: app.getVersion(),
+      platform: process.platform,
+    }),
+  });
+
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {}
+
+  if (!response.ok) {
+    throw new Error(data?.error || 'Could not authorize Orion Desktop.');
+  }
+
+  return data;
+};
+
+const handleDesktopAuthCallback = async (rawUrl) => {
+  if (!isDesktopAuthCallbackUrl(rawUrl)) return false;
+
+  const callbackUrl = new URL(rawUrl);
+  const state = callbackUrl.searchParams.get('state');
+  const code = callbackUrl.searchParams.get('code');
+  const error = callbackUrl.searchParams.get('error');
+
+  if (error) {
+    await publishAccountState(await readAccountSession());
+    return true;
+  }
+
+  const pending = pendingDesktopAuth;
+  pendingDesktopAuth = null;
+
+  if (!pending || !state || pending.state !== state || !code) {
+    await publishAccountState(await readAccountSession());
+    return true;
+  }
+
+  if (Date.now() - pending.createdAt > 10 * 60 * 1000) {
+    await publishAccountState(await readAccountSession());
+    return true;
+  }
+
+  try {
+    const session = await exchangeDesktopAuthCode({
+      code,
+      state,
+      codeVerifier: pending.codeVerifier,
+    });
+    await writeAccountSession(session);
+    await publishAccountState(session);
+    const [window] = BrowserWindow.getAllWindows();
+    if (window) {
+      if (window.isMinimized()) window.restore();
+      window.focus();
+    }
+  } catch (exchangeError) {
+    console.error('account:exchange error', exchangeError);
+    await publishAccountState(await readAccountSession());
+  }
+
+  return true;
+};
 
 const humanizeModelSlug = (slug) =>
   String(slug)
@@ -1634,6 +1888,35 @@ if (started) {
   app.quit();
 }
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
+
+if (process.defaultApp && process.argv.length >= 2) {
+  app.setAsDefaultProtocolClient(appProtocol, process.execPath, [path.resolve(process.argv[1])]);
+} else {
+  app.setAsDefaultProtocolClient(appProtocol);
+}
+
+app.on('second-instance', (_event, argv) => {
+  const callbackUrl = argv.find((arg) => isDesktopAuthCallbackUrl(arg));
+  if (callbackUrl) {
+    void handleDesktopAuthCallback(callbackUrl);
+  }
+
+  const [window] = BrowserWindow.getAllWindows();
+  if (window) {
+    if (window.isMinimized()) window.restore();
+    window.focus();
+  }
+});
+
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  void handleDesktopAuthCallback(url);
+});
+
 const getAppIconPath = () => {
   if (app.isPackaged) {
     return path.join(process.resourcesPath, 'icon.png');
@@ -1805,7 +2088,7 @@ const createWindow = () => {
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Reinforce the app name (helps in some dev launch scenarios)
   app.setName('Orion');
 
@@ -1848,6 +2131,13 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+
+  const startupAuthUrl = process.argv.find((arg) => isDesktopAuthCallbackUrl(arg));
+  if (startupAuthUrl) {
+    void handleDesktopAuthCallback(startupAuthUrl);
+  } else {
+    void publishAccountState(await readAccountSession());
+  }
 
   if (process.platform === 'darwin') {
     const dockIcon = nativeImage.createFromPath(getAppIconPath());
@@ -2357,6 +2647,21 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
 });
 
 ipcMain.handle('providers:authenticate', async (_event, providerId) => authenticateProviderTool(providerId));
+
+ipcMain.handle('account:getSession', async () => verifyAccountSession());
+
+ipcMain.handle('account:startAuth', async () => {
+  try {
+    return await startDesktopAuth();
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+
+ipcMain.handle('account:signOut', async () => {
+  await clearAccountSession();
+  return publishAccountState(null);
+});
 
 ipcMain.handle('appUpdate:getState', async () => appUpdateState);
 

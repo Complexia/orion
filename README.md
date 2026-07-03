@@ -31,6 +31,10 @@ npm install
 npm run start
 ```
 
+For local desktop login testing, set `ORION_WEB_URL` to the Orion Web origin
+that has Clerk and the desktop auth routes configured. Production defaults to
+`https://orioncode.xyz`.
+
 ## Build
 
 ```bash

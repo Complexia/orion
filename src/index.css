@@ -586,6 +586,10 @@ body {
   height: 30px;
   min-width: 116px;
   padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   background: rgb(255 255 255 / 4%);
@@ -614,6 +618,84 @@ body {
   padding: 0 8px;
   font-size: 11px;
   font-weight: 600;
+}
+
+.account-row {
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+}
+
+.account-card-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.account-avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  object-fit: cover;
+  border: 1px solid var(--border-default);
+  background: rgb(255 255 255 / 5%);
+}
+
+.account-avatar-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.account-card-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.account-card-title {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.account-card-subtitle {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.account-status-chip {
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid rgb(244 162 97 / 26%);
+  border-radius: 999px;
+  background: rgb(244 162 97 / 10%);
+  color: #f7c59f;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.account-status-chip.signed-in {
+  border-color: rgb(52 211 153 / 22%);
+  background: rgb(52 211 153 / 10%);
+  color: #a7f3d0;
+}
+
+.account-primary-button {
+  min-width: 92px;
 }
 
 /* New Providers list in settings (matches screenshot style) */
