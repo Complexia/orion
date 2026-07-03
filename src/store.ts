@@ -1,0 +1,467 @@
+import { create } from 'zustand';
+import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware';
+
+export type Project = {
+  id: string;
+  name: string;
+  path: string;
+};
+
+export type AgentActivity = {
+  id: string;
+  key?: string;
+  type: 'thought' | 'command' | 'tool' | 'result' | 'error';
+  title: string;
+  detail?: string;
+  status?: 'running' | 'done' | 'error';
+  ts: string;
+};
+
+export type ChangedFileSummary = {
+  path: string;
+  status: 'added' | 'copied' | 'conflicted' | 'deleted' | 'modified' | 'renamed' | 'untracked';
+  additions: number;
+  deletions: number;
+};
+
+export type ImageAttachment = {
+  id: string;
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+};
+
+export type Message = {
+  id: string;
+  role: 'user' | 'agent' | 'system';
+  content: string;
+  ts: string;
+  attachments?: ImageAttachment[];
+  kind?: 'text' | 'agent-run';
+  status?: 'running' | 'done' | 'error' | 'stopped';
+  statusText?: string;
+  command?: string;
+  activities?: AgentActivity[];
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+  changedFiles?: ChangedFileSummary[];
+};
+
+export type Thread = {
+  id: string;
+  projectId: string;
+  title: string;
+  status: 'idle' | 'running' | 'done' | 'error';
+  modelId: string;
+  accessMode: 'read-only' | 'workspace-write' | 'full-access';
+  codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  codexServiceTier?: 'default' | 'priority';
+  claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
+  claudeContextWindow?: '200k' | '1m';
+  createdAt: string;
+  messages: Message[];
+};
+
+export type OpenFile = {
+  path: string;
+  content: string;
+  isDirty: boolean;
+};
+
+export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'opencode';
+
+export type ProviderSettings = Record<ProviderId, { enabled: boolean }>;
+
+export const defaultProviderSettings: ProviderSettings = {
+  grok: { enabled: true },
+  codex: { enabled: true },
+  claude: { enabled: true },
+  cursor: { enabled: true },
+  opencode: { enabled: true },
+};
+
+interface OrionState {
+  // Tabs
+  activeTab: 'agents' | 'code';
+
+  // Projects & Threads
+  projects: Project[];
+  threads: Thread[];
+  selectedProjectId: string | null;
+  selectedThreadId: string | null;
+
+  // Code tab workspace
+  workspacePath: string | null;
+  openFiles: OpenFile[];
+  activeFilePath: string | null;
+
+  // UI
+  expandedProjects: string[];
+  providerSettings: ProviderSettings;
+
+  // Actions
+  setActiveTab: (tab: 'agents' | 'code') => void;
+  setProviderEnabled: (id: ProviderId, enabled: boolean) => void;
+
+  addProject: (project: Omit<Project, 'id'>) => void;
+  removeProject: (id: string) => void;
+
+  createThread: (projectId: string, title?: string) => string; // returns new thread id
+  selectProject: (id: string | null) => void;
+  selectThread: (id: string | null) => void;
+  updateThread: (id: string, updates: Partial<Thread>) => void;
+  deleteThread: (id: string) => void;
+  addMessageToThread: (threadId: string, message: Omit<Message, 'id' | 'ts'>) => string;
+  appendToThreadMessage: (threadId: string, messageId: string, chunk: string) => void;
+  updateThreadMessage: (
+    threadId: string,
+    messageId: string,
+    updates: Partial<Omit<Message, 'id'>>
+  ) => void;
+  addActivityToThreadMessage: (
+    threadId: string,
+    messageId: string,
+    activity: Omit<AgentActivity, 'id' | 'ts'>
+  ) => void;
+
+  toggleProjectExpanded: (id: string) => void;
+
+  setWorkspacePath: (path: string | null) => void;
+
+  openFile: (path: string, content: string) => void;
+  closeFile: (path: string) => void;
+  setActiveFile: (path: string) => void;
+  updateOpenFileContent: (path: string, content: string) => void;
+  markFileSaved: (path: string) => void;
+  closeAllFiles: () => void;
+}
+
+const memoryStorage = new Map<string, string>();
+
+const orionStorage: StateStorage = {
+  getItem: async (name) => {
+    if (typeof window === 'undefined' || !window.orion?.loadStore) {
+      return memoryStorage.get(name) ?? null;
+    }
+
+    const value = await window.orion.loadStore();
+    if (value !== null) {
+      memoryStorage.set(name, value);
+      return value;
+    }
+
+    const legacyValue = window.localStorage.getItem(name);
+    if (legacyValue !== null) {
+      memoryStorage.set(name, legacyValue);
+      await window.orion.saveStore(legacyValue);
+      return legacyValue;
+    }
+
+    return null;
+  },
+  setItem: async (name, value) => {
+    memoryStorage.set(name, value);
+
+    if (typeof window === 'undefined' || !window.orion?.saveStore) {
+      return;
+    }
+
+    const saved = await window.orion.saveStore(value);
+    if (!saved) {
+      console.warn(`Failed to persist ${name}`);
+    }
+  },
+  removeItem: async (name) => {
+    memoryStorage.delete(name);
+
+    if (typeof window === 'undefined' || !window.orion?.clearStore) {
+      return;
+    }
+
+    const cleared = await window.orion.clearStore();
+    if (!cleared) {
+      console.warn(`Failed to clear ${name}`);
+    }
+  },
+};
+
+export const useOrionStore = create<OrionState>()(
+  persist(
+    (set, get) => ({
+      activeTab: 'agents',
+      projects: [],
+      threads: [],
+      selectedProjectId: null,
+      selectedThreadId: null,
+      workspacePath: null,
+      openFiles: [],
+      activeFilePath: null,
+      expandedProjects: [],
+      providerSettings: defaultProviderSettings,
+
+      setActiveTab: (tab) => set({ activeTab: tab }),
+      setProviderEnabled: (id, enabled) =>
+        set((state) => ({
+          providerSettings: {
+            ...defaultProviderSettings,
+            ...state.providerSettings,
+            [id]: { enabled },
+          },
+        })),
+
+      addProject: (project) => {
+        const newProject: Project = {
+          ...project,
+          id: crypto.randomUUID(),
+        };
+        set((state) => ({
+          projects: [...state.projects, newProject],
+          expandedProjects: [...state.expandedProjects, newProject.id],
+          selectedProjectId: newProject.id,
+        }));
+        // Auto-set as workspace if none
+        if (!get().workspacePath) {
+          set({ workspacePath: newProject.path });
+        }
+      },
+
+      removeProject: (id) => {
+        set((state) => {
+          const removedProject = state.projects.find((p) => p.id === id);
+          const remainingProjects = state.projects.filter((p) => p.id !== id);
+          const fallbackProject = remainingProjects[0] ?? null;
+          const wasWorkspaceProject = removedProject?.path === state.workspacePath;
+
+          return {
+            projects: remainingProjects,
+            threads: state.threads.filter((t) => t.projectId !== id),
+            selectedProjectId:
+              state.selectedProjectId === id ? fallbackProject?.id ?? null : state.selectedProjectId,
+            selectedThreadId:
+              state.threads.find((t) => t.id === state.selectedThreadId)?.projectId === id
+                ? null
+                : state.selectedThreadId,
+            expandedProjects: state.expandedProjects.filter((pid) => pid !== id),
+            workspacePath: wasWorkspaceProject ? fallbackProject?.path ?? null : state.workspacePath,
+            openFiles: wasWorkspaceProject ? [] : state.openFiles,
+            activeFilePath: wasWorkspaceProject ? null : state.activeFilePath,
+          };
+        });
+      },
+
+      createThread: (projectId, title) => {
+        const newThread: Thread = {
+          id: crypto.randomUUID(),
+          projectId,
+          title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+          status: 'idle',
+          modelId: 'grok:grok-build',
+          accessMode: 'workspace-write',
+          createdAt: new Date().toISOString(),
+          messages: [],
+        };
+        set((state) => ({
+          threads: [newThread, ...state.threads],
+          selectedProjectId: projectId,
+          selectedThreadId: newThread.id,
+        }));
+        return newThread.id;
+      },
+
+      selectProject: (id) =>
+        set((state) => {
+          const selectedThread = state.threads.find((t) => t.id === state.selectedThreadId);
+
+          return {
+            selectedProjectId: id,
+            selectedThreadId:
+              selectedThread && selectedThread.projectId !== id ? null : state.selectedThreadId,
+          };
+        }),
+
+      selectThread: (id) =>
+        set((state) => {
+          const thread = state.threads.find((t) => t.id === id);
+
+          return {
+            selectedThreadId: id,
+            selectedProjectId: thread?.projectId ?? state.selectedProjectId,
+          };
+        }),
+
+      updateThread: (id, updates) =>
+        set((state) => ({
+          threads: state.threads.map((t) => (t.id === id ? { ...t, ...updates } : t)),
+        })),
+
+      deleteThread: (id) =>
+        set((state) => ({
+          threads: state.threads.filter((t) => t.id !== id),
+          selectedThreadId: state.selectedThreadId === id ? null : state.selectedThreadId,
+        })),
+
+      addMessageToThread: (threadId, message) => {
+        const msg: Message = {
+          ...message,
+          id: crypto.randomUUID(),
+          ts: new Date().toISOString(),
+        };
+        set((state) => ({
+          threads: state.threads.map((t) =>
+            t.id === threadId ? { ...t, messages: [...t.messages, msg] } : t
+          ),
+        }));
+        return msg.id;
+      },
+
+      appendToThreadMessage: (threadId, messageId, chunk) => {
+        if (!chunk) return;
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId
+              ? {
+                  ...thread,
+                  messages: thread.messages.map((message) =>
+                    message.id === messageId
+                      ? { ...message, content: `${message.content}${chunk}` }
+                      : message
+                  ),
+                }
+              : thread
+          ),
+        }));
+      },
+
+      updateThreadMessage: (threadId, messageId, updates) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId
+              ? {
+                  ...thread,
+                  messages: thread.messages.map((message) =>
+                    message.id === messageId ? { ...message, ...updates } : message
+                  ),
+                }
+              : thread
+          ),
+        })),
+
+      addActivityToThreadMessage: (threadId, messageId, activity) =>
+        set((state) => {
+          const nextActivity: AgentActivity = {
+            ...activity,
+            id: crypto.randomUUID(),
+            ts: new Date().toISOString(),
+          };
+
+          return {
+            threads: state.threads.map((thread) =>
+              thread.id === threadId
+                ? {
+                    ...thread,
+                    messages: thread.messages.map((message) => {
+                      if (message.id !== messageId) return message;
+
+                      const existingActivities = message.activities ?? [];
+                      const existingIndex = activity.key
+                        ? existingActivities.findIndex((existing) => existing.key === activity.key)
+                        : -1;
+
+                      if (existingIndex >= 0) {
+                        return {
+                          ...message,
+                          activities: existingActivities.map((existing, index) =>
+                            index === existingIndex
+                              ? {
+                                  ...existing,
+                                  ...activity,
+                                  ts: nextActivity.ts,
+                                }
+                              : existing
+                          ),
+                        };
+                      }
+
+                      return {
+                        ...message,
+                        activities: [...existingActivities, nextActivity],
+                      };
+                    }),
+                  }
+                : thread
+            ),
+          };
+        }),
+
+      toggleProjectExpanded: (id) =>
+        set((state) => ({
+          expandedProjects: state.expandedProjects.includes(id)
+            ? state.expandedProjects.filter((p) => p !== id)
+            : [...state.expandedProjects, id],
+        })),
+
+      setWorkspacePath: (path) => set({ workspacePath: path }),
+
+      openFile: (path, content) => {
+        const existing = get().openFiles.find((f) => f.path === path);
+        if (existing) {
+          set({ activeFilePath: path });
+          return;
+        }
+        set((state) => ({
+          openFiles: [...state.openFiles, { path, content, isDirty: false }],
+          activeFilePath: path,
+        }));
+      },
+
+      closeFile: (path) => {
+        set((state) => {
+          const newFiles = state.openFiles.filter((f) => f.path !== path);
+          let newActive = state.activeFilePath;
+          if (state.activeFilePath === path) {
+            newActive = newFiles.length > 0 ? newFiles[newFiles.length - 1].path : null;
+          }
+          return { openFiles: newFiles, activeFilePath: newActive };
+        });
+      },
+
+      setActiveFile: (path) => set({ activeFilePath: path }),
+
+      updateOpenFileContent: (path, content) =>
+        set((state) => ({
+          openFiles: state.openFiles.map((f) =>
+            f.path === path ? { ...f, content, isDirty: true } : f
+          ),
+        })),
+
+      markFileSaved: (path) =>
+        set((state) => ({
+          openFiles: state.openFiles.map((f) =>
+            f.path === path ? { ...f, isDirty: false } : f
+          ),
+        })),
+
+      closeAllFiles: () => set({ openFiles: [], activeFilePath: null }),
+    }),
+    {
+      name: 'orion-storage',
+      storage: createJSONStorage(() => orionStorage),
+      version: 1,
+      partialize: (state) => ({
+        activeTab: state.activeTab,
+        projects: state.projects,
+        threads: state.threads,
+        selectedProjectId: state.selectedProjectId,
+        selectedThreadId: state.selectedThreadId,
+        workspacePath: state.workspacePath,
+        expandedProjects: state.expandedProjects,
+        providerSettings: {
+          ...defaultProviderSettings,
+          ...state.providerSettings,
+        },
+      }),
+    }
+  )
+);

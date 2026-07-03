@@ -1,0 +1,55 @@
+{
+  "name": "orion",
+  "productName": "Orion",
+  "version": "1.0.6",
+  "description": "Orion - Agentic IDE",
+  "main": ".vite/build/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "deploy": "node scripts/deploy.mjs",
+    "publish": "electron-forge publish",
+    "lint": "echo \"No linting configured\""
+  },
+  "keywords": [],
+  "author": {
+    "name": "Complexia",
+    "email": "complexia701@gmail.com"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@aws-sdk/client-s3": "^3.1078.0",
+    "@electron-forge/cli": "^7.11.2",
+    "@electron-forge/maker-deb": "^7.11.2",
+    "@electron-forge/maker-dmg": "^7.11.2",
+    "@electron-forge/maker-rpm": "^7.11.2",
+    "@electron-forge/maker-squirrel": "^7.11.2",
+    "@electron-forge/maker-zip": "^7.11.2",
+    "@electron-forge/plugin-auto-unpack-natives": "^7.11.2",
+    "@electron-forge/plugin-fuses": "^7.11.2",
+    "@electron-forge/plugin-vite": "^7.11.2",
+    "@electron/fuses": "^1.8.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.5.2",
+    "electron": "42.5.0",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^3.4.19",
+    "vite": "^5.4.21"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "date-fns": "^4.4.0",
+    "electron-squirrel-startup": "^1.0.1",
+    "electron-updater": "^6.8.9",
+    "lucide-react": "^1.21.0",
+    "monaco-editor": "^0.55.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "sonner": "^2.0.7",
+    "zustand": "^5.0.14"
+  }
+}

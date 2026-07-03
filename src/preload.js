@@ -1,0 +1,72 @@
+// See the Electron documentation for details on how to use preload scripts:
+// https://www.electronjs.org/docs/latest/tutorial/process-model#preload-scripts
+
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+contextBridge.exposeInMainWorld('orion', {
+  // App persistence
+  loadStore: () => ipcRenderer.invoke('storage:load'),
+  saveStore: (value) => ipcRenderer.invoke('storage:save', value),
+  clearStore: () => ipcRenderer.invoke('storage:clear'),
+
+  // Dialog
+  openDirectory: () => ipcRenderer.invoke('dialog:openDirectory'),
+
+  // File system
+  readDirectory: (dirPath) => ipcRenderer.invoke('fs:readDirectory', dirPath),
+  readFile: (filePath) => ipcRenderer.invoke('fs:readFile', filePath),
+  writeFile: (filePath, content) => ipcRenderer.invoke('fs:writeFile', filePath, content),
+  createFile: (filePath, content = '') => ipcRenderer.invoke('fs:createFile', filePath, content),
+  createDirectory: (dirPath) => ipcRenderer.invoke('fs:createDirectory', dirPath),
+  deletePath: (targetPath) => ipcRenderer.invoke('fs:deletePath', targetPath),
+  saveImageAttachment: (input) => ipcRenderer.invoke('attachment:saveImage', input),
+  getPathForFile: (file) => webUtils.getPathForFile(file),
+
+  // Git
+  getGitState: (projectPath) => ipcRenderer.invoke('git:getState', projectPath),
+  checkoutGitBranch: (input) => ipcRenderer.invoke('git:checkoutBranch', input),
+  commitAndPush: (projectPath) => ipcRenderer.invoke('git:commitAndPush', projectPath),
+
+  // Agent runtime
+  listAgentModels: () => ipcRenderer.invoke('agent:listModels'),
+  runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
+  stopAgentTurn: (runId) => ipcRenderer.invoke('agent:stopTurn', runId),
+  generateThreadTitle: (input) => ipcRenderer.invoke('agent:generateTitle', input),
+  getProviderStatus: () => ipcRenderer.invoke('providers:getStatus'),
+  checkProviderUpdates: (input) => ipcRenderer.invoke('providers:checkUpdates', input),
+  updateProviders: (input) => ipcRenderer.invoke('providers:updateAll', input),
+  authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
+
+  // App updates
+  getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
+  checkForAppUpdate: () => ipcRenderer.invoke('appUpdate:check'),
+  downloadAppUpdate: () => ipcRenderer.invoke('appUpdate:download'),
+  restartToUpdate: () => ipcRenderer.invoke('appUpdate:restart'),
+
+  // Project assets
+  findProjectIcon: (projectPath) => ipcRenderer.invoke('project:findIcon', projectPath),
+
+  // Path utils
+  basename: (p) => ipcRenderer.invoke('path:basename', p),
+  dirname: (p) => ipcRenderer.invoke('path:dirname', p),
+  join: (...parts) => ipcRenderer.invoke('path:join', ...parts),
+
+  onAgentTurnEvent: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('agent:turnEvent', listener);
+    return () => ipcRenderer.removeListener('agent:turnEvent', listener);
+  },
+
+  // Listen for file changes if needed (future)
+  onFileChange: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('fs:fileChanged', listener);
+    return () => ipcRenderer.removeListener('fs:fileChanged', listener);
+  },
+
+  onAppUpdateState: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('appUpdate:state', listener);
+    return () => ipcRenderer.removeListener('appUpdate:state', listener);
+  },
+});

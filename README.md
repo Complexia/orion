@@ -1,0 +1,83 @@
+# Orion
+
+**Orion** is a lightweight Agentic IDE desktop application.
+
+## Features
+
+### Agents Tab (default)
+- Sidebar with projects and threads
+- Add local folders as projects
+- Create multiple threads per project (agentic runs)
+- Simple chat interface per thread (mock agent for now — easily swappable for real Codex / Claude Code / Cursor agent integrations)
+- Status indicators
+
+### Code Tab
+- File explorer for any folder or linked project
+- Open multiple files as tabs
+- Built-in editor with syntax-aware editing (textarea today, ready for full Monaco)
+- Save files (Cmd/Ctrl+S)
+- Close tabs (Cmd/Ctrl+W)
+
+### Architecture
+- Electron + Vite + React + TypeScript
+- IPC bridge for secure filesystem access (main process)
+- Zustand for client state (persisted)
+- VSCode-inspired dark theme
+
+## Run
+
+```bash
+npm install
+npm run start
+```
+
+## Build
+
+```bash
+npm run package
+npm run make   # produces distributables
+```
+
+## Release
+
+Create `.env.release.local` from `.env.release.example`, then run:
+
+```bash
+bun run deploy
+```
+
+By default this bumps the patch version, builds the current platform/architecture, uploads artifacts to versioned R2 keys under `releases/v<version>/`, and updates `releases/latest.json`.
+
+macOS builds are Developer ID signed, notarized, stapled DMGs. See [docs/macos-signing-release.md](docs/macos-signing-release.md) for local keychain setup and verification commands.
+
+Useful overrides:
+
+```bash
+bun run deploy --bump minor
+bun run deploy --version 1.2.3
+bun run deploy --bump none
+```
+
+## Extending
+
+### Real Agents
+In `src/App.tsx`, the `sendMessage` function currently simulates replies. Replace the mock logic with calls to:
+- Codex CLI
+- Claude Code
+- Cursor agent
+- T3 Code compatible providers
+
+Use child_process or the existing CLI tools via IPC in `src/main.js`.
+
+### Full Monaco Editor
+Uncomment the Monaco `<Editor>` component in the Code tab and import from `@monaco-editor/react`. The project is already set up for it (workers + config ready).
+
+### Linting
+Monaco + language servers (or simple ESLint worker) can be added to the editor pane.
+
+## Notes
+Inspired by T3 Code, OpenAI Codex desktop, and Cursor's agentic views.
+
+Core is deliberately simple: two tabs, projects/threads, file explorer + editor.
+
+MIT
