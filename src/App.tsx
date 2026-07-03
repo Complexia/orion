@@ -2223,6 +2223,28 @@ const App: React.FC = () => {
       )}
       <button
         type="button"
+        className={`sidebar-account-button ${accountState.authenticated ? 'signed-in' : ''}`}
+        onClick={() => {
+          if (accountState.authenticated) {
+            setSettingsTab('account');
+            setSettingsOpen(true);
+            return;
+          }
+          handleStartAccountAuth();
+        }}
+        title={accountState.authenticated ? accountName : 'Sign in to Orion'}
+        disabled={accountLoading || accountBusy}
+      >
+        {accountState.authenticated && accountState.user?.imageUrl ? (
+          <img src={accountState.user.imageUrl} alt="" />
+        ) : accountState.authenticated ? (
+          <span>{accountInitials || 'O'}</span>
+        ) : (
+          <LogIn size={16} />
+        )}
+      </button>
+      <button
+        type="button"
         className="sidebar-settings-button"
         onClick={() => setSettingsOpen(true)}
         title="Settings"

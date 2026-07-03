@@ -1182,6 +1182,7 @@ body {
   z-index: 1;
 }
 
+.sidebar-account-button,
 .sidebar-settings-button {
   width: 32px;
   height: 32px;
@@ -1196,10 +1197,46 @@ body {
   transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
 }
 
+.sidebar-account-button img,
+.sidebar-account-button span {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+}
+
+.sidebar-account-button img {
+  object-fit: cover;
+}
+
+.sidebar-account-button span {
+  background: rgb(139 130 255 / 16%);
+  color: var(--text-primary);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.sidebar-account-button.signed-in {
+  color: var(--text-primary);
+}
+
 .sidebar-settings-button:hover {
   background: rgb(255 255 255 / 6%);
   border-color: var(--border-default);
   color: var(--text-primary);
+}
+
+.sidebar-account-button:hover:not(:disabled) {
+  background: rgb(255 255 255 / 6%);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+
+.sidebar-account-button:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .agents-sidebar-content {
