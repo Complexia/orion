@@ -42,6 +42,14 @@ contextBridge.exposeInMainWorld('orion', {
   startAccountAuth: () => ipcRenderer.invoke('account:startAuth'),
   signOutAccount: () => ipcRenderer.invoke('account:signOut'),
 
+  // Orion Cloud repositories
+  getCloudState: (projectPath) => ipcRenderer.invoke('cloud:getState', projectPath),
+  publishToCloud: (input) => ipcRenderer.invoke('cloud:publish', input),
+  pushToCloud: (projectPath) => ipcRenderer.invoke('cloud:push', projectPath),
+  pullFromCloud: (projectPath) => ipcRenderer.invoke('cloud:pull', projectPath),
+  openCloudRepoInBrowser: (projectPath) => ipcRenderer.invoke('cloud:openInBrowser', projectPath),
+  openExternalUrl: (url) => ipcRenderer.invoke('app:openExternalUrl', url),
+
   // App updates
   getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
   checkForAppUpdate: () => ipcRenderer.invoke('appUpdate:check'),

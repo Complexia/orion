@@ -14,6 +14,61 @@ type AppUpdateState = {
   error?: string | null;
 };
 
+declare global {
+type OrionCloudSyncStatus = 'synced' | 'ahead' | 'behind' | 'diverged' | 'unknown';
+
+type OrionCloudState = {
+  ok: boolean;
+  authenticated?: boolean;
+  linked?: boolean;
+  stale?: boolean;
+  repoId?: string;
+  repoName?: string;
+  repo?: { id: string; name: string; defaultBranch: string; generation: number };
+  refs?: Array<{ name: string; oid: string }>;
+  currentBranch?: string | null;
+  sync?: OrionCloudSyncStatus;
+  webUrl?: string | null;
+  error?: string;
+};
+
+type OrionCloudPushResult = {
+  ok: boolean;
+  upToDate?: boolean;
+  conflict?: boolean;
+  needsAuth?: boolean;
+  pushed?: string[];
+  skipped?: Array<{ branch: string; reason: string }>;
+  repo?: { id: string; name: string };
+  webUrl?: string | null;
+  app?: { slug: string; url: string; status: string; error: string | null } | null;
+  error?: string;
+};
+
+type OrionCloudPullResult = {
+  ok: boolean;
+  needsAuth?: boolean;
+  branches?: Array<{ branch: string; oid?: string; status: string }>;
+  merge?: {
+    status:
+      | 'none'
+      | 'up-to-date'
+      | 'checked-out'
+      | 'fast-forwarded'
+      | 'ff-failed'
+      | 'local-ahead'
+      | 'diverged'
+      | 'unborn-dirty';
+    to?: string;
+    error?: string;
+    hint?: string;
+  };
+  downloadedPacks?: number;
+  downloadedLoose?: number;
+  error?: string;
+};
+}
+
 type OrionAccountState = {
   authenticated: boolean;
   user: {
@@ -229,6 +284,11 @@ declare global {
         error?: string;
       }>;
       signOutAccount: () => Promise<OrionAccountState>;
+      getCloudState: (projectPath: string) => Promise<OrionCloudState>;
+      publishToCloud: (input: { projectPath: string; name?: string }) => Promise<OrionCloudPushResult>;
+      pushToCloud: (projectPath: string) => Promise<OrionCloudPushResult>;
+      pullFromCloud: (projectPath: string) => Promise<OrionCloudPullResult>;
+      openCloudRepoInBrowser: (projectPath: string) => Promise<{ ok: boolean; error?: string }>;
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: () => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;

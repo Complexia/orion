@@ -6,6 +6,13 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import started from 'electron-squirrel-startup';
 import { autoUpdater } from 'electron-updater';
+import {
+  getCloudRepoLink,
+  getCloudState,
+  publishRepo,
+  pullRepo,
+  pushRepo,
+} from './cloud-sync.js';
 
 // Set the application name as early as possible.
 // This helps the Dock, menu bar, and tooltips show "Orion" instead of "Electron"
@@ -340,7 +347,10 @@ const randomBase64Url = (byteLength = 32) => base64Url(crypto.randomBytes(byteLe
 const sha256Base64Url = (value) => base64Url(crypto.createHash('sha256').update(value).digest());
 
 const getOrionWebUrl = () => {
-  const rawUrl = process.env.ORION_WEB_URL || 'https://orioncode.xyz';
+  // Packaged builds talk to the live site; development defaults to the local
+  // Orion Web dev server. ORION_WEB_URL overrides either.
+  const defaultWebUrl = app.isPackaged ? 'https://orioncode.xyz' : 'http://localhost:3000';
+  const rawUrl = process.env.ORION_WEB_URL || defaultWebUrl;
   const url = new URL(rawUrl);
   url.hash = '';
   url.search = '';
@@ -359,9 +369,16 @@ const desktopAccountForRenderer = (session) => {
   };
 };
 
+// macOS ties keychain ACLs to the app's code signature. In development the app
+// runs under the stock Electron binary, whose signature never matches the ACL
+// on the "Orion Safe Storage" keychain item, so every safeStorage call triggers
+// a login-keychain password prompt. Only use the keychain in packaged builds,
+// which are signed with a stable Developer ID.
+const canUseSafeStorage = () => app.isPackaged && safeStorage.isEncryptionAvailable();
+
 const encryptAccountToken = (token) => {
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('OS-backed secure storage is not available.');
+  if (!canUseSafeStorage()) {
+    return { encrypted: false, value: token };
   }
   return {
     encrypted: true,
@@ -372,6 +389,9 @@ const encryptAccountToken = (token) => {
 const decryptAccountToken = (storedToken) => {
   if (!storedToken || typeof storedToken !== 'object') return null;
   if (storedToken.encrypted) {
+    // Decrypting in dev would re-trigger the keychain prompt; treat the
+    // session as absent and let the user sign in again.
+    if (!app.isPackaged) return null;
     return safeStorage.decryptString(Buffer.from(String(storedToken.value || ''), 'base64'));
   }
   return typeof storedToken.value === 'string' ? storedToken.value : null;
@@ -402,8 +422,10 @@ const readAccountSession = async () => {
 const writeAccountSession = async (session) => {
   inMemoryAccountSession = session;
 
-  // Never persist account tokens without OS-backed encryption.
-  if (!safeStorage.isEncryptionAvailable()) {
+  // In packaged builds, never persist account tokens without OS-backed
+  // encryption. Development builds store the token unencrypted to avoid the
+  // keychain password prompt on every launch.
+  if (app.isPackaged && !safeStorage.isEncryptionAvailable()) {
     return;
   }
 
@@ -2539,6 +2561,155 @@ ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
     };
   } catch (error) {
     return { ok: false, error: error?.stderr?.toString().trim() || error?.message || String(error) };
+  }
+});
+
+// --- Orion Cloud repositories -------------------------------------------------
+
+const cloudErrorMessage = (error) => {
+  if (error?.status === 401) return 'Your Orion session expired. Sign in again.';
+  if (error?.status === 404) {
+    // A real "repo not found" comes back as JSON from the git API; a bare 404
+    // (HTML page) means this Orion Web deployment doesn't have the API at all.
+    return error?.data?.error
+      ? 'Cloud repository not found. It may have been deleted.'
+      : `Orion Cloud at ${getOrionWebUrl().host} does not support repositories yet. Deploy the latest Orion Web, or point ORION_WEB_URL at a server that has it.`;
+  }
+  if (error?.message?.includes('fetch failed')) return 'Could not reach Orion Cloud.';
+  return error?.stderr?.toString().trim() || error?.message || String(error);
+};
+
+const sanitizeCloudRepoName = (value) =>
+  String(value ?? '')
+    .trim()
+    .replace(/\.git$/i, '')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^[-.]+/, '')
+    .slice(0, 100);
+
+const cloudRepoWebUrl = (repoId) => new URL(`/repos/${repoId}`, getOrionWebUrl()).toString();
+
+ipcMain.handle('cloud:getState', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: true, authenticated: false, linked: false };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const state = await getCloudState({
+      gitRoot,
+      baseUrl: getOrionWebUrl(),
+      token: session.token,
+    });
+    return {
+      ok: true,
+      authenticated: true,
+      ...state,
+      webUrl: state.linked ? cloudRepoWebUrl(state.repoId) : null,
+    };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('cloud:publish', async (_event, input) => {
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, error: 'Sign in to your Orion account to publish.', needsAuth: true };
+    }
+
+    const gitRoot = await getGitRoot(projectPath);
+    const existing = await getCloudRepoLink(gitRoot);
+    if (existing) {
+      return { ok: false, error: 'This repository is already linked to Orion Cloud.' };
+    }
+
+    const name = sanitizeCloudRepoName(input?.name || path.basename(gitRoot));
+    if (!name) return { ok: false, error: 'Invalid repository name.' };
+
+    const result = await publishRepo({
+      gitRoot,
+      name,
+      baseUrl: getOrionWebUrl(),
+      token: session.token,
+    });
+    return { ...result, webUrl: result.repo ? cloudRepoWebUrl(result.repo.id) : null };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('cloud:push', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const link = await getCloudRepoLink(gitRoot);
+    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+
+    return await pushRepo({
+      gitRoot,
+      repoId: link.repoId,
+      baseUrl: getOrionWebUrl(),
+      token: session.token,
+    });
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('cloud:pull', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const link = await getCloudRepoLink(gitRoot);
+    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+
+    return await pullRepo({
+      gitRoot,
+      repoId: link.repoId,
+      baseUrl: getOrionWebUrl(),
+      token: session.token,
+    });
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('app:openExternalUrl', async (_event, url) => {
+  try {
+    const parsed = new URL(String(url));
+    if (parsed.protocol !== 'https:') {
+      return { ok: false, error: 'Only https URLs can be opened.' };
+    }
+    await shell.openExternal(parsed.toString());
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Invalid URL.' };
+  }
+});
+
+ipcMain.handle('cloud:openInBrowser', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const gitRoot = await getGitRoot(projectPath);
+    const link = await getCloudRepoLink(gitRoot);
+    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+    await shell.openExternal(cloudRepoWebUrl(link.repoId));
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
   }
 });
 

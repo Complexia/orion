@@ -36,6 +36,10 @@ import {
   UserRound,
   LogIn,
   LogOut,
+  Cloud,
+  CloudUpload,
+  CloudDownload,
+  Globe,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -1014,6 +1018,8 @@ const App: React.FC = () => {
   const [gitState, setGitState] = useState<GitRepoState | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
   const [gitBusy, setGitBusy] = useState(false);
+  const [cloudState, setCloudState] = useState<OrionCloudState | null>(null);
+  const [cloudBusy, setCloudBusy] = useState(false);
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
   const [threadListLimits, setThreadListLimits] = useState<Record<string, number>>({});
   const [editorBottomPadding, setEditorBottomPadding] = useState(280);
@@ -1426,6 +1432,29 @@ const App: React.FC = () => {
   useEffect(() => {
     void refreshGitState();
   }, [refreshGitState]);
+
+  const refreshCloudState = useCallback(async () => {
+    const projectPath = activeThreadProject?.path;
+    if (!projectPath || !window.orion?.getCloudState) {
+      setCloudState(null);
+      return;
+    }
+
+    try {
+      setCloudState(await window.orion.getCloudState(projectPath));
+    } catch (error) {
+      setCloudState({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Unable to read Orion Cloud state',
+      });
+    }
+  }, [activeThreadProject?.path]);
+
+  // Cloud state depends on both the account session and local git state
+  // (each git action can change what is ahead/behind the cloud copy).
+  useEffect(() => {
+    void refreshCloudState();
+  }, [refreshCloudState, accountState.authenticated, gitState]);
 
   const handleUpdateProviders = useCallback(async () => {
     if (!window.orion?.updateProviders || providerUpdatesRunning) return;
@@ -1891,6 +1920,97 @@ const App: React.FC = () => {
       }
     } finally {
       setGitBusy(false);
+    }
+  };
+
+  const handleCloudPublish = async () => {
+    if (!activeThreadProject?.path || !window.orion?.publishToCloud || cloudBusy) return;
+
+    setCloudBusy(true);
+    try {
+      const result = await window.orion.publishToCloud({ projectPath: activeThreadProject.path });
+      if (result.ok) {
+        toast.success(`Published to Orion Cloud as ${result.repo?.name ?? 'repository'}`, {
+          description: 'Press Deploy on Orion Cloud to host it as an app.',
+          action: {
+            label: 'Open',
+            onClick: () => void window.orion?.openCloudRepoInBrowser?.(activeThreadProject.path),
+          },
+        });
+        await refreshCloudState();
+      } else if (result.needsAuth) {
+        toast.error(result.error ?? 'Sign in first.');
+        setSettingsTab('account');
+        setSettingsOpen(true);
+      } else {
+        toast.error(result.error ?? 'Publish failed');
+      }
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleCloudPush = async () => {
+    if (!activeThreadProject?.path || !window.orion?.pushToCloud || cloudBusy) return;
+
+    setCloudBusy(true);
+    try {
+      const result = await window.orion.pushToCloud(activeThreadProject.path);
+      if (result.ok && result.upToDate) {
+        toast.info('Orion Cloud is already up to date');
+      } else if (result.ok) {
+        toast.success(
+          `Pushed ${result.pushed?.length === 1 ? result.pushed[0] : `${result.pushed?.length ?? 0} branches`} to Orion Cloud`,
+          result.app?.url
+            ? {
+                description: `Redeploying ${new URL(result.app.url).host}`,
+                action: {
+                  label: 'Open app',
+                  onClick: () => void window.orion?.openExternalUrl?.(result.app!.url),
+                },
+              }
+            : undefined
+        );
+      } else {
+        toast.error(result.error ?? 'Push to Orion Cloud failed');
+      }
+      if (result.skipped?.length) {
+        toast.info(`Skipped ${result.skipped.map((item) => item.branch).join(', ')}: ${result.skipped[0].reason}`);
+      }
+      await refreshCloudState();
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleCloudPull = async () => {
+    if (!activeThreadProject?.path || !window.orion?.pullFromCloud || cloudBusy) return;
+
+    setCloudBusy(true);
+    try {
+      const result = await window.orion.pullFromCloud(activeThreadProject.path);
+      if (!result.ok) {
+        toast.error(result.error ?? 'Pull from Orion Cloud failed');
+      } else {
+        const merge = result.merge;
+        if (merge?.status === 'fast-forwarded' || merge?.status === 'checked-out') {
+          toast.success('Pulled latest changes from Orion Cloud');
+        } else if (merge?.status === 'up-to-date') {
+          toast.info('Already up to date with Orion Cloud');
+        } else if (merge?.status === 'diverged') {
+          toast.info(merge.hint ?? 'Local and cloud history diverged — merge manually.');
+        } else if (merge?.status === 'ff-failed' || merge?.status === 'unborn-dirty') {
+          toast.info(merge.error ?? merge.hint ?? 'Fetched, but could not update your branch.');
+        } else if (merge?.status === 'local-ahead') {
+          toast.info('Fetched — your branch is ahead of Orion Cloud. Push when ready.');
+        } else {
+          toast.success('Fetched from Orion Cloud');
+        }
+      }
+      await refreshGitState();
+      await refreshCloudState();
+    } finally {
+      setCloudBusy(false);
     }
   };
 
@@ -2477,6 +2597,76 @@ const App: React.FC = () => {
                   <GitCommit size={14} />
                   <span>Commit and Push</span>
                 </button>
+
+                {gitState?.ok && cloudState?.ok && !cloudState.linked && (
+                  <button
+                    type="button"
+                    className="shell-cloud-button"
+                    onClick={() => {
+                      if (!cloudState.authenticated) {
+                        toast.info('Sign in to your Orion account to publish this repository.');
+                        setSettingsTab('account');
+                        setSettingsOpen(true);
+                        return;
+                      }
+                      void handleCloudPublish();
+                    }}
+                    disabled={cloudBusy || gitBusy}
+                    title="Publish this repository to Orion Cloud"
+                  >
+                    <Cloud size={14} />
+                    <span>{cloudBusy ? 'Publishing…' : 'Publish'}</span>
+                  </button>
+                )}
+
+                {gitState?.ok && cloudState?.ok && cloudState.linked && (
+                  <div className="shell-cloud-group" title={`Orion Cloud: ${cloudState.repoName ?? ''}`}>
+                    <button
+                      type="button"
+                      className={`shell-cloud-icon-button ${
+                        cloudState.sync === 'ahead' || cloudState.sync === 'diverged' ? 'attention' : ''
+                      }`}
+                      onClick={() => void handleCloudPush()}
+                      disabled={cloudBusy || gitBusy}
+                      title={
+                        cloudState.sync === 'ahead'
+                          ? 'Push local commits to Orion Cloud'
+                          : cloudState.sync === 'diverged'
+                            ? 'Local and cloud history diverged'
+                            : 'Push to Orion Cloud'
+                      }
+                    >
+                      <CloudUpload size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      className={`shell-cloud-icon-button ${
+                        cloudState.sync === 'behind' || cloudState.sync === 'diverged' ? 'attention' : ''
+                      }`}
+                      onClick={() => void handleCloudPull()}
+                      disabled={cloudBusy || gitBusy}
+                      title={
+                        cloudState.sync === 'behind'
+                          ? 'Orion Cloud has new changes — pull them'
+                          : 'Pull from Orion Cloud'
+                      }
+                    >
+                      <CloudDownload size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      className="shell-cloud-icon-button"
+                      onClick={() =>
+                        activeThreadProject?.path &&
+                        void window.orion?.openCloudRepoInBrowser?.(activeThreadProject.path)
+                      }
+                      disabled={!cloudState.linked}
+                      title="Open on Orion Cloud"
+                    >
+                      <Globe size={14} />
+                    </button>
+                  </div>
+                )}
               </>
             )}
             {activeTab === 'agents' && selectedThread && (

@@ -18,6 +18,11 @@
 - Save files (Cmd/Ctrl+S)
 - Close tabs (Cmd/Ctrl+W)
 
+### Orion Cloud repositories
+- Publish any git project to Orion Cloud and push/pull from the shell bar
+- Browse and edit the code on Orion Web (Monaco); web edits are real git commits you pull back
+- See [docs/orion-cloud-repos.md](docs/orion-cloud-repos.md)
+
 ### Architecture
 - Electron + Vite + React + TypeScript
 - IPC bridge for secure filesystem access (main process)
@@ -31,9 +36,10 @@ npm install
 npm run start
 ```
 
-For local desktop login testing, set `ORION_WEB_URL` to the Orion Web origin
-that has Clerk and the desktop auth routes configured. Production defaults to
-`https://orioncode.xyz`.
+Desktop login targets the Orion Web origin: development (`npm run start`)
+defaults to `http://localhost:3000`, packaged builds default to
+`https://orioncode.xyz`. Set `ORION_WEB_URL` to override either (the origin
+must have Clerk and the desktop auth routes configured).
 
 ## Build
 

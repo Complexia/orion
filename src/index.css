@@ -227,6 +227,76 @@ body {
   color: var(--text-secondary);
 }
 
+.shell-cloud-button {
+  height: 30px;
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.shell-cloud-button:hover:not(:disabled) {
+  background: rgb(255 255 255 / 6%);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+
+.shell-cloud-button:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+}
+
+.shell-cloud-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  -webkit-app-region: no-drag;
+}
+
+.shell-cloud-icon-button {
+  height: 30px;
+  width: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.shell-cloud-icon-button:hover:not(:disabled) {
+  background: rgb(255 255 255 / 6%);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+
+.shell-cloud-icon-button:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+}
+
+.shell-cloud-icon-button.attention {
+  color: var(--accent);
+}
+
+.shell-cloud-icon-button.attention:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: rgb(77 141 255 / 35%);
+}
+
 .shell-project-picker,
 .shell-branch-picker {
   position: absolute;
