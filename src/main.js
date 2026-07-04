@@ -762,6 +762,7 @@ const commandForModel = (model, input) => {
     return [
       'codex',
       'exec',
+      '--json',
       '--cd',
       cwd,
       '--skip-git-repo-check',
@@ -896,8 +897,215 @@ const extractClaudeTextFromJsonEvent = (value) => {
   return '';
 };
 
-const textExtractorForProvider = (providerId) =>
-  providerId === 'claude' ? extractClaudeTextFromJsonEvent : extractTextFromJsonEvent;
+const claudeStreamEventDelta = (value) =>
+  value?.type === 'stream_event' && !value.parent_tool_use_id ? value.event?.delta : null;
+
+// Claude thinking arrives as incremental thinking_delta stream events. Older
+// CLIs without partial messages only include complete thinking blocks on each
+// assistant message, so fall back to those until the first delta is seen.
+const extractClaudeReasoningFromJsonEvent = (value, context = {}) => {
+  const delta = claudeStreamEventDelta(value);
+  if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+    context.thinkingDeltaSeen = true;
+    return delta.thinking;
+  }
+
+  if (
+    !context.thinkingDeltaSeen &&
+    value?.type === 'assistant' &&
+    !value.parent_tool_use_id &&
+    Array.isArray(value.message?.content)
+  ) {
+    return value.message.content
+      .filter((part) => part?.type === 'thinking' && typeof part.thinking === 'string')
+      .map((part) => `${part.thinking}\n\n`)
+      .join('');
+  }
+
+  return '';
+};
+
+// cursor-agent stream-json mirrors Claude Code's: assistant events carry the
+// streamed text and a final 'result' event repeats the whole response.
+const extractCursorTextFromJsonEvent = (value, context = {}) => {
+  if (!value || typeof value !== 'object') return '';
+
+  if (value.type === 'assistant') {
+    const parts = Array.isArray(value.message?.content) ? value.message.content : [];
+    const text = parts
+      .map((part) => (part && typeof part === 'object' && typeof part.text === 'string' ? part.text : ''))
+      .join('');
+    if (!text) return '';
+
+    // --stream-partial-output may resend a message's text cumulatively;
+    // append only the new suffix. Genuine deltas fail the prefix test and
+    // are appended whole.
+    const previous = context.lastAssistantText ?? '';
+    context.lastAssistantText = text;
+    if (previous && text.startsWith(previous)) return text.slice(previous.length);
+    return text;
+  }
+
+  // Only use the final aggregate when nothing streamed, so the response
+  // isn't duplicated at the end of the message.
+  if (value.type === 'result' && !context.textSeen && typeof value.result === 'string') {
+    return value.result;
+  }
+
+  return '';
+};
+
+const extractGrokTextFromJsonEvent = (value) => {
+  if (!value || typeof value !== 'object') return '';
+  if (value.type === 'text' && typeof value.data === 'string') return value.data;
+  if (value.type === 'error' && typeof value.data === 'string') return value.data;
+  return '';
+};
+
+// codex exec --json emits JSONL: thread.started, turn.started/completed/failed,
+// and item.started/updated/completed for items typed agent_message, reasoning,
+// command_execution, file_change, mcp_tool_call, web_search, todo_list, error.
+const extractCodexTextFromJsonEvent = (value) => {
+  if (!value || typeof value !== 'object') return '';
+  if (
+    value.type === 'item.completed' &&
+    value.item?.type === 'agent_message' &&
+    typeof value.item.text === 'string'
+  ) {
+    return `${value.item.text}\n\n`;
+  }
+  if (value.type === 'turn.failed' && typeof value.error?.message === 'string') {
+    return `${value.error.message}\n`;
+  }
+  return '';
+};
+
+const extractCodexReasoningFromJsonEvent = (value) => {
+  if (!value || typeof value !== 'object' || value.type !== 'item.completed') return '';
+  if (value.item?.type !== 'reasoning') return '';
+  const text = value.item.text ?? value.item.summary;
+  return typeof text === 'string' && text ? `${text}\n\n` : '';
+};
+
+const codexActivityFromItem = (item, eventType) => {
+  if (!item || typeof item !== 'object') return null;
+
+  const failed =
+    item.status === 'failed' || (typeof item.exit_code === 'number' && item.exit_code !== 0);
+  const status = failed
+    ? 'error'
+    : eventType === 'item.completed' || item.status === 'completed'
+      ? 'done'
+      : 'running';
+  const base = { key: typeof item.id === 'string' ? item.id : undefined, status };
+
+  if (item.type === 'command_execution') {
+    return {
+      ...base,
+      type: 'command',
+      title: `Command - ${stringifySummary(item.command, 80)}`,
+      detail: stringifySummary(item.command),
+    };
+  }
+  if (item.type === 'file_change') {
+    const paths = Array.isArray(item.changes)
+      ? item.changes.map((change) => change?.path).filter(Boolean)
+      : [];
+    return {
+      ...base,
+      type: 'tool',
+      title: `File changes (${paths.length})`,
+      detail: stringifySummary(paths.join(', ')),
+    };
+  }
+  if (item.type === 'mcp_tool_call') {
+    const name = [item.server, item.tool].filter(Boolean).join('.');
+    return {
+      ...base,
+      type: 'tool',
+      title: `Tool - ${name || 'MCP'}`,
+      detail: stringifySummary(item.arguments ?? ''),
+    };
+  }
+  if (item.type === 'web_search') {
+    return {
+      ...base,
+      type: 'tool',
+      title: 'Web search',
+      detail: stringifySummary(item.query ?? ''),
+    };
+  }
+  if (item.type === 'todo_list') {
+    const todos = Array.isArray(item.items) ? item.items : [];
+    const doneCount = todos.filter((todo) => todo?.completed).length;
+    return {
+      ...base,
+      type: 'tool',
+      title: `Plan - ${doneCount}/${todos.length} done`,
+      detail: stringifySummary(todos.map((todo) => todo?.text).filter(Boolean).join(' · ')),
+      status: 'done',
+    };
+  }
+  if (item.type === 'error') {
+    return {
+      ...base,
+      type: 'error',
+      title: 'Codex notice',
+      detail: stringifySummary(item.message, 300),
+      status: 'error',
+    };
+  }
+
+  return null;
+};
+
+const extractCodexActivitiesFromJsonEvent = (value) => {
+  if (!value || typeof value !== 'object') return [];
+  if (value.type === 'turn.failed' && typeof value.error?.message === 'string') {
+    return [
+      {
+        type: 'error',
+        title: 'Turn failed',
+        detail: stringifySummary(value.error.message, 300),
+        status: 'error',
+      },
+    ];
+  }
+  if (!String(value.type || '').startsWith('item.')) return [];
+  const activity = codexActivityFromItem(value.item, value.type);
+  return activity ? [activity] : [];
+};
+
+const providerJsonAdapters = {
+  claude: {
+    text: extractClaudeTextFromJsonEvent,
+    reasoning: extractClaudeReasoningFromJsonEvent,
+    activities: extractActivitiesFromJsonEvent,
+  },
+  codex: {
+    text: extractCodexTextFromJsonEvent,
+    reasoning: extractCodexReasoningFromJsonEvent,
+    activities: extractCodexActivitiesFromJsonEvent,
+  },
+  cursor: {
+    text: extractCursorTextFromJsonEvent,
+    reasoning: extractReasoningFromJsonEvent,
+    activities: extractActivitiesFromJsonEvent,
+  },
+  grok: {
+    text: extractGrokTextFromJsonEvent,
+    reasoning: extractReasoningFromJsonEvent,
+    activities: extractActivitiesFromJsonEvent,
+  },
+};
+
+const genericJsonAdapter = {
+  text: extractTextFromJsonEvent,
+  reasoning: extractReasoningFromJsonEvent,
+  activities: extractActivitiesFromJsonEvent,
+};
+
+const jsonAdapterForProvider = (providerId) => providerJsonAdapters[providerId] ?? genericJsonAdapter;
 
 const stringifySummary = (value, maxLength = 180) => {
   if (value === null || value === undefined) return '';
@@ -1031,12 +1239,23 @@ const activityFromCandidate = (candidate) => {
       ? `Command - ${stringifySummary(command || name, 80)}`
       : `Tool - ${name}`;
 
-  return {
+  const activity = {
     type: candidate.is_error === true ? 'error' : isResult ? 'result' : isCommand ? 'command' : 'tool',
     title,
     detail,
     status: candidate.is_error === true ? 'error' : isResult ? 'done' : 'running',
   };
+
+  // Claude/cursor tool_use blocks carry an id and tool_result blocks point
+  // back at it via tool_use_id — used to flip the original step to done.
+  if (!isResult && typeof candidate.id === 'string' && candidate.id) {
+    activity.key = candidate.id;
+  }
+  if (isResult && typeof candidate.tool_use_id === 'string' && candidate.tool_use_id) {
+    activity.updateForKey = candidate.tool_use_id;
+  }
+
+  return activity;
 };
 
 const extractActivitiesFromJsonEvent = (value) => {
@@ -1078,7 +1297,7 @@ const extractActivitiesFromJsonEvent = (value) => {
   });
 };
 
-const sendsJsonEvents = (providerId) => ['claude', 'cursor', 'grok'].includes(providerId);
+const sendsJsonEvents = (providerId) => ['claude', 'codex', 'cursor', 'grok'].includes(providerId);
 
 const checkCommandAvailable = async (command) => {
   try {
@@ -2887,13 +3106,22 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     let stdoutSeen = false;
     let jsonBuffer = '';
     const jsonMode = sendsJsonEvents(model.providerId);
+    const adapter = jsonAdapterForProvider(model.providerId);
+    const streamContext = { textSeen: false };
+    const knownToolActivities = new Map();
     let reasoningText = '';
+    let reasoningEmitTimer = null;
+    let lastReasoningEmitAt = 0;
     const reasoningActivityKey = `${runId}:reasoning`;
+    const REASONING_EMIT_INTERVAL_MS = 150;
     activeAgentRuns.set(runId, child);
 
-    const emitReasoningActivity = (text) => {
-      const detail = stringifySummary(text, 600);
-      if (!detail) return;
+    const sendReasoningActivity = (status = 'running') => {
+      const collapsed = reasoningText.replace(/\s+/g, ' ').trim();
+      if (!collapsed) return;
+      // Show the tail so the card tracks the live thought stream instead of
+      // freezing on the opening words.
+      const detail = collapsed.length > 600 ? `…${collapsed.slice(-600)}` : collapsed;
 
       emitAgentEvent(event.sender, {
         runId,
@@ -2904,31 +3132,77 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           type: 'thought',
           title: 'Reasoning',
           detail,
-          status: 'running',
+          status,
         },
       });
     };
 
+    // Thinking deltas arrive per token; cap reasoning updates so each one
+    // doesn't turn into an IPC message and a renderer store write.
+    const queueReasoningActivity = () => {
+      const elapsed = Date.now() - lastReasoningEmitAt;
+      if (elapsed >= REASONING_EMIT_INTERVAL_MS) {
+        lastReasoningEmitAt = Date.now();
+        sendReasoningActivity();
+        return;
+      }
+      if (reasoningEmitTimer) return;
+      reasoningEmitTimer = setTimeout(() => {
+        reasoningEmitTimer = null;
+        lastReasoningEmitAt = Date.now();
+        sendReasoningActivity();
+      }, REASONING_EMIT_INTERVAL_MS - elapsed);
+    };
+
+    const finishReasoningActivity = () => {
+      if (reasoningEmitTimer) {
+        clearTimeout(reasoningEmitTimer);
+        reasoningEmitTimer = null;
+      }
+      sendReasoningActivity('done');
+    };
+
+    const emitActivity = (activity) => {
+      emitAgentEvent(event.sender, {
+        runId,
+        threadId: input.threadId,
+        type: 'activity',
+        activity,
+      });
+    };
+
     const emitParsedJsonEvent = (parsed) => {
-      const reasoningDelta = extractReasoningFromJsonEvent(parsed);
+      const reasoningDelta = adapter.reasoning(parsed, streamContext);
       if (reasoningDelta) {
         reasoningText = `${reasoningText}${reasoningDelta}`;
-        emitReasoningActivity(reasoningText);
+        queueReasoningActivity();
       }
 
-      const activities = extractActivitiesFromJsonEvent(parsed);
-      for (const activity of activities) {
-        emitAgentEvent(event.sender, {
-          runId,
-          threadId: input.threadId,
-          type: 'activity',
-          activity,
-        });
+      for (const { updateForKey, ...activity } of adapter.activities(parsed)) {
+        if (updateForKey) {
+          // A tool result: flip the original step to done/error in place
+          // instead of appending a detached "Tool result" row.
+          const known = knownToolActivities.get(updateForKey);
+          if (known) {
+            emitActivity({
+              ...known,
+              key: updateForKey,
+              status: activity.status === 'error' || activity.type === 'error' ? 'error' : 'done',
+            });
+            continue;
+          }
+        }
+        if (activity.key) {
+          const { key, status, ...rest } = activity;
+          knownToolActivities.set(key, rest);
+        }
+        emitActivity(activity);
       }
 
-      const text = textExtractorForProvider(model.providerId)(parsed);
+      const text = adapter.text(parsed, streamContext);
       if (text) {
         stdoutSeen = true;
+        streamContext.textSeen = true;
         emitAgentEvent(event.sender, {
           runId,
           threadId: input.threadId,
@@ -3007,6 +3281,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           emitParsedJsonEvent(parsed);
         } catch {}
       }
+      finishReasoningActivity();
 
       if (exitCode !== 0 && stderr.trim()) {
         emitAgentEvent(event.sender, {
@@ -3099,6 +3374,8 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
 
         if (jsonMode) {
           // Parse NDJSON / streaming-json output and extract only real text (ignore thoughts etc.)
+          const adapter = jsonAdapterForProvider(model.providerId);
+          const titleContext = { textSeen: false };
           const lines = stdout.split(/\r?\n/);
           let partial = '';
           for (const rawLine of lines) {
@@ -3110,9 +3387,10 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
             }
             try {
               const parsed = JSON.parse(trimmed);
-              const t = textExtractorForProvider(model.providerId)(parsed);
+              const t = adapter.text(parsed, titleContext);
               if (t) {
                 responseText += t;
+                titleContext.textSeen = true;
                 partial = '';
               } else {
                 // parsed but no text content (e.g. thought) — discard this line
@@ -3132,7 +3410,7 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
           if (partial.trim()) {
             try {
               const p = JSON.parse(partial.trim());
-              const t = textExtractorForProvider(model.providerId)(p);
+              const t = adapter.text(p, titleContext);
               if (t) responseText += t;
             } catch {
               if (!/^\s*[\{\[]/.test(partial)) responseText += partial;

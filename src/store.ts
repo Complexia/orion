@@ -140,6 +140,32 @@ interface OrionState {
 
 const memoryStorage = new Map<string, string>();
 
+// Streaming agent runs update the store many times per second, and zustand's
+// persist middleware serializes the whole store on every update. Debounce the
+// IPC/file write so tokens don't each trigger a full-store disk write; the
+// in-memory copy is always current.
+const STORE_SAVE_DEBOUNCE_MS = 400;
+let pendingStoreValue: string | null = null;
+let storeSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+const flushStoreSave = () => {
+  if (storeSaveTimer !== null) {
+    clearTimeout(storeSaveTimer);
+    storeSaveTimer = null;
+  }
+  if (pendingStoreValue === null) return;
+  const value = pendingStoreValue;
+  pendingStoreValue = null;
+  if (typeof window === 'undefined' || !window.orion?.saveStore) return;
+  void window.orion.saveStore(value).then((saved) => {
+    if (!saved) console.warn('Failed to persist orion-storage');
+  });
+};
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', flushStoreSave);
+}
+
 const orionStorage: StateStorage = {
   getItem: async (name) => {
     if (typeof window === 'undefined' || !window.orion?.loadStore) {
@@ -168,13 +194,21 @@ const orionStorage: StateStorage = {
       return;
     }
 
-    const saved = await window.orion.saveStore(value);
-    if (!saved) {
-      console.warn(`Failed to persist ${name}`);
+    pendingStoreValue = value;
+    if (storeSaveTimer === null) {
+      storeSaveTimer = setTimeout(() => {
+        storeSaveTimer = null;
+        flushStoreSave();
+      }, STORE_SAVE_DEBOUNCE_MS);
     }
   },
   removeItem: async (name) => {
     memoryStorage.delete(name);
+    pendingStoreValue = null;
+    if (storeSaveTimer !== null) {
+      clearTimeout(storeSaveTimer);
+      storeSaveTimer = null;
+    }
 
     if (typeof window === 'undefined' || !window.orion?.clearStore) {
       return;

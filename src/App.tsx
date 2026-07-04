@@ -642,7 +642,9 @@ const AgentActivityCard: React.FC<{
   runStatus?: Message['status'];
 }> = ({ activities, runStatus }) => {
   const [expanded, setExpanded] = useState(false);
-  const visibleActivities = expanded ? activities : activities.slice(0, 6);
+  // Collapsed view tracks the newest steps so the card shows what the agent
+  // is doing now, not what it did first.
+  const visibleActivities = expanded ? activities : activities.slice(-6);
 
   if (activities.length === 0) return null;
 
@@ -685,11 +687,11 @@ const AgentActivityCard: React.FC<{
   );
 };
 
-const MarkdownContent: React.FC<{ content: string }> = ({ content }) => (
+const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (
   <div className="markdown-content">
     <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
   </div>
-);
+));
 
 const changedFileStatusLabels: Record<ChangedFileSummary['status'], string> = {
   added: 'A',
@@ -769,13 +771,29 @@ const ChangedFilesCard: React.FC<{ files: ChangedFileSummary[] }> = ({ files }) 
   );
 };
 
+// Re-render once a second while a run is active so the elapsed time ticks.
+const useRunTicker = (enabled: boolean) => {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const id = window.setInterval(() => setTick((value) => value + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [enabled]);
+};
+
 const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
   const attachments = message.attachments ?? [];
+  const isAgentRun = message.role === 'agent' && message.kind === 'agent-run';
+  const isRunning = isAgentRun && message.status === 'running';
+  useRunTicker(isRunning);
 
-  if (message.role === 'agent' && message.kind === 'agent-run') {
+  if (isAgentRun) {
     const duration = formatRunDuration(message.startedAt, message.completedAt);
-    const isRunning = message.status === 'running';
     const hasContent = message.content.trim().length > 0;
+    const latestActivity = message.activities?.length
+      ? message.activities[message.activities.length - 1]
+      : undefined;
+    const runningLabel = latestActivity?.title ?? message.statusText ?? 'Working on it...';
 
     return (
       <div className={`message agent agent-run ${message.status ?? ''}`}>
@@ -787,7 +805,8 @@ const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
         {(message.statusText || isRunning) && (
           <div className={`agent-status-line ${isRunning ? 'running' : ''}`}>
             {isRunning && <span className="working-dots" aria-hidden="true"><span /><span /><span /></span>}
-            <span>{message.statusText ?? 'Working on it...'}</span>
+            <span>{isRunning ? runningLabel : message.statusText}</span>
+            {isRunning && duration && <span className="agent-status-elapsed">{duration}</span>}
           </div>
         )}
         <AgentActivityCard activities={message.activities ?? []} runStatus={message.status} />
@@ -1046,6 +1065,8 @@ const App: React.FC = () => {
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const chatPinnedRef = useRef(true);
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const editorContainerRef = useRef<HTMLDivElement>(null);
@@ -1349,9 +1370,25 @@ const App: React.FC = () => {
     };
   }, []);
 
+  const handleChatScroll = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    chatPinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }, []);
+
   useEffect(() => {
+    chatPinnedRef.current = true;
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [selectedThreadId, selectedThread?.messages.length, isSending]);
+  }, [selectedThreadId]);
+
+  // Follow streaming output (chunks and activities mutate the messages array)
+  // while the user stays pinned near the bottom; never fight a manual scroll.
+  // 'instant' overrides the container's smooth scroll-behavior, which would
+  // otherwise restart its animation on every streamed chunk.
+  useEffect(() => {
+    if (!chatPinnedRef.current) return;
+    chatEndRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' });
+  }, [selectedThread?.messages, isSending]);
 
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
@@ -1598,9 +1635,29 @@ const App: React.FC = () => {
     setThreadMenuOpen(false);
   }, [selectedThreadId]);
 
+  // Streamed chunks can arrive many times per second; buffer them briefly so
+  // each token doesn't trigger a full store update (and a store persist).
+  const chunkBuffers = useRef(
+    new Map<string, { threadId: string; messageId: string; text: string }>()
+  );
+  const chunkFlushTimer = useRef<number | null>(null);
+
+  const flushChunkBuffers = useCallback(() => {
+    if (chunkFlushTimer.current !== null) {
+      window.clearTimeout(chunkFlushTimer.current);
+      chunkFlushTimer.current = null;
+    }
+    if (chunkBuffers.current.size === 0) return;
+    const buffered = Array.from(chunkBuffers.current.values());
+    chunkBuffers.current.clear();
+    for (const { threadId, messageId, text } of buffered) {
+      if (text) appendToThreadMessage(threadId, messageId, text);
+    }
+  }, [appendToThreadMessage]);
+
   useEffect(() => {
     if (!window.orion?.onAgentTurnEvent) return undefined;
-    return window.orion.onAgentTurnEvent((event) => {
+    const unsubscribe = window.orion.onAgentTurnEvent((event) => {
       const tracked = runOutputMessages.current.get(event.runId);
       if (!tracked) return;
 
@@ -1619,10 +1676,23 @@ const App: React.FC = () => {
       }
 
       if (event.type === 'chunk' && event.chunk) {
-        appendToThreadMessage(tracked.threadId, tracked.messageId, event.chunk);
+        const buffer = chunkBuffers.current.get(event.runId);
+        if (buffer) {
+          buffer.text += event.chunk;
+        } else {
+          chunkBuffers.current.set(event.runId, {
+            threadId: tracked.threadId,
+            messageId: tracked.messageId,
+            text: event.chunk,
+          });
+        }
+        if (chunkFlushTimer.current === null) {
+          chunkFlushTimer.current = window.setTimeout(flushChunkBuffers, 60);
+        }
       }
 
       if (event.type === 'done') {
+        flushChunkBuffers();
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'done',
           completedAt: new Date().toISOString(),
@@ -1636,6 +1706,7 @@ const App: React.FC = () => {
       }
 
       if (event.type === 'error') {
+        flushChunkBuffers();
         if (event.error) {
           appendToThreadMessage(tracked.threadId, tracked.messageId, `\n\n${event.error}`);
         }
@@ -1652,7 +1723,12 @@ const App: React.FC = () => {
         setActiveRunId((current) => (current === event.runId ? null : current));
       }
     });
-  }, [addActivityToThreadMessage, appendToThreadMessage, updateThread, updateThreadMessage]);
+
+    return () => {
+      unsubscribe?.();
+      flushChunkBuffers();
+    };
+  }, [addActivityToThreadMessage, appendToThreadMessage, flushChunkBuffers, updateThread, updateThreadMessage]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
@@ -2209,6 +2285,7 @@ const App: React.FC = () => {
       );
     }
 
+    chatPinnedRef.current = true;
     addMessageToThread(selectedThreadId, {
       role: 'user',
       content: userContent,
@@ -2278,6 +2355,7 @@ const App: React.FC = () => {
   const stopActiveAgent = async () => {
     if (!activeRunId || !window.orion?.stopAgentTurn) return;
     await window.orion.stopAgentTurn(activeRunId);
+    flushChunkBuffers();
     const tracked = runOutputMessages.current.get(activeRunId);
     if (tracked) {
       appendToThreadMessage(tracked.threadId, tracked.messageId, '\n\nStopped by user.');
@@ -3276,7 +3354,7 @@ const App: React.FC = () => {
               ) : (
                 <>
                   <div className="panel-content">
-                    <div className="chat-scroll">
+                    <div className="chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll}>
                       <div className="chat-container">
                         {selectedThread.messages.length === 0 && (
                           <AgentsWelcome projectName={selectedThreadProject?.name} />

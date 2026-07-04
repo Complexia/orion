@@ -2106,6 +2106,20 @@ body {
   background: linear-gradient(135deg, rgb(77 141 255 / 6%), rgb(139 124 246 / 4%));
 }
 
+.agent-status-line.running > span:not(.working-dots) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-status-elapsed {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .working-dots {
   display: inline-flex;
   align-items: center;
