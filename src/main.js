@@ -2292,9 +2292,24 @@ const publishAppUpdateState = (patch) => {
   return appUpdateState;
 };
 
-const initializeAppUpdater = () => {
+const initializeAppUpdater = async () => {
   if (appUpdateInitialized) return;
   appUpdateInitialized = true;
+
+  // electron-forge does not generate the app-update.yml that electron-builder
+  // ships in Resources, and electron-updater insists on reading one when
+  // downloading (it holds the cache-dir config). Write an equivalent file to
+  // user data and point the updater at it.
+  try {
+    const updateConfigPath = path.join(app.getPath('userData'), 'app-update.yml');
+    await fs.writeFile(
+      updateConfigPath,
+      ['provider: generic', `url: ${getAppUpdateFeedUrl()}`, 'updaterCacheDirName: orion-updater', ''].join('\n')
+    );
+    autoUpdater.updateConfigPath = updateConfigPath;
+  } catch {
+    // Checking still works via setFeedURL below; download will surface errors.
+  }
 
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
@@ -2372,7 +2387,7 @@ const checkForAppUpdate = async () => {
     });
   }
 
-  initializeAppUpdater();
+  await initializeAppUpdater();
   await autoUpdater.checkForUpdates();
   return appUpdateState;
 };
@@ -3168,7 +3183,7 @@ ipcMain.handle('appUpdate:check', async () => checkForAppUpdate());
 
 ipcMain.handle('appUpdate:download', async () => {
   if (!app.isPackaged) return appUpdateState;
-  initializeAppUpdater();
+  await initializeAppUpdater();
   publishAppUpdateState({ status: 'downloading', progress: { percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 }, error: null });
   await autoUpdater.downloadUpdate();
   return appUpdateState;
