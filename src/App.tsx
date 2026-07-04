@@ -52,6 +52,7 @@ import {
   type ImageAttachment,
   type Message,
   type ProviderId,
+  type ProviderRuntimeOptions,
   type Thread,
 } from './store';
 import { Toaster, toast } from 'sonner';
@@ -68,6 +69,7 @@ import {
   defaultCodexServiceTier,
   fallbackAgentModels,
   findAgentModel,
+  providerOptionDefs,
   type AgentModel,
   type AgentProviderId,
   type ClaudeContextWindow,
@@ -1015,6 +1017,8 @@ const App: React.FC = () => {
     closeAllFiles,
     providerSettings,
     setProviderEnabled,
+    setProviderOptions,
+    setThreadAgentSession,
   } = useOrionStore();
 
   const [treeRoot, setTreeRoot] = useState<string | null>(null);
@@ -1057,6 +1061,7 @@ const App: React.FC = () => {
   const [accountLoading, setAccountLoading] = useState(true);
   const [accountBusy, setAccountBusy] = useState(false);
   const [revealedProviderEmails, setRevealedProviderEmails] = useState<Record<string, boolean>>({});
+  const [expandedProviderOptions, setExpandedProviderOptions] = useState<Record<string, boolean>>({});
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const branchPickerRef = useRef<HTMLDivElement>(null);
   const threadSearchRef = useRef<HTMLDivElement>(null);
@@ -1675,6 +1680,10 @@ const App: React.FC = () => {
         addActivityToThreadMessage(tracked.threadId, tracked.messageId, event.activity);
       }
 
+      if (event.type === 'session' && event.sessionId && event.providerId) {
+        setThreadAgentSession(tracked.threadId, event.providerId as ProviderId, event.sessionId);
+      }
+
       if (event.type === 'chunk' && event.chunk) {
         const buffer = chunkBuffers.current.get(event.runId);
         if (buffer) {
@@ -1728,7 +1737,7 @@ const App: React.FC = () => {
       unsubscribe?.();
       flushChunkBuffers();
     };
-  }, [addActivityToThreadMessage, appendToThreadMessage, flushChunkBuffers, updateThread, updateThreadMessage]);
+  }, [addActivityToThreadMessage, appendToThreadMessage, flushChunkBuffers, setThreadAgentSession, updateThread, updateThreadMessage]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
@@ -2312,7 +2321,9 @@ const App: React.FC = () => {
       projectPath: selectedThreadProject.path,
       prompt: agentPrompt,
       modelId: selectedAgentModel.id,
-      accessMode: selectedThread.accessMode ?? 'workspace-write',
+      accessMode: selectedThread.accessMode ?? 'full-access',
+      resumeSessionId: selectedThread.agentSessionIds?.[selectedAgentModel.providerId],
+      providerOptions: providerSettings[selectedAgentModel.providerId]?.options,
       ...(selectedAgentModel.providerId === 'codex'
         ? {
             codexReasoningEffort: selectedCodexReasoning,
@@ -3086,8 +3097,14 @@ const App: React.FC = () => {
                           ? 'red'
                           : 'green';
 
+                      const optionDefs = providerOptionDefs[provider.id] ?? [];
+                      const optionsExpanded = !!expandedProviderOptions[provider.id];
+                      const optionValues =
+                        providerSettings[provider.id as ProviderId]?.options ?? {};
+
                       return (
-                        <div key={provider.id} className="provider-row">
+                        <div key={provider.id} className="provider-row-wrap">
+                        <div className="provider-row">
                           <div className="provider-left">
                             <span className={`provider-status-dot ${statusColor}`} />
                             <span className="provider-icon-wrap">
@@ -3120,10 +3137,13 @@ const App: React.FC = () => {
                           <div className="provider-right">
                             <button
                               type="button"
-                              className="provider-menu-btn"
-                              title="More"
+                              className={`provider-menu-btn ${optionsExpanded ? 'open' : ''}`}
+                              title={optionsExpanded ? 'Hide options' : 'Provider options'}
                               onClick={() => {
-                                // placeholder for future menu; currently no-op
+                                setExpandedProviderOptions((prev) => ({
+                                  ...prev,
+                                  [provider.id]: !prev[provider.id],
+                                }));
                               }}
                             >
                               <ChevronDown size={14} />
@@ -3151,6 +3171,58 @@ const App: React.FC = () => {
                               <span />
                             </label>
                           </div>
+                        </div>
+
+                        {optionsExpanded && optionDefs.length > 0 && (
+                          <div className="provider-options">
+                            {optionDefs.map((option) => {
+                              if (option.type === 'boolean') {
+                                const checked = optionValues[option.key] === true;
+                                return (
+                                  <div key={option.key} className="provider-option">
+                                    <span className="provider-option-text">
+                                      <span className="provider-option-label">{option.label}</span>
+                                      <span className="provider-option-description">{option.description}</span>
+                                    </span>
+                                    <label className="provider-toggle">
+                                      <input
+                                        type="checkbox"
+                                        checked={checked}
+                                        onChange={(event) => {
+                                          setProviderOptions(provider.id as ProviderId, {
+                                            [option.key]: event.target.checked,
+                                          } as Partial<ProviderRuntimeOptions>);
+                                        }}
+                                      />
+                                      <span />
+                                    </label>
+                                  </div>
+                                );
+                              }
+
+                              const value = optionValues[option.key];
+                              return (
+                                <div key={option.key} className="provider-option column">
+                                  <span className="provider-option-text">
+                                    <span className="provider-option-label">{option.label}</span>
+                                    <span className="provider-option-description">{option.description}</span>
+                                  </span>
+                                  <input
+                                    type="text"
+                                    className="provider-option-input"
+                                    placeholder={option.placeholder}
+                                    value={typeof value === 'string' ? value : ''}
+                                    onChange={(event) => {
+                                      setProviderOptions(provider.id as ProviderId, {
+                                        [option.key]: event.target.value,
+                                      } as Partial<ProviderRuntimeOptions>);
+                                    }}
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                         </div>
                       );
                     })}
@@ -3660,7 +3732,7 @@ const App: React.FC = () => {
                         <label className="access-select">
                           <Shield size={15} />
                           <select
-                            value={selectedThread.accessMode ?? 'workspace-write'}
+                            value={selectedThread.accessMode ?? 'full-access'}
                             onChange={(event) =>
                               updateThread(selectedThread.id, {
                                 accessMode: event.target.value as typeof selectedThread.accessMode,

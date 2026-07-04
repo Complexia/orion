@@ -85,6 +85,65 @@ export const claudeContextWindowOptions: Array<{
   { value: '1m', label: '1M' },
 ];
 
+export type ProviderOptionDef = {
+  key: 'allowedTools' | 'networkAccess' | 'webSearch' | 'experimentalMemory' | 'extraArgs';
+  label: string;
+  description: string;
+  type: 'boolean' | 'string';
+  placeholder?: string;
+};
+
+const extraArgsOption = (command: string): ProviderOptionDef => ({
+  key: 'extraArgs',
+  label: 'Extra CLI flags',
+  description: `Appended to every ${command} invocation. Quotes are respected.`,
+  type: 'string',
+  placeholder: '--flag value',
+});
+
+// Harness capabilities surfaced per provider. Everything here maps directly
+// onto a CLI flag or config override in main.js's commandForModel.
+export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = {
+  claude: [
+    {
+      key: 'allowedTools',
+      label: 'Auto-allowed tools',
+      description:
+        'Tools approved without prompting in Read only / Workspace write modes (headless runs cannot ask). E.g. Bash, WebFetch, WebSearch, mcp__claude-in-chrome. Full Access already allows everything.',
+      type: 'string',
+      placeholder: 'Bash, WebFetch, WebSearch',
+    },
+    extraArgsOption('claude'),
+  ],
+  codex: [
+    {
+      key: 'networkAccess',
+      label: 'Network access in sandbox',
+      description:
+        'Allow network inside the workspace-write sandbox (web fetches, npm install). Full Access is never sandboxed.',
+      type: 'boolean',
+    },
+    {
+      key: 'webSearch',
+      label: 'Web search',
+      description: 'Enable the Codex web search tool for all runs.',
+      type: 'boolean',
+    },
+    extraArgsOption('codex'),
+  ],
+  grok: [
+    {
+      key: 'experimentalMemory',
+      label: 'Cross-session memory',
+      description: 'Enable Grok experimental memory across sessions (--experimental-memory).',
+      type: 'boolean',
+    },
+    extraArgsOption('grok'),
+  ],
+  cursor: [extraArgsOption('cursor-agent')],
+  opencode: [extraArgsOption('opencode')],
+};
+
 export const agentProviders: AgentProvider[] = [
   { id: 'grok', label: 'Grok', icon: GrokBrandIcon },
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },

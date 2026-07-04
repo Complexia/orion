@@ -62,6 +62,9 @@ export type Thread = {
   claudeContextWindow?: '200k' | '1m';
   createdAt: string;
   messages: Message[];
+  // Per-provider harness session ids so follow-up turns resume the same
+  // conversation (claude --resume, codex exec resume, etc.).
+  agentSessionIds?: Partial<Record<ProviderId, string>>;
 };
 
 export type OpenFile = {
@@ -72,7 +75,24 @@ export type OpenFile = {
 
 export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'opencode';
 
-export type ProviderSettings = Record<ProviderId, { enabled: boolean }>;
+// Per-provider harness capabilities, passed through to the CLI invocation.
+export type ProviderRuntimeOptions = {
+  /** claude: extra tools auto-approved outside Full Access (--allowedTools) */
+  allowedTools?: string;
+  /** codex: allow network inside the workspace-write sandbox */
+  networkAccess?: boolean;
+  /** codex: enable the web search tool */
+  webSearch?: boolean;
+  /** grok: enable cross-session memory (--experimental-memory) */
+  experimentalMemory?: boolean;
+  /** any provider: extra CLI flags appended to every run */
+  extraArgs?: string;
+};
+
+export type ProviderSettings = Record<
+  ProviderId,
+  { enabled: boolean; options?: ProviderRuntimeOptions }
+>;
 
 export const defaultProviderSettings: ProviderSettings = {
   grok: { enabled: true },
@@ -104,6 +124,8 @@ interface OrionState {
   // Actions
   setActiveTab: (tab: 'agents' | 'code') => void;
   setProviderEnabled: (id: ProviderId, enabled: boolean) => void;
+  setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
+  setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
   addProject: (project: Omit<Project, 'id'>) => void;
   removeProject: (id: string) => void;
@@ -241,8 +263,33 @@ export const useOrionStore = create<OrionState>()(
           providerSettings: {
             ...defaultProviderSettings,
             ...state.providerSettings,
-            [id]: { enabled },
+            [id]: { ...state.providerSettings[id], enabled },
           },
+        })),
+      setProviderOptions: (id, options) =>
+        set((state) => {
+          const current = state.providerSettings[id] ?? defaultProviderSettings[id];
+          return {
+            providerSettings: {
+              ...defaultProviderSettings,
+              ...state.providerSettings,
+              [id]: {
+                ...current,
+                options: { ...current.options, ...options },
+              },
+            },
+          };
+        }),
+      setThreadAgentSession: (threadId, providerId, sessionId) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId
+              ? {
+                  ...thread,
+                  agentSessionIds: { ...thread.agentSessionIds, [providerId]: sessionId },
+                }
+              : thread
+          ),
         })),
 
       addProject: (project) => {
@@ -292,7 +339,7 @@ export const useOrionStore = create<OrionState>()(
           title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
           status: 'idle',
           modelId: 'grok:grok-build',
-          accessMode: 'workspace-write',
+          accessMode: 'full-access',
           createdAt: new Date().toISOString(),
           messages: [],
         };

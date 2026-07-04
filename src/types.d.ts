@@ -304,6 +304,14 @@ declare global {
         codexServiceTier?: 'default' | 'priority';
         claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
         claudeContextWindow?: '200k' | '1m';
+        resumeSessionId?: string;
+        providerOptions?: {
+          allowedTools?: string;
+          networkAccess?: boolean;
+          webSearch?: boolean;
+          experimentalMemory?: boolean;
+          extraArgs?: string;
+        };
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
       stopAgentTurn: (runId: string) => Promise<boolean>;
       generateThreadTitle: (input: {
@@ -318,11 +326,13 @@ declare global {
       onAgentTurnEvent?: (cb: (event: {
         runId: string;
         threadId: string;
-        type: 'started' | 'chunk' | 'activity' | 'error' | 'done';
+        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done';
         chunk?: string;
         exitCode?: number | null;
         error?: string;
         command?: string;
+        providerId?: string;
+        sessionId?: string;
         changedFiles?: Array<{
           path: string;
           status: 'added' | 'copied' | 'conflicted' | 'deleted' | 'modified' | 'renamed' | 'untracked';

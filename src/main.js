@@ -743,6 +743,19 @@ const claudeModelArgForContextWindow = (modelArg, contextWindow = defaultClaudeC
   return `${modelArg}[1m]`;
 };
 
+// Tokenize a user-provided flags string, respecting single/double quotes.
+const parseExtraArgs = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return [];
+  const args = [];
+  const tokenPattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let match;
+  while ((match = tokenPattern.exec(text))) {
+    args.push(match[1] ?? match[2] ?? match[3]);
+  }
+  return args;
+};
+
 const commandForModel = (model, input) => {
   const prompt =
     model.providerId === 'claude' && input.claudeReasoningEffort === 'ultrathink'
@@ -750,11 +763,47 @@ const commandForModel = (model, input) => {
       : input.prompt;
   const cwd = input.projectPath;
   const modelArg = model.slug;
-  const accessMode = input.accessMode || 'workspace-write';
+  const accessMode = input.accessMode || 'full-access';
+  const options = input.providerOptions && typeof input.providerOptions === 'object' ? input.providerOptions : {};
+  const extraArgs = parseExtraArgs(options.extraArgs);
+  const resumeSessionId =
+    typeof input.resumeSessionId === 'string' && input.resumeSessionId ? input.resumeSessionId : null;
 
   if (model.providerId === 'codex') {
     const reasoningEffort = input.codexReasoningEffort || defaultCodexReasoningEffort;
     const serviceTier = input.codexServiceTier || defaultCodexServiceTier;
+    const configArgs = [
+      '--config',
+      `model_reasoning_effort="${reasoningEffort}"`,
+      '--config',
+      `service_tier="${serviceTier}"`,
+    ];
+    if (options.networkAccess) configArgs.push('--config', 'sandbox_workspace_write.network_access=true');
+    if (options.webSearch) configArgs.push('--config', 'tools.web_search=true');
+
+    if (resumeSessionId) {
+      // `exec resume` has no --cd/--sandbox/--color flags: cwd comes from the
+      // spawn cwd and the sandbox from a config override.
+      const accessArgs =
+        accessMode === 'full-access'
+          ? ['--dangerously-bypass-approvals-and-sandbox']
+          : ['--config', `sandbox_mode="${accessMode === 'read-only' ? 'read-only' : 'workspace-write'}"`];
+      return [
+        'codex',
+        'exec',
+        'resume',
+        resumeSessionId,
+        '--json',
+        '--skip-git-repo-check',
+        '--model',
+        modelArg,
+        ...configArgs,
+        ...accessArgs,
+        ...extraArgs,
+        prompt,
+      ];
+    }
+
     const accessArgs =
       accessMode === 'full-access'
         ? ['--dangerously-bypass-approvals-and-sandbox']
@@ -770,11 +819,9 @@ const commandForModel = (model, input) => {
       'never',
       '--model',
       modelArg,
-      '--config',
-      `model_reasoning_effort="${reasoningEffort}"`,
-      '--config',
-      `service_tier="${serviceTier}"`,
+      ...configArgs,
       ...accessArgs,
+      ...extraArgs,
       prompt,
     ];
   }
@@ -788,6 +835,12 @@ const commandForModel = (model, input) => {
       accessMode === 'full-access'
         ? ['--dangerously-skip-permissions']
         : ['--permission-mode', accessMode === 'read-only' ? 'plan' : 'acceptEdits'];
+    // Headless runs can't show permission prompts, so tools outside the
+    // permission mode's defaults must be pre-approved here.
+    const allowedTools = String(options.allowedTools || '').trim();
+    const allowedToolsArgs =
+      accessMode !== 'full-access' && allowedTools ? ['--allowedTools', allowedTools] : [];
+    const resumeArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
     return [
       'claude',
       '--print',
@@ -801,12 +854,16 @@ const commandForModel = (model, input) => {
       claudeEffortForCli(reasoningEffort),
       ...settingsArgs,
       ...accessArgs,
+      ...allowedToolsArgs,
+      ...resumeArgs,
+      ...extraArgs,
       prompt,
     ];
   }
 
   if (model.providerId === 'cursor') {
     const accessArgs = accessMode === 'read-only' ? ['--mode', 'plan'] : ['--force'];
+    const resumeArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
     return [
       'cursor-agent',
       '--print',
@@ -819,6 +876,8 @@ const commandForModel = (model, input) => {
       '--model',
       modelArg,
       ...accessArgs,
+      ...resumeArgs,
+      ...extraArgs,
       prompt,
     ];
   }
@@ -828,6 +887,8 @@ const commandForModel = (model, input) => {
       accessMode === 'full-access'
         ? ['--permission-mode', 'bypassPermissions', '--always-approve']
         : ['--permission-mode', accessMode === 'read-only' ? 'plan' : 'acceptEdits'];
+    const resumeArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
+    const memoryArgs = options.experimentalMemory ? ['--experimental-memory'] : [];
     return [
       'grok',
       '--cwd',
@@ -837,12 +898,31 @@ const commandForModel = (model, input) => {
       '--output-format',
       'streaming-json',
       ...accessArgs,
+      ...resumeArgs,
+      ...memoryArgs,
+      ...extraArgs,
       '--single',
       prompt,
     ];
   }
 
-  return ['opencode', 'run', '--model', modelArg, prompt];
+  return ['opencode', 'run', '--model', modelArg, ...extraArgs, prompt];
+};
+
+// Pull the harness's session/thread id out of its stream so follow-up turns
+// can resume the same conversation.
+const extractSessionIdFromJsonEvent = (providerId, value) => {
+  if (!value || typeof value !== 'object') return null;
+  if (providerId === 'codex') {
+    return value.type === 'thread.started' && typeof value.thread_id === 'string'
+      ? value.thread_id
+      : null;
+  }
+  if (providerId === 'grok') {
+    return typeof value.sessionId === 'string' && value.sessionId ? value.sessionId : null;
+  }
+  // claude / cursor stream-json events carry session_id (init event onwards)
+  return typeof value.session_id === 'string' && value.session_id ? value.session_id : null;
 };
 
 const extractTextFromJsonEvent = (value) => {
@@ -3089,9 +3169,17 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     }
 
     const runId = input.runId || crypto.randomUUID();
-    const args = commandForModel(model, input);
-    const commandString = args.map(shellQuote).join(' ');
     const beforeSnapshot = await captureGitChangeSnapshot(input.projectPath);
+    const jsonMode = sendsJsonEvents(model.providerId);
+    const adapter = jsonAdapterForProvider(model.providerId);
+    const reasoningActivityKey = `${runId}:reasoning`;
+    const REASONING_EMIT_INTERVAL_MS = 150;
+
+    // One spawn of the provider CLI. If resuming a prior session fails before
+    // producing output, close() falls back to a single fresh attempt.
+    const startAttempt = (resumeSessionId) => {
+    const args = commandForModel(model, { ...input, resumeSessionId });
+    const commandString = args.map(shellQuote).join(' ');
     const child = spawn(loginShell, ['-lc', commandString], {
       cwd: input.projectPath,
       env: {
@@ -3105,16 +3193,27 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     let stderr = '';
     let stdoutSeen = false;
     let jsonBuffer = '';
-    const jsonMode = sendsJsonEvents(model.providerId);
-    const adapter = jsonAdapterForProvider(model.providerId);
     const streamContext = { textSeen: false };
     const knownToolActivities = new Map();
     let reasoningText = '';
     let reasoningEmitTimer = null;
     let lastReasoningEmitAt = 0;
-    const reasoningActivityKey = `${runId}:reasoning`;
-    const REASONING_EMIT_INTERVAL_MS = 150;
+    let sessionIdReported = false;
     activeAgentRuns.set(runId, child);
+
+    const maybeEmitSessionId = (parsed) => {
+      if (sessionIdReported) return;
+      const sessionId = extractSessionIdFromJsonEvent(model.providerId, parsed);
+      if (!sessionId) return;
+      sessionIdReported = true;
+      emitAgentEvent(event.sender, {
+        runId,
+        threadId: input.threadId,
+        type: 'session',
+        providerId: model.providerId,
+        sessionId,
+      });
+    };
 
     const sendReasoningActivity = (status = 'running') => {
       const collapsed = reasoningText.replace(/\s+/g, ' ').trim();
@@ -3172,6 +3271,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     };
 
     const emitParsedJsonEvent = (parsed) => {
+      maybeEmitSessionId(parsed);
+
       const reasoningDelta = adapter.reasoning(parsed, streamContext);
       if (reasoningDelta) {
         reasoningText = `${reasoningText}${reasoningDelta}`;
@@ -3283,6 +3384,19 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       }
       finishReasoningActivity();
 
+      // The stored session may be gone (harness cache cleared, expired, or a
+      // CLI update). If resuming produced no output at all, run fresh once.
+      if (exitCode !== 0 && resumeSessionId && !stdoutSeen) {
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'chunk',
+          chunk: '_Could not resume the previous session; starting a fresh one._\n\n',
+        });
+        startAttempt(null);
+        return;
+      }
+
       if (exitCode !== 0 && stderr.trim()) {
         emitAgentEvent(event.sender, {
           runId,
@@ -3301,6 +3415,13 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         ...(exitCode === 0 ? {} : { error: `${model.label} exited with code ${exitCode}.` }),
       });
     });
+    };
+
+    startAttempt(
+      typeof input.resumeSessionId === 'string' && input.resumeSessionId
+        ? input.resumeSessionId
+        : null
+    );
 
     return { ok: true, runId };
   } catch (error) {
