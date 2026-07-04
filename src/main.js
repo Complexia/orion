@@ -1156,37 +1156,6 @@ const extractCodexActivitiesFromJsonEvent = (value) => {
   return activity ? [activity] : [];
 };
 
-const providerJsonAdapters = {
-  claude: {
-    text: extractClaudeTextFromJsonEvent,
-    reasoning: extractClaudeReasoningFromJsonEvent,
-    activities: extractActivitiesFromJsonEvent,
-  },
-  codex: {
-    text: extractCodexTextFromJsonEvent,
-    reasoning: extractCodexReasoningFromJsonEvent,
-    activities: extractCodexActivitiesFromJsonEvent,
-  },
-  cursor: {
-    text: extractCursorTextFromJsonEvent,
-    reasoning: extractReasoningFromJsonEvent,
-    activities: extractActivitiesFromJsonEvent,
-  },
-  grok: {
-    text: extractGrokTextFromJsonEvent,
-    reasoning: extractReasoningFromJsonEvent,
-    activities: extractActivitiesFromJsonEvent,
-  },
-};
-
-const genericJsonAdapter = {
-  text: extractTextFromJsonEvent,
-  reasoning: extractReasoningFromJsonEvent,
-  activities: extractActivitiesFromJsonEvent,
-};
-
-const jsonAdapterForProvider = (providerId) => providerJsonAdapters[providerId] ?? genericJsonAdapter;
-
 const stringifySummary = (value, maxLength = 180) => {
   if (value === null || value === undefined) return '';
   if (typeof value === 'string') return value.replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -1377,7 +1346,65 @@ const extractActivitiesFromJsonEvent = (value) => {
   });
 };
 
+const providerJsonAdapters = {
+  claude: {
+    text: extractClaudeTextFromJsonEvent,
+    reasoning: extractClaudeReasoningFromJsonEvent,
+    activities: extractActivitiesFromJsonEvent,
+  },
+  codex: {
+    text: extractCodexTextFromJsonEvent,
+    reasoning: extractCodexReasoningFromJsonEvent,
+    activities: extractCodexActivitiesFromJsonEvent,
+  },
+  cursor: {
+    text: extractCursorTextFromJsonEvent,
+    reasoning: extractReasoningFromJsonEvent,
+    activities: extractActivitiesFromJsonEvent,
+  },
+  grok: {
+    text: extractGrokTextFromJsonEvent,
+    reasoning: extractReasoningFromJsonEvent,
+    activities: extractActivitiesFromJsonEvent,
+  },
+};
+
+const genericJsonAdapter = {
+  text: extractTextFromJsonEvent,
+  reasoning: extractReasoningFromJsonEvent,
+  activities: extractActivitiesFromJsonEvent,
+};
+
+const jsonAdapterForProvider = (providerId) => providerJsonAdapters[providerId] ?? genericJsonAdapter;
+
 const sendsJsonEvents = (providerId) => ['claude', 'codex', 'cursor', 'grok'].includes(providerId);
+
+// Finder-launched apps inherit launchd's minimal PATH, and most CLI
+// installers (nvm, bun, grok, ...) export PATH from ~/.zshrc, which only
+// interactive shells source. Capture the interactive login shell's PATH once
+// at startup so provider detection and agent runs can find the CLIs.
+const syncPathFromUserShell = async () => {
+  if (process.platform === 'win32') return;
+  try {
+    const marker = '__ORION_PATH__';
+    const { stdout } = await execFileAsync(
+      loginShell,
+      ['-ilc', `printf "${marker}%s${marker}" "$PATH"`],
+      { timeout: 8000, env: { ...process.env, DISABLE_AUTO_UPDATE: 'true' } }
+    );
+    const match = stdout.match(/__ORION_PATH__([\s\S]*)__ORION_PATH__/);
+    const shellPath = match?.[1]?.trim();
+    if (!shellPath) return;
+    const merged = [
+      ...new Set([...shellPath.split(':'), ...String(process.env.PATH || '').split(':')]),
+    ]
+      .filter(Boolean)
+      .join(':');
+    process.env.PATH = merged;
+  } catch {
+    // Keep the inherited PATH; provider checks will report what they can see.
+  }
+};
 
 const checkCommandAvailable = async (command) => {
   try {
@@ -2412,6 +2439,8 @@ const createWindow = () => {
 app.whenReady().then(async () => {
   // Reinforce the app name (helps in some dev launch scenarios)
   app.setName('Orion');
+
+  await syncPathFromUserShell();
 
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({
