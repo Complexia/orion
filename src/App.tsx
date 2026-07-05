@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
 import {
   FolderOpen,
   FolderPlus,
@@ -46,6 +46,8 @@ import {
   SquareArrowOutUpRight,
   ListPlus,
   Zap,
+  SquareKanban,
+  CircleCheck,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -392,6 +394,178 @@ const buildPromptWithAttachments = (prompt: string, attachments: ImageAttachment
   ].join('\n');
 
   return trimmedPrompt ? `${trimmedPrompt}\n\n${attachmentText}` : attachmentText;
+};
+
+// Context block prepended to the first agent turn of a thread linked to an
+// Orion board task, so the agent knows what card it's working on.
+const buildLinkedTaskContext = (task: { title: string; description: string }) => {
+  const lines = [
+    '## Linked task from the Orion board',
+    `Title: ${task.title}`,
+  ];
+  const description = task.description.trim();
+  if (description) {
+    lines.push('', 'Description:', description);
+  }
+  lines.push(
+    '',
+    'This thread is linked to the board task above; treat it as the goal of the work. The user message follows.',
+    '',
+    '---'
+  );
+  return lines.join('\n');
+};
+
+const linkedTaskStatusLabel = (status?: string) => {
+  switch (status) {
+    case 'running':
+      return 'In progress';
+    case 'finished':
+      return 'In review';
+    case 'done':
+      return 'Done';
+    case 'error':
+      return 'Error';
+    default:
+      return 'Linked';
+  }
+};
+
+const TaskPickerPopover = ({
+  linkedTaskId,
+  authenticated,
+  onSignIn,
+  onPick,
+}: {
+  linkedTaskId?: string;
+  authenticated: boolean;
+  onSignIn: () => void;
+  onPick: (task: OrionBoardTask) => Promise<void> | void;
+}) => {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [needsAuth, setNeedsAuth] = useState(!authenticated);
+  const [columns, setColumns] = useState<OrionBoardColumn[]>([]);
+  const [tasks, setTasks] = useState<OrionBoardTask[]>([]);
+  const [search, setSearch] = useState('');
+  const [linkingId, setLinkingId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!window.orion?.listBoardTasks) {
+      setError('Board tasks are unavailable in this build.');
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    const result = await window.orion.listBoardTasks();
+    if (result.ok) {
+      setColumns(result.columns ?? []);
+      setTasks(result.tasks ?? []);
+      setNeedsAuth(false);
+    } else if (result.needsAuth) {
+      setNeedsAuth(true);
+    } else {
+      setError(result.error ?? 'Could not load board tasks.');
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const query = search.trim().toLowerCase();
+  const visibleTasks = query
+    ? tasks.filter(
+        (task) =>
+          task.title.toLowerCase().includes(query) ||
+          task.description.toLowerCase().includes(query)
+      )
+    : tasks;
+
+  return (
+    <div className="task-picker-popover">
+      <div className="task-picker-header">
+        <SquareKanban size={14} />
+        <span>Link a board task</span>
+        <button className="task-picker-refresh" onClick={() => void load()} title="Refresh">
+          <RefreshCw size={13} />
+        </button>
+      </div>
+      {needsAuth ? (
+        <div className="task-picker-empty">
+          <p>Sign in to your Orion account to link tasks from your board.</p>
+          <button className="task-picker-signin" onClick={onSignIn}>
+            <LogIn size={14} />
+            <span>Sign in to Orion</span>
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="task-picker-search">
+            <Search size={14} />
+            <input
+              autoFocus
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search tasks..."
+            />
+          </div>
+          <div className="task-picker-list">
+            {loading && <div className="task-picker-note">Loading your board…</div>}
+            {!loading && error && <div className="task-picker-note error">{error}</div>}
+            {!loading && !error && visibleTasks.length === 0 && (
+              <div className="task-picker-note">
+                {tasks.length === 0
+                  ? 'No tasks yet — create them on your Orion board on the web.'
+                  : 'No tasks match your search.'}
+              </div>
+            )}
+            {!loading &&
+              !error &&
+              columns.map((column) => {
+                const columnTasks = visibleTasks.filter((task) => task.columnId === column.id);
+                if (columnTasks.length === 0) return null;
+                return (
+                  <div key={column.id} className="task-picker-group">
+                    <div className="task-picker-column-label">{column.name}</div>
+                    {columnTasks.map((task) => {
+                      const isCurrent = task.id === linkedTaskId;
+                      const linkedElsewhere = Boolean(task.linked) && !isCurrent;
+                      return (
+                        <button
+                          key={task.id}
+                          className={`task-picker-row ${isCurrent ? 'selected' : ''}`}
+                          disabled={linkingId !== null}
+                          onClick={async () => {
+                            setLinkingId(task.id);
+                            try {
+                              await onPick(task);
+                            } finally {
+                              setLinkingId(null);
+                            }
+                          }}
+                          title={task.description || task.title}
+                        >
+                          <span className="task-picker-row-title">{task.title}</span>
+                          {isCurrent && <Check size={14} />}
+                          {linkedElsewhere && <span className="task-picker-tag">linked</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+          </div>
+          <div className="task-picker-footer">
+            The task's title and description are added to the agent's context, and the card moves
+            across the board as this thread runs.
+          </div>
+        </>
+      )}
+    </div>
+  );
 };
 
 const getDroppedFilePath = (file: File) => {
@@ -1362,16 +1536,20 @@ const App: React.FC = () => {
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatPinnedRef = useRef(true);
   const modelPickerRef = useRef<HTMLDivElement>(null);
+  const taskPickerRef = useRef<HTMLDivElement>(null);
+  const [taskPickerOpen, setTaskPickerOpen] = useState(false);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const editorContainerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
+  // The Agents pane unmounts while the Code tab is active, so the textarea must
+  // be re-measured when it remounts, not only when the text changes.
+  useLayoutEffect(() => {
     const el = chatInputRef.current;
     if (!el) return;
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
-  }, [chatInput]);
+  }, [chatInput, activeTab]);
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
   const selectedThreadProject = selectedThread
@@ -1390,6 +1568,31 @@ const App: React.FC = () => {
     projects[0] ??
     null;
   const activeThreadProject = selectedThreadProject ?? defaultNewThreadProject;
+
+  // Unsent composer drafts are kept per project so switching projects swaps the
+  // draft instead of carrying it along.
+  const composerDraftKey = activeThreadProject?.id ?? null;
+  const composerDraftsRef = useRef(new Map<string, { text: string; attachments: ImageAttachment[] }>());
+  const composerDraftKeyRef = useRef<string | null>(composerDraftKey);
+
+  useEffect(() => {
+    // Skip the render where the key just changed: chatInput still holds the
+    // previous project's draft until the swap effect below runs.
+    if (!composerDraftKey || composerDraftKeyRef.current !== composerDraftKey) return;
+    composerDraftsRef.current.set(composerDraftKey, { text: chatInput, attachments: chatAttachments });
+  }, [chatInput, chatAttachments, composerDraftKey]);
+
+  useEffect(() => {
+    const prevKey = composerDraftKeyRef.current;
+    if (prevKey === composerDraftKey) return;
+    composerDraftKeyRef.current = composerDraftKey;
+    // Text typed before any project existed carries over to the first project.
+    if (prevKey === null) return;
+    const draft = composerDraftKey ? composerDraftsRef.current.get(composerDraftKey) : undefined;
+    setChatInput(draft?.text ?? '');
+    setChatAttachments(draft?.attachments ?? []);
+  }, [composerDraftKey]);
+
   const canChangeSelectedThreadProject =
     !!selectedThread && selectedThread.messages.length === 0 && selectedThread.status === 'idle' && !isSending;
 
@@ -1545,10 +1748,19 @@ const App: React.FC = () => {
     () =>
       threads
         .filter((t) => !t.hiddenFromRecent)
-        .sort(
-          (a, b) =>
-            getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
-        ),
+        .sort((a, b) => {
+          // Running agents are active "now", so they always rank above
+          // finished ones. Among running agents, keep start order so the list
+          // doesn't reshuffle as they stream; finished agents sort by their
+          // last activity (i.e. when they finished).
+          const aRunning = a.status === 'running';
+          const bRunning = b.status === 'running';
+          if (aRunning !== bRunning) return aRunning ? -1 : 1;
+          if (aRunning) {
+            return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+          }
+          return getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime();
+        }),
     [threads]
   );
 
@@ -1744,6 +1956,27 @@ const App: React.FC = () => {
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [modelPickerOpen]);
+
+  useEffect(() => {
+    if (!taskPickerOpen) return undefined;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!taskPickerRef.current?.contains(event.target as Node)) {
+        setTaskPickerOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setTaskPickerOpen(false);
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [taskPickerOpen]);
 
   useEffect(() => {
     if (!codexSettingsOpen) return undefined;
@@ -1992,6 +2225,109 @@ const App: React.FC = () => {
   );
   const chunkFlushTimer = useRef<number | null>(null);
 
+  // --- Linked board tasks (Orion web kanban) -----------------------------------
+
+  const pushLinkedTaskStatus = useCallback(
+    (threadId: string, status: 'running' | 'finished' | 'done' | 'error') => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
+      const linked = thread?.linkedTask;
+      if (!linked || !window.orion?.updateBoardTaskThreadStatus) return;
+      updateThread(threadId, { linkedTask: { ...linked, lastStatus: status } });
+      void window.orion
+        .updateBoardTaskThreadStatus({ taskId: linked.id, threadId, status })
+        .then((result) => {
+          if (result.ok || !result.stale) return;
+          // The card was unlinked or relinked on the web — drop our side.
+          const current = useOrionStore.getState().threads.find((t) => t.id === threadId);
+          if (current?.linkedTask?.id === linked.id) {
+            updateThread(threadId, { linkedTask: undefined });
+          }
+        })
+        .catch(() => {});
+    },
+    [updateThread]
+  );
+
+  const unlinkTaskFromThread = useCallback(
+    (threadId: string) => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
+      const linked = thread?.linkedTask;
+      if (!linked) return;
+      updateThread(threadId, { linkedTask: undefined });
+      void window.orion?.unlinkBoardTask?.({ taskId: linked.id, threadId }).catch(() => {});
+    },
+    [updateThread]
+  );
+
+  const markLinkedTaskDone = useCallback(
+    (threadId: string) => {
+      pushLinkedTaskStatus(threadId, 'done');
+      toast.success('Task moved to Done on your board');
+    },
+    [pushLinkedTaskStatus]
+  );
+
+  const linkTaskToSelectedThread = useCallback(
+    async (task: OrionBoardTask) => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((t) => t.id === state.selectedThreadId);
+      if (!thread || !window.orion?.linkBoardTask) return;
+      const project = state.projects.find((p) => p.id === thread.projectId);
+      // A fresh, untitled thread adopts the task's title.
+      const adoptTitle = thread.messages.length === 0 && isDefaultTitle(thread.title);
+      const previous = thread.linkedTask;
+
+      const result = await window.orion.linkBoardTask({
+        taskId: task.id,
+        threadId: thread.id,
+        threadTitle: adoptTitle ? task.title : thread.title,
+        projectName: project?.name,
+      });
+      if (!result.ok) {
+        toast.error(result.error ?? 'Could not link the task');
+        return;
+      }
+      if (previous && previous.id !== task.id) {
+        void window.orion.unlinkBoardTask?.({ taskId: previous.id, threadId: thread.id }).catch(() => {});
+      }
+      updateThread(thread.id, {
+        linkedTask: { id: task.id, title: task.title, description: task.description, injected: false },
+        ...(adoptTitle ? { title: task.title } : {}),
+      });
+      setTaskPickerOpen(false);
+      toast.success(`Linked "${task.title}"`);
+    },
+    [updateThread]
+  );
+
+  // Refresh the linked-task snapshot (and detect web-side unlink or deletion)
+  // whenever a thread whose task context hasn't been injected yet is selected,
+  // so the agent gets the latest title/description from the board.
+  useEffect(() => {
+    const threadId = selectedThread?.id;
+    const linked = selectedThread?.linkedTask;
+    if (!threadId || !linked || linked.injected || !window.orion?.listBoardTasks) return undefined;
+    let cancelled = false;
+    void window.orion.listBoardTasks().then((result) => {
+      if (cancelled || !result.ok) return;
+      const current = useOrionStore.getState().threads.find((t) => t.id === threadId)?.linkedTask;
+      if (!current || current.id !== linked.id || current.injected) return;
+      const fresh = result.tasks?.find((t) => t.id === linked.id);
+      if (!fresh || fresh.linked?.threadId !== threadId) {
+        updateThread(threadId, { linkedTask: undefined });
+        return;
+      }
+      if (fresh.title !== current.title || fresh.description !== current.description) {
+        updateThread(threadId, {
+          linkedTask: { ...current, title: fresh.title, description: fresh.description },
+        });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedThread?.id, selectedThread?.linkedTask?.id, selectedThread?.linkedTask?.injected, updateThread]);
+
   const flushChunkBuffers = useCallback(() => {
     if (chunkFlushTimer.current !== null) {
       window.clearTimeout(chunkFlushTimer.current);
@@ -2057,6 +2393,8 @@ const App: React.FC = () => {
           changedFiles: event.changedFiles ?? [],
         });
         updateThread(tracked.threadId, { status: 'done' });
+        // Turn finished — surface the work on the board (In Review column).
+        pushLinkedTaskStatus(tracked.threadId, 'finished');
         runOutputMessages.current.delete(event.runId);
         clearActiveRun(event.runId);
       }
@@ -2074,6 +2412,7 @@ const App: React.FC = () => {
           changedFiles: event.changedFiles ?? [],
         });
         updateThread(tracked.threadId, { status: 'error' });
+        pushLinkedTaskStatus(tracked.threadId, 'error');
         runOutputMessages.current.delete(event.runId);
         clearActiveRun(event.runId);
       }
@@ -2083,7 +2422,7 @@ const App: React.FC = () => {
       unsubscribe?.();
       flushChunkBuffers();
     };
-  }, [addActivityToThreadMessage, appendToThreadMessage, clearActiveRun, flushChunkBuffers, setThreadAgentSession, updateThread, updateThreadMessage]);
+  }, [addActivityToThreadMessage, appendToThreadMessage, clearActiveRun, flushChunkBuffers, pushLinkedTaskStatus, setThreadAgentSession, updateThread, updateThreadMessage]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
@@ -2657,7 +2996,16 @@ const App: React.FC = () => {
       }
 
       const userContent = promptText || 'Attached image';
-      const agentPrompt = buildPromptWithAttachments(promptText, attachments);
+      let agentPrompt = buildPromptWithAttachments(promptText, attachments);
+
+      // First turn with a linked board task: prepend the card's title and
+      // description as agent context (later turns resume the same session, so
+      // the agent already has it).
+      const linkedTask = thread.linkedTask;
+      if (linkedTask && !linkedTask.injected) {
+        agentPrompt = `${buildLinkedTaskContext(linkedTask)}\n\n${agentPrompt}`;
+        updateThread(threadId, { linkedTask: { ...linkedTask, injected: true } });
+      }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
       if (thread.messages.length === 0 && isDefaultTitle(thread.title)) {
@@ -2676,6 +3024,7 @@ const App: React.FC = () => {
         attachments,
       });
       updateThread(threadId, { status: 'running' });
+      pushLinkedTaskStatus(threadId, 'running');
 
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
@@ -2750,6 +3099,7 @@ const App: React.FC = () => {
       updateThread,
       updateThreadMessage,
       clearActiveRun,
+      pushLinkedTaskStatus,
     ]
   );
 
@@ -3600,6 +3950,16 @@ const App: React.FC = () => {
                       <span />
                     </label>
                   </div>
+
+                  <div className="setting-row">
+                    <div className="setting-label">
+                      <div className="setting-label-title">About</div>
+                      <div className="setting-label-desc">The Orion version currently installed.</div>
+                    </div>
+                    <span className="setting-version">
+                      {appUpdateState?.currentVersion ? `v${appUpdateState.currentVersion}` : '—'}
+                    </span>
+                  </div>
                 </>
               )}
 
@@ -4271,6 +4631,38 @@ const App: React.FC = () => {
                             ))}
                           </div>
                         )}
+                        {selectedThread.linkedTask && (
+                          <div className="composer-task-row">
+                            <div
+                              className={`composer-task-chip status-${selectedThread.linkedTask.lastStatus ?? 'linked'}`}
+                              title={selectedThread.linkedTask.description || selectedThread.linkedTask.title}
+                            >
+                              <SquareKanban size={13} />
+                              <span className="composer-task-title">{selectedThread.linkedTask.title}</span>
+                              <span className="composer-task-status">
+                                {linkedTaskStatusLabel(selectedThread.linkedTask.lastStatus)}
+                              </span>
+                              {selectedThread.linkedTask.lastStatus !== 'done' && !isSending && (
+                                <button
+                                  type="button"
+                                  className="composer-task-action done"
+                                  onClick={() => markLinkedTaskDone(selectedThread.id)}
+                                  title="Mark the task as done on the board"
+                                >
+                                  <CircleCheck size={13} />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="composer-task-action"
+                                onClick={() => unlinkTaskFromThread(selectedThread.id)}
+                                title="Unlink task"
+                              >
+                                <X size={12} />
+                              </button>
+                            </div>
+                          </div>
+                        )}
                         <textarea
                           ref={chatInputRef}
                           className="chat-input min-h-[52px]"
@@ -4552,6 +4944,29 @@ const App: React.FC = () => {
                           </select>
                           <ChevronDown size={13} />
                         </label>
+
+                        <div className="task-picker-anchor" ref={taskPickerRef}>
+                          <button
+                            className={`model-trigger task-link-trigger ${selectedThread.linkedTask ? 'linked' : ''}`}
+                            onClick={() => setTaskPickerOpen((open) => !open)}
+                            title={
+                              selectedThread.linkedTask
+                                ? `Linked task: ${selectedThread.linkedTask.title}`
+                                : 'Link a task from your Orion board'
+                            }
+                          >
+                            <SquareKanban size={15} />
+                            {!selectedThread.linkedTask && <span>Link task</span>}
+                          </button>
+                          {taskPickerOpen && (
+                            <TaskPickerPopover
+                              linkedTaskId={selectedThread.linkedTask?.id}
+                              authenticated={accountState.authenticated}
+                              onSignIn={() => void handleStartAccountAuth()}
+                              onPick={linkTaskToSelectedThread}
+                            />
+                          )}
+                        </div>
 
                         {isSending ? (
                           <>

@@ -53,6 +53,12 @@ contextBridge.exposeInMainWorld('orion', {
   openCloudRepoInBrowser: (projectPath) => ipcRenderer.invoke('cloud:openInBrowser', projectPath),
   openExternalUrl: (url) => ipcRenderer.invoke('app:openExternalUrl', url),
 
+  // Orion board tasks (kanban on the web app)
+  listBoardTasks: () => ipcRenderer.invoke('tasks:list'),
+  linkBoardTask: (input) => ipcRenderer.invoke('tasks:link', input),
+  unlinkBoardTask: (input) => ipcRenderer.invoke('tasks:unlink', input),
+  updateBoardTaskThreadStatus: (input) => ipcRenderer.invoke('tasks:threadStatus', input),
+
   // App updates
   getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
   checkForAppUpdate: () => ipcRenderer.invoke('appUpdate:check'),

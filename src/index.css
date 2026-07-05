@@ -1266,6 +1266,14 @@ body {
   border-color: var(--accent);
 }
 
+.setting-version {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  user-select: text;
+}
+
 /* Main layout */
 .main-content {
   display: flex;
@@ -3816,4 +3824,310 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #555;
+}
+
+/* ============ Linked board tasks (Orion web kanban) ============ */
+
+.composer-task-row {
+  display: flex;
+  padding: 10px 10px 0;
+}
+
+.composer-task-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 5px 8px 5px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.composer-task-chip > svg {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.composer-task-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.composer-task-status {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.composer-task-chip.status-running .composer-task-status {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.composer-task-chip.status-finished .composer-task-status {
+  background: rgb(139 124 246 / 16%);
+  color: var(--agent-violet);
+}
+
+.composer-task-chip.status-done .composer-task-status {
+  background: rgb(52 211 153 / 14%);
+  color: var(--success);
+}
+
+.composer-task-chip.status-error .composer-task-status {
+  background: rgb(248 113 113 / 14%);
+  color: var(--danger);
+}
+
+.composer-task-action {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.composer-task-action:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.composer-task-action.done:hover {
+  color: var(--success);
+}
+
+.task-picker-anchor {
+  position: relative;
+  min-width: 0;
+}
+
+.task-link-trigger {
+  padding: 0 10px;
+}
+
+.task-link-trigger.linked {
+  border-color: rgb(77 141 255 / 40%);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.task-picker-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: 340px;
+  max-height: 430px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  z-index: 100;
+  animation: popover-in 220ms var(--ease-out) both;
+}
+
+.task-picker-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.task-picker-header > svg {
+  color: var(--accent);
+}
+
+.task-picker-refresh {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.task-picker-refresh:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.task-picker-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+}
+
+.task-picker-search input {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+
+.task-picker-list {
+  flex: 1;
+  min-height: 60px;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.task-picker-group + .task-picker-group {
+  margin-top: 6px;
+}
+
+.task-picker-column-label {
+  padding: 6px 8px 4px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.task-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.task-picker-row:hover:not(:disabled) {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.task-picker-row:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.task-picker-row.selected {
+  color: var(--accent);
+}
+
+.task-picker-row > svg {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.task-picker-row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-picker-tag {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.task-picker-note {
+  padding: 18px 12px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.task-picker-note.error {
+  color: var(--danger);
+}
+
+.task-picker-footer {
+  padding: 9px 12px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.task-picker-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 26px 18px;
+  text-align: center;
+}
+
+.task-picker-empty p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.task-picker-signin {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: white;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.task-picker-signin:hover {
+  background: #3f7ff0;
 }

@@ -61,6 +61,19 @@ export type QueuedMessage = {
   attachments?: ImageAttachment[];
 };
 
+// A kanban card from the Orion web board linked to this thread. Title and
+// description are snapshotted at link time (refreshed just before injection)
+// and fed to the agent as context on the first linked turn.
+export type LinkedBoardTask = {
+  id: string;
+  title: string;
+  description: string;
+  /** True once the task context has been injected into an agent turn. */
+  injected?: boolean;
+  /** Last thread status pushed to the board (running | finished | done | error). */
+  lastStatus?: string;
+};
+
 export type Thread = {
   id: string;
   projectId: string;
@@ -81,6 +94,8 @@ export type Thread = {
   agentSessionIds?: Partial<Record<ProviderId, string>>;
   /** Follow-ups submitted while a run was in flight; dispatched in order when the run ends. */
   queuedMessages?: QueuedMessage[];
+  /** Kanban card on the Orion web board driving/driven by this thread. */
+  linkedTask?: LinkedBoardTask;
 };
 
 export type OpenFile = {

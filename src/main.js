@@ -2383,6 +2383,9 @@ const initializeAppUpdater = async () => {
   });
 
   autoUpdater.on('checking-for-update', () => {
+    // Background re-checks (the startup timer, the 2h interval) must not hide
+    // the update button while a download is in flight or already staged.
+    if (appUpdateState.status === 'downloading' || appUpdateState.status === 'downloaded') return;
     publishAppUpdateState({
       status: 'checking',
       checkedAt: new Date().toISOString(),
@@ -2393,6 +2396,25 @@ const initializeAppUpdater = async () => {
 
   autoUpdater.on('update-available', (info) => {
     const availableVersion = info?.version ?? null;
+
+    // This fires on every check, including background re-checks that race a
+    // just-finished download. If this exact version is already staged, keep
+    // the 'downloaded' state so "Restart to update" doesn't revert to
+    // "Install update" and prompt a second download of the same bytes.
+    if (availableVersion && availableVersion === appUpdateDownloadedVersion) {
+      publishAppUpdateState({
+        status: 'downloaded',
+        availableVersion,
+        checkedAt: new Date().toISOString(),
+        progress: null,
+        error: null,
+      });
+      return;
+    }
+    if (appUpdateState.status === 'downloading' && availableVersion === appUpdateState.availableVersion) {
+      return;
+    }
+
     publishAppUpdateState({
       status: 'available',
       availableVersion,
@@ -3249,6 +3271,115 @@ ipcMain.handle('cloud:pull', async (_event, projectPath) => {
   }
 });
 
+// --- Orion board tasks (kanban on the web app) --------------------------------
+
+const boardTasksRequest = async (token, apiPath, options = {}) => {
+  const response = await fetch(new URL(apiPath, getOrionWebUrl()), {
+    ...options,
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(options.body ? { 'content-type': 'application/json' } : {}),
+    },
+  });
+  let data = {};
+  try {
+    data = await response.json();
+  } catch {
+    // non-JSON error body
+  }
+  if (!response.ok) {
+    const error = new Error(data?.error || `Orion Cloud request failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+};
+
+const requireAccountToken = async () => {
+  const session = await readAccountSession();
+  return session?.token ?? null;
+};
+
+ipcMain.handle('tasks:list', async () => {
+  try {
+    const token = await requireAccountToken();
+    if (!token) {
+      return { ok: false, error: 'Sign in to your Orion account to see board tasks.', needsAuth: true };
+    }
+    const board = await boardTasksRequest(token, '/api/tasks');
+    return { ok: true, columns: board.columns ?? [], tasks: board.tasks ?? [] };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('tasks:link', async (_event, input) => {
+  try {
+    const taskId = String(input?.taskId ?? '');
+    const threadId = String(input?.threadId ?? '');
+    if (!taskId || !threadId) return { ok: false, error: 'Missing task or thread id.' };
+    const token = await requireAccountToken();
+    if (!token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'link',
+        threadId,
+        threadTitle: input?.threadTitle,
+        projectName: input?.projectName,
+      }),
+    });
+    return { ok: true, task: result.task };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('tasks:unlink', async (_event, input) => {
+  try {
+    const taskId = String(input?.taskId ?? '');
+    if (!taskId) return { ok: false, error: 'Missing task id.' };
+    const token = await requireAccountToken();
+    if (!token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'unlink' }),
+    });
+    return { ok: true, task: result.task };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('tasks:threadStatus', async (_event, input) => {
+  try {
+    const taskId = String(input?.taskId ?? '');
+    const threadId = String(input?.threadId ?? '');
+    const status = String(input?.status ?? '');
+    if (!taskId || !threadId || !status) return { ok: false, error: 'Missing task status input.' };
+    const token = await requireAccountToken();
+    if (!token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'thread-status', threadId, status }),
+    });
+    return { ok: true, task: result.task };
+  } catch (error) {
+    // 409 = the card was unlinked/relinked on the web; tell the renderer to
+    // drop its side of the link instead of retrying forever.
+    if (error?.status === 409) {
+      return { ok: false, stale: true, error: cloudErrorMessage(error) };
+    }
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
 ipcMain.handle('app:openExternalUrl', async (_event, url) => {
   try {
     const parsed = new URL(String(url));
@@ -3409,6 +3540,12 @@ ipcMain.handle('appUpdate:download', async () => {
   // we always download the latest version from a fresh URL.
   const checkResult = await autoUpdater.checkForUpdates();
   if (!checkResult?.isUpdateAvailable) return appUpdateState;
+  const targetVersion = checkResult?.updateInfo?.version ?? null;
+  if (targetVersion && targetVersion === appUpdateDownloadedVersion) {
+    // This version is already downloaded and staged; go straight back to
+    // "Restart to update" instead of fetching the same bytes again.
+    return publishAppUpdateState({ status: 'downloaded', availableVersion: targetVersion, progress: null, error: null });
+  }
   publishAppUpdateState({ status: 'downloading', progress: { percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 }, error: null });
   await autoUpdater.downloadUpdate(checkResult.cancellationToken);
   return appUpdateState;

@@ -70,6 +70,47 @@ type OrionCloudPullResult = {
 };
 }
 
+type OrionBoardColumn = {
+  id: string;
+  name: string;
+  role: 'todo' | 'in_progress' | 'review' | 'done' | null;
+  position: number;
+};
+
+type OrionBoardTask = {
+  id: string;
+  columnId: string;
+  title: string;
+  description: string;
+  position: number;
+  linked: {
+    threadId: string;
+    threadTitle: string | null;
+    projectName: string | null;
+    status: string;
+    linkedAt: string | null;
+  } | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type OrionBoardResult = {
+  ok: boolean;
+  error?: string;
+  needsAuth?: boolean;
+  columns?: OrionBoardColumn[];
+  tasks?: OrionBoardTask[];
+};
+
+type OrionTaskActionResult = {
+  ok: boolean;
+  error?: string;
+  needsAuth?: boolean;
+  /** The task was unlinked or relinked on the web — drop the local link. */
+  stale?: boolean;
+  task?: OrionBoardTask;
+};
+
 type OrionAccountState = {
   authenticated: boolean;
   user: {
@@ -297,6 +338,19 @@ declare global {
       pushToCloud: (projectPath: string) => Promise<OrionCloudPushResult>;
       pullFromCloud: (projectPath: string) => Promise<OrionCloudPullResult>;
       openCloudRepoInBrowser: (projectPath: string) => Promise<{ ok: boolean; error?: string }>;
+      listBoardTasks: () => Promise<OrionBoardResult>;
+      linkBoardTask: (input: {
+        taskId: string;
+        threadId: string;
+        threadTitle?: string;
+        projectName?: string;
+      }) => Promise<OrionTaskActionResult>;
+      unlinkBoardTask: (input: { taskId: string; threadId: string }) => Promise<OrionTaskActionResult>;
+      updateBoardTaskThreadStatus: (input: {
+        taskId: string;
+        threadId: string;
+        status: 'running' | 'finished' | 'done' | 'error';
+      }) => Promise<OrionTaskActionResult>;
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: () => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
