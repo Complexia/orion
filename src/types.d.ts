@@ -102,6 +102,13 @@ declare global {
       createFile: (filePath: string, content?: string) => Promise<boolean>;
       createDirectory: (dirPath: string) => Promise<boolean>;
       deletePath: (targetPath: string) => Promise<boolean>;
+      renamePath: (oldPath: string, newPath: string) => Promise<{ ok: boolean; error?: string }>;
+      showFileTreeMenu: (input: {
+        path: string;
+        isDirectory: boolean;
+        rootPath?: string | null;
+      }) => Promise<'new-file' | 'new-folder' | 'rename' | 'delete' | null>;
+      confirmDeletePath: (input: { path: string; isDirectory: boolean }) => Promise<boolean>;
       getGitState: (projectPath: string) => Promise<{
         ok: boolean;
         root?: string;

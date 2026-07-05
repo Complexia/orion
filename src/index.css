@@ -3057,6 +3057,11 @@ body {
   outline: none;
   resize: none;
   font-family: inherit;
+
+  /* Auto-grows via JS to fit content; cap keeps the whole composer
+     (textarea + controls + padding) within ~2/3 of the viewport. */
+  max-height: calc(66vh - 90px);
+  overflow-y: auto;
 }
 
 .chat-input::placeholder {
@@ -3489,6 +3494,23 @@ body {
 
 .file-item.active {
   background: #37373d;
+}
+
+.file-rename-input {
+  flex: 1;
+  min-width: 0;
+  background: #1e1e1e;
+  border: 1px solid #4a4a4a;
+  border-radius: 3px;
+  color: inherit;
+  font: inherit;
+  padding: 0 4px;
+  height: 20px;
+  outline: none;
+}
+
+.file-rename-input:focus {
+  border-color: #7aa2d6;
 }
 
 .file-disclosure {

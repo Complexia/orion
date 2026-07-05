@@ -985,14 +985,42 @@ const FileTreeNode: React.FC<{
   onFileClick: (path: string) => void;
   activePath?: string | null;
   loadChildren: (path: string) => Promise<FileTreeItem[]>;
-}> = ({ item, depth = 0, onFileClick, activePath, loadChildren }) => {
+  rootPath?: string | null;
+  refreshToken?: number;
+  onRequestDelete: (item: FileTreeItem) => void;
+  onRenamed: (oldPath: string, newPath: string, isDirectory: boolean) => void;
+}> = ({
+  item,
+  depth = 0,
+  onFileClick,
+  activePath,
+  loadChildren,
+  rootPath,
+  refreshToken = 0,
+  onRequestDelete,
+  onRenamed,
+}) => {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<FileTreeItem[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(item.name);
+  const [creating, setCreating] = useState<'file' | 'folder' | null>(null);
+  const [createValue, setCreateValue] = useState('');
   const iconMeta = getFileIconMeta(item.name, item.isDirectory);
   const gitStatusTitle = item.gitStatus ? gitStatusTitles[item.gitStatus] : null;
 
+  // Re-fetch already-loaded children when the tree is refreshed after a
+  // create/rename/delete elsewhere, without collapsing expanded folders.
+  useEffect(() => {
+    if (refreshToken > 0 && children !== null) {
+      loadChildren(item.path).then(setChildren);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshToken]);
+
   const handleClick = async () => {
+    if (renaming) return;
     if (item.isDirectory) {
       if (!expanded && !children) {
         setLoading(true);
@@ -1006,12 +1034,75 @@ const FileTreeNode: React.FC<{
     }
   };
 
+  const handleContextMenu = async (event: React.MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!window.orion?.showFileTreeMenu) return;
+    const action = await window.orion.showFileTreeMenu({
+      path: item.path,
+      isDirectory: item.isDirectory,
+      rootPath,
+    });
+    if (action === 'rename') {
+      setRenameValue(item.name);
+      setRenaming(true);
+    } else if (action === 'delete') {
+      onRequestDelete(item);
+    } else if (action === 'new-file' || action === 'new-folder') {
+      setCreating(action === 'new-file' ? 'file' : 'folder');
+      setCreateValue('');
+      if (!expanded) {
+        if (!children) {
+          setLoading(true);
+          const kids = await loadChildren(item.path);
+          setChildren(kids);
+          setLoading(false);
+        }
+        setExpanded(true);
+      }
+    }
+  };
+
+  const submitRename = async () => {
+    const newName = renameValue.trim();
+    setRenaming(false);
+    if (!newName || newName === item.name || /[/\\]/.test(newName)) return;
+    const parentPrefix = item.path.slice(0, item.path.length - item.name.length);
+    const newPath = parentPrefix + newName;
+    const result = await window.orion.renamePath(item.path, newPath);
+    if (!result?.ok) {
+      toast.error(result?.error ?? 'Rename failed');
+      return;
+    }
+    onRenamed(item.path, newPath, item.isDirectory);
+  };
+
+  const submitCreate = async () => {
+    const kind = creating;
+    const name = createValue.trim();
+    setCreating(null);
+    if (!kind || !name || /[/\\]/.test(name)) return;
+    const newPath = await window.orion.join(item.path, name);
+    const ok =
+      kind === 'file'
+        ? await window.orion.createFile(newPath)
+        : await window.orion.createDirectory(newPath);
+    if (!ok) {
+      toast.error(`Could not create ${kind === 'file' ? 'file' : 'folder'}`);
+      return;
+    }
+    const kids = await loadChildren(item.path);
+    setChildren(kids);
+    if (kind === 'file') onFileClick(newPath);
+  };
+
   return (
     <div>
       <div
         className={`file-item ${activePath === item.path ? 'active' : ''}`}
         style={{ paddingLeft: 6 + depth * 14 }}
         onClick={handleClick}
+        onContextMenu={handleContextMenu}
         title={item.path}
       >
         {item.isDirectory ? (
@@ -1033,7 +1124,26 @@ const FileTreeNode: React.FC<{
             <FileText size={14} />
           )}
         </span>
-        <span className="file-name truncate">{item.name}</span>
+        {renaming ? (
+          <input
+            className="file-rename-input"
+            autoFocus
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onFocus={(e) => {
+              const dotIndex = e.currentTarget.value.lastIndexOf('.');
+              e.currentTarget.setSelectionRange(0, dotIndex > 0 ? dotIndex : e.currentTarget.value.length);
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') submitRename();
+              else if (e.key === 'Escape') setRenaming(false);
+            }}
+            onBlur={() => setRenaming(false)}
+          />
+        ) : (
+          <span className="file-name truncate">{item.name}</span>
+        )}
         {item.gitStatus && (
           item.isDirectory ? (
             <span
@@ -1053,6 +1163,27 @@ const FileTreeNode: React.FC<{
 
       {item.isDirectory && expanded && (
         <div className="file-children">
+          {creating && (
+            <div className="file-item" style={{ paddingLeft: 6 + (depth + 1) * 14 }}>
+              <span className="file-disclosure" />
+              <span className={`file-tree-icon ${creating === 'folder' ? 'folder' : 'text'}`}>
+                {creating === 'folder' ? <Folder size={15} /> : <FileText size={14} />}
+              </span>
+              <input
+                className="file-rename-input"
+                autoFocus
+                value={createValue}
+                placeholder={creating === 'folder' ? 'Folder name' : 'File name'}
+                onChange={(e) => setCreateValue(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') submitCreate();
+                  else if (e.key === 'Escape') setCreating(null);
+                }}
+                onBlur={() => setCreating(null)}
+              />
+            </div>
+          )}
           {loading && <div className="file-item" style={{ paddingLeft: 20 + depth * 12 }}>Loading...</div>}
           {children?.map((child) => (
             <FileTreeNode
@@ -1062,6 +1193,10 @@ const FileTreeNode: React.FC<{
               onFileClick={onFileClick}
               activePath={activePath}
               loadChildren={loadChildren}
+              rootPath={rootPath}
+              refreshToken={refreshToken}
+              onRequestDelete={onRequestDelete}
+              onRenamed={onRenamed}
             />
           ))}
         </div>
@@ -1110,6 +1245,7 @@ const App: React.FC = () => {
 
   const [treeRoot, setTreeRoot] = useState<string | null>(null);
   const [treeItems, setTreeItems] = useState<FileTreeItem[]>([]);
+  const [treeRefreshToken, setTreeRefreshToken] = useState(0);
   const [chatInput, setChatInput] = useState('');
   const [chatAttachments, setChatAttachments] = useState<ImageAttachment[]>([]);
   const [draggingImages, setDraggingImages] = useState(false);
@@ -1184,8 +1320,16 @@ const App: React.FC = () => {
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatPinnedRef = useRef(true);
   const modelPickerRef = useRef<HTMLDivElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const editorContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = chatInputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [chatInput]);
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
   const selectedThreadProject = selectedThread
@@ -1978,6 +2122,50 @@ const App: React.FC = () => {
   const loadChildren = async (dirPath: string): Promise<FileTreeItem[]> => {
     if (!window.orion) return [];
     return await window.orion.readDirectory(dirPath);
+  };
+
+  // Reload the root listing and tell expanded nodes to re-fetch their children.
+  const refreshTree = useCallback(() => {
+    if (treeRoot) loadRoot(treeRoot);
+    setTreeRefreshToken((v) => v + 1);
+  }, [treeRoot, loadRoot]);
+
+  const isPathWithin = (candidate: string, ancestor: string) =>
+    candidate === ancestor ||
+    candidate.startsWith(`${ancestor}/`) ||
+    candidate.startsWith(`${ancestor}\\`);
+
+  // Delete a tree entry after native confirmation; closes any editor tabs
+  // showing the deleted file (or files inside the deleted folder).
+  const handleDeleteTreeItem = async (item: FileTreeItem) => {
+    if (!window.orion) return;
+    const confirmed = await window.orion.confirmDeletePath({
+      path: item.path,
+      isDirectory: item.isDirectory,
+    });
+    if (!confirmed) return;
+    const ok = await window.orion.deletePath(item.path);
+    if (!ok) {
+      toast.error(`Could not delete ${item.name}`);
+      return;
+    }
+    for (const file of openFiles) {
+      if (isPathWithin(file.path, item.path)) closeFile(file.path);
+    }
+    toast.success(`Deleted ${item.name}`);
+    refreshTree();
+  };
+
+  // After a rename, retarget open editor tabs and refresh the tree.
+  const handleTreeItemRenamed = async (oldPath: string, newPath: string, isDirectory: boolean) => {
+    const wasOpen = openFiles.some((file) => file.path === oldPath);
+    for (const file of openFiles) {
+      if (isPathWithin(file.path, oldPath)) closeFile(file.path);
+    }
+    if (!isDirectory && wasOpen) {
+      await handleOpenFile(newPath);
+    }
+    refreshTree();
   };
 
   // Save current file
@@ -4042,6 +4230,7 @@ const App: React.FC = () => {
                           </div>
                         )}
                         <textarea
+                          ref={chatInputRef}
                           className="chat-input min-h-[52px]"
                           placeholder={
                             isSending
@@ -4444,6 +4633,10 @@ const App: React.FC = () => {
                         onFileClick={handleOpenFile}
                         activePath={activeFilePath}
                         loadChildren={loadChildren}
+                        rootPath={treeRoot}
+                        refreshToken={treeRefreshToken}
+                        onRequestDelete={handleDeleteTreeItem}
+                        onRenamed={handleTreeItemRenamed}
                       />
                     ))}
                   </div>

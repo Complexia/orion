@@ -19,6 +19,9 @@ contextBridge.exposeInMainWorld('orion', {
   createFile: (filePath, content = '') => ipcRenderer.invoke('fs:createFile', filePath, content),
   createDirectory: (dirPath) => ipcRenderer.invoke('fs:createDirectory', dirPath),
   deletePath: (targetPath) => ipcRenderer.invoke('fs:deletePath', targetPath),
+  renamePath: (oldPath, newPath) => ipcRenderer.invoke('fs:renamePath', oldPath, newPath),
+  showFileTreeMenu: (input) => ipcRenderer.invoke('fileTree:showContextMenu', input),
+  confirmDeletePath: (input) => ipcRenderer.invoke('fileTree:confirmDelete', input),
   saveImageAttachment: (input) => ipcRenderer.invoke('attachment:saveImage', input),
   getPathForFile: (file) => webUtils.getPathForFile(file),
 

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, clipboard, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
@@ -2367,6 +2367,10 @@ const initializeAppUpdater = async () => {
 
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
+  // Differential download fetches blockmaps and many byte ranges against the
+  // feed's signed URL; any of those requests landing after the signature
+  // expires 403s the whole update. One plain GET keeps the window small.
+  autoUpdater.disableDifferentialDownload = true;
   autoUpdater.setFeedURL({
     provider: 'generic',
     url: getAppUpdateFeedUrl(),
@@ -2880,6 +2884,139 @@ ipcMain.handle('fs:deletePath', async (_event, targetPath) => {
     console.error('deletePath error', e);
     return false;
   }
+});
+
+// Rename/move file or dir
+ipcMain.handle('fs:renamePath', async (_event, oldPath, newPath) => {
+  try {
+    try {
+      await fs.access(newPath);
+      return { ok: false, error: 'A file or folder with that name already exists.' };
+    } catch {}
+    await fs.rename(oldPath, newPath);
+    return { ok: true };
+  } catch (e) {
+    console.error('renamePath error', e);
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+});
+
+const openPathInTerminal = async (targetPath) => {
+  let dir = targetPath;
+  try {
+    const stat = await fs.stat(targetPath);
+    if (!stat.isDirectory()) dir = path.dirname(targetPath);
+  } catch {
+    dir = path.dirname(targetPath);
+  }
+
+  if (process.platform === 'darwin') {
+    await execFileAsync('open', ['-a', 'Terminal', dir]);
+  } else if (process.platform === 'win32') {
+    spawn('cmd.exe', ['/c', 'start', 'cmd.exe'], { cwd: dir, detached: true, shell: false });
+  } else {
+    spawn('x-terminal-emulator', [], { cwd: dir, detached: true });
+  }
+};
+
+// Native context menu for the Code file tree. Resolves with the action the
+// renderer must perform (rename/delete/new-file/new-folder) or null when the
+// action was fully handled here (reveal, terminal, copy path) or dismissed.
+ipcMain.handle('fileTree:showContextMenu', async (event, input) => {
+  const { path: targetPath, isDirectory, rootPath } = input ?? {};
+  if (!targetPath) return null;
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+
+  const revealLabel =
+    process.platform === 'darwin'
+      ? 'Reveal in Finder'
+      : process.platform === 'win32'
+        ? 'Reveal in File Explorer'
+        : 'Reveal in File Manager';
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+
+    const template = [];
+    if (isDirectory) {
+      template.push(
+        { label: 'New File…', click: () => finish('new-file') },
+        { label: 'New Folder…', click: () => finish('new-folder') },
+        { type: 'separator' }
+      );
+    }
+    template.push(
+      { label: 'Rename…', click: () => finish('rename') },
+      { label: 'Delete', click: () => finish('delete') },
+      { type: 'separator' },
+      {
+        label: revealLabel,
+        click: () => {
+          shell.showItemInFolder(targetPath);
+          finish(null);
+        },
+      },
+      {
+        label: 'Open in Terminal',
+        click: () => {
+          openPathInTerminal(targetPath).catch((error) =>
+            console.error('openInTerminal error', error)
+          );
+          finish(null);
+        },
+      },
+      { type: 'separator' },
+      {
+        label: 'Copy Path',
+        click: () => {
+          clipboard.writeText(targetPath);
+          finish(null);
+        },
+      }
+    );
+    if (rootPath) {
+      template.push({
+        label: 'Copy Relative Path',
+        click: () => {
+          clipboard.writeText(path.relative(rootPath, targetPath));
+          finish(null);
+        },
+      });
+    }
+
+    const menu = Menu.buildFromTemplate(template);
+    // The close callback fires before item click handlers, so defer the
+    // "dismissed" resolution one tick to let a click win the race.
+    menu.popup({ window: win, callback: () => setTimeout(() => finish(null), 0) });
+  });
+});
+
+// Native confirmation dialog before deleting a tree entry.
+ipcMain.handle('fileTree:confirmDelete', async (event, input) => {
+  const { path: targetPath, isDirectory } = input ?? {};
+  if (!targetPath) return false;
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const options = {
+    type: 'warning',
+    buttons: ['Delete', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    message: `Delete “${path.basename(targetPath)}”?`,
+    detail: isDirectory
+      ? 'The folder and all of its contents will be deleted. This cannot be undone.'
+      : 'This cannot be undone.',
+  };
+  const { response } = win
+    ? await dialog.showMessageBox(win, options)
+    : await dialog.showMessageBox(options);
+  return response === 0;
 });
 
 ipcMain.handle('git:getState', async (_event, projectPath) => {
