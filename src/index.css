@@ -2651,13 +2651,29 @@ body {
 
 .agent-tool-row {
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr);
+  grid-template-columns: 32px minmax(0, 1fr) auto;
   align-items: start;
   gap: 10px;
   min-height: 38px;
   padding: 8px 14px;
   color: var(--text-secondary);
   transition: background var(--transition-fast);
+}
+
+.agent-tool-row.expandable {
+  cursor: pointer;
+}
+
+.agent-tool-chevron {
+  display: flex;
+  align-items: center;
+  padding-top: 2px;
+  color: var(--text-muted);
+  transition: transform var(--transition-base);
+}
+
+.agent-tool-row.open .agent-tool-chevron {
+  transform: rotate(180deg);
 }
 
 .agent-tool-row:hover {
@@ -2708,6 +2724,15 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.agent-tool-detail.expanded {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  line-height: 1.5;
+  user-select: text;
+  cursor: text;
 }
 
 .agent-empty-output {

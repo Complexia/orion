@@ -646,14 +646,38 @@ const AgentActivityIcon: React.FC<{ activity: AgentActivity }> = ({ activity }) 
   return <Wrench size={15} />;
 };
 
+// A detail long enough that the one-line preview loses information — these
+// rows expand on click to show the full text.
+const isExpandableDetail = (detail?: string) =>
+  !!detail && (detail.length > 160 || detail.includes('\n'));
+
+const collapsedDetailPreview = (activity: AgentActivity) => {
+  const flattened = (activity.detail ?? '').replace(/\s+/g, ' ').trim();
+  // Thought streams show the tail so the card tracks what the agent is
+  // thinking now, not the opening words.
+  if (activity.type === 'thought' && flattened.length > 300) {
+    return `…${flattened.slice(-300)}`;
+  }
+  return flattened;
+};
+
 const AgentActivityCard: React.FC<{
   activities: AgentActivity[];
   runStatus?: Message['status'];
 }> = ({ activities, runStatus }) => {
   const [expanded, setExpanded] = useState(false);
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(() => new Set());
   // Collapsed view tracks the newest steps so the card shows what the agent
   // is doing now, not what it did first.
   const visibleActivities = expanded ? activities : activities.slice(-4);
+
+  const toggleRow = (id: string) =>
+    setExpandedRows((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   if (activities.length === 0) return null;
 
@@ -673,24 +697,42 @@ const AgentActivityCard: React.FC<{
         </span>
       </button>
       <div className="agent-tools-list">
-        {visibleActivities.map((activity) => (
-          <div
-            key={activity.id}
-            className={`agent-tool-row ${
-              runStatus !== 'running' && activity.status === 'running'
-                ? 'done'
-                : activity.status ?? 'done'
-            }`}
-          >
-            <span className="agent-tool-icon">
-              <AgentActivityIcon activity={activity} />
-            </span>
-            <span className="agent-tool-text">
-              <span className="agent-tool-title">{activity.title}</span>
-              {activity.detail && <span className="agent-tool-detail">{activity.detail}</span>}
-            </span>
-          </div>
-        ))}
+        {visibleActivities.map((activity) => {
+          const expandable = isExpandableDetail(activity.detail);
+          const rowExpanded = expandable && expandedRows.has(activity.id);
+          return (
+            <div
+              key={activity.id}
+              className={`agent-tool-row ${
+                runStatus !== 'running' && activity.status === 'running'
+                  ? 'done'
+                  : activity.status ?? 'done'
+              }${expandable ? ' expandable' : ''}${rowExpanded ? ' open' : ''}`}
+              onClick={expandable ? () => toggleRow(activity.id) : undefined}
+              role={expandable ? 'button' : undefined}
+              title={
+                expandable ? (rowExpanded ? 'Collapse full text' : 'Expand full text') : undefined
+              }
+            >
+              <span className="agent-tool-icon">
+                <AgentActivityIcon activity={activity} />
+              </span>
+              <span className="agent-tool-text">
+                <span className="agent-tool-title">{activity.title}</span>
+                {activity.detail && (
+                  <span className={`agent-tool-detail${rowExpanded ? ' expanded' : ''}`}>
+                    {rowExpanded ? activity.detail : collapsedDetailPreview(activity)}
+                  </span>
+                )}
+              </span>
+              {expandable && (
+                <span className="agent-tool-chevron">
+                  <ChevronDown size={13} />
+                </span>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

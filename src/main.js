@@ -1411,6 +1411,12 @@ const genericJsonAdapter = {
 
 const jsonAdapterForProvider = (providerId) => providerJsonAdapters[providerId] ?? genericJsonAdapter;
 
+// grok's stream ends with an explicit {"type":"end","stopReason":...} event,
+// but the process (or a background process it spawned that inherited its
+// pipes) can outlive it — treat the event itself as the completion signal.
+const isTerminalJsonEvent = (providerId, value) =>
+  providerId === 'grok' && value?.type === 'end';
+
 const sendsJsonEvents = (providerId) => ['claude', 'codex', 'cursor', 'grok'].includes(providerId);
 
 // Finder-launched apps inherit launchd's minimal PATH, and most CLI
@@ -3462,7 +3468,54 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     let reasoningEmitTimer = null;
     let lastReasoningEmitAt = 0;
     let sessionIdReported = false;
+    let finalized = false;
+    let exitFallbackTimer = null;
+    let terminalEventTimer = null;
     activeAgentRuns.set(runId, child);
+
+    const clearFinalizeTimers = () => {
+      if (exitFallbackTimer) {
+        clearTimeout(exitFallbackTimer);
+        exitFallbackTimer = null;
+      }
+      if (terminalEventTimer) {
+        clearTimeout(terminalEventTimer);
+        terminalEventTimer = null;
+      }
+    };
+
+    const finalizeRun = async (exitCode) => {
+      if (finalized) return;
+      finalized = true;
+      clearFinalizeTimers();
+      activeAgentRuns.delete(runId);
+      stoppedAgentRuns.delete(runId);
+      if (jsonMode && jsonBuffer.trim()) {
+        try {
+          emitParsedJsonEvent(JSON.parse(jsonBuffer.trim()));
+        } catch {}
+        jsonBuffer = '';
+      }
+      finishReasoningActivity();
+
+      if (exitCode !== 0 && stderr.trim()) {
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'chunk',
+          chunk: `${stdoutSeen ? '\n\n' : ''}${stderr.trim()}\n`,
+        });
+      }
+
+      emitAgentEvent(event.sender, {
+        runId,
+        threadId: input.threadId,
+        type: exitCode === 0 ? 'done' : 'error',
+        exitCode,
+        changedFiles: await summarizeChangedFiles(input.projectPath, beforeSnapshot),
+        ...(exitCode === 0 ? {} : { error: `${model.label} exited with code ${exitCode}.` }),
+      });
+    };
 
     const maybeEmitSessionId = (parsed) => {
       if (sessionIdReported) return;
@@ -3479,11 +3532,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     };
 
     const sendReasoningActivity = (status = 'running') => {
-      const collapsed = reasoningText.replace(/\s+/g, ' ').trim();
-      if (!collapsed) return;
-      // Show the tail so the card tracks the live thought stream instead of
-      // freezing on the opening words.
-      const detail = collapsed.length > 600 ? `…${collapsed.slice(-600)}` : collapsed;
+      // Send the full thought stream; the renderer shows a one-line tail
+      // preview when the row is collapsed and the full text when expanded.
+      const detail = reasoningText.trim();
+      if (!detail) return;
 
       emitAgentEvent(event.sender, {
         runId,
@@ -3574,6 +3626,16 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           chunk: text,
         });
       }
+
+      if (!terminalEventTimer && !finalized && isTerminalJsonEvent(model.providerId, parsed)) {
+        // Give the process a moment to exit on its own; if it (or something
+        // holding its pipes) lingers, complete the run from the stream event.
+        terminalEventTimer = setTimeout(() => {
+          terminalEventTimer = null;
+          child.kill('SIGTERM');
+          finalizeRun(0);
+        }, 2000);
+      }
     };
 
     emitAgentEvent(event.sender, {
@@ -3584,6 +3646,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     });
 
     child.stdout.on('data', (data) => {
+      if (finalized) return;
       const raw = data.toString();
       if (!jsonMode) {
         stdoutSeen = stdoutSeen || raw.trim().length > 0;
@@ -3637,20 +3700,28 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       });
     });
 
+    // 'close' waits for the stdio pipes to drain, not just process exit. An
+    // agent-spawned background process (e.g. a dev server left running for
+    // the user) inherits those pipes and can hold them open forever, so
+    // finalize from 'exit' if 'close' doesn't follow shortly.
+    child.on('exit', (exitCode, signal) => {
+      if (finalized || exitFallbackTimer) return;
+      exitFallbackTimer = setTimeout(() => {
+        exitFallbackTimer = null;
+        finalizeRun(exitCode ?? (signal ? 1 : 0));
+      }, 2000);
+    });
+
     child.on('close', async (exitCode) => {
       activeAgentRuns.delete(runId);
       const wasStopped = stoppedAgentRuns.delete(runId);
-      if (jsonMode && jsonBuffer.trim()) {
-        try {
-          const parsed = JSON.parse(jsonBuffer.trim());
-          emitParsedJsonEvent(parsed);
-        } catch {}
-      }
-      finishReasoningActivity();
+      if (finalized) return;
 
       // The stored session may be gone (harness cache cleared, expired, or a
       // CLI update). If resuming produced no output at all, run fresh once.
       if (exitCode !== 0 && resumeSessionId && !stdoutSeen && !wasStopped) {
+        finalized = true;
+        clearFinalizeTimers();
         emitAgentEvent(event.sender, {
           runId,
           threadId: input.threadId,
@@ -3661,23 +3732,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         return;
       }
 
-      if (exitCode !== 0 && stderr.trim()) {
-        emitAgentEvent(event.sender, {
-          runId,
-          threadId: input.threadId,
-          type: 'chunk',
-          chunk: `${stdoutSeen ? '\n\n' : ''}${stderr.trim()}\n`,
-        });
-      }
-
-      emitAgentEvent(event.sender, {
-        runId,
-        threadId: input.threadId,
-        type: exitCode === 0 ? 'done' : 'error',
-        exitCode,
-        changedFiles: await summarizeChangedFiles(input.projectPath, beforeSnapshot),
-        ...(exitCode === 0 ? {} : { error: `${model.label} exited with code ${exitCode}.` }),
-      });
+      await finalizeRun(exitCode);
     });
     };
 
