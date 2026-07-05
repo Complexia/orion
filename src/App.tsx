@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   FolderOpen,
+  FolderPlus,
   Plus,
   Trash2,
   MessageSquare,
@@ -40,6 +41,11 @@ import {
   CloudUpload,
   CloudDownload,
   Globe,
+  Copy,
+  AppWindow,
+  SquareArrowOutUpRight,
+  ListPlus,
+  Zap,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -69,6 +75,7 @@ import {
   defaultCodexServiceTier,
   fallbackAgentModels,
   findAgentModel,
+  providerFollowUpSupport,
   providerOptionDefs,
   type AgentModel,
   type AgentProviderId,
@@ -646,7 +653,7 @@ const AgentActivityCard: React.FC<{
   const [expanded, setExpanded] = useState(false);
   // Collapsed view tracks the newest steps so the card shows what the agent
   // is doing now, not what it did first.
-  const visibleActivities = expanded ? activities : activities.slice(-6);
+  const visibleActivities = expanded ? activities : activities.slice(-4);
 
   if (activities.length === 0) return null;
 
@@ -686,6 +693,72 @@ const AgentActivityCard: React.FC<{
         ))}
       </div>
     </div>
+  );
+};
+
+// Split an agent run into chronological segments: text that streamed before
+// an activity renders before it, text after it renders after. Activities
+// recorded before contentOffset existed (older messages) anchor at 0, which
+// reproduces the previous steps-then-text layout.
+type AgentRunSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'activities'; activities: AgentActivity[] };
+
+const buildAgentRunSegments = (
+  content: string,
+  activities: AgentActivity[]
+): AgentRunSegment[] => {
+  const segments: AgentRunSegment[] = [];
+  let cursor = 0;
+
+  for (const activity of activities) {
+    const offset = Math.max(cursor, Math.min(activity.contentOffset ?? 0, content.length));
+    if (offset > cursor) {
+      segments.push({ kind: 'text', text: content.slice(cursor, offset) });
+      cursor = offset;
+    }
+    const last = segments[segments.length - 1];
+    if (last?.kind === 'activities') {
+      last.activities.push(activity);
+    } else {
+      segments.push({ kind: 'activities', activities: [activity] });
+    }
+  }
+
+  if (cursor < content.length) {
+    segments.push({ kind: 'text', text: content.slice(cursor) });
+  }
+
+  return segments;
+};
+
+const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ text, className }) => {
+  const [copied, setCopied] = useState(false);
+  const resetTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => window.clearTimeout(resetTimer.current), []);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.clearTimeout(resetTimer.current);
+      resetTimer.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard access denied; nothing to surface.
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      className={`message-copy-btn${copied ? ' copied' : ''}${className ? ` ${className}` : ''}`}
+      onClick={handleCopy}
+      aria-label={copied ? 'Copied' : 'Copy message'}
+      title={copied ? 'Copied' : 'Copy'}
+    >
+      {copied ? <Check size={14} /> : <Copy size={14} />}
+    </button>
   );
 };
 
@@ -802,6 +875,7 @@ const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
         {!isRunning && (
           <div className="agent-response-divider">
             <span>Response{duration && ` · worked for ${duration}`}</span>
+            {hasContent && <CopyMessageButton text={message.content} className="in-divider" />}
           </div>
         )}
         {(message.statusText || isRunning) && (
@@ -811,15 +885,22 @@ const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
             {isRunning && duration && <span className="agent-status-elapsed">{duration}</span>}
           </div>
         )}
-        <AgentActivityCard activities={message.activities ?? []} runStatus={message.status} />
-        {hasContent ? (
-          <MarkdownContent content={message.content} />
-        ) : (
-          isRunning &&
-          (message.activities?.length ? null : (
-            <div className="agent-empty-output">Waiting for the agent to produce output...</div>
-          ))
+        {buildAgentRunSegments(message.content, message.activities ?? []).map((segment, index) =>
+          segment.kind === 'activities' ? (
+            <AgentActivityCard
+              key={segment.activities[0].id}
+              activities={segment.activities}
+              runStatus={message.status}
+            />
+          ) : segment.text.trim() ? (
+            <MarkdownContent key={`text-${index}`} content={segment.text} />
+          ) : null
         )}
+        {!hasContent &&
+          isRunning &&
+          !message.activities?.length && (
+            <div className="agent-empty-output">Waiting for the agent to produce output...</div>
+          )}
         {!isRunning && message.changedFiles && <ChangedFilesCard files={message.changedFiles} />}
         {message.error && <div className="agent-error">{message.error}</div>}
       </div>
@@ -844,6 +925,9 @@ const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
             </div>
           )}
         </>
+      )}
+      {(message.role === 'user' || message.role === 'agent') && message.content.trim() && (
+        <CopyMessageButton text={message.content} />
       )}
     </div>
   );
@@ -996,6 +1080,7 @@ const App: React.FC = () => {
     selectedThreadId,
     addProject,
     removeProject,
+    renameProject,
     createThread,
     selectProject,
     selectThread,
@@ -1019,6 +1104,8 @@ const App: React.FC = () => {
     setProviderEnabled,
     setProviderOptions,
     setThreadAgentSession,
+    queueMessageToThread,
+    removeQueuedThreadMessage,
   } = useOrionStore();
 
   const [treeRoot, setTreeRoot] = useState<string | null>(null);
@@ -1026,16 +1113,34 @@ const App: React.FC = () => {
   const [chatInput, setChatInput] = useState('');
   const [chatAttachments, setChatAttachments] = useState<ImageAttachment[]>([]);
   const [draggingImages, setDraggingImages] = useState(false);
-  const [isSending, setIsSending] = useState(false);
+  // One agent run may be active per thread; runs in other threads are
+  // independent, so starting/stopping one never blocks the rest.
+  const [activeRunsByThread, setActiveRunsByThread] = useState<Record<string, string>>({});
+  const activeRunId = selectedThreadId ? activeRunsByThread[selectedThreadId] ?? null : null;
+  const isSending = Boolean(activeRunId);
+  const clearActiveRun = useCallback((runId: string) => {
+    setActiveRunsByThread((current) => {
+      const next: Record<string, string> = {};
+      let changed = false;
+      for (const [threadId, id] of Object.entries(current)) {
+        if (id === runId) changed = true;
+        else next[threadId] = id;
+      }
+      return changed ? next : current;
+    });
+  }, []);
   const [currentEditorValue, setCurrentEditorValue] = useState<string>('');
   const [agentModels, setAgentModels] = useState<AgentModel[]>(fallbackAgentModels);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState('');
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [branchPickerOpen, setBranchPickerOpen] = useState(false);
+  const [openWithApps, setOpenWithApps] = useState<
+    Array<{ id: string; name: string; icon: string | null }>
+  >([]);
+  const [openWithOpen, setOpenWithOpen] = useState(false);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
   const [gitState, setGitState] = useState<GitRepoState | null>(null);
@@ -1044,7 +1149,11 @@ const App: React.FC = () => {
   const [cloudState, setCloudState] = useState<OrionCloudState | null>(null);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
+  const [projectMenuOpenId, setProjectMenuOpenId] = useState<string | null>(null);
   const [threadListLimits, setThreadListLimits] = useState<Record<string, number>>({});
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
+  const [recentAgentsOpen, setRecentAgentsOpen] = useState(true);
+  const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
   const [editorBottomPadding, setEditorBottomPadding] = useState(280);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
@@ -1064,8 +1173,10 @@ const App: React.FC = () => {
   const [expandedProviderOptions, setExpandedProviderOptions] = useState<Record<string, boolean>>({});
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const branchPickerRef = useRef<HTMLDivElement>(null);
+  const openWithRef = useRef<HTMLDivElement>(null);
   const threadSearchRef = useRef<HTMLDivElement>(null);
   const threadMenuRef = useRef<HTMLDivElement>(null);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
@@ -1226,11 +1337,39 @@ const App: React.FC = () => {
     .map((part) => part[0]?.toUpperCase())
     .join('');
 
+  // Order projects by their most recently active thread (same activity signal
+  // as the Recent agents list) so current work stays at the top. Projects with
+  // no threads sort last, keeping their insertion order. Merely selecting a
+  // project does not reorder the sidebar.
   const sortedProjects = useMemo(() => {
-    if (!selectedProject) return projects;
-    const others = projects.filter((p) => p.id !== selectedProject.id);
-    return [selectedProject, ...others];
-  }, [projects, selectedProject]);
+    const lastActivityByProject = new Map<string, number>();
+    for (const thread of threads) {
+      const ts = getThreadActivityTime(thread).getTime();
+      const prev = lastActivityByProject.get(thread.projectId) ?? -Infinity;
+      if (ts > prev) lastActivityByProject.set(thread.projectId, ts);
+    }
+    return [...projects].sort(
+      (a, b) =>
+        (lastActivityByProject.get(b.id) ?? -Infinity) -
+        (lastActivityByProject.get(a.id) ?? -Infinity)
+    );
+  }, [projects, threads]);
+
+  const recentThreads = useMemo(
+    () =>
+      threads
+        .filter((t) => !t.hiddenFromRecent)
+        .sort(
+          (a, b) =>
+            getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
+        ),
+    [threads]
+  );
+
+  const runningAgentCount = useMemo(
+    () => threads.filter((t) => t.status === 'running').length,
+    [threads]
+  );
 
   const getProjectThreads = useCallback(
     (projectId: string) =>
@@ -1393,7 +1532,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!chatPinnedRef.current) return;
     chatEndRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' });
-  }, [selectedThread?.messages, isSending]);
+  }, [selectedThread?.messages, selectedThread?.queuedMessages, isSending]);
 
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
@@ -1600,7 +1739,9 @@ const App: React.FC = () => {
       !projectPickerOpen &&
       !branchPickerOpen &&
       !threadSearchOpen &&
-      !threadMenuOpen
+      !threadMenuOpen &&
+      !openWithOpen &&
+      projectMenuOpenId === null
     ) return undefined;
 
     const handlePointerDown = (event: MouseEvent) => {
@@ -1611,11 +1752,17 @@ const App: React.FC = () => {
       if (branchPickerOpen && !branchPickerRef.current?.contains(target)) {
         setBranchPickerOpen(false);
       }
+      if (openWithOpen && !openWithRef.current?.contains(target)) {
+        setOpenWithOpen(false);
+      }
       if (threadSearchOpen && !threadSearchRef.current?.contains(target)) {
         setThreadSearchOpen(false);
       }
       if (threadMenuOpen && !threadMenuRef.current?.contains(target)) {
         setThreadMenuOpen(false);
+      }
+      if (projectMenuOpenId !== null && !projectMenuRef.current?.contains(target)) {
+        setProjectMenuOpenId(null);
       }
     };
 
@@ -1625,6 +1772,8 @@ const App: React.FC = () => {
         setBranchPickerOpen(false);
         setThreadSearchOpen(false);
         setThreadMenuOpen(false);
+        setOpenWithOpen(false);
+        setProjectMenuOpenId(null);
       }
     };
 
@@ -1634,11 +1783,21 @@ const App: React.FC = () => {
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, threadSearchOpen]);
+  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId]);
 
   useEffect(() => {
     setThreadMenuOpen(false);
   }, [selectedThreadId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.orion?.listOpenWithApps?.().then((apps) => {
+      if (!cancelled && Array.isArray(apps)) setOpenWithApps(apps);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Streamed chunks can arrive many times per second; buffer them briefly so
   // each token doesn't trigger a full store update (and a store persist).
@@ -1677,6 +1836,9 @@ const App: React.FC = () => {
       }
 
       if (event.type === 'activity' && event.activity) {
+        // Flush buffered text first so the activity anchors after the text
+        // that streamed before it (contentOffset), not before it.
+        flushChunkBuffers();
         addActivityToThreadMessage(tracked.threadId, tracked.messageId, event.activity);
       }
 
@@ -1710,8 +1872,7 @@ const App: React.FC = () => {
         });
         updateThread(tracked.threadId, { status: 'done' });
         runOutputMessages.current.delete(event.runId);
-        setIsSending(false);
-        setActiveRunId((current) => (current === event.runId ? null : current));
+        clearActiveRun(event.runId);
       }
 
       if (event.type === 'error') {
@@ -1728,8 +1889,7 @@ const App: React.FC = () => {
         });
         updateThread(tracked.threadId, { status: 'error' });
         runOutputMessages.current.delete(event.runId);
-        setIsSending(false);
-        setActiveRunId((current) => (current === event.runId ? null : current));
+        clearActiveRun(event.runId);
       }
     });
 
@@ -1737,7 +1897,7 @@ const App: React.FC = () => {
       unsubscribe?.();
       flushChunkBuffers();
     };
-  }, [addActivityToThreadMessage, appendToThreadMessage, flushChunkBuffers, setThreadAgentSession, updateThread, updateThreadMessage]);
+  }, [addActivityToThreadMessage, appendToThreadMessage, clearActiveRun, flushChunkBuffers, setThreadAgentSession, updateThread, updateThreadMessage]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
@@ -1881,10 +2041,14 @@ const App: React.FC = () => {
     if (!dir) return;
 
     const name = await window.orion.basename(dir);
-    addProject({ name, path: dir });
+    const projectId = addProject({ name, path: dir });
 
     // Also set workspace to this project
     setWorkspacePath(dir);
+
+    // Adding a project means the user wants to work in it now — drop them
+    // straight into a fresh thread for it.
+    handleCreateThread(projectId);
 
     toast.success(`Added project: ${name}`);
   };
@@ -2014,7 +2178,10 @@ const App: React.FC = () => {
     setCloudBusy(true);
     try {
       const result = await window.orion.publishToCloud({ projectPath: activeThreadProject.path });
-      if (result.ok) {
+      if (result.ok && result.alreadyLinked) {
+        toast.success(result.upToDate ? 'Orion Cloud is already up to date' : 'Pushed to Orion Cloud');
+        await refreshCloudState();
+      } else if (result.ok) {
         toast.success(`Published to Orion Cloud as ${result.repo?.name ?? 'repository'}`, {
           description: 'Press Deploy on Orion Cloud to host it as an app.',
           action: {
@@ -2101,6 +2268,7 @@ const App: React.FC = () => {
 
   // Create new thread for a project
   const handleCreateThread = (projectId: string) => {
+    setCollapsedProjects((prev) => (prev[projectId] ? { ...prev, [projectId]: false } : prev));
     // Prevent spamming empty threads: if selected thread for this project is empty and nothing typed, do nothing
     if (
       selectedThread &&
@@ -2121,11 +2289,6 @@ const App: React.FC = () => {
     async (files: FileList | File[]) => {
       const imageFiles = Array.from(files).filter(isImageFile);
       if (imageFiles.length === 0) return false;
-
-      if (isSending) {
-        toast.error('Wait for the current agent run to finish before attaching images');
-        return true;
-      }
 
       let targetThreadId = selectedThreadId;
       if (!targetThreadId) {
@@ -2192,7 +2355,6 @@ const App: React.FC = () => {
     [
       activeTab,
       handleCreateThread,
-      isSending,
       projects,
       selectThread,
       selectedProject?.id,
@@ -2237,134 +2399,248 @@ const App: React.FC = () => {
     setChatAttachments((current) => current.filter((attachment) => attachment.id !== id));
   };
 
-  const sendMessage = async () => {
-    if (
-      !selectedThreadId ||
-      !selectedThread ||
-      (!chatInput.trim() && chatAttachments.length === 0) ||
-      isSending
-    ) {
-      return;
+  // Start a turn on any thread — not just the selected one — so queued
+  // follow-ups can dispatch for threads running in the background. Preflight
+  // and transcript setup are synchronous; the CLI spawn result is handled in
+  // the continuation.
+  const startTurnForThread = useCallback(
+    (
+      threadId: string,
+      promptText: string,
+      attachments: ImageAttachment[]
+    ): { ok: boolean; error?: string } => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((t) => t.id === threadId);
+      if (!thread) return { ok: false, error: 'Thread no longer exists' };
+      const project = state.projects.find((p) => p.id === thread.projectId);
+      if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      if (!model) return { ok: false, error: 'Select an agent model first' };
+      if (normalizedProviderSettings[model.providerId]?.enabled === false) {
+        return { ok: false, error: `${model.providerLabel} is disabled` };
+      }
+      if (model.available === false) {
+        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+      }
+      if (!window.orion?.runAgentTurn) {
+        return { ok: false, error: 'Agent runtime is unavailable' };
+      }
+
+      const userContent = promptText || 'Attached image';
+      const agentPrompt = buildPromptWithAttachments(promptText, attachments);
+
+      // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
+      if (thread.messages.length === 0 && isDefaultTitle(thread.title)) {
+        const initialTitle = deriveTitle(userContent);
+        if (isPlausibleTitle(initialTitle)) {
+          updateThread(threadId, { title: initialTitle });
+        }
+        // Kick off async LLM refinement for a nicer title
+        void tryGenerateBetterTitle(threadId, userContent, model.id, project.path, updateThread);
+      }
+
+      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+      addMessageToThread(threadId, {
+        role: 'user',
+        content: userContent,
+        attachments,
+      });
+      updateThread(threadId, { status: 'running' });
+
+      const messageId = addMessageToThread(threadId, {
+        role: 'agent',
+        content: '',
+        kind: 'agent-run',
+        status: 'running',
+        statusText: "I'm working on this now.",
+        startedAt: new Date().toISOString(),
+        activities: [],
+      });
+      const runId = crypto.randomUUID();
+      runOutputMessages.current.set(runId, { threadId, messageId });
+      setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
+
+      void window.orion
+        .runAgentTurn({
+          runId,
+          threadId,
+          projectPath: project.path,
+          prompt: agentPrompt,
+          modelId: model.id,
+          accessMode: thread.accessMode ?? 'full-access',
+          resumeSessionId: thread.agentSessionIds?.[model.providerId],
+          providerOptions: normalizedProviderSettings[model.providerId]?.options,
+          ...(model.providerId === 'codex'
+            ? {
+                codexReasoningEffort: thread.codexReasoningEffort ?? defaultCodexReasoningEffort,
+                codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
+              }
+            : {}),
+          ...(model.providerId === 'claude'
+            ? {
+                claudeReasoningEffort:
+                  thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
+                claudeContextWindow: getEffectiveClaudeContextWindow(
+                  model,
+                  thread.claudeContextWindow ?? defaultClaudeContextWindow
+                ),
+              }
+            : {}),
+        })
+        .then((result) => {
+          if (result.ok && result.runId) {
+            if (result.runId !== runId) {
+              runOutputMessages.current.delete(runId);
+              runOutputMessages.current.set(result.runId, { threadId, messageId });
+              setActiveRunsByThread((current) =>
+                current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
+              );
+            }
+          } else {
+            runOutputMessages.current.delete(runId);
+            clearActiveRun(runId);
+            appendToThreadMessage(threadId, messageId, result.error ?? 'The agent failed to start.');
+            updateThreadMessage(threadId, messageId, {
+              status: 'error',
+              completedAt: new Date().toISOString(),
+              statusText: 'The agent failed to start.',
+              error: result.error,
+            });
+            updateThread(threadId, { status: 'error' });
+          }
+        });
+
+      return { ok: true };
+    },
+    [
+      agentModels,
+      normalizedProviderSettings,
+      addMessageToThread,
+      appendToThreadMessage,
+      updateThread,
+      updateThreadMessage,
+      clearActiveRun,
+    ]
+  );
+
+  // Queued follow-ups dispatch as soon as their thread has no run in flight —
+  // after a turn finishes (done or error) and after app-restart recovery. Each
+  // dispatch resumes the provider session, so the agent keeps its context.
+  useEffect(() => {
+    for (const thread of threads) {
+      const next = thread.queuedMessages?.[0];
+      if (!next) continue;
+      if (thread.status === 'running' || activeRunsByThread[thread.id]) continue;
+      removeQueuedThreadMessage(thread.id, next.id);
+      const result = startTurnForThread(thread.id, next.text, next.attachments ?? []);
+      if (!result.ok) {
+        addMessageToThread(thread.id, {
+          role: 'system',
+          content: `Could not send the queued message: ${result.error}`,
+        });
+      }
     }
-    if (!selectedThreadProject) {
-      toast.error('Select a project for this thread first');
-      return;
-    }
-    if (!selectedAgentModel) {
-      toast.error('Select an agent model first');
-      return;
-    }
-    if (!enabledProviderIdSet.has(selectedAgentModel.providerId)) {
-      toast.error(`${selectedAgentModel.providerLabel} is disabled`);
-      return;
-    }
-    if (selectedAgentModel.available === false) {
-      toast.error(selectedAgentModel.unavailableReason ?? `${selectedAgentModel.label} is unavailable`);
-      return;
-    }
-    if (!window.orion?.runAgentTurn) {
-      toast.error('Agent runtime is unavailable');
+  }, [threads, activeRunsByThread, removeQueuedThreadMessage, startTurnForThread, addMessageToThread]);
+
+  const sendMessage = () => {
+    if (!selectedThreadId || !selectedThread) return;
+    const promptText = chatInput.trim();
+    if (!promptText && chatAttachments.length === 0) return;
+
+    // Agent mid-run: hold the message; it dispatches when the current turn ends.
+    if (isSending) {
+      chatPinnedRef.current = true;
+      queueMessageToThread(selectedThreadId, { text: promptText, attachments: chatAttachments });
+      setChatInput('');
+      setChatAttachments([]);
       return;
     }
 
-    const promptText = chatInput.trim();
-    const attachments = chatAttachments;
-    const userContent = promptText || 'Attached image';
-    const agentPrompt = buildPromptWithAttachments(promptText, attachments);
+    const result = startTurnForThread(selectedThreadId, promptText, chatAttachments);
+    if (!result.ok) {
+      toast.error(result.error);
+      return;
+    }
     setChatInput('');
     setChatAttachments([]);
-    setIsSending(true);
     setModelPickerOpen(false);
     setCodexSettingsOpen(false);
+  };
 
-    // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
-    const isFirstMessage = selectedThread.messages.length === 0;
-    if (isFirstMessage && isDefaultTitle(selectedThread.title)) {
-      const initialTitle = deriveTitle(userContent);
-      if (isPlausibleTitle(initialTitle)) {
-        updateThread(selectedThreadId, { title: initialTitle });
-      }
-      // Kick off async LLM refinement for a nicer title
-      void tryGenerateBetterTitle(
-        selectedThreadId,
-        userContent,
-        selectedAgentModel.id,
-        selectedThreadProject.path,
-        updateThread
-      );
-    }
+  // Steering = interrupt the running CLI and immediately resume its session
+  // with the new instruction. Needs the harness to have reported a session id
+  // (arrives within the first events of a run).
+  const steerSupported =
+    isSending && !!selectedAgentModel && providerFollowUpSupport[selectedAgentModel.providerId].steer;
+  const steerReady =
+    steerSupported &&
+    !!selectedAgentModel &&
+    !!selectedThread?.agentSessionIds?.[selectedAgentModel.providerId];
 
-    chatPinnedRef.current = true;
-    addMessageToThread(selectedThreadId, {
-      role: 'user',
-      content: userContent,
-      attachments,
-    });
-    updateThread(selectedThreadId, { status: 'running' });
+  const steerWithContent = async (promptText: string, attachments: ImageAttachment[]) => {
+    if (!selectedThreadId || !activeRunId || !steerReady || !window.orion?.stopAgentTurn) return;
+    if (!promptText && attachments.length === 0) return;
 
-    const messageId = addMessageToThread(selectedThreadId, {
-      role: 'agent',
-      content: '',
-      kind: 'agent-run',
-      status: 'running',
-      statusText: "I'm working on this now.",
-      startedAt: new Date().toISOString(),
-      activities: [],
-    });
-    const runId = crypto.randomUUID();
-    runOutputMessages.current.set(runId, { threadId: selectedThreadId, messageId });
-    setActiveRunId(runId);
-
-    const result = await window.orion.runAgentTurn({
-      runId,
-      threadId: selectedThreadId,
-      projectPath: selectedThreadProject.path,
-      prompt: agentPrompt,
-      modelId: selectedAgentModel.id,
-      accessMode: selectedThread.accessMode ?? 'full-access',
-      resumeSessionId: selectedThread.agentSessionIds?.[selectedAgentModel.providerId],
-      providerOptions: providerSettings[selectedAgentModel.providerId]?.options,
-      ...(selectedAgentModel.providerId === 'codex'
-        ? {
-            codexReasoningEffort: selectedCodexReasoning,
-            codexServiceTier: selectedCodexServiceTier,
-          }
-        : {}),
-      ...(selectedAgentModel.providerId === 'claude'
-        ? {
-            claudeReasoningEffort: selectedClaudeReasoning,
-            claudeContextWindow: effectiveClaudeContextWindow,
-          }
-        : {}),
-    });
-
-    if (result.ok && result.runId) {
-      if (result.runId !== runId) {
-        runOutputMessages.current.delete(runId);
-        runOutputMessages.current.set(result.runId, { threadId: selectedThreadId, messageId });
-        setActiveRunId(result.runId);
-      }
-    } else {
-      runOutputMessages.current.delete(runId);
-      setActiveRunId(null);
-      appendToThreadMessage(
-        selectedThreadId,
-        messageId,
-        result.error ?? 'The agent failed to start.'
-      );
-      updateThreadMessage(selectedThreadId, messageId, {
-        status: 'error',
+    const runId = activeRunId;
+    const threadId = selectedThreadId;
+    // Untrack before killing so the dying process's tail events can't write
+    // into the transcript.
+    const tracked = runOutputMessages.current.get(runId);
+    runOutputMessages.current.delete(runId);
+    clearActiveRun(runId);
+    flushChunkBuffers();
+    if (tracked) {
+      updateThreadMessage(tracked.threadId, tracked.messageId, {
+        status: 'stopped',
         completedAt: new Date().toISOString(),
-        statusText: 'The agent failed to start.',
-        error: result.error,
+        statusText: 'Interrupted — steered to a new instruction.',
       });
-      updateThread(selectedThreadId, { status: 'error' });
-      setIsSending(false);
+    }
+    await window.orion.stopAgentTurn(runId);
+    // Give the CLI a beat to flush its session file before we resume it.
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    const result = startTurnForThread(threadId, promptText, attachments);
+    if (!result.ok) {
+      toast.error(result.error);
+      updateThread(threadId, { status: 'error' });
     }
   };
 
+  // Composer ⚡ / ⌘⏎: steer with the current draft.
+  const steerActiveAgent = async () => {
+    const promptText = chatInput.trim();
+    const attachments = chatAttachments;
+    if (!promptText && attachments.length === 0) return;
+    setChatInput('');
+    setChatAttachments([]);
+    await steerWithContent(promptText, attachments);
+  };
+
+  // "Steer now" on a queued transcript bubble: promote that message to an
+  // immediate interrupt-and-resume instead of waiting for the turn to end.
+  const steerQueuedMessage = async (queuedId: string) => {
+    if (!selectedThreadId || !activeRunId || !steerReady) return;
+    const thread = useOrionStore.getState().threads.find((t) => t.id === selectedThreadId);
+    const queued = thread?.queuedMessages?.find((q) => q.id === queuedId);
+    if (!queued) return;
+    removeQueuedThreadMessage(selectedThreadId, queuedId);
+    await steerWithContent(queued.text, queued.attachments ?? []);
+  };
+
   const stopActiveAgent = async () => {
+    // Stops only the selected thread's run; agents in other threads keep going.
     if (!activeRunId || !window.orion?.stopAgentTurn) return;
+    // Stop means "halt everything": queued follow-ups return to the composer
+    // instead of auto-dispatching against the stopped run's session.
+    const thread = useOrionStore.getState().threads.find((t) => t.id === selectedThreadId);
+    const queued = thread?.queuedMessages ?? [];
+    if (thread && queued.length > 0) {
+      updateThread(thread.id, { queuedMessages: [] });
+      setChatInput((current) =>
+        [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n')
+      );
+      setChatAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
+    }
     await window.orion.stopAgentTurn(activeRunId);
     flushChunkBuffers();
     const tracked = runOutputMessages.current.get(activeRunId);
@@ -2378,16 +2654,18 @@ const App: React.FC = () => {
       updateThread(tracked.threadId, { status: 'idle' });
       runOutputMessages.current.delete(activeRunId);
     }
-    setActiveRunId(null);
-    setIsSending(false);
+    clearActiveRun(activeRunId);
   };
 
-  // Handle chat submit
+  // Handle chat submit: ⏎ sends (or queues mid-run), ⌘⏎ steers mid-run.
   const handleChatKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
+    if (e.key !== 'Enter' || e.shiftKey) return;
+    e.preventDefault();
+    if ((e.metaKey || e.ctrlKey) && isSending && steerReady) {
+      void steerActiveAgent();
+      return;
     }
+    sendMessage();
   };
 
   const currentLanguage = activeFilePath ? getLanguageFromPath(activeFilePath) : 'plaintext';
@@ -2672,25 +2950,30 @@ const App: React.FC = () => {
                       >
                         <Plus size={13} /> New branch
                       </button>
+                      <button
+                        type="button"
+                        className="branch-picker-item"
+                        onClick={() => {
+                          setBranchPickerOpen(false);
+                          void handleCommitAndPush();
+                        }}
+                        disabled={gitBusy || !gitState?.ok || !gitState.currentBranch}
+                        title="git add . && git commit && git push"
+                      >
+                        <GitCommit size={13} /> Commit and Push
+                      </button>
                     </div>
                   )}
                 </div>
 
-                <button
-                  type="button"
-                  className="shell-commit-button"
-                  onClick={handleCommitAndPush}
-                  disabled={gitBusy || gitLoading || !gitState?.ok || !gitState.currentBranch}
-                  title="git add . && git commit && git push"
-                >
-                  <GitCommit size={14} />
-                  <span>Commit and Push</span>
-                </button>
-
-                {gitState?.ok && cloudState?.ok && !cloudState.linked && (
+                {gitState?.ok && cloudState?.ok && (
                   <button
                     type="button"
-                    className="shell-cloud-button"
+                    className={`shell-cloud-button ${
+                      cloudState.linked && (cloudState.sync === 'ahead' || cloudState.sync === 'diverged')
+                        ? 'attention'
+                        : ''
+                    }`}
                     onClick={() => {
                       if (!cloudState.authenticated) {
                         toast.info('Sign in to your Orion account to publish this repository.');
@@ -2698,35 +2981,36 @@ const App: React.FC = () => {
                         setSettingsOpen(true);
                         return;
                       }
-                      void handleCloudPublish();
+                      if (cloudState.linked) {
+                        void handleCloudPush();
+                      } else {
+                        void handleCloudPublish();
+                      }
                     }}
                     disabled={cloudBusy || gitBusy}
-                    title="Publish this repository to Orion Cloud"
+                    title={
+                      !cloudState.linked
+                        ? 'Publish this repository to Orion Cloud'
+                        : cloudState.sync === 'diverged'
+                          ? 'Local and cloud history diverged'
+                          : 'Push local commits to Orion Cloud'
+                    }
                   >
-                    <Cloud size={14} />
-                    <span>{cloudBusy ? 'Publishing…' : 'Publish'}</span>
+                    {cloudState.linked ? <CloudUpload size={14} /> : <Cloud size={14} />}
+                    <span>
+                      {cloudBusy
+                        ? cloudState.linked
+                          ? 'Pushing…'
+                          : 'Publishing…'
+                        : cloudState.linked
+                          ? 'Push'
+                          : 'Publish'}
+                    </span>
                   </button>
                 )}
 
                 {gitState?.ok && cloudState?.ok && cloudState.linked && (
                   <div className="shell-cloud-group" title={`Orion Cloud: ${cloudState.repoName ?? ''}`}>
-                    <button
-                      type="button"
-                      className={`shell-cloud-icon-button ${
-                        cloudState.sync === 'ahead' || cloudState.sync === 'diverged' ? 'attention' : ''
-                      }`}
-                      onClick={() => void handleCloudPush()}
-                      disabled={cloudBusy || gitBusy}
-                      title={
-                        cloudState.sync === 'ahead'
-                          ? 'Push local commits to Orion Cloud'
-                          : cloudState.sync === 'diverged'
-                            ? 'Local and cloud history diverged'
-                            : 'Push to Orion Cloud'
-                      }
-                    >
-                      <CloudUpload size={14} />
-                    </button>
                     <button
                       type="button"
                       className={`shell-cloud-icon-button ${
@@ -2763,25 +3047,86 @@ const App: React.FC = () => {
             )}
           </div>
 
-          <div className="shell-mode-tabs" role="tablist" aria-label="Mode">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === 'agents'}
-              className={`shell-mode-tab ${activeTab === 'agents' ? 'active' : ''}`}
-              onClick={() => handleSetActiveTab('agents')}
-            >
-              <MessageSquare size={15} /> Agents
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === 'code'}
-              className={`shell-mode-tab ${activeTab === 'code' ? 'active' : ''}`}
-              onClick={() => handleSetActiveTab('code')}
-            >
-              <Code2 size={15} /> Code
-            </button>
+          <div className="shell-right-group">
+            {openWithApps.length > 0 && activeThreadProject?.path && (
+              <div className="shell-openwith-control" ref={openWithRef}>
+                <button
+                  type="button"
+                  className="shell-openwith-trigger"
+                  onClick={() => setOpenWithOpen((open) => !open)}
+                  title={`Open ${activeThreadProject.name} in another app`}
+                  aria-label="Open with"
+                  aria-haspopup="menu"
+                  aria-expanded={openWithOpen}
+                >
+                  <SquareArrowOutUpRight size={14} />
+                  <ChevronDown
+                    size={13}
+                    className={`project-pill-chevron ${openWithOpen ? 'open' : ''}`}
+                  />
+                </button>
+                {openWithOpen && (
+                  <div className="shell-openwith-menu" role="menu">
+                    {openWithApps.map((appOption) => (
+                      <button
+                        key={appOption.id}
+                        type="button"
+                        className="openwith-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setOpenWithOpen(false);
+                          void window.orion
+                            ?.openProjectWith?.({
+                              appId: appOption.id,
+                              projectPath: activeThreadProject.path,
+                            })
+                            .then((result) => {
+                              if (result && !result.ok && result.error) {
+                                toast.error(result.error);
+                              }
+                            });
+                        }}
+                      >
+                        {appOption.icon ? (
+                          <img
+                            src={appOption.icon}
+                            alt=""
+                            className="openwith-item-icon"
+                            width={18}
+                            height={18}
+                            draggable={false}
+                          />
+                        ) : (
+                          <AppWindow size={16} className="openwith-item-icon" />
+                        )}
+                        <span className="truncate">{appOption.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="shell-mode-tabs" role="tablist" aria-label="Mode">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'agents'}
+                className={`shell-mode-tab ${activeTab === 'agents' ? 'active' : ''}`}
+                onClick={() => handleSetActiveTab('agents')}
+              >
+                <MessageSquare size={15} /> Agents
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'code'}
+                className={`shell-mode-tab ${activeTab === 'code' ? 'active' : ''}`}
+                onClick={() => handleSetActiveTab('code')}
+              >
+                <Code2 size={15} /> Code
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -3319,45 +3664,42 @@ const App: React.FC = () => {
                   </div>
                 )}
 
-                {sortedProjects.map((project) => {
-                  const projectThreads = getProjectThreads(project.id);
-                  const isActiveProject = selectedProject?.id === project.id;
-                  const visibleLimit = threadListLimits[project.id] ?? THREADS_VISIBLE_LIMIT;
-                  const visibleThreads = projectThreads.slice(0, visibleLimit);
-                  const hasMoreThreads = projectThreads.length > visibleLimit;
-
-                  return (
-                    <div
-                      key={project.id}
-                      className={`project-section ${isActiveProject ? 'project-section-active' : ''}`}
+                {projects.length > 0 && (
+                  <div className="recent-agents-section">
+                    <button
+                      type="button"
+                      className="sidebar-section-toggle"
+                      onClick={() => setRecentAgentsOpen((open) => !open)}
+                      aria-expanded={recentAgentsOpen}
                     >
-                      <button
-                        type="button"
-                        className="project-section-header"
-                        onClick={() => selectProject(project.id)}
-                        title={project.path}
-                      >
-                        <ProjectIcon projectPath={project.path} size={13} />
-                        <span className="truncate">{project.name}</span>
-                      </button>
-
-                      <div className="threads-list">
-                        {projectThreads.length === 0 ? (
-                          <button
-                            type="button"
-                            className="thread-item thread-item-empty"
-                            onClick={() => handleCreateThread(project.id)}
-                          >
-                            <span className="thread-title">New thread</span>
-                          </button>
+                      <ChevronRight
+                        size={12}
+                        className={`sidebar-section-chevron ${recentAgentsOpen ? 'open' : ''}`}
+                      />
+                      <span>Recent agents</span>
+                      {runningAgentCount > 0 && (
+                        <span className="sidebar-section-count">{runningAgentCount}</span>
+                      )}
+                    </button>
+                    {recentAgentsOpen && (
+                      <>
+                      <div className="threads-list recent-agents-list">
+                        {recentThreads.length === 0 ? (
+                          <div className="recent-agents-empty">No recent agents</div>
                         ) : (
-                          visibleThreads.map((thread) => (
+                          (recentAgentsShowAll
+                            ? recentThreads
+                            : recentThreads.slice(0, THREADS_VISIBLE_LIMIT)
+                          ).map((thread) => (
                             <div
                               key={thread.id}
                               className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
                               onClick={() => selectThread(thread.id)}
                             >
                               <span className="thread-title">{thread.title}</span>
+                              <span className="thread-project-tag thread-meta">
+                                {projects.find((p) => p.id === thread.projectId)?.name}
+                              </span>
                               <span className="thread-time thread-meta">
                                 {thread.status === 'running' ? (
                                   <span className="thread-working-dot" title="Working" />
@@ -3368,12 +3710,10 @@ const App: React.FC = () => {
                               <button
                                 type="button"
                                 className="thread-delete"
-                                title="Delete thread"
+                                title="Remove from Recent agents"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  if (confirm('Delete this thread?')) {
-                                    deleteThread(thread.id);
-                                  }
+                                  updateThread(thread.id, { hiddenFromRecent: true });
                                 }}
                               >
                                 <Trash2 size={13} />
@@ -3382,20 +3722,199 @@ const App: React.FC = () => {
                           ))
                         )}
                       </div>
-
-                      {hasMoreThreads && (
+                      {!recentAgentsShowAll && recentThreads.length > THREADS_VISIBLE_LIMIT && (
                         <button
                           type="button"
                           className="threads-show-more"
-                          onClick={() =>
-                            setThreadListLimits((prev) => ({
-                              ...prev,
-                              [project.id]: projectThreads.length,
-                            }))
-                          }
+                          onClick={() => setRecentAgentsShowAll(true)}
                         >
                           Show more
                         </button>
+                      )}
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {projects.length > 0 && (
+                  <div className="sidebar-section-header">
+                    <span className="sidebar-section-title">Projects</span>
+                    <button
+                      type="button"
+                      className="sidebar-section-action"
+                      title="Add project"
+                      onClick={() => void handleAddProject()}
+                    >
+                      <FolderPlus size={14} />
+                    </button>
+                  </div>
+                )}
+
+                {sortedProjects.map((project) => {
+                  const projectThreads = getProjectThreads(project.id);
+                  const isActiveProject = selectedProject?.id === project.id;
+                  const isCollapsed = collapsedProjects[project.id] ?? false;
+                  const visibleLimit = threadListLimits[project.id] ?? THREADS_VISIBLE_LIMIT;
+                  const visibleThreads = projectThreads.slice(0, visibleLimit);
+                  const hasMoreThreads = projectThreads.length > visibleLimit;
+
+                  return (
+                    <div
+                      key={project.id}
+                      className={`project-section ${isActiveProject ? 'project-section-active' : ''}`}
+                    >
+                      <div className="project-section-header-row">
+                        <button
+                          type="button"
+                          className="project-collapse-toggle"
+                          title={isCollapsed ? 'Expand threads' : 'Collapse threads'}
+                          aria-expanded={!isCollapsed}
+                          onClick={() =>
+                            setCollapsedProjects((prev) => ({
+                              ...prev,
+                              [project.id]: !isCollapsed,
+                            }))
+                          }
+                        >
+                          <ChevronRight
+                            size={12}
+                            className={`sidebar-section-chevron ${isCollapsed ? '' : 'open'}`}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          className="project-section-header"
+                          onClick={() => selectProject(project.id)}
+                          title={project.path}
+                        >
+                          <ProjectIcon projectPath={project.path} size={13} />
+                          <span className="truncate">{project.name}</span>
+                          {isCollapsed && projectThreads.length > 0 && (
+                            <span className="sidebar-section-count">{projectThreads.length}</span>
+                          )}
+                        </button>
+                        <div
+                          className="project-menu-wrap"
+                          ref={projectMenuOpenId === project.id ? projectMenuRef : undefined}
+                        >
+                          <button
+                            type="button"
+                            className="project-options-trigger"
+                            title="Project options"
+                            aria-label={`Options for ${project.name}`}
+                            aria-haspopup="menu"
+                            aria-expanded={projectMenuOpenId === project.id}
+                            onClick={() =>
+                              setProjectMenuOpenId((open) =>
+                                open === project.id ? null : project.id
+                              )
+                            }
+                          >
+                            <Ellipsis size={13} />
+                          </button>
+                          {projectMenuOpenId === project.id && (
+                            <div className="thread-menu project-menu" role="menu">
+                              <button
+                                type="button"
+                                className="project-menu-item"
+                                role="menuitem"
+                                onClick={() => {
+                                  setProjectMenuOpenId(null);
+                                  const newName = prompt('Rename project', project.name);
+                                  if (newName?.trim()) renameProject(project.id, newName.trim());
+                                }}
+                              >
+                                <SquarePen size={13} /> Rename
+                              </button>
+                              <button
+                                type="button"
+                                className="project-menu-item danger"
+                                role="menuitem"
+                                onClick={() => {
+                                  setProjectMenuOpenId(null);
+                                  if (
+                                    confirm(
+                                      `Remove "${project.name}" and its threads? Files on disk are not affected.`
+                                    )
+                                  ) {
+                                    removeProject(project.id);
+                                  }
+                                }}
+                              >
+                                <Trash2 size={13} /> Delete
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          className="project-new-thread"
+                          title={`New thread in ${project.name}`}
+                          onClick={() => handleCreateThread(project.id)}
+                        >
+                          <SquarePen size={13} />
+                        </button>
+                      </div>
+
+                      {!isCollapsed && (
+                        <>
+                        <div className="threads-list">
+                          {projectThreads.length === 0 ? (
+                            <button
+                              type="button"
+                              className="thread-item thread-item-empty"
+                              onClick={() => handleCreateThread(project.id)}
+                            >
+                              <span className="thread-title">New thread</span>
+                            </button>
+                          ) : (
+                            visibleThreads.map((thread) => (
+                              <div
+                                key={thread.id}
+                                className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                                onClick={() => selectThread(thread.id)}
+                              >
+                                <span className="thread-title">{thread.title}</span>
+                                <span className="thread-time thread-meta">
+                                  {thread.status === 'running' ? (
+                                    <span className="thread-working-dot" title="Working" />
+                                  ) : (
+                                    formatShortTime(getThreadActivityTime(thread))
+                                  )}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="thread-delete"
+                                  title="Delete thread"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (confirm('Delete this thread?')) {
+                                      deleteThread(thread.id);
+                                    }
+                                  }}
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              </div>
+                            ))
+                          )}
+                        </div>
+  
+                        {hasMoreThreads && (
+                          <button
+                            type="button"
+                            className="threads-show-more"
+                            onClick={() =>
+                              setThreadListLimits((prev) => ({
+                                ...prev,
+                                [project.id]: projectThreads.length,
+                              }))
+                            }
+                          >
+                            Show more
+                          </button>
+                        )}
+                        </>
                       )}
 
                     </div>
@@ -3439,6 +3958,60 @@ const App: React.FC = () => {
                         {isSending && selectedThread.messages.at(-1)?.role !== 'agent' && (
                           <div className="message agent opacity-70">Starting agent...</div>
                         )}
+
+                        {(selectedThread.queuedMessages ?? []).map((queued) => (
+                          <div key={queued.id} className="message user queued">
+                            {queued.text && (
+                              <div className="whitespace-pre-wrap break-words">{queued.text}</div>
+                            )}
+                            {(queued.attachments?.length ?? 0) > 0 && (
+                              <div className="message-attachments">
+                                {queued.attachments!.map((attachment) => (
+                                  <div
+                                    key={attachment.id}
+                                    className="message-attachment"
+                                    title={attachment.path}
+                                  >
+                                    <img
+                                      src={imageAttachmentSrc(attachment)}
+                                      alt={attachment.name}
+                                    />
+                                    <span>{attachment.name}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            <div className="queued-message-bar">
+                              <span className="queued-message-badge">Queued</span>
+                              {steerSupported && (
+                                <button
+                                  type="button"
+                                  className="queued-message-action steer"
+                                  onClick={() => steerQueuedMessage(queued.id)}
+                                  disabled={!steerReady}
+                                  title={
+                                    steerReady
+                                      ? 'Interrupt the agent and send this now'
+                                      : 'Steer becomes available once the agent reports its session'
+                                  }
+                                >
+                                  <Zap size={12} />
+                                  Steer now
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="queued-message-action remove"
+                                onClick={() =>
+                                  removeQueuedThreadMessage(selectedThread.id, queued.id)
+                                }
+                                title="Remove queued message"
+                              >
+                                <X size={12} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
                         <div ref={chatEndRef} />
                       </div>
                     </div>
@@ -3460,7 +4033,6 @@ const App: React.FC = () => {
                                   type="button"
                                   className="composer-attachment-remove"
                                   onClick={() => removeChatAttachment(attachment.id)}
-                                  disabled={isSending}
                                   title="Remove image"
                                 >
                                   <X size={13} />
@@ -3472,14 +4044,17 @@ const App: React.FC = () => {
                         <textarea
                           className="chat-input min-h-[52px]"
                           placeholder={
-                            chatAttachments.length > 0
-                              ? 'Ask something about the attached image...'
-                              : 'Describe what you want the agent to do...'
+                            isSending
+                              ? steerSupported
+                                ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
+                                : 'Queue a follow-up — sends when the agent finishes (⏎)…'
+                              : chatAttachments.length > 0
+                                ? 'Ask something about the attached image...'
+                                : 'Describe what you want the agent to do...'
                           }
                           value={chatInput}
                           onChange={(e) => setChatInput(e.target.value)}
                           onKeyDown={handleChatKeyDown}
-                          disabled={isSending}
                           rows={2}
                         />
                         <div className="composer-controls">
@@ -3748,9 +4323,36 @@ const App: React.FC = () => {
                         </label>
 
                         {isSending ? (
-                          <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
-                            <Square size={14} fill="currentColor" />
-                          </button>
+                          <>
+                            {(chatInput.trim() || chatAttachments.length > 0) && (
+                              <>
+                                <button
+                                  className="send-button"
+                                  onClick={sendMessage}
+                                  title="Queue — sends when the current run finishes (⏎)"
+                                >
+                                  <ListPlus size={15} />
+                                </button>
+                                {steerSupported && (
+                                  <button
+                                    className="send-button steer"
+                                    onClick={steerActiveAgent}
+                                    disabled={!steerReady}
+                                    title={
+                                      steerReady
+                                        ? 'Steer — interrupt the agent and redirect it now (⌘⏎)'
+                                        : 'Steer becomes available once the agent reports its session'
+                                    }
+                                  >
+                                    <Zap size={14} />
+                                  </button>
+                                )}
+                              </>
+                            )}
+                            <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
+                              <Square size={14} fill="currentColor" />
+                            </button>
+                          </>
                         ) : (
                           <button
                             className="send-button"

@@ -1,12 +1,14 @@
 import { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol, safeStorage, shell } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import started from 'electron-squirrel-startup';
 import { autoUpdater } from 'electron-updater';
 import {
+  clearCloudRepoLink,
   getCloudRepoLink,
   getCloudState,
   publishRepo,
@@ -29,6 +31,9 @@ const attachmentProtocol = 'orion-attachment';
 const appProtocol = 'orion';
 const loginShell = process.env.SHELL || '/bin/zsh';
 const activeAgentRuns = new Map();
+// Runs killed on purpose (stop / steer) — their nonzero exit must not trigger
+// the "resume failed, retry fresh" fallback in agent:runTurn.
+const stoppedAgentRuns = new Set();
 let pendingDesktopAuth = null;
 let inMemoryAccountSession = null;
 let storageSaveQueue = Promise.resolve();
@@ -963,12 +968,27 @@ const extractTextFromJsonEvent = (value) => {
 // stream_event deltas, a complete 'assistant' message per turn, and the final
 // 'result' event. Render only the deltas so text isn't repeated; keep the
 // 'result' payload only when it carries an error that was never streamed.
-const extractClaudeTextFromJsonEvent = (value) => {
+// Text blocks separated by tool use are distinct paragraphs, so a new text
+// block after earlier text gets a blank line instead of gluing onto it.
+const extractClaudeTextFromJsonEvent = (value, context = {}) => {
   if (!value || typeof value !== 'object') return '';
   if (value.type === 'stream_event') {
     if (value.parent_tool_use_id) return '';
-    const delta = value.event?.delta;
-    if (delta?.type === 'text_delta' && typeof delta.text === 'string') return delta.text;
+    const streamEvent = value.event;
+    if (
+      streamEvent?.type === 'content_block_start' &&
+      streamEvent.content_block?.type === 'text' &&
+      context.textSeen
+    ) {
+      context.pendingTextBreak = true;
+      return '';
+    }
+    const delta = streamEvent?.delta;
+    if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+      const prefix = context.pendingTextBreak ? '\n\n' : '';
+      context.pendingTextBreak = false;
+      return `${prefix}${delta.text}`;
+    }
     return '';
   }
   if (value.type === 'result' && value.is_error && typeof value.result === 'string') {
@@ -1017,13 +1037,23 @@ const extractCursorTextFromJsonEvent = (value, context = {}) => {
       .join('');
     if (!text) return '';
 
+    // A new assistant message (id changed) after earlier text is a separate
+    // paragraph — insert a blank line and stop prefix-matching against the
+    // previous message's text.
+    const messageId = typeof value.message?.id === 'string' ? value.message.id : null;
+    const isNewMessage =
+      messageId && context.lastAssistantMessageId && messageId !== context.lastAssistantMessageId;
+    if (messageId) context.lastAssistantMessageId = messageId;
+    if (isNewMessage) context.lastAssistantText = '';
+    const prefix = isNewMessage && context.textSeen ? '\n\n' : '';
+
     // --stream-partial-output may resend a message's text cumulatively;
     // append only the new suffix. Genuine deltas fail the prefix test and
     // are appended whole.
     const previous = context.lastAssistantText ?? '';
     context.lastAssistantText = text;
-    if (previous && text.startsWith(previous)) return text.slice(previous.length);
-    return text;
+    if (previous && text.startsWith(previous)) return `${prefix}${text.slice(previous.length)}`;
+    return `${prefix}${text}`;
   }
 
   // Only use the final aggregate when nothing streamed, so the response
@@ -1127,6 +1157,9 @@ const codexActivityFromItem = (item, eventType) => {
     };
   }
   if (item.type === 'error') {
+    // Codex emits its experimental-feature warning ("Under-development features
+    // enabled: ...") as an error item on every turn; it is noise, not a failure.
+    if (/under-development features/i.test(String(item.message ?? ''))) return null;
     return {
       ...base,
       type: 'error',
@@ -2236,6 +2269,26 @@ if (started) {
   app.quit();
 }
 
+// The single-instance lock is scoped to userData, and two live instances
+// sharing one profile would clobber the store file. Give the dev build its
+// own profile so it can run alongside the installed app instead of quitting
+// immediately; seed it from the installed app's store on first run.
+if (!app.isPackaged) {
+  const liveUserData = app.getPath('userData');
+  const devUserData = `${liveUserData} (dev)`;
+  try {
+    mkdirSync(devUserData, { recursive: true });
+    const liveStore = path.join(liveUserData, storageFileName);
+    const devStore = path.join(devUserData, storageFileName);
+    if (!existsSync(devStore) && existsSync(liveStore)) {
+      copyFileSync(liveStore, devStore);
+    }
+  } catch (error) {
+    console.warn('Could not seed dev profile, starting empty:', error);
+  }
+  app.setPath('userData', devUserData);
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
@@ -2408,7 +2461,7 @@ const scheduleAppUpdateChecks = () => {
   if (appUpdateCheckTimer) clearInterval(appUpdateCheckTimer);
   appUpdateCheckTimer = setInterval(() => {
     void checkForAppUpdate().catch(() => {});
-  }, 6 * 60 * 60 * 1000);
+  }, 2 * 60 * 60 * 1000);
 }
 
 const createWindow = () => {
@@ -2968,7 +3021,20 @@ ipcMain.handle('cloud:publish', async (_event, input) => {
     const gitRoot = await getGitRoot(projectPath);
     const existing = await getCloudRepoLink(gitRoot);
     if (existing) {
-      return { ok: false, error: 'This repository is already linked to Orion Cloud.' };
+      // Already linked — publishing again just means updating the cloud copy.
+      try {
+        const result = await pushRepo({
+          gitRoot,
+          repoId: existing.repoId,
+          baseUrl: getOrionWebUrl(),
+          token: session.token,
+        });
+        return { ...result, alreadyLinked: true, webUrl: cloudRepoWebUrl(existing.repoId) };
+      } catch (error) {
+        if (error?.status !== 404) throw error;
+        // The cloud repo is gone — drop the stale link and publish fresh.
+        await clearCloudRepoLink(gitRoot);
+      }
     }
 
     const name = sanitizeCloudRepoName(input?.name || path.basename(gitRoot));
@@ -3420,6 +3486,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     child.on('close', async (exitCode) => {
       activeAgentRuns.delete(runId);
+      const wasStopped = stoppedAgentRuns.delete(runId);
       if (jsonMode && jsonBuffer.trim()) {
         try {
           const parsed = JSON.parse(jsonBuffer.trim());
@@ -3430,7 +3497,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
       // The stored session may be gone (harness cache cleared, expired, or a
       // CLI update). If resuming produced no output at all, run fresh once.
-      if (exitCode !== 0 && resumeSessionId && !stdoutSeen) {
+      if (exitCode !== 0 && resumeSessionId && !stdoutSeen && !wasStopped) {
         emitAgentEvent(event.sender, {
           runId,
           threadId: input.threadId,
@@ -3477,6 +3544,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 ipcMain.handle('agent:stopTurn', async (_event, runId) => {
   const child = activeAgentRuns.get(runId);
   if (!child) return false;
+  stoppedAgentRuns.add(runId);
   child.kill('SIGTERM');
   activeAgentRuns.delete(runId);
   return true;
@@ -3625,6 +3693,156 @@ ipcMain.handle('project:findIcon', async (_event, projectPath) => {
   } catch (error) {
     console.error('project:findIcon error', error);
     return null;
+  }
+});
+
+// "Open with" apps (macOS): detect installed apps and open the project in them.
+// cliRelPaths: VS Code-fork CLI binaries inside the bundle. Launching through
+// them opens the folder in an editor window; `open -a` can land on the app's
+// agents/dashboard view instead (e.g. Cursor).
+const OPEN_WITH_CANDIDATES = [
+  {
+    id: 'cursor',
+    name: 'Cursor',
+    bundles: ['Cursor.app'],
+    cliRelPaths: ['Contents/Resources/app/bin/cursor', 'Contents/Resources/app/bin/code'],
+  },
+  // Prefer the code-editor app ("Antigravity IDE.app") over the agents app ("Antigravity.app").
+  {
+    id: 'antigravity',
+    name: 'Antigravity',
+    bundles: ['Antigravity IDE.app', 'Antigravity.app'],
+    cliRelPaths: ['Contents/Resources/app/bin/antigravity-ide'],
+  },
+  { id: 'ghostty', name: 'Ghostty', bundles: ['Ghostty.app'] },
+  {
+    id: 'terminal',
+    name: 'Terminal',
+    bundles: [],
+    absolutePaths: [
+      '/System/Applications/Utilities/Terminal.app',
+      '/Applications/Utilities/Terminal.app',
+    ],
+  },
+  {
+    id: 'finder',
+    name: 'Finder',
+    bundles: [],
+    absolutePaths: ['/System/Library/CoreServices/Finder.app'],
+  },
+  {
+    id: 'vscode',
+    name: 'VS Code',
+    bundles: ['Visual Studio Code.app'],
+    cliRelPaths: ['Contents/Resources/app/bin/code'],
+  },
+];
+
+let openWithAppsCache = null;
+
+function resolveOpenWithAppPath(candidate) {
+  const roots = [path.join(app.getPath('home'), 'Applications'), '/Applications'];
+  const candidatePaths = [
+    ...(candidate.absolutePaths ?? []),
+    ...candidate.bundles.flatMap((bundle) => roots.map((root) => path.join(root, bundle))),
+  ];
+  return candidatePaths.find((appPath) => existsSync(appPath)) ?? null;
+}
+
+// app.getFileIcon returns a generic document icon for .app bundles on macOS,
+// so pull the real icon out of the bundle (Info.plist -> .icns -> png via sips).
+async function extractMacAppIcon(appPath) {
+  try {
+    const resourcesDir = path.join(appPath, 'Contents', 'Resources');
+    const candidates = [];
+    try {
+      const { stdout } = await execFileAsync('plutil', [
+        '-extract', 'CFBundleIconFile', 'raw', '-o', '-',
+        path.join(appPath, 'Contents', 'Info.plist'),
+      ]);
+      const iconFile = stdout.trim();
+      if (iconFile) {
+        candidates.push(
+          path.join(resourcesDir, iconFile.endsWith('.icns') ? iconFile : `${iconFile}.icns`)
+        );
+      }
+    } catch {
+      // No CFBundleIconFile entry; fall through to common icon names.
+    }
+    candidates.push(path.join(resourcesDir, 'AppIcon.icns'));
+    let icnsPath = candidates.find((candidate) => existsSync(candidate));
+    if (!icnsPath) {
+      const entries = await fs.readdir(resourcesDir).catch(() => []);
+      const firstIcns = entries.find((name) => name.endsWith('.icns'));
+      if (firstIcns) icnsPath = path.join(resourcesDir, firstIcns);
+    }
+    if (!icnsPath) return null;
+
+    const outPath = path.join(app.getPath('temp'), `orion-openwith-${crypto.randomUUID()}.png`);
+    try {
+      await execFileAsync('sips', [
+        '-s', 'format', 'png', '--resampleHeightWidthMax', '64',
+        icnsPath, '--out', outPath,
+      ]);
+      const image = nativeImage.createFromPath(outPath);
+      return image.isEmpty() ? null : image.toDataURL();
+    } finally {
+      await fs.unlink(outPath).catch(() => {});
+    }
+  } catch {
+    return null;
+  }
+}
+
+ipcMain.handle('openWith:listApps', async () => {
+  if (process.platform !== 'darwin') return [];
+  if (openWithAppsCache) return openWithAppsCache;
+
+  const apps = [];
+  for (const candidate of OPEN_WITH_CANDIDATES) {
+    const appPath = resolveOpenWithAppPath(candidate);
+    if (!appPath) continue;
+    // Icon is optional; the renderer falls back to a generic glyph.
+    const icon = await extractMacAppIcon(appPath);
+    apps.push({ id: candidate.id, name: candidate.name, icon });
+  }
+  openWithAppsCache = apps;
+  return apps;
+});
+
+ipcMain.handle('openWith:open', async (_event, input) => {
+  const { appId, projectPath } = input ?? {};
+  try {
+    if (typeof projectPath !== 'string' || !existsSync(projectPath)) {
+      return { ok: false, error: 'Project folder not found' };
+    }
+    const candidate = OPEN_WITH_CANDIDATES.find((entry) => entry.id === appId);
+    if (!candidate) return { ok: false, error: 'Unknown app' };
+
+    if (candidate.id === 'finder') {
+      const error = await shell.openPath(projectPath);
+      return error ? { ok: false, error } : { ok: true };
+    }
+
+    const appPath = resolveOpenWithAppPath(candidate);
+    if (!appPath) return { ok: false, error: `${candidate.name} is not installed` };
+
+    const cliPath = (candidate.cliRelPaths ?? [])
+      .map((rel) => path.join(appPath, rel))
+      .find((cli) => existsSync(cli));
+    if (cliPath) {
+      try {
+        await execFileAsync(cliPath, [projectPath]);
+        return { ok: true };
+      } catch (error) {
+        console.error(`openWith: ${candidate.id} CLI failed, falling back to open -a`, error);
+      }
+    }
+    await execFileAsync('open', ['-a', appPath, projectPath]);
+    return { ok: true };
+  } catch (error) {
+    console.error('openWith:open error', error);
+    return { ok: false, error: error?.message ?? 'Failed to open' };
   }
 });
 

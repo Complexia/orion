@@ -144,6 +144,20 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
   opencode: [extraArgsOption('opencode')],
 };
 
+// What each harness supports for messages sent while a run is in flight.
+// queue: hold the message and send it as the next turn (session resume).
+// steer: interrupt the running process and immediately resume the same
+// harness session with the new instruction. The non-interactive CLI modes
+// Orion uses accept no stdin mid-run, so interrupt+resume is the steer path;
+// opencode has no session resume wired, so it is queue-only.
+export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; steer: boolean }> = {
+  grok: { queue: true, steer: true },
+  codex: { queue: true, steer: true },
+  claude: { queue: true, steer: true },
+  cursor: { queue: true, steer: true },
+  opencode: { queue: true, steer: false },
+};
+
 export const agentProviders: AgentProvider[] = [
   { id: 'grok', label: 'Grok', icon: GrokBrandIcon },
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },

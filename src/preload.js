@@ -59,6 +59,10 @@ contextBridge.exposeInMainWorld('orion', {
   // Project assets
   findProjectIcon: (projectPath) => ipcRenderer.invoke('project:findIcon', projectPath),
 
+  // Open project in external apps
+  listOpenWithApps: () => ipcRenderer.invoke('openWith:listApps'),
+  openProjectWith: (input) => ipcRenderer.invoke('openWith:open', input),
+
   // Path utils
   basename: (p) => ipcRenderer.invoke('path:basename', p),
   dirname: (p) => ipcRenderer.invoke('path:dirname', p),

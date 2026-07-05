@@ -15,6 +15,12 @@ export type AgentActivity = {
   detail?: string;
   status?: 'running' | 'done' | 'error';
   ts: string;
+  /**
+   * Length of the message content when this activity was added — lets the
+   * transcript interleave activities with the streamed text in order.
+   * Activities updated in place (by key) keep their original offset.
+   */
+  contentOffset?: number;
 };
 
 export type ChangedFileSummary = {
@@ -49,6 +55,12 @@ export type Message = {
   changedFiles?: ChangedFileSummary[];
 };
 
+export type QueuedMessage = {
+  id: string;
+  text: string;
+  attachments?: ImageAttachment[];
+};
+
 export type Thread = {
   id: string;
   projectId: string;
@@ -61,10 +73,14 @@ export type Thread = {
   claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
   claudeContextWindow?: '200k' | '1m';
   createdAt: string;
+  /** Removed from the sidebar Recent agents list (still listed under its project). */
+  hiddenFromRecent?: boolean;
   messages: Message[];
   // Per-provider harness session ids so follow-up turns resume the same
   // conversation (claude --resume, codex exec resume, etc.).
   agentSessionIds?: Partial<Record<ProviderId, string>>;
+  /** Follow-ups submitted while a run was in flight; dispatched in order when the run ends. */
+  queuedMessages?: QueuedMessage[];
 };
 
 export type OpenFile = {
@@ -127,8 +143,9 @@ interface OrionState {
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
-  addProject: (project: Omit<Project, 'id'>) => void;
+  addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
   removeProject: (id: string) => void;
+  renameProject: (id: string, name: string) => void;
 
   createThread: (projectId: string, title?: string) => string; // returns new thread id
   selectProject: (id: string | null) => void;
@@ -147,6 +164,8 @@ interface OrionState {
     messageId: string,
     activity: Omit<AgentActivity, 'id' | 'ts'>
   ) => void;
+  queueMessageToThread: (threadId: string, message: Omit<QueuedMessage, 'id'>) => string;
+  removeQueuedThreadMessage: (threadId: string, messageId: string) => void;
 
   toggleProjectExpanded: (id: string) => void;
 
@@ -297,8 +316,10 @@ export const useOrionStore = create<OrionState>()(
           ...project,
           id: crypto.randomUUID(),
         };
+        // Newest project first — adding a project means the user wants to
+        // work in it now, so it should lead the sidebar.
         set((state) => ({
-          projects: [...state.projects, newProject],
+          projects: [newProject, ...state.projects],
           expandedProjects: [...state.expandedProjects, newProject.id],
           selectedProjectId: newProject.id,
         }));
@@ -306,6 +327,7 @@ export const useOrionStore = create<OrionState>()(
         if (!get().workspacePath) {
           set({ workspacePath: newProject.path });
         }
+        return newProject.id;
       },
 
       removeProject: (id) => {
@@ -332,14 +354,31 @@ export const useOrionStore = create<OrionState>()(
         });
       },
 
+      renameProject: (id, name) =>
+        set((state) => ({
+          projects: state.projects.map((p) => (p.id === id ? { ...p, name } : p)),
+        })),
+
       createThread: (projectId, title) => {
+        // Inherit model + settings from the most recently used thread in the
+        // same project so new threads default to what the user last picked.
+        const threadActivityTime = (t: Thread) =>
+          new Date(t.messages.at(-1)?.ts ?? t.createdAt).getTime();
+        const lastProjectThread = get()
+          .threads.filter((t) => t.projectId === projectId)
+          .sort((a, b) => threadActivityTime(b) - threadActivityTime(a))[0];
+
         const newThread: Thread = {
           id: crypto.randomUUID(),
           projectId,
           title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
           status: 'idle',
-          modelId: 'grok:grok-build',
-          accessMode: 'full-access',
+          modelId: lastProjectThread?.modelId ?? 'grok:grok-build',
+          accessMode: lastProjectThread?.accessMode ?? 'full-access',
+          codexReasoningEffort: lastProjectThread?.codexReasoningEffort,
+          codexServiceTier: lastProjectThread?.codexServiceTier,
+          claudeReasoningEffort: lastProjectThread?.claudeReasoningEffort,
+          claudeContextWindow: lastProjectThread?.claudeContextWindow,
           createdAt: new Date().toISOString(),
           messages: [],
         };
@@ -391,7 +430,8 @@ export const useOrionStore = create<OrionState>()(
         };
         set((state) => ({
           threads: state.threads.map((t) =>
-            t.id === threadId ? { ...t, messages: [...t.messages, msg] } : t
+            // New activity puts a thread back in Recent agents even if it was removed.
+            t.id === threadId ? { ...t, messages: [...t.messages, msg], hiddenFromRecent: false } : t
           ),
         }));
         return msg.id;
@@ -459,6 +499,7 @@ export const useOrionStore = create<OrionState>()(
                                   ...existing,
                                   ...activity,
                                   ts: nextActivity.ts,
+                                  contentOffset: existing.contentOffset,
                                 }
                               : existing
                           ),
@@ -467,7 +508,10 @@ export const useOrionStore = create<OrionState>()(
 
                       return {
                         ...message,
-                        activities: [...existingActivities, nextActivity],
+                        activities: [
+                          ...existingActivities,
+                          { ...nextActivity, contentOffset: message.content.length },
+                        ],
                       };
                     }),
                   }
@@ -475,6 +519,30 @@ export const useOrionStore = create<OrionState>()(
             ),
           };
         }),
+
+      queueMessageToThread: (threadId, message) => {
+        const id = crypto.randomUUID();
+        set((state) => ({
+          threads: state.threads.map((t) =>
+            t.id === threadId
+              ? { ...t, queuedMessages: [...(t.queuedMessages ?? []), { ...message, id }] }
+              : t
+          ),
+        }));
+        return id;
+      },
+
+      removeQueuedThreadMessage: (threadId, messageId) =>
+        set((state) => ({
+          threads: state.threads.map((t) =>
+            t.id === threadId
+              ? {
+                  ...t,
+                  queuedMessages: (t.queuedMessages ?? []).filter((m) => m.id !== messageId),
+                }
+              : t
+          ),
+        })),
 
       toggleProjectExpanded: (id) =>
         set((state) => ({

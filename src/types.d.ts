@@ -34,6 +34,7 @@ type OrionCloudState = {
 
 type OrionCloudPushResult = {
   ok: boolean;
+  alreadyLinked?: boolean;
   upToDate?: boolean;
   conflict?: boolean;
   needsAuth?: boolean;
@@ -320,6 +321,8 @@ declare global {
         projectPath?: string;
       }) => Promise<string>;
       findProjectIcon: (projectPath: string) => Promise<string | null>;
+      listOpenWithApps: () => Promise<Array<{ id: string; name: string; icon: string | null }>>;
+      openProjectWith: (input: { appId: string; projectPath: string }) => Promise<{ ok: boolean; error?: string }>;
       basename: (p: string) => Promise<string>;
       dirname: (p: string) => Promise<string>;
       join: (...parts: string[]) => Promise<string>;
