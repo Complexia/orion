@@ -47,6 +47,7 @@ let appUpdateState = {
 };
 let appUpdateInitialized = false;
 let appUpdateCheckTimer = null;
+let appUpdateDownloadedVersion = null;
 
 const defaultCodexReasoningEffort = 'medium';
 const defaultCodexServiceTier = 'default';
@@ -2381,13 +2382,21 @@ const initializeAppUpdater = async () => {
   });
 
   autoUpdater.on('update-available', (info) => {
+    const availableVersion = info?.version ?? null;
     publishAppUpdateState({
       status: 'available',
-      availableVersion: info?.version ?? null,
+      availableVersion,
       checkedAt: new Date().toISOString(),
       progress: null,
       error: null,
     });
+
+    // With autoInstallOnAppQuit, a previously downloaded update stays staged
+    // and would install on quit even after newer releases ship. Re-download
+    // so the staged update is always the latest one.
+    if (appUpdateDownloadedVersion && availableVersion && appUpdateDownloadedVersion !== availableVersion) {
+      void autoUpdater.downloadUpdate().catch(() => {});
+    }
   });
 
   autoUpdater.on('update-not-available', () => {
@@ -2414,6 +2423,7 @@ const initializeAppUpdater = async () => {
   });
 
   autoUpdater.on('update-downloaded', (info) => {
+    appUpdateDownloadedVersion = info?.version ?? appUpdateState.availableVersion;
     publishAppUpdateState({
       status: 'downloaded',
       availableVersion: info?.version ?? appUpdateState.availableVersion,
@@ -3250,8 +3260,14 @@ ipcMain.handle('appUpdate:check', async () => checkForAppUpdate());
 ipcMain.handle('appUpdate:download', async () => {
   if (!app.isPackaged) return appUpdateState;
   await initializeAppUpdater();
+  // downloadUpdate() fetches whatever the last check found, and that check
+  // can be hours old — newer releases may have shipped since, and the feed's
+  // signed download URLs expire minutes after each check. Re-check first so
+  // we always download the latest version from a fresh URL.
+  const checkResult = await autoUpdater.checkForUpdates();
+  if (!checkResult?.isUpdateAvailable) return appUpdateState;
   publishAppUpdateState({ status: 'downloading', progress: { percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 }, error: null });
-  await autoUpdater.downloadUpdate();
+  await autoUpdater.downloadUpdate(checkResult.cancellationToken);
   return appUpdateState;
 });
 
