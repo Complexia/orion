@@ -61,6 +61,21 @@ export type QueuedMessage = {
   attachments?: ImageAttachment[];
 };
 
+/**
+ * A `/btw` aside: a quick question answered by a read-only fork of the
+ * thread's agent session. It has the thread's full context but never joins
+ * the thread — the main session and transcript are untouched.
+ */
+export type BtwExchange = {
+  id: string;
+  question: string;
+  answer: string;
+  status: 'running' | 'done' | 'error';
+  createdAt: string;
+  completedAt?: string;
+  error?: string;
+};
+
 // A kanban card from the Orion web board linked to this thread. Title and
 // description are snapshotted at link time (refreshed just before injection)
 // and fed to the agent as context on the first linked turn.
@@ -92,8 +107,19 @@ export type Thread = {
   // Per-provider harness session ids so follow-up turns resume the same
   // conversation (claude --resume, codex exec resume, etc.).
   agentSessionIds?: Partial<Record<ProviderId, string>>;
+  /**
+   * Providers whose session id was inherited by branching and must be forked
+   * (never resumed in place) on this thread's next turn, so runs here don't
+   * append to the parent thread's CLI-side conversation. Cleared per provider
+   * once the fork reports its own session id.
+   */
+  pendingForkProviders?: ProviderId[];
+  /** Thread this one was branched from, if any. */
+  branchedFromThreadId?: string;
   /** Follow-ups submitted while a run was in flight; dispatched in order when the run ends. */
   queuedMessages?: QueuedMessage[];
+  /** `/btw` asides answered by session forks; rendered alongside the transcript, never part of it. */
+  btwExchanges?: BtwExchange[];
   /** Kanban card on the Orion web board driving/driven by this thread. */
   linkedTask?: LinkedBoardTask;
 };
@@ -163,6 +189,7 @@ interface OrionState {
   renameProject: (id: string, name: string) => void;
 
   createThread: (projectId: string, title?: string) => string; // returns new thread id
+  branchThread: (sourceThreadId: string) => string | null; // returns new thread id
   selectProject: (id: string | null) => void;
   selectThread: (id: string | null) => void;
   updateThread: (id: string, updates: Partial<Thread>) => void;
@@ -181,6 +208,14 @@ interface OrionState {
   ) => void;
   queueMessageToThread: (threadId: string, message: Omit<QueuedMessage, 'id'>) => string;
   removeQueuedThreadMessage: (threadId: string, messageId: string) => void;
+  addBtwExchange: (threadId: string, question: string) => string;
+  appendToBtwExchange: (threadId: string, exchangeId: string, chunk: string) => void;
+  updateBtwExchange: (
+    threadId: string,
+    exchangeId: string,
+    updates: Partial<Omit<BtwExchange, 'id'>>
+  ) => void;
+  removeBtwExchange: (threadId: string, exchangeId: string) => void;
 
   toggleProjectExpanded: (id: string) => void;
 
@@ -321,6 +356,11 @@ export const useOrionStore = create<OrionState>()(
               ? {
                   ...thread,
                   agentSessionIds: { ...thread.agentSessionIds, [providerId]: sessionId },
+                  // A branched thread's first turn forks the inherited session
+                  // and reports the fork's id; from here on resume in place.
+                  pendingForkProviders: thread.pendingForkProviders?.filter(
+                    (p) => p !== providerId
+                  ),
                 }
               : thread
           ),
@@ -400,6 +440,46 @@ export const useOrionStore = create<OrionState>()(
         set((state) => ({
           threads: [newThread, ...state.threads],
           selectedProjectId: projectId,
+          selectedThreadId: newThread.id,
+        }));
+        return newThread.id;
+      },
+
+      branchThread: (sourceThreadId) => {
+        const source = get().threads.find((t) => t.id === sourceThreadId);
+        if (!source) return null;
+
+        const sessionIds = { ...source.agentSessionIds };
+        const inheritedProviders = Object.keys(sessionIds) as ProviderId[];
+        const newThread: Thread = {
+          id: crypto.randomUUID(),
+          projectId: source.projectId,
+          title: `${source.title} (branch)`,
+          status: 'idle',
+          modelId: source.modelId,
+          accessMode: source.accessMode,
+          codexReasoningEffort: source.codexReasoningEffort,
+          codexServiceTier: source.codexServiceTier,
+          claudeReasoningEffort: source.claudeReasoningEffort,
+          claudeContextWindow: source.claudeContextWindow,
+          createdAt: new Date().toISOString(),
+          // Copy the transcript for display; the agent's context comes from
+          // forking the CLI-side session (pendingForkProviders), not from
+          // replaying these messages.
+          messages: source.messages.map((message) => ({
+            ...message,
+            status: message.status === 'running' ? 'stopped' : message.status,
+            attachments: message.attachments?.map((a) => ({ ...a })),
+            activities: message.activities?.map((a) => ({ ...a })),
+            changedFiles: message.changedFiles?.map((f) => ({ ...f })),
+          })),
+          agentSessionIds: inheritedProviders.length ? sessionIds : undefined,
+          pendingForkProviders: inheritedProviders.length ? inheritedProviders : undefined,
+          branchedFromThreadId: source.id,
+        };
+        set((state) => ({
+          threads: [newThread, ...state.threads],
+          selectedProjectId: source.projectId,
           selectedThreadId: newThread.id,
         }));
         return newThread.id;
@@ -554,6 +634,68 @@ export const useOrionStore = create<OrionState>()(
               ? {
                   ...t,
                   queuedMessages: (t.queuedMessages ?? []).filter((m) => m.id !== messageId),
+                }
+              : t
+          ),
+        })),
+
+      addBtwExchange: (threadId, question) => {
+        const exchange: BtwExchange = {
+          id: crypto.randomUUID(),
+          question,
+          answer: '',
+          status: 'running',
+          createdAt: new Date().toISOString(),
+        };
+        set((state) => ({
+          threads: state.threads.map((t) =>
+            t.id === threadId
+              ? { ...t, btwExchanges: [...(t.btwExchanges ?? []), exchange] }
+              : t
+          ),
+        }));
+        return exchange.id;
+      },
+
+      appendToBtwExchange: (threadId, exchangeId, chunk) => {
+        if (!chunk) return;
+        set((state) => ({
+          threads: state.threads.map((t) =>
+            t.id === threadId
+              ? {
+                  ...t,
+                  btwExchanges: (t.btwExchanges ?? []).map((exchange) =>
+                    exchange.id === exchangeId
+                      ? { ...exchange, answer: `${exchange.answer}${chunk}` }
+                      : exchange
+                  ),
+                }
+              : t
+          ),
+        }));
+      },
+
+      updateBtwExchange: (threadId, exchangeId, updates) =>
+        set((state) => ({
+          threads: state.threads.map((t) =>
+            t.id === threadId
+              ? {
+                  ...t,
+                  btwExchanges: (t.btwExchanges ?? []).map((exchange) =>
+                    exchange.id === exchangeId ? { ...exchange, ...updates } : exchange
+                  ),
+                }
+              : t
+          ),
+        })),
+
+      removeBtwExchange: (threadId, exchangeId) =>
+        set((state) => ({
+          threads: state.threads.map((t) =>
+            t.id === threadId
+              ? {
+                  ...t,
+                  btwExchanges: (t.btwExchanges ?? []).filter((e) => e.id !== exchangeId),
                 }
               : t
           ),

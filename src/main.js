@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell, systemPreferences } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
@@ -846,7 +846,9 @@ const commandForModel = (model, input) => {
     const allowedTools = String(options.allowedTools || '').trim();
     const allowedToolsArgs =
       accessMode !== 'full-access' && allowedTools ? ['--allowedTools', allowedTools] : [];
-    const resumeArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
+    const resumeArgs = resumeSessionId
+      ? ['--resume', resumeSessionId, ...(input.forkSession ? ['--fork-session'] : [])]
+      : [];
     return [
       'claude',
       '--print',
@@ -893,7 +895,9 @@ const commandForModel = (model, input) => {
       accessMode === 'full-access'
         ? ['--permission-mode', 'bypassPermissions', '--always-approve']
         : ['--permission-mode', accessMode === 'read-only' ? 'plan' : 'acceptEdits'];
-    const resumeArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
+    const resumeArgs = resumeSessionId
+      ? ['--resume', resumeSessionId, ...(input.forkSession ? ['--fork-session'] : [])]
+      : [];
     const memoryArgs = options.experimentalMemory ? ['--experimental-memory'] : [];
     return [
       'grok',
@@ -913,6 +917,58 @@ const commandForModel = (model, input) => {
   }
 
   return ['opencode', 'run', '--model', modelArg, ...extraArgs, prompt];
+};
+
+// Branched threads inherit the parent's session id but must never resume it
+// in place — codex and cursor append resumed turns to the parent's own
+// on-disk record. claude and grok expose --fork-session for this; for codex
+// and cursor the session is forked by copying that record under a new uuid.
+const forkCodexSessionFile = async (sessionId) => {
+  const sessionsRoot = path.join(app.getPath('home'), '.codex', 'sessions');
+  const suffix = `-${sessionId}.jsonl`;
+  const entries = await fs.readdir(sessionsRoot, { recursive: true });
+  const relativePath = entries.find((entry) => entry.endsWith(suffix));
+  if (!relativePath) return null;
+
+  const sourcePath = path.join(sessionsRoot, relativePath);
+  const newId = crypto.randomUUID();
+  const lines = (await fs.readFile(sourcePath, 'utf8')).split('\n');
+  // Line 1 is session_meta; codex matches resume ids against both the
+  // filename and this embedded id.
+  const meta = JSON.parse(lines[0]);
+  meta.payload.id = newId;
+  lines[0] = JSON.stringify(meta);
+  await fs.writeFile(sourcePath.replace(suffix, `-${newId}.jsonl`), lines.join('\n'));
+  return newId;
+};
+
+const forkCursorChatDir = async (sessionId) => {
+  // Chats live at ~/.cursor/chats/<workspace-hash>/<chatId>/; resume resolves
+  // the chat by directory name.
+  const chatsRoot = path.join(app.getPath('home'), '.cursor', 'chats');
+  for (const workspaceHash of await fs.readdir(chatsRoot)) {
+    const sourceDir = path.join(chatsRoot, workspaceHash, sessionId);
+    const isChatDir = await fs
+      .stat(sourceDir)
+      .then((stat) => stat.isDirectory())
+      .catch(() => false);
+    if (!isChatDir) continue;
+
+    const newId = crypto.randomUUID();
+    await fs.cp(sourceDir, path.join(chatsRoot, workspaceHash, newId), { recursive: true });
+    return newId;
+  }
+  return null;
+};
+
+const forkSessionOnDisk = async (providerId, sessionId) => {
+  try {
+    if (providerId === 'codex') return await forkCodexSessionFile(sessionId);
+    if (providerId === 'cursor') return await forkCursorChatDir(sessionId);
+  } catch (error) {
+    console.error(`Failed to fork ${providerId} session ${sessionId}`, error);
+  }
+  return null;
 };
 
 // Pull the harness's session/thread id out of its stream so follow-up turns
@@ -3393,6 +3449,119 @@ ipcMain.handle('app:openExternalUrl', async (_event, url) => {
   }
 });
 
+// Computer use (codex's computer-use plugin and similar) needs macOS TCC
+// grants — Accessibility, Screen Recording, Automation. TCC attributes child
+// processes to their responsible process, so granting Orion covers every CLI
+// it spawns. There is no API to query Automation without prompting, so its
+// status is always reported as 'unknown'.
+const computerUseSettingsPanes = {
+  accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+  'screen-recording': 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+  automation: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation',
+};
+
+// Automation state can only be learned by sending a real Apple Event: macOS
+// prompts on the first-ever send, then answers silently (success or -1743)
+// once the (Orion → System Events) pair is determined. So we remember on disk
+// that the user requested it once, and only probe after that — the tab never
+// pops the system prompt on its own.
+const computerUseStateFile = () => path.join(app.getPath('userData'), 'computer-use.json');
+const automationProbeCommand = `osascript -e 'tell application id "com.apple.systemevents" to count processes'`;
+let automationRequestedCache = null;
+let automationProbe = { checkedAt: 0, status: 'unknown' };
+
+const readAutomationRequested = async () => {
+  // Only a positive result is cached: markAutomationRequested() sets it in
+  // this process, and a missing file is re-read so it stays cheap but correct.
+  if (automationRequestedCache !== true) {
+    try {
+      automationRequestedCache = Boolean(JSON.parse(await fs.readFile(computerUseStateFile(), 'utf8'))?.automationRequested);
+    } catch {
+      automationRequestedCache = false;
+    }
+  }
+  return automationRequestedCache;
+};
+
+const markAutomationRequested = async () => {
+  automationRequestedCache = true;
+  try {
+    await fs.writeFile(computerUseStateFile(), JSON.stringify({ automationRequested: true }));
+  } catch {
+    // best effort; worst case the row falls back to 'Request access'
+  }
+};
+
+const probeAutomationStatus = async (timeout = 5000) => {
+  if (Date.now() - automationProbe.checkedAt < 15000) return automationProbe.status;
+  let status;
+  try {
+    await runShellCommand(automationProbeCommand, timeout);
+    status = 'granted';
+  } catch {
+    status = 'denied';
+  }
+  automationProbe = { checkedAt: Date.now(), status };
+  return status;
+};
+
+const getComputerUsePermissions = async () => {
+  if (process.platform !== 'darwin') {
+    return {
+      supported: false,
+      accessibility: 'unsupported',
+      screenRecording: 'unsupported',
+      automation: 'unsupported',
+    };
+  }
+  return {
+    supported: true,
+    accessibility: systemPreferences.isTrustedAccessibilityClient(false) ? 'granted' : 'denied',
+    screenRecording: systemPreferences.getMediaAccessStatus('screen'),
+    automation: (await readAutomationRequested()) ? await probeAutomationStatus() : 'not-determined',
+  };
+};
+
+ipcMain.handle('computerUse:getPermissions', async () => getComputerUsePermissions());
+
+ipcMain.handle('computerUse:requestPermission', async (_event, kind) => {
+  if (process.platform !== 'darwin') {
+    return { ok: false, error: 'Computer use permissions only apply on macOS.', state: await getComputerUsePermissions() };
+  }
+  try {
+    if (kind === 'accessibility') {
+      // Shows the system dialog and registers Orion in the Accessibility pane
+      // (unchecked) so the user has a row to toggle on.
+      systemPreferences.isTrustedAccessibilityClient(true);
+    } else if (kind === 'screen-recording') {
+      // A capture attempt is what registers Orion in the Screen Recording pane
+      // and shows the one-time system prompt; the thumbnail is discarded.
+      await desktopCapturer
+        .getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } })
+        .catch(() => {});
+    } else if (kind === 'automation') {
+      // Trigger the Automation prompt; the long timeout leaves room for the
+      // user to answer the dialog so the returned state reflects their choice.
+      await markAutomationRequested();
+      automationProbe = { checkedAt: 0, status: 'unknown' };
+      await probeAutomationStatus(60000);
+    } else {
+      return { ok: false, error: `Unknown permission: ${kind}`, state: await getComputerUsePermissions() };
+    }
+    const pane = computerUseSettingsPanes[kind];
+    if (pane) await shell.openExternal(pane);
+    return { ok: true, state: await getComputerUsePermissions() };
+  } catch (error) {
+    return { ok: false, error: getProcessErrorMessage(error), state: await getComputerUsePermissions() };
+  }
+});
+
+ipcMain.handle('app:relaunch', () => {
+  app.relaunch();
+  app.exit(0);
+  return true;
+});
+
 ipcMain.handle('cloud:openInBrowser', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
@@ -3581,10 +3750,37 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const reasoningActivityKey = `${runId}:reasoning`;
     const REASONING_EMIT_INTERVAL_MS = 150;
 
+    // A branched thread's first turn must not resume the parent's session in
+    // place. claude/grok fork natively via --fork-session; codex/cursor
+    // sessions are copied on disk here and the copy is resumed instead. If
+    // the copy fails, start fresh — never touch the parent's session.
+    let initialResumeId =
+      typeof input.resumeSessionId === 'string' && input.resumeSessionId
+        ? input.resumeSessionId
+        : null;
+    const forkRequested = Boolean(input.forkSession) && Boolean(initialResumeId);
+    const forkWithNativeFlag =
+      forkRequested && (model.providerId === 'claude' || model.providerId === 'grok');
+    if (forkRequested && !forkWithNativeFlag) {
+      initialResumeId = await forkSessionOnDisk(model.providerId, initialResumeId);
+      if (!initialResumeId) {
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'chunk',
+          chunk: "_Couldn't copy the parent thread's session; starting this branch fresh._\n\n",
+        });
+      }
+    }
+
     // One spawn of the provider CLI. If resuming a prior session fails before
     // producing output, close() falls back to a single fresh attempt.
     const startAttempt = (resumeSessionId) => {
-    const args = commandForModel(model, { ...input, resumeSessionId });
+    const args = commandForModel(model, {
+      ...input,
+      resumeSessionId,
+      forkSession: forkWithNativeFlag && Boolean(resumeSessionId),
+    });
     const commandString = args.map(shellQuote).join(' ');
     const child = spawn(loginShell, ['-lc', commandString], {
       cwd: input.projectPath,
@@ -3873,11 +4069,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     });
     };
 
-    startAttempt(
-      typeof input.resumeSessionId === 'string' && input.resumeSessionId
-        ? input.resumeSessionId
-        : null
-    );
+    startAttempt(initialResumeId);
 
     return { ok: true, runId };
   } catch (error) {

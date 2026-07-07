@@ -123,6 +123,23 @@ type OrionAccountState = {
 };
 
 declare global {
+type OrionComputerUsePermissionKind = 'accessibility' | 'screen-recording' | 'automation';
+
+type OrionComputerUsePermissionStatus =
+  | 'granted'
+  | 'denied'
+  | 'restricted'
+  | 'not-determined'
+  | 'unknown'
+  | 'unsupported';
+
+type OrionComputerUsePermissions = {
+  supported: boolean;
+  accessibility: OrionComputerUsePermissionStatus;
+  screenRecording: OrionComputerUsePermissionStatus;
+  automation: OrionComputerUsePermissionStatus;
+};
+
   interface Window {
     orion: {
       loadStore: () => Promise<string | null>;
@@ -351,6 +368,13 @@ declare global {
         threadId: string;
         status: 'running' | 'finished' | 'done' | 'error';
       }) => Promise<OrionTaskActionResult>;
+      getComputerUsePermissions: () => Promise<OrionComputerUsePermissions>;
+      requestComputerUsePermission: (kind: OrionComputerUsePermissionKind) => Promise<{
+        ok: boolean;
+        error?: string;
+        state?: OrionComputerUsePermissions;
+      }>;
+      relaunchApp: () => Promise<boolean>;
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: () => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
@@ -367,6 +391,8 @@ declare global {
         claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
         claudeContextWindow?: '200k' | '1m';
         resumeSessionId?: string;
+        /** Fork resumeSessionId into a new session instead of resuming it in place (branched threads). */
+        forkSession?: boolean;
         providerOptions?: {
           allowedTools?: string;
           networkAccess?: boolean;

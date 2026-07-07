@@ -48,6 +48,7 @@ import {
   Zap,
   SquareKanban,
   CircleCheck,
+  MousePointerClick,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -185,7 +186,7 @@ type OrionAccountState = {
   expiresAt: string | null;
 };
 
-type SettingsTab = 'account' | 'general' | 'providers' | 'cosmetics';
+type SettingsTab = 'account' | 'general' | 'providers' | 'computer-use' | 'cosmetics';
 
 const gitStatusTitles: Record<GitStatusKind, string> = {
   added: 'Added',
@@ -1433,6 +1434,7 @@ const App: React.FC = () => {
     removeProject,
     renameProject,
     createThread,
+    branchThread,
     selectProject,
     selectThread,
     updateThread,
@@ -1457,6 +1459,10 @@ const App: React.FC = () => {
     setThreadAgentSession,
     queueMessageToThread,
     removeQueuedThreadMessage,
+    addBtwExchange,
+    appendToBtwExchange,
+    updateBtwExchange,
+    removeBtwExchange,
   } = useOrionStore();
 
   const [treeRoot, setTreeRoot] = useState<string | null>(null);
@@ -1521,6 +1527,8 @@ const App: React.FC = () => {
   });
   const [accountLoading, setAccountLoading] = useState(true);
   const [accountBusy, setAccountBusy] = useState(false);
+  const [computerUsePerms, setComputerUsePerms] = useState<OrionComputerUsePermissions | null>(null);
+  const [computerUseBusyKind, setComputerUseBusyKind] = useState<OrionComputerUsePermissionKind | null>(null);
   const [revealedProviderEmails, setRevealedProviderEmails] = useState<Record<string, boolean>>({});
   const [expandedProviderOptions, setExpandedProviderOptions] = useState<Record<string, boolean>>({});
   const projectPickerRef = useRef<HTMLDivElement>(null);
@@ -1530,6 +1538,10 @@ const App: React.FC = () => {
   const threadMenuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
+  // `/btw` side-question runs, routed to a thread's btwExchanges instead of
+  // its transcript. Kept separate from runOutputMessages so aside runs never
+  // touch thread status, queued-message dispatch, or the active-run map.
+  const btwRuns = useRef(new Map<string, { threadId: string; exchangeId: string }>());
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -1930,7 +1942,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!chatPinnedRef.current) return;
     chatEndRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' });
-  }, [selectedThread?.messages, selectedThread?.queuedMessages, isSending]);
+  }, [selectedThread?.messages, selectedThread?.queuedMessages, selectedThread?.btwExchanges, isSending]);
 
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
@@ -2006,6 +2018,42 @@ const App: React.FC = () => {
       setCodexSettingsOpen(false);
     }
   }, [shouldShowAgentSettings]);
+
+  // Poll while the Computer Use tab is visible so grants toggled over in
+  // System Settings show up without a manual refresh.
+  useEffect(() => {
+    if (!settingsOpen || settingsTab !== 'computer-use') return undefined;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const state = await window.orion.getComputerUsePermissions();
+        if (!cancelled) setComputerUsePerms(state);
+      } catch {
+        // main process unavailable; leave the last known state in place
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => {
+      void refresh();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [settingsOpen, settingsTab]);
+
+  const handleRequestComputerUsePermission = useCallback(async (kind: OrionComputerUsePermissionKind) => {
+    setComputerUseBusyKind(kind);
+    try {
+      const result = await window.orion.requestComputerUsePermission(kind);
+      if (result.state) setComputerUsePerms(result.state);
+      if (!result.ok && result.error) toast.error(result.error);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not request the permission.');
+    } finally {
+      setComputerUseBusyKind(null);
+    }
+  }, []);
 
   const refreshGitState = useCallback(async () => {
     const projectPath = activeThreadProject?.path;
@@ -2344,6 +2392,32 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!window.orion?.onAgentTurnEvent) return undefined;
     const unsubscribe = window.orion.onAgentTurnEvent((event) => {
+      // `/btw` aside runs stream into their exchange, not the transcript.
+      // Their `session` events are deliberately dropped: the fork's id must
+      // never replace the thread's real session id.
+      const btwRun = btwRuns.current.get(event.runId);
+      if (btwRun) {
+        if (event.type === 'chunk' && event.chunk) {
+          appendToBtwExchange(btwRun.threadId, btwRun.exchangeId, event.chunk);
+        }
+        if (event.type === 'done') {
+          updateBtwExchange(btwRun.threadId, btwRun.exchangeId, {
+            status: 'done',
+            completedAt: new Date().toISOString(),
+          });
+          btwRuns.current.delete(event.runId);
+        }
+        if (event.type === 'error') {
+          updateBtwExchange(btwRun.threadId, btwRun.exchangeId, {
+            status: 'error',
+            completedAt: new Date().toISOString(),
+            error: event.error,
+          });
+          btwRuns.current.delete(event.runId);
+        }
+        return;
+      }
+
       const tracked = runOutputMessages.current.get(event.runId);
       if (!tracked) return;
 
@@ -2422,12 +2496,20 @@ const App: React.FC = () => {
       unsubscribe?.();
       flushChunkBuffers();
     };
-  }, [addActivityToThreadMessage, appendToThreadMessage, clearActiveRun, flushChunkBuffers, pushLinkedTaskStatus, setThreadAgentSession, updateThread, updateThreadMessage]);
+  }, [addActivityToThreadMessage, appendToThreadMessage, appendToBtwExchange, clearActiveRun, flushChunkBuffers, pushLinkedTaskStatus, setThreadAgentSession, updateBtwExchange, updateThread, updateThreadMessage]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
     recoveredInterruptedRuns.current = true;
     for (const thread of threads) {
+      for (const exchange of thread.btwExchanges ?? []) {
+        if (exchange.status === 'running') {
+          updateBtwExchange(thread.id, exchange.id, {
+            status: 'error',
+            error: 'Interrupted before Orion received the answer.',
+          });
+        }
+      }
       if (thread.status !== 'running') continue;
       const lastMessage = thread.messages.at(-1);
       if (lastMessage?.role === 'agent' && lastMessage.content.trim().length === 0) {
@@ -2444,7 +2526,7 @@ const App: React.FC = () => {
       }
       updateThread(thread.id, { status: 'error' });
     }
-  }, [addMessageToThread, appendToThreadMessage, threads, updateThread]);
+  }, [addMessageToThread, appendToThreadMessage, threads, updateBtwExchange, updateThread]);
 
   // Sync workspace with first project if none set
   useEffect(() => {
@@ -3048,6 +3130,12 @@ const App: React.FC = () => {
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
           resumeSessionId: thread.agentSessionIds?.[model.providerId],
+          // Branched thread's first turn per provider: fork the inherited
+          // session instead of resuming the parent's in place.
+          forkSession: Boolean(
+            thread.agentSessionIds?.[model.providerId] &&
+              thread.pendingForkProviders?.includes(model.providerId)
+          ),
           providerOptions: normalizedProviderSettings[model.providerId]?.options,
           ...(model.providerId === 'codex'
             ? {
@@ -3103,6 +3191,102 @@ const App: React.FC = () => {
     ]
   );
 
+  // `/btw` — ask the agent a side question without interrupting the thread
+  // (Claude Code's /btw). The question runs against a read-only FORK of the
+  // thread's Claude session (--resume <id> --fork-session), so it sees the
+  // full conversation context but the main session, transcript, thread
+  // status, and queued-message dispatch are all untouched. Works mid-run: the
+  // fork reads whatever the session file holds so far.
+  const askBtwQuestion = useCallback(
+    (threadId: string, question: string): { ok: boolean; error?: string } => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((t) => t.id === threadId);
+      if (!thread) return { ok: false, error: 'Thread no longer exists' };
+      const project = state.projects.find((p) => p.id === thread.projectId);
+      if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      if (!model) return { ok: false, error: 'Select an agent model first' };
+      if (model.providerId !== 'claude') {
+        return { ok: false, error: '/btw is only available on Claude agents for now' };
+      }
+      if (normalizedProviderSettings.claude?.enabled === false) {
+        return { ok: false, error: `${model.providerLabel} is disabled` };
+      }
+      if (model.available === false) {
+        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+      }
+      if (!window.orion?.runAgentTurn) {
+        return { ok: false, error: 'Agent runtime is unavailable' };
+      }
+
+      const sessionId = thread.agentSessionIds?.claude;
+      const prompt =
+        'The user has a quick aside question about this session (asked via /btw). ' +
+        'Answer it directly and concisely. Do not make any changes and do not treat ' +
+        'it as a new task — this exchange is a side conversation that the main ' +
+        'session will never see.\n\n' +
+        question;
+
+      const exchangeId = addBtwExchange(threadId, question);
+      const runId = crypto.randomUUID();
+      btwRuns.current.set(runId, { threadId, exchangeId });
+      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+
+      void window.orion
+        .runAgentTurn({
+          runId,
+          threadId,
+          projectPath: project.path,
+          prompt,
+          modelId: model.id,
+          // Plan mode: the aside can read the repo but never mutate it.
+          accessMode: 'read-only',
+          resumeSessionId: sessionId,
+          forkSession: Boolean(sessionId),
+          providerOptions: normalizedProviderSettings.claude?.options,
+          claudeReasoningEffort:
+            thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
+          claudeContextWindow: getEffectiveClaudeContextWindow(
+            model,
+            thread.claudeContextWindow ?? defaultClaudeContextWindow
+          ),
+        })
+        .then((result) => {
+          if (result.ok && result.runId) {
+            if (result.runId !== runId) {
+              const tracked = btwRuns.current.get(runId);
+              btwRuns.current.delete(runId);
+              if (tracked) btwRuns.current.set(result.runId, tracked);
+            }
+          } else {
+            btwRuns.current.delete(runId);
+            updateBtwExchange(threadId, exchangeId, {
+              status: 'error',
+              completedAt: new Date().toISOString(),
+              error: result.error ?? 'The agent failed to start.',
+            });
+          }
+        });
+
+      return { ok: true };
+    },
+    [agentModels, normalizedProviderSettings, addBtwExchange, updateBtwExchange]
+  );
+
+  // Dismissing a still-running aside also kills its forked run.
+  const dismissBtwExchange = useCallback(
+    (threadId: string, exchangeId: string) => {
+      for (const [runId, tracked] of btwRuns.current) {
+        if (tracked.threadId === threadId && tracked.exchangeId === exchangeId) {
+          btwRuns.current.delete(runId);
+          void window.orion?.stopAgentTurn?.(runId);
+        }
+      }
+      removeBtwExchange(threadId, exchangeId);
+    },
+    [removeBtwExchange]
+  );
+
   // Queued follow-ups dispatch as soon as their thread has no run in flight —
   // after a turn finishes (done or error) and after app-restart recovery. Each
   // dispatch resumes the provider session, so the agent keeps its context.
@@ -3126,6 +3310,24 @@ const App: React.FC = () => {
     if (!selectedThreadId || !selectedThread) return;
     const promptText = chatInput.trim();
     if (!promptText && chatAttachments.length === 0) return;
+
+    // `/btw <question>` — side question, handled before the mid-run queue
+    // branch because asking while the agent works is exactly its use case.
+    const btwMatch = promptText.match(/^\/btw(?:\s+([\s\S]+))?$/i);
+    if (btwMatch) {
+      const question = btwMatch[1]?.trim();
+      if (!question) {
+        toast.error('Ask something after /btw, e.g. “/btw why did you pick zustand?”');
+        return;
+      }
+      const result = askBtwQuestion(selectedThreadId, question);
+      if (!result.ok) {
+        toast.error(result.error);
+        return;
+      }
+      setChatInput('');
+      return;
+    }
 
     // Agent mid-run: hold the message; it dispatches when the current turn ends.
     if (isSending) {
@@ -3377,6 +3579,17 @@ const App: React.FC = () => {
                       }}
                     >
                       <SquarePen size={13} /> Rename
+                    </button>
+                    <button
+                      type="button"
+                      className="project-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        setThreadMenuOpen(false);
+                        if (selectedThread) branchThread(selectedThread.id);
+                      }}
+                    >
+                      <GitBranch size={13} /> Branch
                     </button>
                     <button
                       type="button"
@@ -3741,6 +3954,7 @@ const App: React.FC = () => {
                 { id: 'account', label: 'Account', Icon: UserRound },
                 { id: 'general', label: 'General', Icon: Settings },
                 { id: 'providers', label: 'Providers', Icon: Plug },
+                { id: 'computer-use', label: 'Computer Use', Icon: MousePointerClick },
                 { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
               ].map(({ id, label, Icon }) => (
                 <button
@@ -3770,6 +3984,7 @@ const App: React.FC = () => {
               {settingsTab === 'account' && 'ACCOUNT'}
               {settingsTab === 'general' && 'GENERAL'}
               {settingsTab === 'providers' && 'PROVIDERS'}
+              {settingsTab === 'computer-use' && 'COMPUTER USE'}
               {settingsTab === 'cosmetics' && 'COSMETICS'}
             </div>
 
@@ -4162,6 +4377,116 @@ const App: React.FC = () => {
                       );
                     })}
                   </>
+              )}
+
+              {settingsTab === 'computer-use' && (
+                computerUsePerms && !computerUsePerms.supported ? (
+                  <div className="settings-empty-panel">
+                    <div className="settings-panel-title">Computer use</div>
+                    <div className="settings-muted">
+                      Computer use permissions only apply on macOS. Nothing to configure on this platform.
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Computer use permissions</div>
+                        <div className="setting-label-desc">
+                          Agents that control the mouse, keyboard, and screen (such as Codex computer use) need
+                          Orion to hold these macOS permissions. macOS attributes every CLI Orion launches back to
+                          Orion, so granting them here covers all agents.
+                        </div>
+                      </div>
+                    </div>
+
+                    {([
+                      {
+                        kind: 'accessibility',
+                        title: 'Accessibility',
+                        desc: 'Lets agents read app windows and send clicks and keystrokes. After requesting, enable Orion in the Accessibility list.',
+                        status: computerUsePerms?.accessibility ?? 'not-determined',
+                      },
+                      {
+                        kind: 'screen-recording',
+                        title: 'Screen Recording',
+                        desc: 'Lets agent screenshots include other apps’ window contents. Without it, captures show only the wallpaper.',
+                        status: computerUsePerms?.screenRecording ?? 'not-determined',
+                      },
+                      {
+                        kind: 'automation',
+                        title: 'Automation (Apple Events)',
+                        desc: 'Lets agents drive apps through AppleScript and System Events. macOS asks once per app an agent controls; the status here reflects the System Events grant.',
+                        status: computerUsePerms?.automation ?? 'not-determined',
+                      },
+                    ] as Array<{
+                      kind: OrionComputerUsePermissionKind;
+                      title: string;
+                      desc: string;
+                      status: OrionComputerUsePermissionStatus;
+                    }>).map((row) => {
+                      const granted = row.status === 'granted';
+                      const chip =
+                        row.status === 'granted'
+                          ? { className: 'authenticated', label: 'Granted' }
+                          : row.status === 'denied' || row.status === 'restricted'
+                            ? { className: 'unauthenticated', label: 'Not granted' }
+                            : row.status === 'not-determined'
+                              ? { className: '', label: 'Not requested' }
+                              : null;
+                      return (
+                        <div className="setting-row" key={row.kind}>
+                          <div className="setting-label">
+                            <div className="setting-label-title">{row.title}</div>
+                            <div className="setting-label-desc">{row.desc}</div>
+                          </div>
+                          <div className="setting-row-actions">
+                            {chip && (
+                              <span className={`provider-status-chip ${chip.className}`}>{chip.label}</span>
+                            )}
+                            <button
+                              type="button"
+                              className="provider-auth-button"
+                              onClick={() => {
+                                void handleRequestComputerUsePermission(row.kind);
+                              }}
+                              disabled={computerUseBusyKind !== null}
+                            >
+                              <SquareArrowOutUpRight size={13} />
+                              {computerUseBusyKind === row.kind
+                                ? 'Requesting...'
+                                : granted
+                                  ? 'System Settings'
+                                  : row.kind === 'automation'
+                                    ? 'Request access'
+                                    : 'Grant access'}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Apply new grants</div>
+                        <div className="setting-label-desc">
+                          macOS applies Screen Recording (and sometimes Accessibility) to an already-running app
+                          only after it relaunches. Restart Orion once you’ve granted access.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="provider-auth-button"
+                        onClick={() => {
+                          void window.orion.relaunchApp();
+                        }}
+                      >
+                        <RefreshCw size={13} />
+                        Relaunch Orion
+                      </button>
+                    </div>
+                  </>
+                )
               )}
 
               {settingsTab === 'cosmetics' && (
@@ -4602,6 +4927,53 @@ const App: React.FC = () => {
                             </div>
                           </div>
                         ))}
+
+                        {(selectedThread.btwExchanges ?? []).map((exchange) => (
+                          <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
+                            <div className="btw-aside-bar">
+                              <span className="btw-aside-badge">
+                                <Sparkles size={11} />
+                                BTW
+                              </span>
+                              <span className="btw-aside-note">
+                                aside · answered from a fork · not part of the thread
+                              </span>
+                              <button
+                                type="button"
+                                className="btw-aside-dismiss"
+                                onClick={() => dismissBtwExchange(selectedThread.id, exchange.id)}
+                                title={
+                                  exchange.status === 'running'
+                                    ? 'Cancel and dismiss this aside'
+                                    : 'Dismiss this aside'
+                                }
+                              >
+                                <X size={12} />
+                              </button>
+                            </div>
+                            <div className="btw-aside-question">{exchange.question}</div>
+                            {exchange.status === 'running' && !exchange.answer && (
+                              <div className="agent-status-line running">
+                                <span className="working-dots" aria-hidden="true">
+                                  <span />
+                                  <span />
+                                  <span />
+                                </span>
+                                <span>Answering on the side…</span>
+                              </div>
+                            )}
+                            {exchange.answer && (
+                              <div className="btw-aside-answer">
+                                <MarkdownContent content={exchange.answer} />
+                              </div>
+                            )}
+                            {exchange.status === 'error' && (
+                              <div className="agent-error">
+                                {exchange.error ?? 'The aside failed.'}
+                              </div>
+                            )}
+                          </div>
+                        ))}
                         <div ref={chatEndRef} />
                       </div>
                     </div>
@@ -4661,6 +5033,16 @@ const App: React.FC = () => {
                                 <X size={12} />
                               </button>
                             </div>
+                          </div>
+                        )}
+                        {/^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
+                          <div className="composer-btw-hint">
+                            <Sparkles size={12} />
+                            <span>
+                              {selectedAgentModel?.providerId === 'claude'
+                                ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
+                                : '/btw is only available on Claude agents for now.'}
+                            </span>
                           </div>
                         )}
                         <textarea

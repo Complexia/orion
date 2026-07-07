@@ -15,6 +15,10 @@ module.exports = {
     name: 'Orion',
     appBundleId: 'com.complexia.orion',
     appCategoryType: 'public.app-category.developer-tools',
+    extendInfo: {
+      NSAppleEventsUsageDescription:
+        'Orion uses Apple Events so agents can control Mac apps on your behalf.',
+    },
     osxSign: {
       identity: macSigningIdentity,
       hardenedRuntime: true,

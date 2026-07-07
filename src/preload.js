@@ -59,6 +59,11 @@ contextBridge.exposeInMainWorld('orion', {
   unlinkBoardTask: (input) => ipcRenderer.invoke('tasks:unlink', input),
   updateBoardTaskThreadStatus: (input) => ipcRenderer.invoke('tasks:threadStatus', input),
 
+  // Computer use permissions (macOS TCC)
+  getComputerUsePermissions: () => ipcRenderer.invoke('computerUse:getPermissions'),
+  requestComputerUsePermission: (kind) => ipcRenderer.invoke('computerUse:requestPermission', kind),
+  relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
+
   // App updates
   getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
   checkForAppUpdate: () => ipcRenderer.invoke('appUpdate:check'),
