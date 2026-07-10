@@ -2103,6 +2103,90 @@ body {
   pointer-events: none;
 }
 
+.thread-menu-wrap {
+  position: absolute;
+  right: 6px;
+  display: inline-flex;
+}
+
+.thread-options-trigger {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.thread-item:hover .thread-options-trigger,
+.thread-options-trigger:focus-visible,
+.thread-options-trigger[aria-expanded="true"] {
+  display: flex;
+}
+
+.thread-options-trigger:hover,
+.thread-options-trigger[aria-expanded="true"] {
+  background: rgb(255 255 255 / 8%);
+  color: var(--text-primary);
+}
+
+/* Keep the timestamp/tag hidden while the menu is open, not just on hover. */
+.thread-item:has(.thread-options-trigger[aria-expanded="true"]) .thread-meta {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.thread-menu-wrap .thread-item-menu {
+  left: auto;
+  right: 0;
+}
+
+.thread-rename-input {
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font: inherit;
+  outline: none;
+}
+
+.thread-rename-input:focus {
+  border-color: var(--accent);
+}
+
+.project-section-header-renaming {
+  cursor: default;
+}
+
+.shell-title-rename-input {
+  min-width: 0;
+  width: 180px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: #f4f4f5;
+  font-size: 13px;
+  font-weight: 600;
+  outline: none;
+}
+
+.shell-title-rename-input:focus {
+  border-color: var(--accent);
+}
+
 .thread-delete {
   position: absolute;
   right: 6px;
@@ -2843,6 +2927,170 @@ body {
   cursor: text;
 }
 
+.agent-tool-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.agent-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.agent-tool-chip .diff-add {
+  color: var(--success);
+}
+
+.agent-tool-chip .diff-delete {
+  color: var(--danger);
+}
+
+.agent-tool-chip.exit {
+  color: var(--danger);
+  border-color: rgb(248 113 113 / 35%);
+}
+
+.agent-tool-chip.waiting {
+  color: var(--warning);
+  border-color: rgb(244 162 97 / 40%);
+  animation: working-pulse 1.4s infinite ease-in-out;
+}
+
+.agent-tool-row.waiting .agent-tool-icon {
+  color: var(--warning);
+}
+
+/* Live terminal output — a short tail while the command runs, full text when
+   the row is expanded. */
+.agent-tool-output {
+  margin: 4px 0 2px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: rgb(0 0 0 / 25%);
+  color: #9a9a9a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow-y: auto;
+  user-select: text;
+  cursor: text;
+}
+
+.agent-tool-row.running .agent-tool-output {
+  border-color: rgb(77 141 255 / 18%);
+}
+
+.agent-tool-sources {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 3px;
+}
+
+.agent-tool-sources a {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: rgb(255 255 255 / 3%);
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  text-decoration: none;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.agent-tool-sources a:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+/* Live task checklist (agent plan updates). */
+.agent-tool-row.plan {
+  cursor: default;
+}
+
+.agent-plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.agent-plan-entry {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.agent-plan-entry.completed .agent-plan-content {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  text-decoration-color: rgb(255 255 255 / 25%);
+}
+
+.agent-plan-entry.in_progress .agent-plan-content {
+  color: var(--text-primary);
+}
+
+.agent-plan-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  flex-shrink: 0;
+  transform: translateY(1px);
+  color: var(--success);
+}
+
+.agent-plan-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  border: 1.5px solid var(--text-muted);
+}
+
+.agent-plan-spinner {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  border: 1.5px solid var(--accent);
+  border-top-color: transparent;
+  animation: plan-spin 0.9s linear infinite;
+}
+
+@keyframes plan-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.agent-response-stats {
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--text-muted);
+}
+
 .agent-empty-output {
   color: #777;
   font-size: 12px;
@@ -3518,6 +3766,14 @@ body {
   background: #2a2a2d;
 }
 
+.codex-settings-row-description {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
 .codex-settings-row:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -4015,6 +4271,15 @@ body {
 
 .composer-task-action.done:hover {
   color: var(--success);
+}
+
+/* Task chip on the user message that sent the task to the agent. */
+.message.user .message-task-chip {
+  background: var(--bg-elevated);
+}
+
+.message.user .message-task-chip:not(:only-child) {
+  margin-bottom: 8px;
 }
 
 .task-picker-anchor {

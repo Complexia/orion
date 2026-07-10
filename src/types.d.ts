@@ -269,8 +269,6 @@ type OrionComputerUsePermissions = {
             status: 'authenticated' | 'unauthenticated' | 'unknown' | 'missing' | 'error';
             label: string;
             detail?: string;
-            updateAuthenticated: boolean;
-            updateBlockedReason?: string;
           };
           error?: string;
         }>;
@@ -294,8 +292,6 @@ type OrionComputerUsePermissions = {
             status: 'authenticated' | 'unauthenticated' | 'unknown' | 'missing' | 'error';
             label: string;
             detail?: string;
-            updateAuthenticated: boolean;
-            updateBlockedReason?: string;
           };
           error?: string;
         }>;
@@ -332,8 +328,6 @@ type OrionComputerUsePermissions = {
               status: 'authenticated' | 'unauthenticated' | 'unknown' | 'missing' | 'error';
               label: string;
               detail?: string;
-              updateAuthenticated: boolean;
-              updateBlockedReason?: string;
             };
             error?: string;
           }>;
@@ -374,6 +368,7 @@ type OrionComputerUsePermissions = {
         error?: string;
         state?: OrionComputerUsePermissions;
       }>;
+      openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>;
       relaunchApp: () => Promise<boolean>;
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: () => Promise<AppUpdateState>;
@@ -386,10 +381,11 @@ type OrionComputerUsePermissions = {
         prompt: string;
         modelId: string;
         accessMode: 'read-only' | 'workspace-write' | 'full-access';
-        codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+        codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
         codexServiceTier?: 'default' | 'priority';
         claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
         claudeContextWindow?: '200k' | '1m';
+        grokReasoningEffort?: 'low' | 'medium' | 'high';
         resumeSessionId?: string;
         /** Fork resumeSessionId into a new session instead of resuming it in place (branched threads). */
         forkSession?: boolean;
@@ -429,12 +425,26 @@ type OrionComputerUsePermissions = {
           additions: number;
           deletions: number;
         }>;
+        stats?: {
+          totalTokens?: number;
+          inputTokens?: number;
+          outputTokens?: number;
+          cachedReadTokens?: number;
+          reasoningTokens?: number;
+          modelId?: string;
+        };
         activity?: {
           key?: string;
-          type: 'thought' | 'command' | 'tool' | 'result' | 'error';
+          type: 'thought' | 'command' | 'tool' | 'result' | 'error' | 'plan';
+          kind?: string;
           title: string;
           detail?: string;
-          status?: 'running' | 'done' | 'error';
+          output?: string;
+          exitCode?: number;
+          diff?: { path: string; additions: number; deletions: number };
+          sources?: Array<{ url: string; title?: string }>;
+          plan?: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
+          status?: 'running' | 'done' | 'error' | 'waiting';
         };
       }) => void) => () => void;
       onFileChange?: (cb: (data: any) => void) => () => void;

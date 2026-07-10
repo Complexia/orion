@@ -7,13 +7,32 @@ export type Project = {
   path: string;
 };
 
+export type AgentToolSource = { url: string; title?: string };
+
+export type AgentPlanEntry = {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+};
+
 export type AgentActivity = {
   id: string;
   key?: string;
-  type: 'thought' | 'command' | 'tool' | 'result' | 'error';
+  type: 'thought' | 'command' | 'tool' | 'result' | 'error' | 'plan';
+  /** Provider tool kind (execute/edit/read/search/fetch/task/plan) for iconography. */
+  kind?: string;
   title: string;
   detail?: string;
-  status?: 'running' | 'done' | 'error';
+  /** Live tool output (streaming terminal stdout, tool result text). */
+  output?: string;
+  exitCode?: number;
+  /** Line counts for a file edit, rendered as a +N −N chip. */
+  diff?: { path: string; additions: number; deletions: number };
+  /** Web search / fetch result links. */
+  sources?: AgentToolSource[];
+  /** Live task checklist (agent plan / todo-list updates). */
+  plan?: AgentPlanEntry[];
+  /** 'waiting' = blocked on a permission decision. */
+  status?: 'running' | 'done' | 'error' | 'waiting';
   ts: string;
   /**
    * Length of the message content when this activity was added — lets the
@@ -21,6 +40,15 @@ export type AgentActivity = {
    * Activities updated in place (by key) keep their original offset.
    */
   contentOffset?: number;
+};
+
+export type TurnTokenStats = {
+  totalTokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedReadTokens?: number;
+  reasoningTokens?: number;
+  modelId?: string;
 };
 
 export type ChangedFileSummary = {
@@ -53,6 +81,10 @@ export type Message = {
   completedAt?: string;
   error?: string;
   changedFiles?: ChangedFileSummary[];
+  /** Per-turn token usage, when the provider reports it (grok ACP). */
+  stats?: TurnTokenStats;
+  /** Board-task chip shown on the user message whose turn sent the task to the agent. */
+  linkedTask?: Pick<LinkedBoardTask, 'id' | 'title' | 'description'>;
 };
 
 export type QueuedMessage = {
@@ -96,10 +128,11 @@ export type Thread = {
   status: 'idle' | 'running' | 'done' | 'error';
   modelId: string;
   accessMode: 'read-only' | 'workspace-write' | 'full-access';
-  codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
   codexServiceTier?: 'default' | 'priority';
   claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
   claudeContextWindow?: '200k' | '1m';
+  grokReasoningEffort?: 'low' | 'medium' | 'high';
   createdAt: string;
   /** Removed from the sidebar Recent agents list (still listed under its project). */
   hiddenFromRecent?: boolean;
@@ -428,7 +461,7 @@ export const useOrionStore = create<OrionState>()(
           projectId,
           title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
           status: 'idle',
-          modelId: lastProjectThread?.modelId ?? 'grok:grok-build',
+          modelId: lastProjectThread?.modelId ?? 'grok:grok-4.5',
           accessMode: lastProjectThread?.accessMode ?? 'full-access',
           codexReasoningEffort: lastProjectThread?.codexReasoningEffort,
           codexServiceTier: lastProjectThread?.codexServiceTier,

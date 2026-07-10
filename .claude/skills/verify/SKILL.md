@@ -43,3 +43,17 @@ Node >= 22 has a global `WebSocket`. Connect to `webSocketDebuggerUrl` from
   on TCC permission prompts in non-interactive sessions — don't use them.
 - Error surfaces in the renderer use sonner toasts:
   `document.querySelectorAll('[data-sonner-toast]')`.
+- React renders asynchronously: DOM queried right after a synthetic `.click()`
+  inside the SAME `Runtime.evaluate` is stale. Split into separate evaluate
+  calls with a ~200ms sleep between the click and the DOM assertion.
+- React controlled inputs ignore direct `.value =` writes — use the native
+  setter, then dispatch an input event:
+  `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, v);
+  input.dispatchEvent(new Event('input', { bubbles: true }))`.
+- To stage app state that's hard to reach through the UI (e.g. a thread with a
+  linked board task), edit the persisted zustand store via the preload bridge:
+  `const d = JSON.parse(await window.orion.loadStore())`, mutate
+  `d.state.threads` etc., `await window.orion.saveStore(JSON.stringify(d))`,
+  then `location.reload()` so the store rehydrates. Dev builds use a separate
+  `Orion (dev)` userData profile, so this never touches the real app's store.
+  Remove staged rows the same way when done.

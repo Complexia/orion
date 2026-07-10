@@ -27,7 +27,7 @@ export type AgentProvider = {
   icon: ProviderIconComponent;
 };
 
-export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
 export type CodexServiceTier = 'default' | 'priority';
 export type ClaudeReasoningEffort =
   | 'low'
@@ -38,17 +38,57 @@ export type ClaudeReasoningEffort =
   | 'ultracode'
   | 'ultrathink';
 export type ClaudeContextWindow = '200k' | '1m';
+export type GrokReasoningEffort = 'low' | 'medium' | 'high';
 
-export const codexReasoningOptions: Array<{
+export type CodexReasoningOption = {
   value: CodexReasoningEffort;
   label: string;
   default?: boolean;
-}> = [
+  description?: string;
+};
+
+export const codexReasoningOptions: CodexReasoningOption[] = [
   { value: 'low', label: 'Low' },
   { value: 'medium', label: 'Medium', default: true },
   { value: 'high', label: 'High' },
   { value: 'xhigh', label: 'Extra High' },
 ];
+
+// The GPT-5.6 family renames the effort tiers (Light instead of Low), defaults
+// to High, and adds Ultra. The wire values stay the Codex CLI enum; "ultra" is
+// only accepted by 5.6 models. The Codex app offers Ultra on Sol and Terra but
+// not Luna, so we mirror that.
+const gpt56CodexReasoningOptions: CodexReasoningOption[] = [
+  { value: 'low', label: 'Light' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High', default: true },
+  { value: 'xhigh', label: 'Extra High' },
+  { value: 'ultra', label: 'Ultra', description: 'Consumes usage limits faster' },
+];
+
+const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
+
+export const codexReasoningOptionsForModel = (
+  model: AgentModel | undefined
+): CodexReasoningOption[] => {
+  if (!model || !gpt56CodexModelSlugs.has(model.slug)) return codexReasoningOptions;
+  if (model.slug === 'gpt-5.6-luna') {
+    return gpt56CodexReasoningOptions.filter((option) => option.value !== 'ultra');
+  }
+  return gpt56CodexReasoningOptions;
+};
+
+// Clamp a stored effort to what the model actually offers (e.g. a thread that
+// picked Ultra on 5.6 Sol and then switched to 5.5 falls back to that model's
+// default).
+export const getEffectiveCodexReasoningEffort = (
+  model: AgentModel | undefined,
+  effort: CodexReasoningEffort | undefined
+): CodexReasoningEffort => {
+  const options = codexReasoningOptionsForModel(model);
+  if (effort && options.some((option) => option.value === effort)) return effort;
+  return options.find((option) => option.default)?.value ?? defaultCodexReasoningEffort;
+};
 
 export const codexServiceTierOptions: Array<{
   value: CodexServiceTier;
@@ -83,6 +123,21 @@ export const claudeContextWindowOptions: Array<{
 }> = [
   { value: '200k', label: '200k' },
   { value: '1m', label: '1M' },
+];
+
+// Grok 4.5 exposes reasoning effort over ACP; labels/descriptions mirror the
+// tiers the agent itself advertises in session/new model metadata.
+export const defaultGrokReasoningEffort: GrokReasoningEffort = 'high';
+
+export const grokReasoningOptions: Array<{
+  value: GrokReasoningEffort;
+  label: string;
+  default?: boolean;
+  description?: string;
+}> = [
+  { value: 'low', label: 'Low', description: 'Quick, fast implementations' },
+  { value: 'medium', label: 'Medium', description: 'Balanced effort with standard implementation and testing' },
+  { value: 'high', label: 'High', default: true, description: 'Highest implementation quality with extensive reasoning' },
 ];
 
 export type ProviderOptionDef = {
@@ -131,14 +186,18 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
     },
     extraArgsOption('codex'),
   ],
+  // Grok turns run over `grok agent stdio` (ACP), which accepts far fewer
+  // flags than the TUI — e.g. --experimental-memory is rejected there, so the
+  // old cross-session memory toggle is gone.
   grok: [
     {
-      key: 'experimentalMemory',
-      label: 'Cross-session memory',
-      description: 'Enable Grok experimental memory across sessions (--experimental-memory).',
-      type: 'boolean',
+      key: 'extraArgs',
+      label: 'Extra CLI flags',
+      description:
+        'Appended to every `grok agent` invocation. Flags must be valid for `grok agent` (not the interactive TUI). Quotes are respected.',
+      type: 'string',
+      placeholder: '--reasoning-effort high',
     },
-    extraArgsOption('grok'),
   ],
   cursor: [extraArgsOption('cursor-agent')],
   opencode: [extraArgsOption('opencode')],
@@ -168,11 +227,11 @@ export const agentProviders: AgentProvider[] = [
 
 export const fallbackAgentModels: AgentModel[] = [
   {
-    id: 'grok:grok-build',
+    id: 'grok:grok-4.5',
     providerId: 'grok',
     providerLabel: 'Grok',
-    label: 'Grok Build',
-    slug: 'grok-build',
+    label: 'Grok 4.5',
+    slug: 'grok-4.5',
     shortcut: '⌘1',
     favorite: true,
   },
@@ -184,6 +243,27 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'grok-composer-2.5-fast',
     shortcut: '⌘2',
     favorite: true,
+  },
+  {
+    id: 'codex:gpt-5.6-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-5.6 Sol',
+    slug: 'gpt-5.6-sol',
+  },
+  {
+    id: 'codex:gpt-5.6-terra',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-5.6 Terra',
+    slug: 'gpt-5.6-terra',
+  },
+  {
+    id: 'codex:gpt-5.6-luna',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-5.6 Luna',
+    slug: 'gpt-5.6-luna',
   },
   {
     id: 'codex:gpt-5.5',
@@ -350,7 +430,7 @@ export const fallbackAgentModels: AgentModel[] = [
   },
 ];
 
-export const defaultAgentModelId = 'grok:grok-build';
+export const defaultAgentModelId = 'grok:grok-4.5';
 
 export const findAgentModel = (models: AgentModel[], id: string | null | undefined) =>
   models.find((model) => model.id === id) ?? models.find((model) => model.id === defaultAgentModelId) ?? models[0];

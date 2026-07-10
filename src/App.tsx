@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Ellipsis,
+  EyeOff,
   SquarePen,
   Check,
   X,
@@ -49,6 +50,9 @@ import {
   SquareKanban,
   CircleCheck,
   MousePointerClick,
+  ListChecks,
+  FilePen,
+  BookOpen,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -59,23 +63,27 @@ import {
   type AgentActivity,
   type ChangedFileSummary,
   type ImageAttachment,
+  type LinkedBoardTask,
   type Message,
   type ProviderId,
   type ProviderRuntimeOptions,
   type Thread,
+  type TurnTokenStats,
 } from './store';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
   claudeContextWindowOptions,
   claudeReasoningOptions,
-  codexReasoningOptions,
+  codexReasoningOptionsForModel,
   codexServiceTierOptions,
   defaultAgentModelId,
   defaultClaudeContextWindow,
   defaultClaudeReasoningEffort,
-  defaultCodexReasoningEffort,
   defaultCodexServiceTier,
+  defaultGrokReasoningEffort,
+  getEffectiveCodexReasoningEffort,
+  grokReasoningOptions,
   fallbackAgentModels,
   findAgentModel,
   providerFollowUpSupport,
@@ -86,6 +94,7 @@ import {
   type ClaudeReasoningEffort,
   type CodexReasoningEffort,
   type CodexServiceTier,
+  type GrokReasoningEffort,
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
 
@@ -149,8 +158,6 @@ type ProviderUpdateItem = {
     status: 'authenticated' | 'unauthenticated' | 'unknown' | 'missing' | 'error';
     label: string;
     detail?: string;
-    updateAuthenticated: boolean;
-    updateBlockedReason?: string;
   };
   error?: string;
 };
@@ -399,7 +406,10 @@ const buildPromptWithAttachments = (prompt: string, attachments: ImageAttachment
 
 // Context block prepended to the first agent turn of a thread linked to an
 // Orion board task, so the agent knows what card it's working on.
-const buildLinkedTaskContext = (task: { title: string; description: string }) => {
+const buildLinkedTaskContext = (
+  task: { title: string; description: string },
+  hasUserMessage: boolean
+) => {
   const lines = [
     '## Linked task from the Orion board',
     `Title: ${task.title}`,
@@ -408,12 +418,19 @@ const buildLinkedTaskContext = (task: { title: string; description: string }) =>
   if (description) {
     lines.push('', 'Description:', description);
   }
-  lines.push(
-    '',
-    'This thread is linked to the board task above; treat it as the goal of the work. The user message follows.',
-    '',
-    '---'
-  );
+  if (hasUserMessage) {
+    lines.push(
+      '',
+      'This thread is linked to the board task above; treat it as the goal of the work. The user message follows.',
+      '',
+      '---'
+    );
+  } else {
+    lines.push(
+      '',
+      'This thread is linked to the board task above; treat it as the goal of the work and carry it out.'
+    );
+  }
   return lines.join('\n');
 };
 
@@ -814,8 +831,14 @@ const formatRunDuration = (startedAt?: string, completedAt?: string) => {
 };
 
 const AgentActivityIcon: React.FC<{ activity: AgentActivity }> = ({ activity }) => {
+  if (activity.type === 'plan') return <ListChecks size={15} />;
+  if (activity.kind === 'edit') return <FilePen size={15} />;
+  if (activity.kind === 'read') return <BookOpen size={15} />;
+  if (activity.kind === 'search') return <Search size={15} />;
+  if (activity.kind === 'fetch') return <Globe size={15} />;
+  if (activity.kind === 'task') return <Bot size={15} />;
   if (activity.type === 'thought') return <Bot size={15} />;
-  if (activity.type === 'command') return <Terminal size={15} />;
+  if (activity.type === 'command' || activity.kind === 'execute') return <Terminal size={15} />;
   if (activity.type === 'error') return <X size={15} />;
   if (activity.type === 'result') return <Check size={15} />;
   return <Wrench size={15} />;
@@ -825,6 +848,59 @@ const AgentActivityIcon: React.FC<{ activity: AgentActivity }> = ({ activity }) 
 // rows expand on click to show the full text.
 const isExpandableDetail = (detail?: string) =>
   !!detail && (detail.length > 160 || detail.includes('\n'));
+
+const hostnameForUrl = (url: string) => {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return url;
+  }
+};
+
+const formatTokenCount = (value?: number) => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 10_000) return `${Math.round(value / 1000)}k`;
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return String(value);
+};
+
+// Compact per-turn usage: "31.4k tokens · 82% cached · 1.2k reasoning".
+const formatTurnStats = (stats: TurnTokenStats) => {
+  const parts: string[] = [];
+  const total = formatTokenCount(stats.totalTokens ?? stats.inputTokens);
+  if (total) parts.push(`${total} tokens`);
+  if (
+    typeof stats.cachedReadTokens === 'number' &&
+    typeof stats.inputTokens === 'number' &&
+    stats.inputTokens > 0
+  ) {
+    parts.push(`${Math.round((stats.cachedReadTokens / stats.inputTokens) * 100)}% cached`);
+  }
+  const reasoning = formatTokenCount(stats.reasoningTokens);
+  if (reasoning && stats.reasoningTokens! > 0) parts.push(`${reasoning} reasoning`);
+  return parts.join(' · ');
+};
+
+// Live task checklist streamed by the agent (grok ACP plan updates).
+const AgentPlanChecklist: React.FC<{ activity: AgentActivity }> = ({ activity }) => (
+  <div className="agent-plan-list">
+    {(activity.plan ?? []).map((entry, index) => (
+      <div key={index} className={`agent-plan-entry ${entry.status}`}>
+        <span className="agent-plan-marker">
+          {entry.status === 'completed' ? (
+            <Check size={12} />
+          ) : entry.status === 'in_progress' ? (
+            <span className="agent-plan-spinner" aria-hidden="true" />
+          ) : (
+            <span className="agent-plan-dot" aria-hidden="true" />
+          )}
+        </span>
+        <span className="agent-plan-content">{entry.content}</span>
+      </div>
+    ))}
+  </div>
+);
 
 const collapsedDetailPreview = (activity: AgentActivity) => {
   const flattened = (activity.detail ?? '').replace(/\s+/g, ' ').trim();
@@ -873,16 +949,41 @@ const AgentActivityCard: React.FC<{
       </button>
       <div className="agent-tools-list">
         {visibleActivities.map((activity) => {
-          const expandable = isExpandableDetail(activity.detail);
+          const rowRunning = runStatus === 'running' && activity.status === 'running';
+          const status =
+            runStatus !== 'running' &&
+            (activity.status === 'running' || activity.status === 'waiting')
+              ? 'done'
+              : activity.status ?? 'done';
+          const expandable = isExpandableDetail(activity.detail) || !!activity.output;
           const rowExpanded = expandable && expandedRows.has(activity.id);
+          // Live terminal output shows a short tail while the tool runs so
+          // the user watches the command work; the full text sits behind the
+          // row's expand toggle.
+          const showOutput = !!activity.output && (rowExpanded || rowRunning);
+          const outputText =
+            rowExpanded || !activity.output
+              ? activity.output
+              : activity.output.slice(-400).replace(/^[^\n]*\n/, '');
+
+          if (activity.type === 'plan') {
+            return (
+              <div key={activity.id} className={`agent-tool-row plan ${status}`}>
+                <span className="agent-tool-icon">
+                  <AgentActivityIcon activity={activity} />
+                </span>
+                <span className="agent-tool-text">
+                  <span className="agent-tool-title">{activity.title}</span>
+                  <AgentPlanChecklist activity={activity} />
+                </span>
+              </div>
+            );
+          }
+
           return (
             <div
               key={activity.id}
-              className={`agent-tool-row ${
-                runStatus !== 'running' && activity.status === 'running'
-                  ? 'done'
-                  : activity.status ?? 'done'
-              }${expandable ? ' expandable' : ''}${rowExpanded ? ' open' : ''}`}
+              className={`agent-tool-row ${status}${expandable ? ' expandable' : ''}${rowExpanded ? ' open' : ''}`}
               onClick={expandable ? () => toggleRow(activity.id) : undefined}
               role={expandable ? 'button' : undefined}
               title={
@@ -893,10 +994,45 @@ const AgentActivityCard: React.FC<{
                 <AgentActivityIcon activity={activity} />
               </span>
               <span className="agent-tool-text">
-                <span className="agent-tool-title">{activity.title}</span>
+                <span className="agent-tool-title-line">
+                  <span className="agent-tool-title">{activity.title}</span>
+                  {activity.diff && (
+                    <span className="agent-tool-chip diff" title={activity.diff.path}>
+                      <span className="diff-add">+{activity.diff.additions}</span>
+                      <span className="diff-delete">−{activity.diff.deletions}</span>
+                    </span>
+                  )}
+                  {typeof activity.exitCode === 'number' && activity.exitCode !== 0 && (
+                    <span className="agent-tool-chip exit">exit {activity.exitCode}</span>
+                  )}
+                  {activity.status === 'waiting' && runStatus === 'running' && (
+                    <span className="agent-tool-chip waiting">needs approval</span>
+                  )}
+                </span>
                 {activity.detail && (
                   <span className={`agent-tool-detail${rowExpanded ? ' expanded' : ''}`}>
                     {rowExpanded ? activity.detail : collapsedDetailPreview(activity)}
+                  </span>
+                )}
+                {showOutput && outputText && (
+                  <pre className="agent-tool-output">{outputText}</pre>
+                )}
+                {!!activity.sources?.length && (
+                  <span className="agent-tool-sources">
+                    {activity.sources.slice(0, 4).map((source) => (
+                      <a
+                        key={source.url}
+                        href={source.url}
+                        title={source.url}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          void window.orion?.openExternalUrl?.(source.url);
+                        }}
+                      >
+                        {hostnameForUrl(source.url)}
+                      </a>
+                    ))}
                   </span>
                 )}
               </span>
@@ -1073,8 +1209,19 @@ const useRunTicker = (enabled: boolean) => {
   }, [enabled]);
 };
 
-const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
+const ChatMessage: React.FC<{
+  message: Message;
+  /** The thread's current linked task, for live status on the message's task chip. */
+  liveTask?: LinkedBoardTask;
+  taskBusy?: boolean;
+  onMarkTaskDone?: () => void;
+  onUnlinkTask?: () => void;
+}> = ({ message, liveTask, taskBusy, onMarkTaskDone, onUnlinkTask }) => {
   const attachments = message.attachments ?? [];
+  const messageTask = message.linkedTask;
+  // Live status/actions only while the chip's task is still the thread's
+  // linked task; after an unlink or relink it renders as a static snapshot.
+  const liveMessageTask = messageTask && liveTask?.id === messageTask.id ? liveTask : undefined;
   const isAgentRun = message.role === 'agent' && message.kind === 'agent-run';
   const isRunning = isAgentRun && message.status === 'running';
   useRunTicker(isRunning);
@@ -1085,13 +1232,22 @@ const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
     const latestActivity = message.activities?.length
       ? message.activities[message.activities.length - 1]
       : undefined;
-    const runningLabel = latestActivity?.title ?? message.statusText ?? 'Working on it...';
+    // Prefer whichever activity is blocked on approval — that's the state the
+    // user can act on — over whatever streamed last.
+    const waitingActivity = message.activities?.find((activity) => activity.status === 'waiting');
+    const runningLabel = waitingActivity
+      ? `Waiting for approval · ${waitingActivity.title}`
+      : latestActivity?.title ?? message.statusText ?? 'Working on it...';
+    const statsSummary = message.stats ? formatTurnStats(message.stats) : '';
 
     return (
       <div className={`message agent agent-run ${message.status ?? ''}`}>
         {!isRunning && (
           <div className="agent-response-divider">
-            <span>Response{duration && ` · worked for ${duration}`}</span>
+            <span>
+              Response{duration && ` · worked for ${duration}`}
+              {statsSummary && <span className="agent-response-stats"> · {statsSummary}</span>}
+            </span>
             {hasContent && <CopyMessageButton text={message.content} className="in-divider" />}
           </div>
         )}
@@ -1130,6 +1286,38 @@ const ChatMessage: React.FC<{ message: Message }> = ({ message }) => {
         <MarkdownContent content={message.content} />
       ) : (
         <>
+          {messageTask && (
+            <div
+              className={`composer-task-chip message-task-chip status-${liveMessageTask?.lastStatus ?? 'linked'}`}
+              title={messageTask.description || messageTask.title}
+            >
+              <SquareKanban size={13} />
+              <span className="composer-task-title">{messageTask.title}</span>
+              <span className="composer-task-status">
+                {liveMessageTask ? linkedTaskStatusLabel(liveMessageTask.lastStatus) : 'Linked'}
+              </span>
+              {liveMessageTask && liveMessageTask.lastStatus !== 'done' && !taskBusy && onMarkTaskDone && (
+                <button
+                  type="button"
+                  className="composer-task-action done"
+                  onClick={onMarkTaskDone}
+                  title="Mark the task as done on the board"
+                >
+                  <CircleCheck size={13} />
+                </button>
+              )}
+              {liveMessageTask && onUnlinkTask && (
+                <button
+                  type="button"
+                  className="composer-task-action"
+                  onClick={onUnlinkTask}
+                  title="Unlink task"
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+          )}
           {message.content && <div className="whitespace-pre-wrap break-words">{message.content}</div>}
           {attachments.length > 0 && (
             <div className="message-attachments">
@@ -1194,6 +1382,45 @@ const getFileIconMeta = (name: string, isDirectory: boolean) => {
   };
 
   return byExtension[ext] ?? { kind: 'text', label: '' };
+};
+
+// window.prompt() is unsupported in Electron's renderer, so renames happen
+// through this inline input instead. Submits on Enter/blur, cancels on Escape.
+const InlineRenameInput: React.FC<{
+  initialValue: string;
+  className?: string;
+  onSubmit: (value: string) => void;
+  onCancel: () => void;
+}> = ({ initialValue, className, onSubmit, onCancel }) => {
+  const [value, setValue] = useState(initialValue);
+  const doneRef = useRef(false);
+
+  const finish = (commit: boolean) => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    const trimmed = value.trim();
+    if (commit && trimmed && trimmed !== initialValue) onSubmit(trimmed);
+    else onCancel();
+  };
+
+  return (
+    <input
+      type="text"
+      className={className}
+      value={value}
+      autoFocus
+      onFocus={(e) => e.currentTarget.select()}
+      onChange={(e) => setValue(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') finish(true);
+        if (e.key === 'Escape') finish(false);
+      }}
+      onBlur={() => finish(true)}
+    />
+  );
 };
 
 const FileTreeNode: React.FC<{
@@ -1495,6 +1722,11 @@ const App: React.FC = () => {
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [branchPickerOpen, setBranchPickerOpen] = useState(false);
+  const [creatingBranch, setCreatingBranch] = useState(false);
+
+  useEffect(() => {
+    if (!branchPickerOpen) setCreatingBranch(false);
+  }, [branchPickerOpen]);
   const [openWithApps, setOpenWithApps] = useState<
     Array<{ id: string; name: string; icon: string | null }>
   >([]);
@@ -1508,6 +1740,11 @@ const App: React.FC = () => {
   const [cloudBusy, setCloudBusy] = useState(false);
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
   const [projectMenuOpenId, setProjectMenuOpenId] = useState<string | null>(null);
+  // Keys are namespaced ("shell:<id>", "recent:<id>", "project:<id>") because the
+  // same thread can appear in both the Recent agents list and its project list.
+  const [threadItemMenuKey, setThreadItemMenuKey] = useState<string | null>(null);
+  const [threadRenameKey, setThreadRenameKey] = useState<string | null>(null);
+  const [projectRenameId, setProjectRenameId] = useState<string | null>(null);
   const [threadListLimits, setThreadListLimits] = useState<Record<string, number>>({});
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
   const [recentAgentsOpen, setRecentAgentsOpen] = useState(true);
@@ -1537,6 +1774,7 @@ const App: React.FC = () => {
   const threadSearchRef = useRef<HTMLDivElement>(null);
   const threadMenuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
+  const threadItemMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
   // `/btw` side-question runs, routed to a thread's btwExchanges instead of
   // its transcript. Kept separate from runOutputMessages so aside runs never
@@ -1581,9 +1819,10 @@ const App: React.FC = () => {
     null;
   const activeThreadProject = selectedThreadProject ?? defaultNewThreadProject;
 
-  // Unsent composer drafts are kept per project so switching projects swaps the
-  // draft instead of carrying it along.
-  const composerDraftKey = activeThreadProject?.id ?? null;
+  // Unsent composer drafts are kept per thread so switching threads swaps the
+  // draft instead of carrying it along, and a fresh thread starts with an
+  // empty composer.
+  const composerDraftKey = selectedThreadId ?? null;
   const composerDraftsRef = useRef(new Map<string, { text: string; attachments: ImageAttachment[] }>());
   const composerDraftKeyRef = useRef<string | null>(composerDraftKey);
 
@@ -1598,8 +1837,6 @@ const App: React.FC = () => {
     const prevKey = composerDraftKeyRef.current;
     if (prevKey === composerDraftKey) return;
     composerDraftKeyRef.current = composerDraftKey;
-    // Text typed before any project existed carries over to the first project.
-    if (prevKey === null) return;
     const draft = composerDraftKey ? composerDraftsRef.current.get(composerDraftKey) : undefined;
     setChatInput(draft?.text ?? '');
     setChatAttachments(draft?.attachments ?? []);
@@ -1625,11 +1862,15 @@ const App: React.FC = () => {
     agentModels,
     selectedThread?.modelId ?? defaultAgentModelId
   );
-  const selectedCodexReasoning = selectedThread?.codexReasoningEffort ?? defaultCodexReasoningEffort;
+  const selectedCodexReasoningOptions = codexReasoningOptionsForModel(selectedAgentModel);
+  const selectedCodexReasoning = getEffectiveCodexReasoningEffort(
+    selectedAgentModel,
+    selectedThread?.codexReasoningEffort
+  );
   const selectedCodexServiceTier = selectedThread?.codexServiceTier ?? defaultCodexServiceTier;
   const selectedCodexReasoningLabel =
-    codexReasoningOptions.find((option) => option.value === selectedCodexReasoning)?.label ??
-    'Medium';
+    selectedCodexReasoningOptions.find((option) => option.value === selectedCodexReasoning)
+      ?.label ?? 'Medium';
   const selectedCodexServiceTierLabel =
     codexServiceTierOptions.find((option) => option.value === selectedCodexServiceTier)?.label ??
     'Standard';
@@ -1648,8 +1889,13 @@ const App: React.FC = () => {
   const selectedClaudeContextWindowLabel =
     claudeContextWindowOptions.find((option) => option.value === effectiveClaudeContextWindow)
       ?.label ?? '200k';
+  const selectedGrokReasoning = selectedThread?.grokReasoningEffort ?? defaultGrokReasoningEffort;
+  const selectedGrokReasoningLabel =
+    grokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
   const shouldShowAgentSettings =
-    selectedAgentModel?.providerId === 'codex' || selectedAgentModel?.providerId === 'claude';
+    selectedAgentModel?.providerId === 'codex' ||
+    selectedAgentModel?.providerId === 'claude' ||
+    selectedAgentModel?.providerId === 'grok';
   const normalizedProviderSettings = useMemo(
     () => ({
       ...defaultProviderSettings,
@@ -2208,7 +2454,8 @@ const App: React.FC = () => {
       !threadSearchOpen &&
       !threadMenuOpen &&
       !openWithOpen &&
-      projectMenuOpenId === null
+      projectMenuOpenId === null &&
+      threadItemMenuKey === null
     ) return undefined;
 
     const handlePointerDown = (event: MouseEvent) => {
@@ -2231,6 +2478,9 @@ const App: React.FC = () => {
       if (projectMenuOpenId !== null && !projectMenuRef.current?.contains(target)) {
         setProjectMenuOpenId(null);
       }
+      if (threadItemMenuKey !== null && !threadItemMenuRef.current?.contains(target)) {
+        setThreadItemMenuKey(null);
+      }
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2241,6 +2491,7 @@ const App: React.FC = () => {
         setThreadMenuOpen(false);
         setOpenWithOpen(false);
         setProjectMenuOpenId(null);
+        setThreadItemMenuKey(null);
       }
     };
 
@@ -2250,7 +2501,7 @@ const App: React.FC = () => {
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId]);
+  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey]);
 
   useEffect(() => {
     setThreadMenuOpen(false);
@@ -2465,6 +2716,7 @@ const App: React.FC = () => {
           completedAt: new Date().toISOString(),
           statusText: 'Finished.',
           changedFiles: event.changedFiles ?? [],
+          ...(event.stats ? { stats: event.stats } : {}),
         });
         updateThread(tracked.threadId, { status: 'done' });
         // Turn finished — surface the work on the board (In Review column).
@@ -2780,11 +3032,10 @@ const App: React.FC = () => {
     }
   };
 
-  const handleCreateBranch = async () => {
+  const handleCreateBranch = async (branchName: string) => {
     if (!activeThreadProject?.path || !window.orion?.checkoutGitBranch || gitBusy) return;
 
-    const branchName = prompt('New branch name');
-    const normalized = branchName?.trim();
+    const normalized = branchName.trim();
     if (!normalized) return;
 
     setGitBusy(true);
@@ -3077,26 +3328,34 @@ const App: React.FC = () => {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
 
-      const userContent = promptText || 'Attached image';
-      let agentPrompt = buildPromptWithAttachments(promptText, attachments);
+      // First turn with a linked board task: the task itself is the prompt,
+      // so an empty draft is fine — the card's title and description become
+      // the agent context (later turns resume the same session, so the agent
+      // already has it). The chip moves onto this turn's user message.
+      const taskToInject =
+        thread.linkedTask && !thread.linkedTask.injected ? thread.linkedTask : undefined;
+      if (!promptText && attachments.length === 0 && !taskToInject) {
+        return { ok: false, error: 'Type a message first' };
+      }
 
-      // First turn with a linked board task: prepend the card's title and
-      // description as agent context (later turns resume the same session, so
-      // the agent already has it).
-      const linkedTask = thread.linkedTask;
-      if (linkedTask && !linkedTask.injected) {
-        agentPrompt = `${buildLinkedTaskContext(linkedTask)}\n\n${agentPrompt}`;
-        updateThread(threadId, { linkedTask: { ...linkedTask, injected: true } });
+      const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
+      let agentPrompt = buildPromptWithAttachments(promptText, attachments);
+      if (taskToInject) {
+        agentPrompt = agentPrompt
+          ? `${buildLinkedTaskContext(taskToInject, true)}\n\n${agentPrompt}`
+          : buildLinkedTaskContext(taskToInject, false);
+        updateThread(threadId, { linkedTask: { ...taskToInject, injected: true } });
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
       if (thread.messages.length === 0 && isDefaultTitle(thread.title)) {
-        const initialTitle = deriveTitle(userContent);
+        const titleSeed = userContent || taskToInject?.title || '';
+        const initialTitle = deriveTitle(titleSeed);
         if (isPlausibleTitle(initialTitle)) {
           updateThread(threadId, { title: initialTitle });
         }
         // Kick off async LLM refinement for a nicer title
-        void tryGenerateBetterTitle(threadId, userContent, model.id, project.path, updateThread);
+        void tryGenerateBetterTitle(threadId, titleSeed, model.id, project.path, updateThread);
       }
 
       if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
@@ -3104,6 +3363,15 @@ const App: React.FC = () => {
         role: 'user',
         content: userContent,
         attachments,
+        ...(taskToInject
+          ? {
+              linkedTask: {
+                id: taskToInject.id,
+                title: taskToInject.title,
+                description: taskToInject.description,
+              },
+            }
+          : {}),
       });
       updateThread(threadId, { status: 'running' });
       pushLinkedTaskStatus(threadId, 'running');
@@ -3139,7 +3407,10 @@ const App: React.FC = () => {
           providerOptions: normalizedProviderSettings[model.providerId]?.options,
           ...(model.providerId === 'codex'
             ? {
-                codexReasoningEffort: thread.codexReasoningEffort ?? defaultCodexReasoningEffort,
+                codexReasoningEffort: getEffectiveCodexReasoningEffort(
+                  model,
+                  thread.codexReasoningEffort
+                ),
                 codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
               }
             : {}),
@@ -3152,6 +3423,9 @@ const App: React.FC = () => {
                   thread.claudeContextWindow ?? defaultClaudeContextWindow
                 ),
               }
+            : {}),
+          ...(model.providerId === 'grok'
+            ? { grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort }
             : {}),
         })
         .then((result) => {
@@ -3309,7 +3583,11 @@ const App: React.FC = () => {
   const sendMessage = () => {
     if (!selectedThreadId || !selectedThread) return;
     const promptText = chatInput.trim();
-    if (!promptText && chatAttachments.length === 0) return;
+    // A freshly linked board task can be sent on its own — the card is the
+    // prompt. Mid-run it can't (queued follow-ups need their own text).
+    const canSendLinkedTaskAlone =
+      !isSending && Boolean(selectedThread.linkedTask && !selectedThread.linkedTask.injected);
+    if (!promptText && chatAttachments.length === 0 && !canSendLinkedTaskAlone) return;
 
     // `/btw <question>` — side question, handled before the mid-run queue
     // branch because asking while the agent works is exactly its use case.
@@ -3553,7 +3831,19 @@ const App: React.FC = () => {
           <div className="shell-title-group">
             {activeTab === 'agents' && selectedThread ? (
               <div className="thread-title-menu shell-thread-title-menu" ref={threadMenuRef}>
-                <span className="shell-title truncate">{shellTitle}</span>
+                {threadRenameKey === `shell:${selectedThread.id}` ? (
+                  <InlineRenameInput
+                    className="shell-title-rename-input"
+                    initialValue={selectedThread.title}
+                    onSubmit={(title) => {
+                      updateThread(selectedThread.id, { title });
+                      setThreadRenameKey(null);
+                    }}
+                    onCancel={() => setThreadRenameKey(null)}
+                  />
+                ) : (
+                  <span className="shell-title truncate">{shellTitle}</span>
+                )}
                 <button
                   type="button"
                   className="thread-title-menu-trigger"
@@ -3574,8 +3864,7 @@ const App: React.FC = () => {
                       onClick={() => {
                         setThreadMenuOpen(false);
                         if (!selectedThread) return;
-                        const newTitle = prompt('Rename thread', selectedThread.title);
-                        if (newTitle) updateThread(selectedThread.id, { title: newTitle });
+                        setThreadRenameKey(`shell:${selectedThread.id}`);
                       }}
                     >
                       <SquarePen size={13} /> Rename
@@ -3735,14 +4024,29 @@ const App: React.FC = () => {
                         <div className="branch-picker-empty">{gitState?.error ?? 'No branches found'}</div>
                       )}
                       <div className="project-picker-divider" />
-                      <button
-                        type="button"
-                        className="branch-picker-item"
-                        onClick={handleCreateBranch}
-                        disabled={gitBusy || !gitState?.ok}
-                      >
-                        <Plus size={13} /> New branch
-                      </button>
+                      {creatingBranch ? (
+                        <div className="branch-picker-item branch-picker-create-row">
+                          <Plus size={13} />
+                          <InlineRenameInput
+                            className="thread-rename-input"
+                            initialValue=""
+                            onSubmit={(name) => {
+                              setCreatingBranch(false);
+                              void handleCreateBranch(name);
+                            }}
+                            onCancel={() => setCreatingBranch(false)}
+                          />
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          className="branch-picker-item"
+                          onClick={() => setCreatingBranch(true)}
+                          disabled={gitBusy || !gitState?.ok}
+                        >
+                          <Plus size={13} /> New branch
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="branch-picker-item"
@@ -4609,9 +4913,23 @@ const App: React.FC = () => {
                             <div
                               key={thread.id}
                               className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                              onClick={() => selectThread(thread.id)}
+                              onClick={() => {
+                                if (threadRenameKey !== `recent:${thread.id}`) selectThread(thread.id);
+                              }}
                             >
-                              <span className="thread-title">{thread.title}</span>
+                              {threadRenameKey === `recent:${thread.id}` ? (
+                                <InlineRenameInput
+                                  className="thread-rename-input"
+                                  initialValue={thread.title}
+                                  onSubmit={(title) => {
+                                    updateThread(thread.id, { title });
+                                    setThreadRenameKey(null);
+                                  }}
+                                  onCancel={() => setThreadRenameKey(null)}
+                                />
+                              ) : (
+                                <span className="thread-title">{thread.title}</span>
+                              )}
                               <span className="thread-project-tag thread-meta">
                                 {projects.find((p) => p.id === thread.projectId)?.name}
                               </span>
@@ -4622,17 +4940,77 @@ const App: React.FC = () => {
                                   formatShortTime(getThreadActivityTime(thread))
                                 )}
                               </span>
-                              <button
-                                type="button"
-                                className="thread-delete"
-                                title="Remove from Recent agents"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  updateThread(thread.id, { hiddenFromRecent: true });
-                                }}
+                              <div
+                                className="thread-menu-wrap"
+                                ref={threadItemMenuKey === `recent:${thread.id}` ? threadItemMenuRef : undefined}
+                                onClick={(e) => e.stopPropagation()}
                               >
-                                <Trash2 size={13} />
-                              </button>
+                                <button
+                                  type="button"
+                                  className="thread-options-trigger"
+                                  title="Thread options"
+                                  aria-label={`Options for ${thread.title}`}
+                                  aria-haspopup="menu"
+                                  aria-expanded={threadItemMenuKey === `recent:${thread.id}`}
+                                  onClick={() =>
+                                    setThreadItemMenuKey((open) =>
+                                      open === `recent:${thread.id}` ? null : `recent:${thread.id}`
+                                    )
+                                  }
+                                >
+                                  <Ellipsis size={13} />
+                                </button>
+                                {threadItemMenuKey === `recent:${thread.id}` && (
+                                  <div className="thread-menu thread-item-menu" role="menu">
+                                    <button
+                                      type="button"
+                                      className="project-menu-item"
+                                      role="menuitem"
+                                      onClick={() => {
+                                        setThreadItemMenuKey(null);
+                                        setThreadRenameKey(`recent:${thread.id}`);
+                                      }}
+                                    >
+                                      <SquarePen size={13} /> Rename
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="project-menu-item"
+                                      role="menuitem"
+                                      onClick={() => {
+                                        setThreadItemMenuKey(null);
+                                        branchThread(thread.id);
+                                      }}
+                                    >
+                                      <GitBranch size={13} /> Branch
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="project-menu-item"
+                                      role="menuitem"
+                                      onClick={() => {
+                                        setThreadItemMenuKey(null);
+                                        updateThread(thread.id, { hiddenFromRecent: true });
+                                      }}
+                                    >
+                                      <EyeOff size={13} /> Remove from Recent
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="project-menu-item danger"
+                                      role="menuitem"
+                                      onClick={() => {
+                                        setThreadItemMenuKey(null);
+                                        if (confirm('Delete this thread?')) {
+                                          deleteThread(thread.id);
+                                        }
+                                      }}
+                                    >
+                                      <Trash2 size={13} /> Delete
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
                             </div>
                           ))
                         )}
@@ -4696,18 +5074,33 @@ const App: React.FC = () => {
                             className={`sidebar-section-chevron ${isCollapsed ? '' : 'open'}`}
                           />
                         </button>
-                        <button
-                          type="button"
-                          className="project-section-header"
-                          onClick={() => selectProject(project.id)}
-                          title={project.path}
-                        >
-                          <ProjectIcon projectPath={project.path} size={13} />
-                          <span className="truncate">{project.name}</span>
-                          {isCollapsed && projectThreads.length > 0 && (
-                            <span className="sidebar-section-count">{projectThreads.length}</span>
-                          )}
-                        </button>
+                        {projectRenameId === project.id ? (
+                          <div className="project-section-header project-section-header-renaming">
+                            <ProjectIcon projectPath={project.path} size={13} />
+                            <InlineRenameInput
+                              className="thread-rename-input"
+                              initialValue={project.name}
+                              onSubmit={(name) => {
+                                renameProject(project.id, name);
+                                setProjectRenameId(null);
+                              }}
+                              onCancel={() => setProjectRenameId(null)}
+                            />
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className="project-section-header"
+                            onClick={() => selectProject(project.id)}
+                            title={project.path}
+                          >
+                            <ProjectIcon projectPath={project.path} size={13} />
+                            <span className="truncate">{project.name}</span>
+                            {isCollapsed && projectThreads.length > 0 && (
+                              <span className="sidebar-section-count">{projectThreads.length}</span>
+                            )}
+                          </button>
+                        )}
                         <div
                           className="project-menu-wrap"
                           ref={projectMenuOpenId === project.id ? projectMenuRef : undefined}
@@ -4735,8 +5128,7 @@ const App: React.FC = () => {
                                 role="menuitem"
                                 onClick={() => {
                                   setProjectMenuOpenId(null);
-                                  const newName = prompt('Rename project', project.name);
-                                  if (newName?.trim()) renameProject(project.id, newName.trim());
+                                  setProjectRenameId(project.id);
                                 }}
                               >
                                 <SquarePen size={13} /> Rename
@@ -4787,9 +5179,23 @@ const App: React.FC = () => {
                               <div
                                 key={thread.id}
                                 className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                                onClick={() => selectThread(thread.id)}
+                                onClick={() => {
+                                  if (threadRenameKey !== `project:${thread.id}`) selectThread(thread.id);
+                                }}
                               >
-                                <span className="thread-title">{thread.title}</span>
+                                {threadRenameKey === `project:${thread.id}` ? (
+                                  <InlineRenameInput
+                                    className="thread-rename-input"
+                                    initialValue={thread.title}
+                                    onSubmit={(title) => {
+                                      updateThread(thread.id, { title });
+                                      setThreadRenameKey(null);
+                                    }}
+                                    onCancel={() => setThreadRenameKey(null)}
+                                  />
+                                ) : (
+                                  <span className="thread-title">{thread.title}</span>
+                                )}
                                 <span className="thread-time thread-meta">
                                   {thread.status === 'running' ? (
                                     <span className="thread-working-dot" title="Working" />
@@ -4797,19 +5203,66 @@ const App: React.FC = () => {
                                     formatShortTime(getThreadActivityTime(thread))
                                   )}
                                 </span>
-                                <button
-                                  type="button"
-                                  className="thread-delete"
-                                  title="Delete thread"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (confirm('Delete this thread?')) {
-                                      deleteThread(thread.id);
-                                    }
-                                  }}
+                                <div
+                                  className="thread-menu-wrap"
+                                  ref={threadItemMenuKey === `project:${thread.id}` ? threadItemMenuRef : undefined}
+                                  onClick={(e) => e.stopPropagation()}
                                 >
-                                  <Trash2 size={13} />
-                                </button>
+                                  <button
+                                    type="button"
+                                    className="thread-options-trigger"
+                                    title="Thread options"
+                                    aria-label={`Options for ${thread.title}`}
+                                    aria-haspopup="menu"
+                                    aria-expanded={threadItemMenuKey === `project:${thread.id}`}
+                                    onClick={() =>
+                                      setThreadItemMenuKey((open) =>
+                                        open === `project:${thread.id}` ? null : `project:${thread.id}`
+                                      )
+                                    }
+                                  >
+                                    <Ellipsis size={13} />
+                                  </button>
+                                  {threadItemMenuKey === `project:${thread.id}` && (
+                                    <div className="thread-menu thread-item-menu" role="menu">
+                                      <button
+                                        type="button"
+                                        className="project-menu-item"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setThreadItemMenuKey(null);
+                                          setThreadRenameKey(`project:${thread.id}`);
+                                        }}
+                                      >
+                                        <SquarePen size={13} /> Rename
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="project-menu-item"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setThreadItemMenuKey(null);
+                                          branchThread(thread.id);
+                                        }}
+                                      >
+                                        <GitBranch size={13} /> Branch
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="project-menu-item danger"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setThreadItemMenuKey(null);
+                                          if (confirm('Delete this thread?')) {
+                                            deleteThread(thread.id);
+                                          }
+                                        }}
+                                      >
+                                        <Trash2 size={13} /> Delete
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
                               </div>
                             ))
                           )}
@@ -4867,7 +5320,14 @@ const App: React.FC = () => {
                         )}
 
                         {selectedThread.messages.map((msg) => (
-                          <ChatMessage key={msg.id} message={msg} />
+                          <ChatMessage
+                            key={msg.id}
+                            message={msg}
+                            liveTask={selectedThread.linkedTask}
+                            taskBusy={isSending}
+                            onMarkTaskDone={() => markLinkedTaskDone(selectedThread.id)}
+                            onUnlinkTask={() => unlinkTaskFromThread(selectedThread.id)}
+                          />
                         ))}
 
                         {isSending && selectedThread.messages.at(-1)?.role !== 'agent' && (
@@ -5003,7 +5463,7 @@ const App: React.FC = () => {
                             ))}
                           </div>
                         )}
-                        {selectedThread.linkedTask && (
+                        {selectedThread.linkedTask && !selectedThread.linkedTask.injected && (
                           <div className="composer-task-row">
                             <div
                               className={`composer-task-chip status-${selectedThread.linkedTask.lastStatus ?? 'linked'}`}
@@ -5055,7 +5515,9 @@ const App: React.FC = () => {
                                 : 'Queue a follow-up — sends when the agent finishes (⏎)…'
                               : chatAttachments.length > 0
                                 ? 'Ask something about the attached image...'
-                                : 'Describe what you want the agent to do...'
+                                : selectedThread.linkedTask && !selectedThread.linkedTask.injected
+                                  ? 'Add details (optional) — send starts on the linked task...'
+                                  : 'Describe what you want the agent to do...'
                           }
                           value={chatInput}
                           onChange={(e) => setChatInput(e.target.value)}
@@ -5127,7 +5589,11 @@ const App: React.FC = () => {
                                           updateThread(selectedThread.id, { modelId: model.id });
                                           setModelPickerOpen(false);
                                           setModelSearch('');
-                                          if (model.providerId !== 'codex' && model.providerId !== 'claude') {
+                                          if (
+                                            model.providerId !== 'codex' &&
+                                            model.providerId !== 'claude' &&
+                                            model.providerId !== 'grok'
+                                          ) {
                                             setCodexSettingsOpen(false);
                                           }
                                         }}
@@ -5162,20 +5628,28 @@ const App: React.FC = () => {
                               title={
                                 selectedAgentModel?.providerId === 'claude'
                                   ? 'Claude reasoning and context window'
-                                  : 'Codex reasoning and service tier'
+                                  : selectedAgentModel?.providerId === 'grok'
+                                    ? 'Grok reasoning effort'
+                                    : 'Codex reasoning and service tier'
                               }
                             >
                               <span>
                                 {selectedAgentModel?.providerId === 'claude'
                                   ? selectedClaudeReasoningLabel
-                                  : selectedCodexReasoningLabel}
+                                  : selectedAgentModel?.providerId === 'grok'
+                                    ? selectedGrokReasoningLabel
+                                    : selectedCodexReasoningLabel}
                               </span>
-                              <span className="control-dot">·</span>
-                              <span>
-                                {selectedAgentModel?.providerId === 'claude'
-                                  ? selectedClaudeContextWindowLabel
-                                  : selectedCodexServiceTierLabel}
-                              </span>
+                              {selectedAgentModel?.providerId !== 'grok' && (
+                                <>
+                                  <span className="control-dot">·</span>
+                                  <span>
+                                    {selectedAgentModel?.providerId === 'claude'
+                                      ? selectedClaudeContextWindowLabel
+                                      : selectedCodexServiceTierLabel}
+                                  </span>
+                                </>
+                              )}
                               <ChevronDown
                                 size={14}
                                 className={`model-trigger-chevron ${codexSettingsOpen ? 'open' : ''}`}
@@ -5184,7 +5658,40 @@ const App: React.FC = () => {
 
                             {codexSettingsOpen && (
                               <div className="codex-settings-popover">
-                                {selectedAgentModel?.providerId === 'claude' ? (
+                                {selectedAgentModel?.providerId === 'grok' ? (
+                                  <div className="codex-settings-section">
+                                    <div className="codex-settings-heading">Reasoning</div>
+                                    <div className="codex-settings-options">
+                                      {grokReasoningOptions.map((option) => {
+                                        const selected = selectedGrokReasoning === option.value;
+                                        return (
+                                          <button
+                                            key={option.value}
+                                            className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                            onClick={() =>
+                                              updateThread(selectedThread.id, {
+                                                grokReasoningEffort: option.value as GrokReasoningEffort,
+                                              })
+                                            }
+                                          >
+                                            <span className="settings-check">
+                                              {selected && <Check size={17} />}
+                                            </span>
+                                            <span>
+                                              {option.label}
+                                              {option.default ? ' (default)' : ''}
+                                              {option.description && (
+                                                <span className="codex-settings-row-description">
+                                                  {option.description}
+                                                </span>
+                                              )}
+                                            </span>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                ) : selectedAgentModel?.providerId === 'claude' ? (
                                   <>
                                     <div className="codex-settings-section">
                                       <div className="codex-settings-heading">Reasoning</div>
@@ -5254,7 +5761,7 @@ const App: React.FC = () => {
                                     <div className="codex-settings-section">
                                       <div className="codex-settings-heading">Reasoning</div>
                                       <div className="codex-settings-options">
-                                        {codexReasoningOptions.map((option) => {
+                                        {selectedCodexReasoningOptions.map((option) => {
                                           const selected = selectedCodexReasoning === option.value;
                                           return (
                                             <button
@@ -5269,7 +5776,14 @@ const App: React.FC = () => {
                                               <span className="settings-check">
                                                 {selected && <Check size={17} />}
                                               </span>
-                                              <span>{option.label}{option.default ? ' (default)' : ''}</span>
+                                              <span>
+                                                {option.label}{option.default ? ' (default)' : ''}
+                                                {option.description && (
+                                                  <span className="codex-settings-row-description">
+                                                    {option.description}
+                                                  </span>
+                                                )}
+                                              </span>
                                             </button>
                                           );
                                         })}
@@ -5386,7 +5900,9 @@ const App: React.FC = () => {
                             className="send-button"
                             onClick={sendMessage}
                             disabled={
-                              (!chatInput.trim() && chatAttachments.length === 0) ||
+                              (!chatInput.trim() &&
+                                chatAttachments.length === 0 &&
+                                !(selectedThread.linkedTask && !selectedThread.linkedTask.injected)) ||
                               selectedAgentModel?.available === false
                             }
                             title="Send"
