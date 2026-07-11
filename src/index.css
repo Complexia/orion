@@ -2588,7 +2588,8 @@ body {
   border: 1px solid rgb(255 255 255 / 14%);
 }
 
-.message-attachment img {
+.message-attachment img,
+.message-attachment video {
   display: block;
   width: 100%;
   aspect-ratio: 4 / 3;
@@ -3084,6 +3085,147 @@ body {
   }
 }
 
+/* Floating Tasks card pinned over the chat area (drag its header to move).
+   Hosted by .chat-scroll-wrap so it overlays messages but never the composer. */
+.chat-scroll-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-scroll-wrap > .chat-scroll {
+  flex: 1;
+  min-height: 0;
+}
+
+.tasks-float-card {
+  position: absolute;
+  top: 14px;
+  right: 18px;
+  z-index: 30;
+  width: 320px;
+  max-width: calc(100% - 32px);
+  background: color-mix(in srgb, var(--bg-elevated) 94%, transparent);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.tasks-float-card.dragging {
+  cursor: grabbing;
+  user-select: none;
+  box-shadow: var(--shadow-lg), 0 0 0 3px var(--accent-soft);
+}
+
+.tasks-float-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 8px 7px 12px;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.tasks-float-card.dragging .tasks-float-header {
+  cursor: grabbing;
+}
+
+.tasks-float-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.tasks-float-progress {
+  color: var(--text-muted);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.tasks-float-state.done {
+  display: inline-flex;
+  align-items: center;
+  color: var(--success);
+}
+
+.tasks-float-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.tasks-float-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.tasks-float-actions button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tasks-float-actions button svg {
+  transition: transform var(--transition-base);
+}
+
+.tasks-float-card.collapsed .tasks-float-actions button:first-child svg {
+  transform: rotate(-90deg);
+}
+
+.tasks-float-meter {
+  height: 2px;
+  background: var(--border-subtle);
+}
+
+.tasks-float-meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width var(--transition-base) ease;
+}
+
+.tasks-float-body {
+  padding: 8px 12px 10px;
+  max-height: 38vh;
+  overflow-y: auto;
+}
+
+.tasks-float-body .agent-plan-list {
+  margin-top: 0;
+  gap: 5px;
+}
+
+.tasks-float-current {
+  padding: 7px 12px 9px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .agent-response-stats {
   font-weight: 500;
   letter-spacing: 0.04em;
@@ -3279,6 +3421,16 @@ body {
   text-underline-offset: 2px;
 }
 
+.markdown-content .markdown-media {
+  display: block;
+  max-width: min(100%, 520px);
+  max-height: 420px;
+  margin: 0.75em 0;
+  border: 1px solid #303034;
+  border-radius: 8px;
+  background: #151516;
+}
+
 .markdown-content code {
   border: 1px solid #3a3a3d;
   border-radius: 5px;
@@ -3374,7 +3526,8 @@ body {
   background: var(--bg-surface);
 }
 
-.composer-attachment img {
+.composer-attachment img,
+.composer-attachment video {
   width: 48px;
   height: 48px;
   border-radius: calc(var(--radius-md) - 3px);

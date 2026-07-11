@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useCallback, useContext, useMemo, useRef } from 'react';
 import {
   FolderOpen,
   FolderPlus,
@@ -55,7 +55,7 @@ import {
   BookOpen,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   useOrionStore,
@@ -370,9 +370,17 @@ const getLanguageFromPath = (filePath: string): string => {
 };
 
 const imageFileNamePattern = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
+const videoFileNamePattern = /\.(mp4|webm|mov|m4v|ogv|mkv|avi)(?:[?#]|$)/i;
 
 const isImageFile = (file: File) =>
   file.type.startsWith('image/') || imageFileNamePattern.test(file.name);
+
+const isVideoFile = (file: File) =>
+  file.type.startsWith('video/') || videoFileNamePattern.test(file.name);
+
+// Models that accept image input can generally interpret video too, so any
+// image-capable model gets both — same behavior as the codex desktop app.
+const isMediaFile = (file: File) => isImageFile(file) || isVideoFile(file);
 
 const formatAttachmentSize = (size: number) => {
   if (!Number.isFinite(size) || size <= 0) return '';
@@ -388,17 +396,81 @@ const imageAttachmentSrc = (attachment: ImageAttachment) => {
   return `orion-attachment://local/image?path=${encodeURIComponent(normalizedPath)}`;
 };
 
+const isVideoAttachment = (attachment: ImageAttachment) =>
+  attachment.mimeType.startsWith('video/') ||
+  videoFileNamePattern.test(attachment.name) ||
+  videoFileNamePattern.test(attachment.path);
+
+// Small still-frame preview used in the composer, queued messages, and
+// message history — branches <video> vs <img> the same way MarkdownMedia does.
+const AttachmentThumb: React.FC<{ attachment: ImageAttachment }> = ({ attachment }) =>
+  isVideoAttachment(attachment) ? (
+    <video src={imageAttachmentSrc(attachment)} muted preload="metadata" />
+  ) : (
+    <img src={imageAttachmentSrc(attachment)} alt={attachment.name} />
+  );
+
+const isLocalFilePath = (src: string) =>
+  src.startsWith('/') || src.startsWith('~/') || /^[a-zA-Z]:[\\/]/.test(src);
+
+// Markdown percent-encodes e.g. spaces in urls; decode so the value can be
+// used as a filesystem path, but tolerate raw `%` characters in filenames.
+const decodeMediaPath = (value: string) => {
+  if (!/%[0-9a-f]{2}/i.test(value)) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+// Turn a media src an agent emitted in markdown (absolute path, ~ path,
+// file:// URL, or relative path) into a URL the renderer is allowed to load
+// via the orion-attachment protocol. Relative paths produce one candidate per
+// base dir; the protocol handler serves the first candidate that exists.
+const localMediaSrc = (src: string, baseDirs: string[]) => {
+  const toProtocolUrl = (paths: string[]) =>
+    `orion-attachment://local/media?${paths
+      .map((p) => `path=${encodeURIComponent(p.replace(/\\/g, '/'))}`)
+      .join('&')}`;
+
+  if (/^file:\/\//i.test(src)) {
+    try {
+      const url = new URL(src);
+      let pathname = decodeMediaPath(url.pathname);
+      if (/^\/[A-Za-z]:/.test(pathname)) {
+        // Windows drive path: file:///C:/Users/... parses to "/C:/Users/..."
+        // and the leading slash breaks path resolution — strip it.
+        pathname = pathname.slice(1);
+      } else if (url.hostname && url.hostname !== 'localhost') {
+        // UNC path: file://server/share/... keeps its host as a UNC prefix.
+        pathname = `//${url.hostname}${pathname}`;
+      }
+      return toProtocolUrl([pathname]);
+    } catch {
+      return toProtocolUrl([decodeMediaPath(src.replace(/^file:\/\//i, ''))]);
+    }
+  }
+  if (isLocalFilePath(src)) return toProtocolUrl([decodeMediaPath(src)]);
+  if (baseDirs.length === 0) return src;
+  const relativePath = decodeMediaPath(src);
+  return toProtocolUrl(baseDirs.map((dir) => `${dir.replace(/[\\/]+$/, '')}/${relativePath}`));
+};
+
 const buildPromptWithAttachments = (prompt: string, attachments: ImageAttachment[]) => {
   const trimmedPrompt = prompt.trim();
   if (attachments.length === 0) return trimmedPrompt;
 
-  const imageLines = attachments.map(
+  const mediaLines = attachments.map(
     (attachment, index) => `${index + 1}. ${attachment.name}: ${attachment.path}`
   );
+  const hasVideo = attachments.some(isVideoAttachment);
+  const hasImage = attachments.some((attachment) => !isVideoAttachment(attachment));
+  const label = hasVideo && hasImage ? 'media files' : hasVideo ? 'videos' : 'images';
   const attachmentText = [
-    'Attached images:',
-    'Use these local image file paths as visual references for the request.',
-    ...imageLines,
+    `Attached ${label}:`,
+    `Use these local file paths as visual references for the request.`,
+    ...mediaLines,
   ].join('\n');
 
   return trimmedPrompt ? `${trimmedPrompt}\n\n${attachmentText}` : attachmentText;
@@ -902,6 +974,114 @@ const AgentPlanChecklist: React.FC<{ activity: AgentActivity }> = ({ activity })
   </div>
 );
 
+// Floating, movable "Tasks" card pinned over the chat area. Only rendered
+// when the current agent turn streamed a plan (grok ACP task list) — simple
+// turns that never emit tasks never show it. Mirrors the same plan activity
+// that lives inside the Agent steps card, so it needs no extra plumbing.
+const FloatingTasksCard: React.FC<{
+  activity: AgentActivity;
+  running: boolean;
+  position: { x: number; y: number } | null;
+  onMove: (position: { x: number; y: number }) => void;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+  onDismiss: () => void;
+}> = ({ activity, running, position, onMove, collapsed, onToggleCollapsed, onDismiss }) => {
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const entries = activity.plan ?? [];
+  const completed = entries.filter((entry) => entry.status === 'completed').length;
+  const allDone = entries.length > 0 && completed === entries.length;
+  const activeEntry = entries.find((entry) => entry.status === 'in_progress');
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    // Header buttons (collapse/close) should click, not start a drag.
+    if ((event.target as HTMLElement).closest('button')) return;
+    const card = cardRef.current;
+    const host = card?.offsetParent as HTMLElement | null;
+    if (!card || !host) return;
+    event.preventDefault();
+    const cardRect = card.getBoundingClientRect();
+    const hostRect = host.getBoundingClientRect();
+    const grabX = event.clientX - cardRect.left;
+    const grabY = event.clientY - cardRect.top;
+    const margin = 8;
+    setDragging(true);
+    const handleMove = (move: PointerEvent) => {
+      const maxX = hostRect.width - cardRect.width - margin;
+      const maxY = hostRect.height - cardRect.height - margin;
+      onMove({
+        x: Math.min(Math.max(move.clientX - hostRect.left - grabX, margin), Math.max(maxX, margin)),
+        y: Math.min(Math.max(move.clientY - hostRect.top - grabY, margin), Math.max(maxY, margin)),
+      });
+    };
+    const handleUp = () => {
+      setDragging(false);
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+  };
+
+  return (
+    <div
+      ref={cardRef}
+      className={`tasks-float-card${collapsed ? ' collapsed' : ''}${dragging ? ' dragging' : ''}`}
+      style={position ? { left: position.x, top: position.y, right: 'auto' } : undefined}
+    >
+      <div
+        className="tasks-float-header"
+        onPointerDown={handlePointerDown}
+        onDoubleClick={onToggleCollapsed}
+        title="Drag to move · double-click to collapse"
+      >
+        <span className="tasks-float-title">
+          <ListChecks size={13} />
+          <span>Tasks</span>
+          <span className="tasks-float-progress">
+            {completed}/{entries.length}
+          </span>
+          {allDone ? (
+            <span className="tasks-float-state done">
+              <Check size={12} />
+            </span>
+          ) : running ? (
+            <span className="agent-plan-spinner" aria-hidden="true" />
+          ) : null}
+        </span>
+        <span className="tasks-float-actions">
+          <button
+            type="button"
+            onClick={onToggleCollapsed}
+            title={collapsed ? 'Expand tasks' : 'Collapse tasks'}
+          >
+            <ChevronDown size={13} />
+          </button>
+          <button type="button" onClick={onDismiss} title="Hide tasks card">
+            <X size={13} />
+          </button>
+        </span>
+      </div>
+      <div className="tasks-float-meter" aria-hidden="true">
+        <span
+          className="tasks-float-meter-fill"
+          style={{ width: `${entries.length > 0 ? (completed / entries.length) * 100 : 0}%` }}
+        />
+      </div>
+      {collapsed ? (
+        activeEntry && <div className="tasks-float-current">{activeEntry.content}</div>
+      ) : (
+        <div className="tasks-float-body">
+          <AgentPlanChecklist activity={activity} />
+        </div>
+      )}
+    </div>
+  );
+};
+
 const collapsedDetailPreview = (activity: AgentActivity) => {
   const flattened = (activity.detail ?? '').replace(/\s+/g, ' ').trim();
   // Thought streams show the tail so the card tracks what the agent is
@@ -1115,9 +1295,56 @@ const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ tex
   );
 };
 
+// Candidate base directories (in priority order) used to resolve relative
+// media paths that agents emit in markdown — the thread's project path, plus
+// provider-specific output dirs (e.g. the grok CLI's session dir, where Grok
+// Imagine saves generated images and references them relatively).
+const MarkdownBaseDirContext = React.createContext<string[]>([]);
+
+// react-markdown's default transform strips unknown schemes; let local file
+// references through so MarkdownMedia can route them via orion-attachment.
+const markdownUrlTransform = (url: string) =>
+  /^(orion-attachment|file):/i.test(url) || /^[a-zA-Z]:[\\/]/.test(url)
+    ? url
+    : defaultUrlTransform(url);
+
+const MarkdownMedia: React.FC<{ src?: string; alt?: string; title?: string }> = ({
+  src,
+  alt,
+  title,
+}) => {
+  const baseDirs = useContext(MarkdownBaseDirContext);
+  if (!src) return null;
+
+  const resolvedSrc = /^(https?|data|blob|orion-attachment):/i.test(src)
+    ? src
+    : localMediaSrc(src, baseDirs);
+
+  if (videoFileNamePattern.test(src)) {
+    return (
+      <video
+        className="markdown-media"
+        src={resolvedSrc}
+        controls
+        preload="metadata"
+        title={title ?? alt}
+      />
+    );
+  }
+  return <img className="markdown-media" src={resolvedSrc} alt={alt ?? ''} title={title} loading="lazy" />;
+};
+
+const markdownComponents = { img: MarkdownMedia };
+
 const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (
   <div className="markdown-content">
-    <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      urlTransform={markdownUrlTransform}
+      components={markdownComponents}
+    >
+      {content}
+    </ReactMarkdown>
   </div>
 ));
 
@@ -1323,7 +1550,7 @@ const ChatMessage: React.FC<{
             <div className="message-attachments">
               {attachments.map((attachment) => (
                 <div key={attachment.id} className="message-attachment" title={attachment.path}>
-                  <img src={imageAttachmentSrc(attachment)} alt={attachment.name} />
+                  <AttachmentThumb attachment={attachment} />
                   <span>{attachment.name}</span>
                 </div>
               ))}
@@ -1805,6 +2032,42 @@ const App: React.FC = () => {
   const selectedThreadProject = selectedThread
     ? projects.find((p) => p.id === selectedThread.projectId)
     : null;
+  // Candidate dirs for resolving relative media paths in agent markdown: the
+  // thread's project dir, plus the grok CLI's per-session dir — Grok Imagine
+  // saves generated images there (~/.grok/sessions/<encoded-cwd>/<session-id>/
+  // images/N.jpg) and references them relative to it, not to the project.
+  const selectedThreadProjectPath = selectedThreadProject?.path;
+  const selectedThreadGrokSessionId = selectedThread?.agentSessionIds?.grok;
+  const mediaBaseDirs = useMemo(() => {
+    if (!selectedThreadProjectPath) return [];
+    const dirs = [selectedThreadProjectPath];
+    if (selectedThreadGrokSessionId) {
+      dirs.push(
+        `~/.grok/sessions/${encodeURIComponent(selectedThreadProjectPath)}/${selectedThreadGrokSessionId}`
+      );
+    }
+    return dirs;
+  }, [selectedThreadProjectPath, selectedThreadGrokSessionId]);
+  // Floating Tasks card: position/collapse persist across turns and threads
+  // for the session (the user parks it once); dismissal is per-message so the
+  // card comes back when a new turn streams a fresh task list.
+  const [tasksCardPos, setTasksCardPos] = useState<{ x: number; y: number } | null>(null);
+  const [tasksCardCollapsed, setTasksCardCollapsed] = useState(false);
+  const [tasksCardDismissedFor, setTasksCardDismissedFor] = useState<string | null>(null);
+  const floatingPlan = useMemo(() => {
+    const messages = selectedThread?.messages;
+    if (!messages) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== 'agent' || message.kind !== 'agent-run') continue;
+      // Only the latest turn counts: if it didn't emit a plan, show nothing
+      // rather than pinning a stale task list from an earlier turn.
+      const activity = message.activities?.find((entry) => entry.type === 'plan');
+      if (!activity || (activity.plan?.length ?? 0) === 0) return null;
+      return { messageId: message.id, activity, running: message.status === 'running' };
+    }
+    return null;
+  }, [selectedThread]);
   const selectedProject =
     projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
   const latestThreadProjectId =
@@ -2036,6 +2299,34 @@ const App: React.FC = () => {
             getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
         ),
     [threads]
+  );
+
+  const disposeThreadRuntime = useCallback(async (threadId: string) => {
+    try {
+      await window.orion?.disposeAgentThread?.(threadId);
+    } catch (error) {
+      console.error('Could not dispose agent thread runtime', error);
+    }
+  }, []);
+
+  const deleteThreadWithRuntime = useCallback(
+    async (threadId: string) => {
+      await disposeThreadRuntime(threadId);
+      deleteThread(threadId);
+    },
+    [deleteThread, disposeThreadRuntime]
+  );
+
+  const removeProjectWithRuntimes = useCallback(
+    async (projectId: string) => {
+      const threadIds = useOrionStore
+        .getState()
+        .threads.filter((thread) => thread.projectId === projectId)
+        .map((thread) => thread.id);
+      await Promise.all(threadIds.map(disposeThreadRuntime));
+      removeProject(projectId);
+    },
+    [disposeThreadRuntime, removeProject]
   );
 
   const threadSearchIndex = useMemo<ThreadSearchEntry[]>(() => {
@@ -2670,7 +2961,30 @@ const App: React.FC = () => {
       }
 
       const tracked = runOutputMessages.current.get(event.runId);
-      if (!tracked) return;
+      if (!tracked) {
+        // A persistent claude session can start a turn on its own when a
+        // background subagent finishes (task notification re-invokes the
+        // model). Grow the transcript with a fresh agent message for it.
+        if (event.type === 'started' && event.background) {
+          const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
+          if (!thread) return;
+          const messageId = addMessageToThread(event.threadId, {
+            role: 'agent',
+            content: '',
+            kind: 'agent-run',
+            status: 'running',
+            statusText: 'Continuing background work.',
+            command: event.command,
+            startedAt: new Date().toISOString(),
+            activities: [],
+          });
+          runOutputMessages.current.set(event.runId, { threadId: event.threadId, messageId });
+          setActiveRunsByThread((current) => ({ ...current, [event.threadId]: event.runId }));
+          updateThread(event.threadId, { status: 'running' });
+          pushLinkedTaskStatus(event.threadId, 'running');
+        }
+        return;
+      }
 
       if (event.type === 'started') {
         updateThreadMessage(tracked.threadId, tracked.messageId, {
@@ -2748,7 +3062,7 @@ const App: React.FC = () => {
       unsubscribe?.();
       flushChunkBuffers();
     };
-  }, [addActivityToThreadMessage, appendToThreadMessage, appendToBtwExchange, clearActiveRun, flushChunkBuffers, pushLinkedTaskStatus, setThreadAgentSession, updateBtwExchange, updateThread, updateThreadMessage]);
+  }, [addActivityToThreadMessage, addMessageToThread, appendToThreadMessage, appendToBtwExchange, clearActiveRun, flushChunkBuffers, pushLinkedTaskStatus, setThreadAgentSession, updateBtwExchange, updateThread, updateThreadMessage]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
@@ -3187,16 +3501,16 @@ const App: React.FC = () => {
     return id;
   };
 
-  const attachImageFiles = useCallback(
+  const attachMediaFiles = useCallback(
     async (files: FileList | File[]) => {
-      const imageFiles = Array.from(files).filter(isImageFile);
-      if (imageFiles.length === 0) return false;
+      const mediaFiles = Array.from(files).filter(isMediaFile);
+      if (mediaFiles.length === 0) return false;
 
       let targetThreadId = selectedThreadId;
       if (!targetThreadId) {
         const projectId = selectedProject?.id ?? projects[0]?.id;
         if (!projectId) {
-          toast.error('Add a project before attaching images');
+          toast.error('Add a project before attaching files');
           return true;
         }
         targetThreadId = handleCreateThread(projectId);
@@ -3208,19 +3522,20 @@ const App: React.FC = () => {
       selectThread(targetThreadId);
 
       if (!window.orion?.saveImageAttachment) {
-        toast.error('Image attachments are unavailable');
+        toast.error('Attachments are unavailable');
         return true;
       }
 
       const savedAttachments: ImageAttachment[] = [];
-      for (const file of imageFiles) {
+      for (const file of mediaFiles) {
+        const fallbackMimeType = isVideoFile(file) ? 'video/*' : 'image/*';
         const droppedPath = getDroppedFilePath(file);
         if (droppedPath) {
           savedAttachments.push({
             id: crypto.randomUUID(),
-            name: file.name || droppedPath.split(/[\\/]/).pop() || 'image',
+            name: file.name || droppedPath.split(/[\\/]/).pop() || 'file',
             path: droppedPath,
-            mimeType: file.type || 'image/*',
+            mimeType: file.type || fallbackMimeType,
             size: file.size,
           });
           continue;
@@ -3228,22 +3543,22 @@ const App: React.FC = () => {
 
         try {
           const result = await window.orion.saveImageAttachment({
-            name: file.name || 'image',
-            mimeType: file.type || 'image/*',
+            name: file.name || 'file',
+            mimeType: file.type || fallbackMimeType,
             data: await file.arrayBuffer(),
           });
 
           if (result.ok && result.attachment) {
             savedAttachments.push(result.attachment);
           } else {
-            toast.error(result.error ?? `Could not attach ${file.name || 'image'}`);
+            toast.error(result.error ?? `Could not attach ${file.name || 'file'}`);
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : '';
           toast.error(
             message.includes('No handler registered')
-              ? 'Restart Orion to finish enabling image attachments.'
-              : message || `Could not attach ${file.name || 'image'}`
+              ? 'Restart Orion to finish enabling attachments.'
+              : message || `Could not attach ${file.name || 'file'}`
           );
         }
       }
@@ -3292,9 +3607,9 @@ const App: React.FC = () => {
       event.preventDefault();
       dragDepth.current = 0;
       setDraggingImages(false);
-      void attachImageFiles(event.dataTransfer.files);
+      void attachMediaFiles(event.dataTransfer.files);
     },
-    [attachImageFiles]
+    [attachMediaFiles]
   );
 
   const removeChatAttachment = (id: string) => {
@@ -3517,6 +3832,9 @@ const App: React.FC = () => {
           accessMode: 'read-only',
           resumeSessionId: sessionId,
           forkSession: Boolean(sessionId),
+          // Asides run one-shot on a forked CLI; they must never reuse (or
+          // replace) the thread's persistent claude session.
+          aside: true,
           providerOptions: normalizedProviderSettings.claude?.options,
           claudeReasoningEffort:
             thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
@@ -3701,9 +4019,15 @@ const App: React.FC = () => {
       );
       setChatAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
     }
-    await window.orion.stopAgentTurn(activeRunId);
+    // Untrack and mark the message stopped BEFORE the IPC call: stopping now
+    // awaits the interrupt acknowledgement, and the interrupted turn's result
+    // lands during that await — if the run were still tracked, the done
+    // handler would mark the message "Finished." and steal the cleanup.
+    const runId = activeRunId;
+    const tracked = runOutputMessages.current.get(runId);
+    runOutputMessages.current.delete(runId);
+    clearActiveRun(runId);
     flushChunkBuffers();
-    const tracked = runOutputMessages.current.get(activeRunId);
     if (tracked) {
       appendToThreadMessage(tracked.threadId, tracked.messageId, '\n\nStopped by user.');
       updateThreadMessage(tracked.threadId, tracked.messageId, {
@@ -3712,9 +4036,11 @@ const App: React.FC = () => {
         statusText: 'Stopped by user.',
       });
       updateThread(tracked.threadId, { status: 'idle' });
-      runOutputMessages.current.delete(activeRunId);
     }
-    clearActiveRun(activeRunId);
+    // terminateBackground: unlike a steer (which only interrupts the current
+    // turn), Stop also tears down the thread's persistent claude session so
+    // background subagents stop mutating the working tree.
+    await window.orion.stopAgentTurn(runId, { terminateBackground: true });
   };
 
   // Handle chat submit: ⏎ sends (or queues mid-run), ⌘⏎ steers mid-run.
@@ -3814,7 +4140,7 @@ const App: React.FC = () => {
         <div className="image-drop-overlay">
           <div className="image-drop-target">
             <ImageIcon size={28} />
-            <span>Drop images to attach</span>
+            <span>Drop images or videos to attach</span>
           </div>
         </div>
       )}
@@ -3887,7 +4213,7 @@ const App: React.FC = () => {
                       onClick={() => {
                         setThreadMenuOpen(false);
                         if (confirm('Delete this thread?')) {
-                          deleteThread(selectedThread.id);
+                          void deleteThreadWithRuntime(selectedThread.id);
                         }
                       }}
                     >
@@ -3967,7 +4293,7 @@ const App: React.FC = () => {
                           onClick={() => {
                             setProjectPickerOpen(false);
                             if (confirm(`Remove project "${activeThreadProject.name}"?`)) {
-                              removeProject(activeThreadProject.id);
+                              void removeProjectWithRuntimes(activeThreadProject.id);
                             }
                           }}
                         >
@@ -4888,7 +5214,13 @@ const App: React.FC = () => {
                     <button
                       type="button"
                       className="sidebar-section-toggle"
-                      onClick={() => setRecentAgentsOpen((open) => !open)}
+                      onClick={() =>
+                        setRecentAgentsOpen((open) => {
+                          // Collapsing resets the list back to the default 5 on next expand.
+                          if (open) setRecentAgentsShowAll(false);
+                          return !open;
+                        })
+                      }
                       aria-expanded={recentAgentsOpen}
                     >
                       <ChevronRight
@@ -5002,7 +5334,7 @@ const App: React.FC = () => {
                                       onClick={() => {
                                         setThreadItemMenuKey(null);
                                         if (confirm('Delete this thread?')) {
-                                          deleteThread(thread.id);
+                                          void deleteThreadWithRuntime(thread.id);
                                         }
                                       }}
                                     >
@@ -5015,13 +5347,13 @@ const App: React.FC = () => {
                           ))
                         )}
                       </div>
-                      {!recentAgentsShowAll && recentThreads.length > THREADS_VISIBLE_LIMIT && (
+                      {recentThreads.length > THREADS_VISIBLE_LIMIT && (
                         <button
                           type="button"
                           className="threads-show-more"
-                          onClick={() => setRecentAgentsShowAll(true)}
+                          onClick={() => setRecentAgentsShowAll((showAll) => !showAll)}
                         >
-                          Show more
+                          {recentAgentsShowAll ? 'Show less' : 'Show more'}
                         </button>
                       )}
                       </>
@@ -5050,6 +5382,9 @@ const App: React.FC = () => {
                   const visibleLimit = threadListLimits[project.id] ?? THREADS_VISIBLE_LIMIT;
                   const visibleThreads = projectThreads.slice(0, visibleLimit);
                   const hasMoreThreads = projectThreads.length > visibleLimit;
+                  const isListExpanded =
+                    visibleLimit > THREADS_VISIBLE_LIMIT &&
+                    projectThreads.length > THREADS_VISIBLE_LIMIT;
 
                   return (
                     <div
@@ -5062,12 +5397,20 @@ const App: React.FC = () => {
                           className="project-collapse-toggle"
                           title={isCollapsed ? 'Expand threads' : 'Collapse threads'}
                           aria-expanded={!isCollapsed}
-                          onClick={() =>
+                          onClick={() => {
+                            // Collapsing resets the list back to the default 5 on next expand.
+                            if (!isCollapsed) {
+                              setThreadListLimits((prev) => {
+                                if (!(project.id in prev)) return prev;
+                                const { [project.id]: _removed, ...rest } = prev;
+                                return rest;
+                              });
+                            }
                             setCollapsedProjects((prev) => ({
                               ...prev,
                               [project.id]: !isCollapsed,
-                            }))
-                          }
+                            }));
+                          }}
                         >
                           <ChevronRight
                             size={12}
@@ -5144,7 +5487,7 @@ const App: React.FC = () => {
                                       `Remove "${project.name}" and its threads? Files on disk are not affected.`
                                     )
                                   ) {
-                                    removeProject(project.id);
+                                    void removeProjectWithRuntimes(project.id);
                                   }
                                 }}
                               >
@@ -5254,7 +5597,7 @@ const App: React.FC = () => {
                                         onClick={() => {
                                           setThreadItemMenuKey(null);
                                           if (confirm('Delete this thread?')) {
-                                            deleteThread(thread.id);
+                                            void deleteThreadWithRuntime(thread.id);
                                           }
                                         }}
                                       >
@@ -5268,18 +5611,21 @@ const App: React.FC = () => {
                           )}
                         </div>
   
-                        {hasMoreThreads && (
+                        {(hasMoreThreads || isListExpanded) && (
                           <button
                             type="button"
                             className="threads-show-more"
                             onClick={() =>
-                              setThreadListLimits((prev) => ({
-                                ...prev,
-                                [project.id]: projectThreads.length,
-                              }))
+                              setThreadListLimits((prev) => {
+                                if (hasMoreThreads) {
+                                  return { ...prev, [project.id]: projectThreads.length };
+                                }
+                                const { [project.id]: _removed, ...rest } = prev;
+                                return rest;
+                              })
                             }
                           >
-                            Show more
+                            {hasMoreThreads ? 'Show more' : 'Show less'}
                           </button>
                         )}
                         </>
@@ -5313,7 +5659,9 @@ const App: React.FC = () => {
               ) : (
                 <>
                   <div className="panel-content">
+                    <div className="chat-scroll-wrap">
                     <div className="chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll}>
+                      <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
                       <div className="chat-container">
                         {selectedThread.messages.length === 0 && (
                           <AgentsWelcome projectName={selectedThreadProject?.name} />
@@ -5347,10 +5695,7 @@ const App: React.FC = () => {
                                     className="message-attachment"
                                     title={attachment.path}
                                   >
-                                    <img
-                                      src={imageAttachmentSrc(attachment)}
-                                      alt={attachment.name}
-                                    />
+                                    <AttachmentThumb attachment={attachment} />
                                     <span>{attachment.name}</span>
                                   </div>
                                 ))}
@@ -5436,6 +5781,20 @@ const App: React.FC = () => {
                         ))}
                         <div ref={chatEndRef} />
                       </div>
+                      </MarkdownBaseDirContext.Provider>
+                    </div>
+
+                    {floatingPlan && tasksCardDismissedFor !== floatingPlan.messageId && (
+                      <FloatingTasksCard
+                        activity={floatingPlan.activity}
+                        running={floatingPlan.running}
+                        position={tasksCardPos}
+                        onMove={setTasksCardPos}
+                        collapsed={tasksCardCollapsed}
+                        onToggleCollapsed={() => setTasksCardCollapsed((current) => !current)}
+                        onDismiss={() => setTasksCardDismissedFor(floatingPlan.messageId)}
+                      />
+                    )}
                     </div>
 
                     <div className="chat-input-area">
@@ -5444,7 +5803,7 @@ const App: React.FC = () => {
                           <div className="composer-attachments">
                             {chatAttachments.map((attachment) => (
                               <div key={attachment.id} className="composer-attachment" title={attachment.path}>
-                                <img src={imageAttachmentSrc(attachment)} alt={attachment.name} />
+                                <AttachmentThumb attachment={attachment} />
                                 <span className="composer-attachment-meta">
                                   <span className="composer-attachment-name">{attachment.name}</span>
                                   <span className="composer-attachment-size">
@@ -5455,7 +5814,7 @@ const App: React.FC = () => {
                                   type="button"
                                   className="composer-attachment-remove"
                                   onClick={() => removeChatAttachment(attachment.id)}
-                                  title="Remove image"
+                                  title="Remove attachment"
                                 >
                                   <X size={13} />
                                 </button>
@@ -5514,7 +5873,7 @@ const App: React.FC = () => {
                                 ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
                                 : 'Queue a follow-up — sends when the agent finishes (⏎)…'
                               : chatAttachments.length > 0
-                                ? 'Ask something about the attached image...'
+                                ? `Ask something about the attached ${chatAttachments.some(isVideoAttachment) ? 'media' : 'image'}...`
                                 : selectedThread.linkedTask && !selectedThread.linkedTask.injected
                                   ? 'Add details (optional) — send starts on the linked task...'
                                   : 'Describe what you want the agent to do...'

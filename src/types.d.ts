@@ -389,6 +389,8 @@ type OrionComputerUsePermissions = {
         resumeSessionId?: string;
         /** Fork resumeSessionId into a new session instead of resuming it in place (branched threads). */
         forkSession?: boolean;
+        /** One-shot side question (/btw): never touches the thread's persistent claude session. */
+        aside?: boolean;
         providerOptions?: {
           allowedTools?: string;
           networkAccess?: boolean;
@@ -397,7 +399,13 @@ type OrionComputerUsePermissions = {
           extraArgs?: string;
         };
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
-      stopAgentTurn: (runId: string) => Promise<boolean>;
+      stopAgentTurn: (
+        runId: string,
+        /** terminateBackground: also dispose the thread's persistent claude session (kills background subagents). Steer omits this. */
+        options?: { terminateBackground?: boolean }
+      ) => Promise<boolean>;
+      /** Dispose any persistent agent runtime owned by a deleted thread. */
+      disposeAgentThread: (threadId: string) => Promise<boolean>;
       generateThreadTitle: (input: {
         prompt: string;
         modelId: string;
@@ -413,6 +421,8 @@ type OrionComputerUsePermissions = {
         runId: string;
         threadId: string;
         type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done';
+        /** started events only: the persistent claude session opened this turn itself (background task finished). */
+        background?: boolean;
         chunk?: string;
         exitCode?: number | null;
         error?: string;

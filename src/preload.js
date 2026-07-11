@@ -33,7 +33,8 @@ contextBridge.exposeInMainWorld('orion', {
   // Agent runtime
   listAgentModels: () => ipcRenderer.invoke('agent:listModels'),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
-  stopAgentTurn: (runId) => ipcRenderer.invoke('agent:stopTurn', runId),
+  stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),
+  disposeAgentThread: (threadId) => ipcRenderer.invoke('agent:disposeThread', threadId),
   generateThreadTitle: (input) => ipcRenderer.invoke('agent:generateTitle', input),
   getProviderStatus: () => ipcRenderer.invoke('providers:getStatus'),
   checkProviderUpdates: (input) => ipcRenderer.invoke('providers:checkUpdates', input),

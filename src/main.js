@@ -1,7 +1,9 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell, systemPreferences } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, createReadStream, existsSync, mkdirSync } from 'node:fs';
+import { Readable } from 'node:stream';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -330,22 +332,45 @@ const imageExtensionsByMimeType = {
   'image/svg+xml': '.svg',
   'image/webp': '.webp',
 };
-const imagePreviewExtensions = new Set(Object.values(imageExtensionsByMimeType));
-
 const imageMimeTypeByExtension = Object.fromEntries(
   Object.entries(imageExtensionsByMimeType).map(([mimeType, ext]) => [ext, mimeType])
 );
 
-const getMimeTypeForImagePath = (filePath) =>
-  imageMimeTypeByExtension[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+const videoMimeTypeByExtension = {
+  '.avi': 'video/x-msvideo',
+  '.m4v': 'video/x-m4v',
+  '.mkv': 'video/x-matroska',
+  '.mov': 'video/quicktime',
+  '.mp4': 'video/mp4',
+  '.ogv': 'video/ogg',
+  '.webm': 'video/webm',
+};
 
-const extensionFromImageInput = (name, mimeType) => {
-  const fromMime = imageExtensionsByMimeType[String(mimeType || '').toLowerCase()];
+// Media the renderer may load from arbitrary local paths (agent-referenced
+// images/videos in markdown), beyond files saved in the attachment dir.
+const mediaMimeTypeByExtension = {
+  ...imageMimeTypeByExtension,
+  '.jpeg': 'image/jpeg',
+  ...videoMimeTypeByExtension,
+};
+const mediaPreviewExtensions = new Set(Object.keys(mediaMimeTypeByExtension));
+
+const getMimeTypeForMediaPath = (filePath) =>
+  mediaMimeTypeByExtension[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+
+const videoExtensionsByMimeType = Object.fromEntries(
+  Object.entries(videoMimeTypeByExtension).map(([ext, mimeType]) => [mimeType, ext])
+);
+
+const extensionFromMediaInput = (name, mimeType) => {
+  const normalizedMimeType = String(mimeType || '').toLowerCase();
+  const fromMime =
+    imageExtensionsByMimeType[normalizedMimeType] || videoExtensionsByMimeType[normalizedMimeType];
   if (fromMime) return fromMime;
 
   const ext = path.extname(String(name || '')).toLowerCase();
-  if (/^\.(apng|avif|gif|jpe?g|png|svg|webp)$/.test(ext)) return ext;
-  return '.png';
+  if (/^\.(apng|avif|gif|jpe?g|png|svg|webp|mp4|webm|mov|m4v|ogv|mkv|avi)$/.test(ext)) return ext;
+  return normalizedMimeType.startsWith('video/') ? '.mp4' : '.png';
 };
 
 const sanitizeAttachmentName = (name) => {
@@ -2035,6 +2060,632 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
   return { start, handleMessage };
 };
 
+// ---------------------------------------------------------------------------
+// Claude persistent sessions (Agent SDK). The one-shot `claude --print` spawn
+// ends the harness process with every turn, which kills any background
+// subagents the model left running and silences the task notifications that
+// are supposed to re-invoke it — long multi-phase runs died at each turn
+// boundary. Claude turns therefore run on a persistent Agent SDK session per
+// thread: one CLI process spans the whole conversation, user turns are pushed
+// over stream-json stdin, steer/stop interrupt the turn in place instead of
+// SIGTERMing the process, and turns the harness starts on its own (a
+// background task finishing) are emitted as `started` events flagged
+// `background` so the renderer can grow the transcript. `/btw` asides and
+// title generation keep the one-shot CLI path.
+
+let claudeSdkQueryPromise = null;
+const loadClaudeSdkQuery = () => {
+  claudeSdkQueryPromise ??= import('@anthropic-ai/claude-agent-sdk').then((sdk) => sdk.query);
+  return claudeSdkQueryPromise;
+};
+
+// The SDK defaults to its own pinned CLI binary; prefer the claude the user
+// installed so persistent sessions run the same version, login, and settings
+// the one-shot spawn path used. Falls back to the SDK's binary if missing.
+let claudeBinaryPromise = null;
+const resolveClaudeBinary = () => {
+  claudeBinaryPromise ??= execFileAsync(loginShell, ['-lc', 'command -v claude'], { timeout: 4000 })
+    .then(({ stdout }) => stdout.trim().split('\n').pop()?.trim() || null)
+    .catch(() => null);
+  return claudeBinaryPromise;
+};
+
+const claudeSdkSessions = new Map(); // threadId -> session
+
+// Legacy extra-flags string ("--foo bar --baz") -> SDK extraArgs map.
+const claudeExtraArgsMap = (extraArgsString) => {
+  const tokens = parseExtraArgs(extraArgsString);
+  const map = {};
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!token.startsWith('--')) continue;
+    const key = token.slice(2);
+    const eq = key.indexOf('=');
+    if (eq !== -1) {
+      map[key.slice(0, eq)] = key.slice(eq + 1);
+      continue;
+    }
+    const next = tokens[i + 1];
+    if (next !== undefined && !next.startsWith('--')) {
+      map[key] = next;
+      i += 1;
+    } else {
+      map[key] = null;
+    }
+  }
+  return map;
+};
+
+const claudeSdkOptionsForInput = (model, input) => {
+  const accessMode = input.accessMode || 'full-access';
+  const providerOptions =
+    input.providerOptions && typeof input.providerOptions === 'object' ? input.providerOptions : {};
+  const reasoningEffort = input.claudeReasoningEffort || defaultClaudeReasoningEffort;
+  const contextWindow = input.claudeContextWindow || defaultClaudeContextWindow;
+  const allowedTools =
+    accessMode !== 'full-access'
+      ? String(providerOptions.allowedTools || '')
+          .split(',')
+          .map((tool) => tool.trim())
+          .filter(Boolean)
+      : [];
+  return {
+    model: claudeModelArgForContextWindow(model.slug, contextWindow),
+    effort: claudeEffortForCli(reasoningEffort),
+    accessMode,
+    ultracode: reasoningEffort === 'ultracode',
+    allowedTools,
+    extraArgs: claudeExtraArgsMap(providerOptions.extraArgs),
+  };
+};
+
+// Async iterable the SDK reads user turns from; push() hands the next turn to
+// a paused reader, close() ends the stream (and with it the CLI process).
+const createClaudeInputQueue = () => {
+  const pending = [];
+  let wake = null;
+  let closed = false;
+  return {
+    push(message) {
+      pending.push(message);
+      if (wake) {
+        const resolve = wake;
+        wake = null;
+        resolve();
+      }
+    },
+    close() {
+      closed = true;
+      if (wake) {
+        const resolve = wake;
+        wake = null;
+        resolve();
+      }
+    },
+    async *stream() {
+      while (true) {
+        while (pending.length > 0) yield pending.shift();
+        if (closed) return;
+        await new Promise((resolve) => {
+          wake = resolve;
+        });
+      }
+    },
+  };
+};
+
+const claudeStatsFromResult = (result) => {
+  const usage = result?.usage;
+  if (!usage || typeof usage !== 'object') return null;
+  const cachedRead = usage.cache_read_input_tokens ?? 0;
+  const inputTokens =
+    (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + cachedRead;
+  const outputTokens = usage.output_tokens ?? 0;
+  if (inputTokens + outputTokens <= 0) return null;
+  return {
+    totalTokens: inputTokens + outputTokens,
+    inputTokens,
+    outputTokens,
+    cachedReadTokens: cachedRead,
+  };
+};
+
+const CLAUDE_SDK_REASONING_EMIT_INTERVAL_MS = 150;
+
+const createClaudeTurnState = (runId, snapshot) => ({
+  runId,
+  snapshot,
+  streamContext: { textSeen: false },
+  knownToolActivities: new Map(),
+  reasoningText: '',
+  reasoningEmitTimer: null,
+  lastReasoningEmitAt: 0,
+});
+
+const sendClaudeTurnReasoning = (session, turn, status = 'running') => {
+  const detail = turn.reasoningText.trim();
+  if (!detail) return;
+  emitAgentEvent(session.sender, {
+    runId: turn.runId,
+    threadId: session.threadId,
+    type: 'activity',
+    activity: { key: `${turn.runId}:reasoning`, type: 'thought', title: 'Reasoning', detail, status },
+  });
+};
+
+const queueClaudeTurnReasoning = (session, turn) => {
+  const elapsed = Date.now() - turn.lastReasoningEmitAt;
+  if (elapsed >= CLAUDE_SDK_REASONING_EMIT_INTERVAL_MS) {
+    turn.lastReasoningEmitAt = Date.now();
+    sendClaudeTurnReasoning(session, turn);
+    return;
+  }
+  if (turn.reasoningEmitTimer) return;
+  turn.reasoningEmitTimer = setTimeout(() => {
+    turn.reasoningEmitTimer = null;
+    turn.lastReasoningEmitAt = Date.now();
+    sendClaudeTurnReasoning(session, turn);
+  }, CLAUDE_SDK_REASONING_EMIT_INTERVAL_MS - elapsed);
+};
+
+const finishClaudeTurnReasoning = (session, turn) => {
+  if (turn.reasoningEmitTimer) {
+    clearTimeout(turn.reasoningEmitTimer);
+    turn.reasoningEmitTimer = null;
+  }
+  sendClaudeTurnReasoning(session, turn, 'done');
+};
+
+// Only model output opens a turn on its own; bookkeeping system messages
+// (background_tasks_changed, task_updated, status, ...) between turns don't.
+const claudeMessageOpensTurn = (message) =>
+  message?.type === 'assistant' ||
+  message?.type === 'stream_event' ||
+  (message?.type === 'system' && message.subtype === 'task_notification');
+
+const finalizeClaudeTurn = async (session, resultMessage) => {
+  const turn = session.activeTurns.shift();
+  if (!turn) return;
+  finishClaudeTurnReasoning(session, turn);
+  let changedFiles = [];
+  try {
+    changedFiles = await summarizeChangedFiles(session.projectPath, turn.snapshot);
+    // Refresh the baseline so a later harness-initiated turn attributes the
+    // files that background agents change while the thread sits idle.
+    session.lastTurnEndSnapshot = await captureGitChangeSnapshot(session.projectPath);
+  } catch {}
+  const stats = claudeStatsFromResult(resultMessage);
+  // Error results (auth failure, max turns, execution error) must not read
+  // as a finished run. When subtype is 'success' the error text has already
+  // streamed as a chunk via the adapter, so keep the event's message short.
+  const resultIsError = resultMessage?.is_error === true;
+  let errorText = null;
+  if (resultIsError) {
+    const details = Array.isArray(resultMessage.errors)
+      ? resultMessage.errors.filter(Boolean).join('; ')
+      : '';
+    errorText =
+      details ||
+      (resultMessage.subtype && resultMessage.subtype !== 'success'
+        ? `Claude ended the turn with an error (${resultMessage.subtype}).`
+        : 'Claude reported an error for this turn.');
+  }
+  emitAgentEvent(session.sender, {
+    runId: turn.runId,
+    threadId: session.threadId,
+    type: resultIsError ? 'error' : 'done',
+    exitCode: resultIsError ? 1 : 0,
+    changedFiles,
+    ...(stats ? { stats } : {}),
+    ...(errorText ? { error: errorText } : {}),
+  });
+};
+
+const handleClaudeSessionMessage = async (session, message) => {
+  if (!session.sessionId) {
+    const sessionId = extractSessionIdFromJsonEvent('claude', message);
+    if (sessionId) {
+      session.sessionId = sessionId;
+      const runId = session.activeTurns[0]?.runId;
+      if (runId) {
+        emitAgentEvent(session.sender, {
+          runId,
+          threadId: session.threadId,
+          type: 'session',
+          providerId: 'claude',
+          sessionId,
+        });
+      }
+    }
+  }
+  if (message?.type === 'system' && message.subtype === 'init') session.sawInit = true;
+
+  let turn = session.activeTurns[0];
+  if (!turn && claudeMessageOpensTurn(message)) {
+    // The harness re-invoked the model between user turns (a background
+    // subagent finished). Open a synthetic turn; the renderer adds a message.
+    turn = createClaudeTurnState(crypto.randomUUID(), session.lastTurnEndSnapshot);
+    session.activeTurns.push(turn);
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'started',
+      background: true,
+      command: 'claude — background work continued',
+    });
+  }
+  if (!turn) return;
+
+  if (message?.type === 'system' && message.subtype === 'task_notification') {
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity: {
+        key: `task:${message.task_id ?? crypto.randomUUID()}`,
+        type: 'tool',
+        title: `Background task ${message.status ?? 'update'}`,
+        detail: stringifySummary(message.summary ?? message.task_id, 300),
+        status: 'done',
+      },
+    });
+    return;
+  }
+
+  // The SDK yields the same message shapes the CLI's stream-json emits, so
+  // the one-shot path's claude adapter functions apply unchanged.
+  if (
+    message?.type !== 'assistant' &&
+    message?.type !== 'user' &&
+    message?.type !== 'stream_event' &&
+    message?.type !== 'result'
+  ) {
+    return;
+  }
+
+  const reasoningDelta = extractClaudeReasoningFromJsonEvent(message, turn.streamContext);
+  if (reasoningDelta) {
+    turn.reasoningText = `${turn.reasoningText}${reasoningDelta}`;
+    queueClaudeTurnReasoning(session, turn);
+  }
+
+  for (const { updateForKey, ...activity } of extractActivitiesFromJsonEvent(message)) {
+    if (updateForKey) {
+      const known = turn.knownToolActivities.get(updateForKey);
+      if (known) {
+        emitAgentEvent(session.sender, {
+          runId: turn.runId,
+          threadId: session.threadId,
+          type: 'activity',
+          activity: {
+            ...known,
+            key: updateForKey,
+            status: activity.status === 'error' || activity.type === 'error' ? 'error' : 'done',
+          },
+        });
+        continue;
+      }
+    }
+    if (activity.key) {
+      const { key, status, ...rest } = activity;
+      turn.knownToolActivities.set(key, rest);
+    }
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity,
+    });
+  }
+
+  const text = extractClaudeTextFromJsonEvent(message, turn.streamContext);
+  if (text) {
+    turn.streamContext.textSeen = true;
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'chunk',
+      chunk: text,
+    });
+  }
+
+  if (message?.type === 'result') {
+    await finalizeClaudeTurn(session, message);
+  }
+};
+
+const endClaudeSession = (session, error) => {
+  if (session.ended) return;
+  session.ended = true;
+  if (claudeSdkSessions.get(session.threadId) === session) {
+    claudeSdkSessions.delete(session.threadId);
+  }
+
+  const pendingTurns = session.activeTurns.splice(0);
+
+  // The stored session may be gone (harness cache cleared, expired, or a CLI
+  // update): the process dies before its init event. Retry once fresh,
+  // re-driving the same runId so the renderer's message keeps streaming.
+  if (
+    error &&
+    !session.disposed &&
+    !session.sawInit &&
+    session.resumeSessionId &&
+    session.firstPrompt &&
+    pendingTurns.length > 0
+  ) {
+    emitAgentEvent(session.sender, {
+      runId: pendingTurns[0].runId,
+      threadId: session.threadId,
+      type: 'chunk',
+      chunk: '_Could not resume the previous session; starting a fresh one._\n\n',
+    });
+    const fresh = createClaudeSdkSession({
+      ...session.createParams,
+      resumeSessionId: null,
+      forkSession: false,
+    });
+    claudeSdkSessions.set(session.threadId, fresh);
+    fresh.activeTurns.push(pendingTurns[0]);
+    fresh
+      .start()
+      .then(() => fresh.pushUserMessage(session.firstPrompt))
+      .catch((startError) => {
+        fresh.dispose();
+        endClaudeSession(fresh, startError);
+      });
+    return;
+  }
+
+  for (const turn of pendingTurns) {
+    finishClaudeTurnReasoning(session, turn);
+    const stderrTail = session.stderrTail.trim();
+    const errorText = session.disposed
+      ? null
+      : [error?.message ?? 'Claude session ended unexpectedly.', stderrTail]
+          .filter(Boolean)
+          .join('\n');
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: session.disposed ? 'done' : 'error',
+      exitCode: session.disposed ? 0 : 1,
+      changedFiles: [],
+      ...(errorText ? { error: errorText } : {}),
+    });
+  }
+};
+
+const pumpClaudeSession = async (session) => {
+  try {
+    for await (const message of session.query) {
+      if (session.disposed) break;
+      await handleClaudeSessionMessage(session, message);
+    }
+    endClaudeSession(session, null);
+  } catch (error) {
+    endClaudeSession(session, error);
+  }
+};
+
+const createClaudeSdkSession = ({
+  sender,
+  threadId,
+  projectPath,
+  model,
+  input,
+  resumeSessionId,
+  forkSession,
+}) => {
+  const sdkOptions = claudeSdkOptionsForInput(model, input);
+  const inputQueue = createClaudeInputQueue();
+  const abortController = new AbortController();
+  const session = {
+    threadId,
+    projectPath,
+    sender,
+    optionsKey: JSON.stringify([projectPath, sdkOptions]),
+    createParams: { sender, threadId, projectPath, model, input },
+    resumeSessionId: resumeSessionId ?? null,
+    sessionId: null,
+    sawInit: false,
+    firstPrompt: null,
+    activeTurns: [],
+    lastTurnEndSnapshot: null,
+    inputQueue,
+    abortController,
+    query: null,
+    stderrTail: '',
+    disposed: false,
+    ended: false,
+  };
+
+  session.pushUserMessage = (text) => {
+    if (session.firstPrompt === null) session.firstPrompt = text;
+    inputQueue.push({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text }] },
+      parent_tool_use_id: null,
+    });
+  };
+
+  session.start = async () => {
+    const [queryFn, claudeBinary] = await Promise.all([loadClaudeSdkQuery(), resolveClaudeBinary()]);
+    session.query = queryFn({
+      prompt: inputQueue.stream(),
+      options: {
+        cwd: projectPath,
+        model: sdkOptions.model,
+        effort: sdkOptions.effort,
+        includePartialMessages: true,
+        // Match the CLI's behavior: without this the SDK loads no user or
+        // project settings — no CLAUDE.md, no skills, no MCP servers.
+        settingSources: ['user', 'project', 'local'],
+        ...(sdkOptions.ultracode ? { settings: JSON.stringify({ ultracode: true }) } : {}),
+        ...(sdkOptions.accessMode === 'full-access'
+          ? { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }
+          : { permissionMode: sdkOptions.accessMode === 'read-only' ? 'plan' : 'acceptEdits' }),
+        ...(sdkOptions.allowedTools.length > 0 ? { allowedTools: sdkOptions.allowedTools } : {}),
+        ...(Object.keys(sdkOptions.extraArgs).length > 0 ? { extraArgs: sdkOptions.extraArgs } : {}),
+        ...(resumeSessionId ? { resume: resumeSessionId } : {}),
+        ...(forkSession ? { forkSession: true } : {}),
+        ...(claudeBinary ? { pathToClaudeCodeExecutable: claudeBinary } : {}),
+        abortController,
+        stderr: (data) => {
+          session.stderrTail = `${session.stderrTail}${data}`.slice(-2000);
+        },
+        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      },
+    });
+    void pumpClaudeSession(session);
+  };
+
+  session.dispose = () => {
+    if (session.disposed) return;
+    session.disposed = true;
+    inputQueue.close();
+    try {
+      abortController.abort();
+    } catch {}
+  };
+
+  return session;
+};
+
+const runClaudeSdkTurn = async ({ sender, input, model, runId }) => {
+  const threadId = input.threadId;
+  const prompt =
+    input.claudeReasoningEffort === 'ultrathink' ? `ultrathink\n\n${input.prompt}` : input.prompt;
+
+  // The window can close and reopen (macOS keeps the app alive) while
+  // sessions persist; a session bound to the old, destroyed webContents would
+  // silently drop every event. Rebind to the live renderer on each turn.
+  for (const persisted of claudeSdkSessions.values()) {
+    if (persisted.sender.isDestroyed()) {
+      persisted.sender = sender;
+      persisted.createParams.sender = sender;
+    }
+  }
+
+  const sdkOptions = claudeSdkOptionsForInput(model, input);
+  const optionsKey = JSON.stringify([input.projectPath, sdkOptions]);
+  const existing = claudeSdkSessions.get(threadId);
+  let session =
+    existing && !existing.ended && !existing.disposed && existing.optionsKey === optionsKey
+      ? existing
+      : null;
+  if (session) {
+    session.sender = sender;
+    session.createParams.sender = sender;
+  }
+
+  if (existing && !session) {
+    // Model, effort, access mode, or project changed: replace the harness
+    // process, resuming the same conversation. Background agents started by
+    // the old process do not survive this.
+    existing.dispose();
+  }
+
+  if (!session) {
+    const resumeSessionId =
+      existing?.sessionId ??
+      (typeof input.resumeSessionId === 'string' && input.resumeSessionId
+        ? input.resumeSessionId
+        : null);
+    // A branched thread's first turn forks the parent session instead of
+    // resuming it in place; replacement sessions resume their own id.
+    const forkSession = Boolean(input.forkSession) && Boolean(resumeSessionId) && !existing;
+    session = createClaudeSdkSession({
+      sender,
+      threadId,
+      projectPath: input.projectPath,
+      model,
+      input,
+      resumeSessionId,
+      forkSession,
+    });
+    claudeSdkSessions.set(threadId, session);
+    try {
+      await session.start();
+    } catch (error) {
+      session.dispose();
+      if (claudeSdkSessions.get(threadId) === session) claudeSdkSessions.delete(threadId);
+      return { ok: false, error: error?.message ?? String(error) };
+    }
+  }
+
+  const snapshot = await captureGitChangeSnapshot(input.projectPath);
+  const turn = createClaudeTurnState(runId, snapshot);
+  session.activeTurns.push(turn);
+  emitAgentEvent(sender, {
+    runId,
+    threadId,
+    type: 'started',
+    command: `claude --model ${sdkOptions.model} --effort ${sdkOptions.effort} (persistent session)`,
+  });
+  if (session.sessionId) {
+    emitAgentEvent(sender, {
+      runId,
+      threadId,
+      type: 'session',
+      providerId: 'claude',
+      sessionId: session.sessionId,
+    });
+  }
+  session.pushUserMessage(prompt);
+  return { ok: true, runId };
+};
+
+const interruptClaudeSdkRun = async (runId, { terminateBackground = false } = {}) => {
+  for (const session of claudeSdkSessions.values()) {
+    if (session.activeTurns.some((turn) => turn.runId === runId)) {
+      if (terminateBackground) {
+        // Explicit Stop: the user wants ALL work halted, including background
+        // subagents still mutating the working tree. Interrupt is best-effort
+        // (flushes an interrupted result into the transcript), then the whole
+        // harness process is torn down; the next turn resumes the
+        // conversation in a fresh process via the stored session id.
+        try {
+          await Promise.race([
+            session.query?.interrupt?.(),
+            new Promise((resolve) => setTimeout(resolve, 1000)),
+          ]);
+        } catch {}
+        disposeClaudeSdkSession(session.threadId);
+        return true;
+      }
+      // Steer: interrupt the turn in place; the session and any background
+      // subagents it spawned keep running. Await the CLI's acknowledgement so
+      // the steer's follow-up prompt (pushed right after stopTurn resolves)
+      // can't race the interrupt and be swallowed with the aborted turn —
+      // but cap the wait so a wedged process can never hang the renderer.
+      try {
+        await Promise.race([
+          session.query?.interrupt?.(),
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+      } catch {}
+      return true;
+    }
+  }
+  return false;
+};
+
+const disposeClaudeSdkSession = (threadId) => {
+  const session = claudeSdkSessions.get(threadId);
+  if (!session) return false;
+  // Remove first so a late pump completion cannot affect a replacement
+  // session created for the same thread id.
+  claudeSdkSessions.delete(threadId);
+  session.dispose();
+  return true;
+};
+
+const disposeAllClaudeSdkSessions = () => {
+  for (const session of claudeSdkSessions.values()) session.dispose();
+  claudeSdkSessions.clear();
+};
+
 // grok's stream ends with an explicit {"type":"end","stopReason":...} event,
 // but the process (or a background process it spawned that inherited its
 // pipes) can outlive it — treat the event itself as the completion signal.
@@ -3156,27 +3807,79 @@ app.whenReady().then(async () => {
   protocol.handle(attachmentProtocol, async (request) => {
     try {
       const url = new URL(request.url);
-      const requestedPath = url.searchParams.get('path');
+      // The renderer may pass several `path` candidates for one media
+      // reference (e.g. a relative markdown path resolved against the project
+      // dir and against the grok session dir) — serve the first that exists.
+      const requestedPaths = url.searchParams.getAll('path');
       const attachmentDir = path.resolve(getAttachmentDirectoryPath());
-      const filePath = requestedPath
-        ? path.resolve(requestedPath)
-        : path.resolve(
-            getAttachmentDirectoryPath(),
-            path.basename(decodeURIComponent(url.pathname.replace(/^\/+/, '')))
-          );
-      const isSavedAttachment = filePath.startsWith(`${attachmentDir}${path.sep}`);
-      const isImagePreview = imagePreviewExtensions.has(path.extname(filePath).toLowerCase());
+      const candidatePaths = requestedPaths.length
+        ? requestedPaths.map((requestedPath) =>
+            path.resolve(
+              /^~[\\/]/.test(requestedPath)
+                ? path.join(os.homedir(), requestedPath.slice(2))
+                : requestedPath
+            )
+          )
+        : [
+            path.resolve(
+              getAttachmentDirectoryPath(),
+              path.basename(decodeURIComponent(url.pathname.replace(/^\/+/, '')))
+            ),
+          ];
 
-      if (!isSavedAttachment && !isImagePreview) {
+      let filePath = null;
+      let stats = null;
+      for (const candidate of candidatePaths) {
+        const isSavedAttachment = candidate.startsWith(`${attachmentDir}${path.sep}`);
+        const isMediaPreview = mediaPreviewExtensions.has(path.extname(candidate).toLowerCase());
+        if (!isSavedAttachment && !isMediaPreview) continue;
+        const candidateStats = await fs.stat(candidate).catch(() => null);
+        if (candidateStats?.isFile()) {
+          filePath = candidate;
+          stats = candidateStats;
+          break;
+        }
+      }
+      if (!filePath) {
         return new Response('Not found', { status: 404 });
       }
 
-      const data = await fs.readFile(filePath);
-      return new Response(data, {
-        headers: {
-          'content-type': getMimeTypeForImagePath(filePath),
-          'cache-control': 'no-store',
-        },
+      const headers = {
+        'content-type': getMimeTypeForMediaPath(filePath),
+        'cache-control': 'no-store',
+        'accept-ranges': 'bytes',
+      };
+
+      if (stats.size === 0) {
+        return new Response(new Uint8Array(), { headers });
+      }
+
+      // Honor Range requests so <video> can seek.
+      let start = 0;
+      let end = stats.size - 1;
+      let status = 200;
+      const rangeMatch = /^bytes=(\d*)-(\d*)$/.exec(request.headers.get('range') ?? '');
+      if (rangeMatch && (rangeMatch[1] || rangeMatch[2])) {
+        if (rangeMatch[1]) {
+          start = Number(rangeMatch[1]);
+          if (rangeMatch[2]) end = Math.min(end, Number(rangeMatch[2]));
+        } else {
+          start = Math.max(0, stats.size - Number(rangeMatch[2]));
+        }
+        if (start > end || start >= stats.size) {
+          return new Response('Range not satisfiable', {
+            status: 416,
+            headers: { 'content-range': `bytes */${stats.size}` },
+          });
+        }
+        status = 206;
+        headers['content-range'] = `bytes ${start}-${end}/${stats.size}`;
+      }
+      headers['content-length'] = String(end - start + 1);
+
+      return new Response(Readable.toWeb(createReadStream(filePath, { start, end })), {
+        status,
+        headers,
       });
     } catch {
       return new Response('Not found', { status: 404 });
@@ -3214,9 +3917,19 @@ app.whenReady().then(async () => {
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
+  // On macOS the main process remains alive after the last window closes.
+  // Tear down persistent sessions so their output is not sent to destroyed
+  // webContents and background agents cannot keep working invisibly.
+  disposeAllClaudeSdkSessions();
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+// Persistent claude sessions outlive individual turns; kill their CLI
+// processes (and any background subagents inside them) when Orion exits.
+app.on('will-quit', () => {
+  disposeAllClaudeSdkSessions();
 });
 
 // In this file you can include the rest of your app's specific main process
@@ -4118,13 +4831,17 @@ ipcMain.handle('attachment:saveImage', async (_event, input) => {
     const originalName = sanitizeAttachmentName(input?.name);
     const data = input?.data;
 
-    if (!data || (!mimeType.startsWith('image/') && !/\.(apng|avif|gif|jpe?g|png|svg|webp)$/i.test(originalName))) {
-      return { ok: false, error: 'Only image attachments are supported.' };
+    const isImage =
+      mimeType.startsWith('image/') || /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i.test(originalName);
+    const isVideo =
+      mimeType.startsWith('video/') || /\.(mp4|webm|mov|m4v|ogv|mkv|avi)$/i.test(originalName);
+    if (!data || (!isImage && !isVideo)) {
+      return { ok: false, error: 'Only image and video attachments are supported.' };
     }
 
     const id = crypto.randomUUID();
-    const ext = extensionFromImageInput(originalName, mimeType);
-    const nameWithoutExtension = originalName.replace(/\.[^.]+$/, '') || 'image';
+    const ext = extensionFromMediaInput(originalName, mimeType);
+    const nameWithoutExtension = originalName.replace(/\.[^.]+$/, '') || 'file';
     const safeFileName = `${id}-${nameWithoutExtension}${ext}`;
     const attachmentDir = getAttachmentDirectoryPath();
     const filePath = path.join(attachmentDir, safeFileName);
@@ -4139,7 +4856,7 @@ ipcMain.handle('attachment:saveImage', async (_event, input) => {
         id,
         name: originalName,
         path: filePath,
-        mimeType: mimeType || 'image/*',
+        mimeType: mimeType || (isVideo ? 'video/*' : 'image/*'),
         size: buffer.byteLength,
       },
     };
@@ -4281,6 +4998,15 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     }
 
     const runId = input.runId || crypto.randomUUID();
+
+    // Claude turns run on a persistent Agent SDK session (one CLI process per
+    // thread) so background subagents and their task notifications survive
+    // turn boundaries. `/btw` asides must not touch the thread's live
+    // session, so they keep the one-shot forked-CLI path below.
+    if (model.providerId === 'claude' && !input.aside) {
+      return await runClaudeSdkTurn({ sender: event.sender, input, model, runId });
+    }
+
     const beforeSnapshot = await captureGitChangeSnapshot(input.projectPath);
     const jsonMode = sendsJsonEvents(model.providerId);
     const adapter = jsonAdapterForProvider(model.providerId);
@@ -4706,13 +5432,19 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
   }
 });
 
-ipcMain.handle('agent:stopTurn', async (_event, runId) => {
+ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
+  if (await interruptClaudeSdkRun(runId, options)) return true;
   const child = activeAgentRuns.get(runId);
   if (!child) return false;
   stoppedAgentRuns.add(runId);
   child.kill('SIGTERM');
   activeAgentRuns.delete(runId);
   return true;
+});
+
+ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
+  if (typeof threadId !== 'string' || !threadId) return false;
+  return disposeClaudeSdkSession(threadId);
 });
 
 // Generate a short, relevant title for a thread based on the first user prompt.
