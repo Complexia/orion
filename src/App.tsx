@@ -594,11 +594,11 @@ const buildOrchestrationContext = (
   ];
   if (accessMode === 'read-only') {
     lines.push(
-      'Access mode: Read only. Every delegated CLI must remain read-only: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`; cursor uses `--mode plan --sandbox enabled`; grok uses `--permission-mode plan`. Never use bypass, force, auto-approve, or browser-control flags.'
+      'Access mode: Read only. Every delegated CLI must remain read-only: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`; cursor uses `--mode plan --sandbox enabled`; grok uses `--permission-mode plan`. Never use bypass, force, auto-approve, or browser-control flags. Kimi may only be delegated through the `spawn_subagent` tool, whose child inherits this access mode; never invoke kimi prompt mode directly because it auto-approves every tool and cannot be made read-only.'
     );
   } else if (accessMode === 'workspace-write') {
     lines.push(
-      'Access mode: Workspace write. Delegated CLIs must remain sandboxed to the workspace: codex uses `--sandbox workspace-write`; claude uses `--permission-mode acceptEdits`; cursor uses `--sandbox enabled --force`; grok uses `--permission-mode acceptEdits`. Do not disable a sandbox or use unrestricted bypass flags.'
+      'Access mode: Workspace write. Delegated CLIs must remain sandboxed to the workspace: codex uses `--sandbox workspace-write`; claude uses `--permission-mode acceptEdits`; cursor uses `--sandbox enabled --force`; grok uses `--permission-mode acceptEdits`. Do not disable a sandbox or use unrestricted bypass flags. Kimi may only be delegated through the `spawn_subagent` tool, whose child inherits this access mode; never invoke kimi prompt mode directly because it auto-approves every tool and cannot be sandboxed.'
     );
   } else {
     lines.push(
@@ -1809,7 +1809,7 @@ const PROVIDER_AUTH_ERROR_PATTERNS: RegExp[] = [
   /\bunauthenticated\b/i,
   /\b401\b[^\n]{0,40}unauthorized/i,
   /unauthorized[^\n]{0,40}\b401\b/i,
-  /run\s+`?(codex|cursor-agent|grok|opencode|claude)\s+(auth\s+)?login/i,
+  /run\s+`?(codex|cursor-agent|grok|opencode|claude|kimi)\s+(auth\s+)?login/i,
   /please (log ?in|sign ?in)/i,
 ];
 
@@ -3548,7 +3548,27 @@ const App: React.FC = () => {
     const offActivity = window.orion.onTerminalActivity((event) => {
       const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
       if (!thread || thread.modelId !== claudeCodeCliModelId) return;
-      if (event.kind === 'started' && thread.status === 'running') return;
+      if (event.kind === 'turn-complete') {
+        // Claude's Stop hook fired: the turn is done even though the TUI (and
+        // its PTY) stay alive waiting for the next prompt.
+        if (thread.status !== 'running') return;
+        updateThread(event.threadId, {
+          status: 'done',
+          terminalActivityAt: new Date().toISOString(),
+        });
+        if (thread.linkedTask && thread.linkedTask.lastStatus === 'running') {
+          pushLinkedTaskStatus(event.threadId, 'finished');
+        }
+        return;
+      }
+      if (event.kind === 'started') {
+        // A freshly spawned/reattached TUI is idle at its prompt — record the
+        // activity for recency ordering but leave the run status alone.
+        if (thread.status !== 'running') {
+          updateThread(event.threadId, { terminalActivityAt: new Date().toISOString() });
+        }
+        return;
+      }
       updateThread(event.threadId, {
         status: 'running',
         terminalActivityAt: new Date().toISOString(),
@@ -5209,6 +5229,13 @@ const App: React.FC = () => {
             : review.mode === 'custom'
               ? 'Code review (custom instructions)'
               : 'Code review (uncommitted changes)';
+
+      // Codex titles review threads "Review Changes" — mirror that rather
+      // than leaving the default timestamp title in the sidebar. The /review
+      // path never reaches the normal send flow that seeds thread titles.
+      if (isDefaultTitle(thread.title)) {
+        updateThread(threadId, { title: 'Review Changes' });
+      }
 
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
@@ -7061,7 +7088,8 @@ const App: React.FC = () => {
                         ? status.currentVersion.replace(/^v/i, '')
                         : null;
                       const hasUpdate = !!status?.updateAvailable;
-                      const isEarly = provider.id === 'cursor' || provider.id === 'grok';
+                      const isEarly =
+                        provider.id === 'cursor' || provider.id === 'grok' || provider.id === 'kimi';
 
                       // Determine subtitle
                       let subtitle = '';

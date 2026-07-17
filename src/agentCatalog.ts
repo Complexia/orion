@@ -3,12 +3,20 @@ import {
   CodexBrandIcon,
   CursorBrandIcon,
   GrokBrandIcon,
+  KimiBrandIcon,
   OpenCodeBrandIcon,
   OrionBrandIcon,
   type ProviderIconComponent,
 } from './providerIcons';
 
-export type AgentProviderId = 'orion' | 'grok' | 'codex' | 'claude' | 'cursor' | 'opencode';
+export type AgentProviderId =
+  | 'orion'
+  | 'grok'
+  | 'codex'
+  | 'claude'
+  | 'cursor'
+  | 'kimi'
+  | 'opencode';
 
 export type AgentModel = {
   id: string;
@@ -232,6 +240,19 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
     },
   ],
   cursor: [extraArgsOption('cursor-agent')],
+  // Kimi turns run over `kimi acp` (ACP over stdio), which takes no
+  // model/permission flags — those travel in the JSON-RPC dialog. Extra flags
+  // are inserted before the `acp` subcommand (e.g. --skills-dir, --add-dir).
+  kimi: [
+    {
+      key: 'extraArgs',
+      label: 'Extra CLI flags',
+      description:
+        'Inserted before the `acp` subcommand on every kimi invocation (e.g. --skills-dir, --add-dir). Quotes are respected.',
+      type: 'string',
+      placeholder: '--add-dir /path',
+    },
+  ],
   opencode: [extraArgsOption('opencode')],
 };
 
@@ -248,6 +269,8 @@ export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; 
   codex: { queue: true, steer: true },
   claude: { queue: true, steer: true },
   cursor: { queue: true, steer: true },
+  // kimi resumes over ACP session/load, so interrupt+resume steering works.
+  kimi: { queue: true, steer: true },
   opencode: { queue: true, steer: false },
 };
 
@@ -256,6 +279,7 @@ export const agentProviders: AgentProvider[] = [
   { id: 'grok', label: 'Grok', icon: GrokBrandIcon },
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },
   { id: 'claude', label: 'Claude', icon: ClaudeBrandIcon },
+  { id: 'kimi', label: 'Kimi', icon: KimiBrandIcon },
   { id: 'cursor', label: 'Cursor', icon: CursorBrandIcon },
   { id: 'opencode', label: 'OpenCode', icon: OpenCodeBrandIcon },
 ];
@@ -406,6 +430,31 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Code CLI',
     slug: 'claude-code-cli',
+  },
+  {
+    id: 'kimi:kimi-code/k3',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3',
+    slug: 'kimi-code/k3',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
+    id: 'kimi:kimi-code/kimi-for-coding',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K2.7 Coding',
+    slug: 'kimi-code/kimi-for-coding',
+    shortcut: '⌘2',
+  },
+  {
+    id: 'kimi:kimi-code/kimi-for-coding-highspeed',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K2.7 Coding Highspeed',
+    slug: 'kimi-code/kimi-for-coding-highspeed',
+    shortcut: '⌘3',
   },
   {
     id: 'cursor:composer-2.5',

@@ -1,7 +1,17 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell, systemPreferences } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { copyFileSync, createReadStream, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import {
+  copyFileSync,
+  createReadStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  readdirSync,
+  realpathSync,
+  watch as watchFsPath,
+} from 'node:fs';
 import { Readable } from 'node:stream';
 import os from 'node:os';
 import http from 'node:http';
@@ -146,6 +156,40 @@ const cursorFallbackModels = [
     label: 'Grok 4.3',
     slug: 'grok-4.3',
     command: 'cursor-agent',
+  },
+];
+
+// Kimi Code CLI ships these three managed models out of the box; the live
+// list (including any user-added providers) is discovered per launch via
+// `kimi provider list --json` and replaces this block when available.
+const kimiFallbackModels = [
+  {
+    id: 'kimi:kimi-code/k3',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3',
+    slug: 'kimi-code/k3',
+    command: 'kimi',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
+    id: 'kimi:kimi-code/kimi-for-coding',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K2.7 Coding',
+    slug: 'kimi-code/kimi-for-coding',
+    command: 'kimi',
+    shortcut: '⌘2',
+  },
+  {
+    id: 'kimi:kimi-code/kimi-for-coding-highspeed',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K2.7 Coding Highspeed',
+    slug: 'kimi-code/kimi-for-coding-highspeed',
+    command: 'kimi',
+    shortcut: '⌘3',
   },
 ];
 
@@ -331,6 +375,7 @@ const agentModels = [
     slug: 'claude-code-cli',
     command: 'claude',
   },
+  ...kimiFallbackModels,
   ...cursorFallbackModels,
   {
     id: 'opencode:anthropic/claude-sonnet-4-6',
@@ -805,18 +850,65 @@ const listCursorAgentModels = async () => {
   return [];
 };
 
-const getAgentModels = async () => {
-  const discoveredCursorModels = await listCursorAgentModels();
-  const cursorModels = discoveredCursorModels.length > 0 ? discoveredCursorModels : cursorFallbackModels;
-  const firstCursorIndex = agentModels.findIndex((model) => model.providerId === 'cursor');
+// Kimi models come from the CLI's own provider registry (managed kimi-code
+// models plus any custom providers the user imported). Aliases double as
+// model slugs: they are what `-m` and the ACP model config option accept.
+const listKimiModels = async () => {
+  if (!(await checkCommandAvailable('kimi'))) return [];
+  try {
+    const { stdout } = await execFileAsync('kimi', ['provider', 'list', '--json'], {
+      timeout: 15000,
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+    });
+    const parsed = JSON.parse(String(stdout || '').trim());
+    const models = parsed?.models && typeof parsed.models === 'object' ? parsed.models : {};
+    // The CLI registry's key order puts newer models last; pin K3 to the top
+    // of the picker (stable sort keeps the rest in registry order).
+    return Object.entries(models)
+      .sort(([a], [b]) => Number(b === 'kimi-code/k3') - Number(a === 'kimi-code/k3'))
+      .map(([alias, value], index) => {
+        if (!alias || typeof alias !== 'string') return null;
+        const label =
+          (value && typeof value === 'object' && typeof value.displayName === 'string' && value.displayName) ||
+          humanizeModelSlug(alias);
+        return {
+          id: `kimi:${alias}`,
+          providerId: 'kimi',
+          providerLabel: 'Kimi',
+          label,
+          slug: alias,
+          command: 'kimi',
+          ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+          favorite: alias === 'kimi-code/k3',
+        };
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+};
 
-  if (firstCursorIndex === -1) return [...agentModels, ...cursorModels];
-
+// Replace a provider's static catalog block with its discovered models,
+// keeping the block's position in the picker order.
+const spliceProviderModels = (models, providerId, replacements) => {
+  if (replacements.length === 0) return models;
+  const firstIndex = models.findIndex((model) => model.providerId === providerId);
+  if (firstIndex === -1) return [...models, ...replacements];
   return [
-    ...agentModels.slice(0, firstCursorIndex).filter((model) => model.providerId !== 'cursor'),
-    ...cursorModels,
-    ...agentModels.slice(firstCursorIndex).filter((model) => model.providerId !== 'cursor'),
+    ...models.slice(0, firstIndex).filter((model) => model.providerId !== providerId),
+    ...replacements,
+    ...models.slice(firstIndex).filter((model) => model.providerId !== providerId),
   ];
+};
+
+const getAgentModels = async () => {
+  const [discoveredCursorModels, discoveredKimiModels] = await Promise.all([
+    listCursorAgentModels(),
+    listKimiModels(),
+  ]);
+  let models = spliceProviderModels(agentModels, 'cursor', discoveredCursorModels);
+  models = spliceProviderModels(models, 'kimi', discoveredKimiModels);
+  return models;
 };
 
 const claudeEffortForCli = (reasoningEffort = defaultClaudeReasoningEffort) => {
@@ -891,6 +983,11 @@ const commandForModel = (model, input) => {
         modelArg,
         '--config',
         `model_reasoning_effort="${reasoningEffort}"`,
+        // GPT-5.6 models default to model_reasoning_summary="none" on the
+        // CLI, which silences the reviewer's narration between commands (the
+        // desktop app requests summaries). Ask for them explicitly.
+        '--config',
+        'model_reasoning_summary="detailed"',
         '--config',
         `service_tier="${input.codexServiceTier || defaultCodexServiceTier}"`,
         ...reviewAccessArgs,
@@ -907,6 +1004,10 @@ const commandForModel = (model, input) => {
     const configArgs = [
       '--config',
       `model_reasoning_effort="${reasoningEffort}"`,
+      // GPT-5.6 models default to no reasoning summaries on the CLI — request
+      // them so the Reasoning activity streams like the desktop app.
+      '--config',
+      'model_reasoning_summary="detailed"',
       '--config',
       `service_tier="${serviceTier}"`,
     ];
@@ -1116,6 +1217,18 @@ const commandForModel = (model, input) => {
     ];
   }
 
+  if (model.providerId === 'kimi') {
+    // kimi always speaks ACP (JSON-RPC over `kimi acp`): the prompt, cwd,
+    // session resume (session/load), model selection (session/set_config_option)
+    // and permission mode (session/set_mode: plan/default/yolo) all travel
+    // over the dialog, not argv. Prompt mode (`kimi -p`) is never used, even
+    // for hidden one-shot turns: it auto-approves every tool and rejects
+    // --plan ("Cannot combine --prompt with --plan" on 0.26), so it cannot
+    // honor any access mode below Full access. Title generation goes through
+    // kimiPlanModeOneShot (ACP plan mode) instead.
+    return ['kimi', ...extraArgs, 'acp'];
+  }
+
   return ['opencode', 'run', '--model', modelArg, ...extraArgs, prompt];
 };
 
@@ -1165,6 +1278,7 @@ const buildOrchestrationBlock = (orchestration) => {
     '   - claude: `claude --print --model <slug> <access flags> "<task>"`',
     '   - cursor: `cursor-agent --print --trust --workspace <cwd> --model <slug> <access flags> "<task>"`',
     '   - grok: `grok --cwd <cwd> --model <slug> <access flags> --single "<task>"`',
+    '   - kimi: `kimi -m <slug> -p "<task>"` — prompt mode auto-approves every tool and cannot be sandboxed, so only delegate to kimi when the access mode is Full access.',
     '',
     '   Iterate: inspect stdout when the command finishes, and follow up with a refined invocation if the result is incomplete.'
   );
@@ -1286,11 +1400,65 @@ const forkGrokSessionDir = async (sessionId) => {
   return null;
 };
 
+// Kimi sessions live at ~/.kimi-code/sessions/<wd-hash>/<sessionId>/ and are
+// located through ~/.kimi-code/session_index.jsonl (append-only; last entry
+// for an id wins). `session/load` accepts a copied directory registered under
+// a fresh id (verified live on kimi-code 0.26.0).
+const kimiHomeDir = () =>
+  process.env.KIMI_CODE_HOME || path.join(app.getPath('home'), '.kimi-code');
+
+const findKimiSessionIndexEntry = async (sessionId) => {
+  const indexPath = path.join(kimiHomeDir(), 'session_index.jsonl');
+  let content;
+  try {
+    content = await fs.readFile(indexPath, 'utf8');
+  } catch {
+    return null;
+  }
+  let entry = null;
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed?.sessionId === sessionId) entry = parsed;
+    } catch {}
+  }
+  return entry;
+};
+
+const forkKimiSessionDir = async (sessionId) => {
+  const entry = await findKimiSessionIndexEntry(sessionId);
+  if (!entry?.sessionDir) return null;
+  const isSessionDir = await fs
+    .stat(entry.sessionDir)
+    .then((stat) => stat.isDirectory())
+    .catch(() => false);
+  if (!isSessionDir) return null;
+
+  const newId = `session_${crypto.randomUUID()}`;
+  const newDir = path.join(path.dirname(entry.sessionDir), newId);
+  await fs.cp(entry.sessionDir, newDir, { recursive: true });
+  // state.json embeds absolute per-agent homedirs under the old session dir;
+  // repoint them at the copy so nothing in the fork references the parent.
+  const statePath = path.join(newDir, 'state.json');
+  try {
+    const state = await fs.readFile(statePath, 'utf8');
+    await fs.writeFile(statePath, state.split(sessionId).join(newId));
+  } catch {}
+  await fs.appendFile(
+    path.join(kimiHomeDir(), 'session_index.jsonl'),
+    `${JSON.stringify({ ...entry, sessionId: newId, sessionDir: newDir })}\n`
+  );
+  return newId;
+};
+
 const forkSessionOnDisk = async (providerId, sessionId) => {
   try {
     if (providerId === 'codex') return await forkCodexSessionFile(sessionId);
     if (providerId === 'cursor') return await forkCursorChatDir(sessionId);
     if (providerId === 'grok') return await forkGrokSessionDir(sessionId);
+    if (providerId === 'kimi') return await forkKimiSessionDir(sessionId);
   } catch (error) {
     console.error(`Failed to fork ${providerId} session ${sessionId}`, error);
   }
@@ -1783,6 +1951,23 @@ const extractActivitiesFromJsonEvent = (value) => {
   });
 };
 
+// kimi's prompt-mode stream-json emits whole chat messages per line:
+// {"role":"assistant","content":...,"tool_calls":[...]}, {"role":"tool",...}
+// and a trailing {"role":"meta","type":"session.resume_hint",...}. Only the
+// assistant text is transcript-worthy. Unused in practice — every kimi turn,
+// including title generation, now speaks ACP (prompt mode can't be
+// sandboxed) — but kept so kimi stays covered if a stream-json path returns.
+const extractKimiTextFromJsonEvent = (value) => {
+  if (!value || typeof value !== 'object' || value.role !== 'assistant') return '';
+  if (typeof value.content === 'string') return value.content;
+  if (Array.isArray(value.content)) {
+    return value.content
+      .map((part) => (part && typeof part === 'object' && typeof part.text === 'string' ? part.text : ''))
+      .join('');
+  }
+  return '';
+};
+
 const providerJsonAdapters = {
   claude: {
     text: extractClaudeTextFromJsonEvent,
@@ -1803,6 +1988,11 @@ const providerJsonAdapters = {
     text: extractGrokTextFromJsonEvent,
     reasoning: extractReasoningFromJsonEvent,
     activities: extractActivitiesFromJsonEvent,
+  },
+  kimi: {
+    text: extractKimiTextFromJsonEvent,
+    reasoning: () => '',
+    activities: () => [],
   },
 };
 
@@ -3070,6 +3260,821 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
 };
 
 // ---------------------------------------------------------------------------
+// Kimi ACP driver. kimi's prompt mode (`kimi -p --output-format stream-json`)
+// only emits whole chat messages — no streaming deltas, thinking, tool
+// progress, or permission dialog — so real turns run `kimi acp` and speak ACP
+// (line-delimited JSON-RPC) instead. That stream carries token-level text and
+// thought chunks, tool calls with streamed argument previews, live status and
+// terminal output, plan (todo) updates, and permission requests Orion answers
+// programmatically. Model (session/set_config_option, configId "model") and
+// permission mode (session/set_mode: plan/default/yolo) are pinned per
+// session over the dialog; verified live on kimi-code 0.26.0.
+
+const KIMI_TOOL_KINDS = {
+  Bash: 'execute',
+  Read: 'read',
+  ReadMediaFile: 'read',
+  Write: 'edit',
+  Edit: 'edit',
+  Grep: 'search',
+  Glob: 'search',
+  WebSearch: 'search',
+  FetchURL: 'fetch',
+  Agent: 'task',
+  AgentSwarm: 'task',
+};
+
+const KIMI_TOOL_LABELS = {
+  Bash: 'Command',
+  Read: 'Read',
+  ReadMediaFile: 'Read media',
+  Write: 'Write',
+  Edit: 'Edit',
+  Grep: 'Grep',
+  Glob: 'Glob',
+  WebSearch: 'Web search',
+  FetchURL: 'Web fetch',
+  Agent: 'Subagent',
+  AgentSwarm: 'Subagent swarm',
+  TodoList: 'Tasks',
+  Skill: 'Skill',
+  AskUserQuestion: 'Question',
+};
+
+const kimiToolLabel = (name) => {
+  if (!name) return 'Tool';
+  return (
+    KIMI_TOOL_LABELS[name] ??
+    String(name)
+      .replace(/[_-]+/g, ' ')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/^\w/, (letter) => letter.toUpperCase())
+  );
+};
+
+// Cumulative session token usage from the session's on-disk wire log — the
+// ACP prompt response carries no usage metadata, but kimi appends a
+// usage.record entry per LLM step. Summing the whole file gives cumulative
+// totals for the session, matching how codex reports thread token usage.
+const kimiStatsFromSessionDisk = async (sessionId) => {
+  try {
+    const entry = await findKimiSessionIndexEntry(sessionId);
+    if (!entry?.sessionDir) return null;
+    const wirePath = path.join(entry.sessionDir, 'agents', 'main', 'wire.jsonl');
+    const content = await fs.readFile(wirePath, 'utf8');
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cachedReadTokens = 0;
+    let modelId = null;
+    let seen = false;
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.includes('"usage.record"')) continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const record = parsed?.type === 'context.append_loop_event' ? parsed.event : parsed;
+      if (record?.type !== 'usage.record' || !record.usage || typeof record.usage !== 'object') {
+        continue;
+      }
+      seen = true;
+      const usage = record.usage;
+      inputTokens +=
+        (usage.inputOther ?? 0) + (usage.inputCacheRead ?? 0) + (usage.inputCacheCreation ?? 0);
+      outputTokens += usage.output ?? 0;
+      cachedReadTokens += usage.inputCacheRead ?? 0;
+      if (typeof record.model === 'string' && record.model) modelId = record.model;
+    }
+    if (!seen) return null;
+    const stats = {
+      inputTokens,
+      outputTokens,
+      cachedReadTokens,
+      totalTokens: inputTokens + outputTokens,
+    };
+    if (modelId) stats.modelId = modelId;
+    return stats;
+  } catch {
+    return null;
+  }
+};
+
+// --- kimi native subagents (Agent / AgentSwarm tools) ------------------------
+// Each spawned subagent runs as an in-process loop with its own wire log at
+// <sessionDir>/agents/<agentId>/wire.jsonl (the main agent's transcript lives
+// under agents/main/). Spawns are detected by watching the agents/ directory;
+// pre-existing agents are baselined only for resumed sessions. For new
+// sessions, an agent may appear while the session-index watcher is attaching,
+// so existing directories must still be emitted.
+
+const watchKimiSubagentSpawns = ({ sessionDir, baselineExisting, onSpawn }) => {
+  const seen = new Set(['main']);
+  const agentsDir = path.join(sessionDir, 'agents');
+  if (baselineExisting) {
+    try {
+      for (const name of readdirSync(agentsDir)) seen.add(name);
+    } catch {
+      // agents/ not created yet; the poller picks it up when it appears.
+    }
+  }
+  let stopped = false;
+  let polling = false;
+
+  const poll = async () => {
+    if (stopped || polling) return;
+    polling = true;
+    try {
+      let entries;
+      try {
+        entries = await fs.readdir(agentsDir);
+      } catch {
+        return;
+      }
+      for (const name of entries) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+        onSpawn({
+          agentId: name,
+          wirePath: path.join(agentsDir, name, 'wire.jsonl'),
+        });
+      }
+    } finally {
+      polling = false;
+    }
+  };
+
+  const timer = setInterval(() => void poll(), 1000);
+  void poll();
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+};
+
+// Translate a subagent's wire.jsonl into subagent turn events. Loop events
+// are wrapped in context.append_loop_event envelopes; unwrap before matching.
+const handleKimiSubagentLine = (value, api, ctx) => {
+  if (!value || typeof value !== 'object') return;
+  const event = value.type === 'context.append_loop_event' ? value.event : value;
+  if (!event || typeof event !== 'object') return;
+
+  if (event.type === 'turn.prompt') {
+    if (!ctx.promptSeen) {
+      ctx.promptSeen = true;
+      const text = (Array.isArray(event.input) ? event.input : [])
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+        .join('');
+      if (text) api.prompt(text);
+    }
+    return;
+  }
+
+  if (event.type === 'content.part') {
+    const part = event.part;
+    if (part?.type === 'think' && typeof part.think === 'string' && part.think) {
+      api.reasoning(`${part.think}\n\n`);
+    } else if (part?.type === 'text' && typeof part.text === 'string' && part.text) {
+      api.text(ctx.textSeen ? `\n\n${part.text}` : part.text);
+      ctx.textSeen = true;
+    }
+    return;
+  }
+
+  if (event.type === 'tool.call') {
+    const name = typeof event.name === 'string' ? event.name : '';
+    const args = event.args && typeof event.args === 'object' ? event.args : {};
+    const kind = KIMI_TOOL_KINDS[name];
+    const label = kimiToolLabel(name);
+    const detail =
+      typeof args.command === 'string'
+        ? args.command
+        : typeof args.path === 'string'
+          ? args.path
+          : typeof args.query === 'string'
+            ? args.query
+            : typeof args.url === 'string'
+              ? args.url
+              : undefined;
+    const activity = {
+      key: typeof event.toolCallId === 'string' ? event.toolCallId : undefined,
+      type: kind === 'execute' ? 'command' : 'tool',
+      title: detail ? `${label} - ${stringifySummary(detail, 80)}` : label,
+      status: 'running',
+    };
+    if (kind) activity.kind = kind;
+    if (detail) activity.detail = detail;
+    api.activity(activity);
+    return;
+  }
+
+  if (event.type === 'tool.result') {
+    if (typeof event.toolCallId === 'string') {
+      api.activity({
+        updateForKey: event.toolCallId,
+        type: 'result',
+        title: 'Tool result',
+        status: event.result?.isError ? 'error' : 'done',
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'usage.record') {
+    const usage = event.usage;
+    if (usage && typeof usage === 'object') {
+      ctx.totalTokens =
+        (ctx.totalTokens ?? 0) +
+        (usage.inputOther ?? 0) +
+        (usage.inputCacheRead ?? 0) +
+        (usage.inputCacheCreation ?? 0) +
+        (usage.output ?? 0);
+      api.stats({ totalTokens: ctx.totalTokens });
+    }
+    return;
+  }
+
+  // A step that ends without requesting tools is the end of the subagent's
+  // loop — there is no dedicated finish marker in the wire log.
+  if (event.type === 'step.end') {
+    if (typeof event.finishReason === 'string' && event.finishReason !== 'tool_use') {
+      api.finish({ status: 'done' });
+    }
+  }
+};
+
+const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, accessMode, callbacks }) => {
+  let nextRequestId = 1;
+  const pendingRequests = new Map();
+  const toolCalls = new Map();
+  // session/load replays the whole prior conversation as session/update
+  // notifications before its response resolves; Orion keeps its own
+  // transcript, so the replay is suppressed.
+  let replayingSession = false;
+  let textSeen = false;
+  let pendingTextBreak = false;
+
+  const write = (message) => {
+    try {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    } catch {}
+  };
+
+  const request = (method, params) =>
+    new Promise((resolve) => {
+      const id = nextRequestId++;
+      pendingRequests.set(id, resolve);
+      write({ jsonrpc: '2.0', id, method, params });
+    });
+
+  const buildActivity = (state) => {
+    const activity = {
+      key: state.id,
+      type: state.kind === 'execute' ? 'command' : 'tool',
+      title: state.title || kimiToolLabel(state.toolName),
+      status: state.status ?? 'running',
+    };
+    if (state.kind) activity.kind = state.kind;
+    if (state.detail) activity.detail = state.detail;
+    // Cap live output so a chatty command doesn't bloat the persisted store.
+    if (state.output) activity.output = state.output.slice(-4000);
+    if (typeof state.exitCode === 'number') activity.exitCode = state.exitCode;
+    if (state.diff) activity.diff = state.diff;
+    return activity;
+  };
+
+  // Streamed argument previews and terminal output can update many times a
+  // second; throttle output-only refreshes like the reasoning card, but
+  // always emit status changes immediately.
+  const TOOL_EMIT_INTERVAL_MS = 130;
+  const emitToolActivity = (state, immediate) => {
+    const send = () => {
+      state.emitTimer = null;
+      state.lastEmitAt = Date.now();
+      callbacks.onActivity(buildActivity(state));
+    };
+    if (immediate || Date.now() - (state.lastEmitAt ?? 0) >= TOOL_EMIT_INTERVAL_MS) {
+      if (state.emitTimer) {
+        clearTimeout(state.emitTimer);
+        state.emitTimer = null;
+      }
+      send();
+      return;
+    }
+    if (!state.emitTimer) state.emitTimer = setTimeout(send, TOOL_EMIT_INTERVAL_MS);
+  };
+
+  const flushToolEmits = () => {
+    for (const state of toolCalls.values()) {
+      if (state.emitTimer) {
+        clearTimeout(state.emitTimer);
+        state.emitTimer = null;
+        callbacks.onActivity(buildActivity(state));
+      }
+    }
+  };
+
+  const refreshToolPresentation = (state) => {
+    const label = kimiToolLabel(state.toolName);
+    // Drop the transient "Preparing…" detail once the real input lands.
+    if (!state.preparing && state.preparingDetail) {
+      state.detail = undefined;
+      state.preparingDetail = false;
+    }
+    if (state.kind === 'execute' && state.command) {
+      state.title = `Command - ${stringifySummary(state.command, 80)}`;
+      state.detail = state.command;
+    } else if ((state.kind === 'search' || state.kind === 'fetch') && state.query) {
+      state.title = `${label} - ${stringifySummary(state.query, 80)}`;
+      state.detail = state.query;
+    } else if (state.filePath) {
+      state.title = `${label} - ${stringifySummary(state.filePath, 80)}`;
+      state.detail = state.filePath;
+    } else if (state.preparing) {
+      // Argument previews stream before the full input lands — show the tool
+      // as soon as the model starts writing its input (a large file write can
+      // take a while to generate).
+      state.title = label;
+      state.detail = state.argsLength
+        ? `Preparing… (${state.argsLength.toLocaleString()} chars)`
+        : 'Preparing…';
+      state.preparingDetail = true;
+    } else if (state.kimiTitle && !KIMI_TOOL_LABELS[state.kimiTitle]) {
+      state.title = state.kimiTitle;
+    }
+  };
+
+  const upsertToolCall = (update, isNew) => {
+    const id = update.toolCallId;
+    if (typeof id !== 'string' || !id) return;
+    const created = !toolCalls.has(id);
+    let state = toolCalls.get(id);
+    if (!state) {
+      state = { id, status: 'running', preparing: true, argsLength: 0 };
+      toolCalls.set(id, state);
+    }
+    const previousStatus = state.status;
+
+    // The initial tool_call announces the tool by name in its title; later
+    // updates may replace the title with a human summary ("Running: …").
+    if (typeof update.title === 'string' && update.title) {
+      if (isNew || KIMI_TOOL_LABELS[update.title]) state.toolName = state.toolName ?? update.title;
+      state.kimiTitle = update.title;
+    }
+    const kind = update.kind ?? state.kind ?? KIMI_TOOL_KINDS[state.toolName];
+    if (kind) state.kind = kind === 'write' ? 'edit' : kind;
+
+    const rawInput = update.rawInput;
+    if (rawInput && typeof rawInput === 'object') {
+      state.preparing = false;
+      if (typeof rawInput.command === 'string') state.command = rawInput.command;
+      const filePath = rawInput.file_path ?? rawInput.path;
+      if (typeof filePath === 'string') state.filePath = filePath;
+      if (typeof rawInput.query === 'string') state.query = rawInput.query;
+      if (typeof rawInput.url === 'string') state.query = rawInput.url;
+    }
+
+    const terminal =
+      update.status === 'completed' || update.status === 'failed' || update.status === 'cancelled';
+    if (Array.isArray(update.content)) {
+      for (const entry of update.content) {
+        if (entry?.type === 'diff' && typeof entry.path === 'string') {
+          state.filePath = entry.path;
+          state.diff = {
+            path: entry.path,
+            additions: countDiffLines(entry.newText),
+            deletions: countDiffLines(entry.oldText),
+          };
+        }
+        if (entry?.type === 'content' && typeof entry.content?.text === 'string' && entry.content.text) {
+          if (state.preparing && !terminal) {
+            // Streamed tool-argument preview (partial JSON), not output.
+            // Kept whole: it is the only place the target path is visible
+            // when the permission request arrives (rawInput lands only after
+            // the tool is approved).
+            state.argsLength = entry.content.text.length;
+            state.argsPreview = entry.content.text;
+          } else {
+            state.output = entry.content.text;
+          }
+        }
+      }
+    }
+
+    // kimi's rawOutput is the tool's output snapshot (string or object).
+    const rawOutput = update.rawOutput;
+    if (typeof rawOutput === 'string' && rawOutput.trim()) {
+      state.output = rawOutput;
+    } else if (rawOutput && typeof rawOutput === 'object') {
+      if (typeof rawOutput.exit_code === 'number') state.exitCode = rawOutput.exit_code;
+      if (typeof rawOutput.output === 'string' && rawOutput.output.trim()) {
+        state.output = rawOutput.output;
+      }
+    }
+
+    if (update.status === 'completed') state.status = 'done';
+    else if (update.status === 'failed' || update.status === 'cancelled') state.status = 'error';
+    else if (update.status === 'pending' || update.status === 'in_progress') {
+      if (state.status !== 'error') state.status = 'running';
+    }
+    if (typeof state.exitCode === 'number' && state.exitCode !== 0) state.status = 'error';
+    if (terminal) state.preparing = false;
+
+    refreshToolPresentation(state);
+    emitToolActivity(state, created || state.status !== previousStatus);
+  };
+
+  const handlePlanUpdate = (entries) => {
+    const list = Array.isArray(entries) ? entries : [];
+    const total = list.length;
+    const completed = list.filter((entry) => entry?.status === 'completed').length;
+    const active = list.find((entry) => entry?.status === 'in_progress');
+    callbacks.onActivity({
+      key: 'plan',
+      type: 'plan',
+      kind: 'plan',
+      title: active
+        ? `Tasks (${completed}/${total}) - ${stringifySummary(active.content, 60)}`
+        : `Tasks (${completed}/${total})`,
+      status: total > 0 && completed === total ? 'done' : 'running',
+      plan: list.map((entry) => ({
+        content: String(entry?.content ?? ''),
+        status:
+          entry?.status === 'completed'
+            ? 'completed'
+            : entry?.status === 'in_progress'
+              ? 'in_progress'
+              : 'pending',
+      })),
+    });
+  };
+
+  // Approvals are answered by access-mode policy, mirroring the grok driver:
+  // Read only allows read-only tools; Full access runs in yolo mode and never
+  // asks. Workspace write allows file mutations only inside the workspace —
+  // kimi has no filesystem sandbox of its own, so the boundary is enforced
+  // here by resolving every reported target path against cwd, including any
+  // symlinked ancestors. Mutations that report no target path fail closed,
+  // and commands are denied outright since their filesystem reach is
+  // unknowable.
+  const workspaceRoot = path.resolve(cwd || '.');
+  let canonicalWorkspaceRoot = null;
+  try {
+    canonicalWorkspaceRoot = realpathSync(workspaceRoot);
+  } catch {}
+
+  // realpathSync requires the final target to exist, but Write commonly
+  // creates a new file. Canonicalize the deepest existing ancestor and append
+  // the missing suffix. lstatSync intentionally detects broken symlinks too:
+  // following one can still create its target outside the workspace.
+  const canonicalizeMutationTarget = (candidate, depth = 0) => {
+    if (depth > 40) throw new Error('Too many symbolic links');
+    const resolved = path.resolve(candidate);
+    let ancestor = resolved;
+    let stats;
+    while (true) {
+      try {
+        stats = lstatSync(ancestor);
+        break;
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+        const parent = path.dirname(ancestor);
+        if (parent === ancestor) throw error;
+        ancestor = parent;
+      }
+    }
+
+    const missingSuffix = path.relative(ancestor, resolved);
+    let canonicalAncestor;
+    try {
+      canonicalAncestor = realpathSync(ancestor);
+    } catch (error) {
+      if (!stats.isSymbolicLink()) throw error;
+      const canonicalParent = canonicalizeMutationTarget(path.dirname(ancestor), depth + 1);
+      canonicalAncestor = canonicalizeMutationTarget(
+        path.resolve(canonicalParent, readlinkSync(ancestor)),
+        depth + 1
+      );
+    }
+    return path.resolve(canonicalAncestor, missingSuffix);
+  };
+  const isInsideWorkspace = (candidate) => {
+    if (!canonicalWorkspaceRoot) return false;
+    try {
+      const resolvedCandidate = path.resolve(workspaceRoot, candidate);
+      const canonicalCandidate = canonicalizeMutationTarget(resolvedCandidate);
+      const relative = path.relative(canonicalWorkspaceRoot, canonicalCandidate);
+      return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+    } catch {
+      return false;
+    }
+  };
+  // kimi 0.26's permission payload carries no kind/rawInput/locations, and
+  // rawInput on tool_call updates lands only after approval — at ask time the
+  // target path lives solely in the completed argument preview (verified
+  // live), so that is the fallback of last resort.
+  const mutationTargets = (toolCall, known) => {
+    const targets = [];
+    const pushFrom = (record) => {
+      if (!record || typeof record !== 'object') return;
+      for (const key of ['file_path', 'path', 'old_path', 'new_path', 'source', 'destination']) {
+        if (typeof record[key] === 'string' && record[key]) targets.push(record[key]);
+      }
+    };
+    pushFrom(toolCall.rawInput);
+    for (const location of Array.isArray(toolCall.locations) ? toolCall.locations : []) {
+      if (typeof location?.path === 'string' && location.path) targets.push(location.path);
+    }
+    if (!targets.length && typeof known?.filePath === 'string' && known.filePath) {
+      targets.push(known.filePath);
+    }
+    if (!targets.length && typeof known?.argsPreview === 'string') {
+      try {
+        pushFrom(JSON.parse(known.argsPreview));
+      } catch {}
+    }
+    return targets;
+  };
+  const answerPermission = (message) => {
+    const params = message.params ?? {};
+    const toolCall = params.toolCall ?? {};
+    const known = typeof toolCall.toolCallId === 'string' ? toolCalls.get(toolCall.toolCallId) : null;
+    const kind =
+      toolCall.kind ??
+      known?.kind ??
+      KIMI_TOOL_KINDS[typeof toolCall.title === 'string' ? toolCall.title : ''];
+    const readOnly = kind === 'read' || kind === 'search' || kind === 'fetch' || kind === 'think';
+    let allow;
+    let denialDetail = "mode doesn't permit this tool.";
+    if (accessMode === 'full-access') {
+      allow = true;
+    } else if (accessMode !== 'workspace-write') {
+      allow = readOnly;
+    } else if (readOnly) {
+      allow = true;
+    } else if (kind === 'execute') {
+      allow = false;
+    } else {
+      const targets = mutationTargets(toolCall, known);
+      allow = targets.length > 0 && targets.every(isInsideWorkspace);
+      if (!allow) {
+        denialDetail = targets.length
+          ? 'mode only permits file changes inside the workspace.'
+          : 'mode requires a known target path for file changes.';
+      }
+    }
+
+    // A path-gated approval must never persist: choosing an "always allow"
+    // option would let kimi self-approve later calls of the same tool without
+    // asking, including ones that target paths outside the workspace.
+    const pathGated = allow && accessMode === 'workspace-write' && !readOnly;
+    const options = (Array.isArray(params.options) ? params.options : []).filter(
+      (option) =>
+        !pathGated ||
+        (option?.kind !== 'allow_always' &&
+          !/always/i.test(`${option?.optionId ?? ''} ${option?.name ?? ''}`))
+    );
+    const pick = (kinds, pattern) =>
+      kinds.map((wanted) => options.find((option) => option?.kind === wanted)).find(Boolean) ??
+      options.find((option) => pattern.test(`${option?.optionId ?? ''} ${option?.name ?? ''}`));
+    const chosen = allow
+      ? pick(['allow_once', 'allow_always'], /allow|approve|yes/i) ?? options[0]
+      : pick(['reject_once', 'reject_always'], /reject|deny|no/i);
+
+    write(
+      chosen
+        ? {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { outcome: { outcome: 'selected', optionId: chosen.optionId } },
+          }
+        : { jsonrpc: '2.0', id: message.id, result: { outcome: { outcome: 'cancelled' } } }
+    );
+
+    if (!allow && known) {
+      known.status = 'error';
+      known.output = `Skipped — ${
+        accessMode === 'read-only' ? 'Read only' : 'Workspace write'
+      } ${denialDetail} Switch to Full Access to allow it.`;
+      emitToolActivity(known, true);
+    }
+  };
+
+  const fail = (error) => {
+    flushToolEmits();
+    callbacks.onFatal(
+      typeof error === 'string' ? error : error?.message ?? 'Kimi agent protocol error.'
+    );
+  };
+
+  const start = async () => {
+    const init = await request('initialize', {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+    });
+    if (init.error) return fail(init.error);
+
+    let sessionId = null;
+    let resumed = false;
+    if (resumeSessionId) {
+      replayingSession = true;
+      const loaded = await request('session/load', {
+        sessionId: resumeSessionId,
+        cwd,
+        mcpServers: [],
+      });
+      replayingSession = false;
+      if (loaded.error) callbacks.onResumeFallback?.();
+      else {
+        sessionId = resumeSessionId;
+        resumed = true;
+      }
+    }
+    if (!sessionId) {
+      const created = await request('session/new', { cwd, mcpServers: [] });
+      if (created.error || typeof created.result?.sessionId !== 'string') {
+        return fail(created.error ?? 'Kimi agent did not return a session id.');
+      }
+      sessionId = created.result.sessionId;
+    }
+    callbacks.onSessionId(sessionId, { resumed });
+
+    // Pin the thread's model: sessions open on the CLI's default_model.
+    const setModel = await request('session/set_config_option', {
+      sessionId,
+      configId: 'model',
+      value: model.slug,
+    });
+    if (setModel.error) {
+      return fail(setModel.error.message ?? `Kimi rejected model "${model.slug}".`);
+    }
+
+    // Pin the permission mode to the thread's access level. Full access uses
+    // yolo (auto-approve everything, no permission round-trips); Read only
+    // uses plan (no tool execution at all). Workspace write uses default —
+    // kimi's auto mode self-approves writes and commands on any path the
+    // process can reach, not just the workdir, so default (ask-first) is the
+    // only mode that routes every mutation through answerPermission, where
+    // the workspace boundary is enforced by path.
+    const modeId =
+      accessMode === 'full-access' ? 'yolo' : accessMode === 'read-only' ? 'plan' : 'default';
+    const setMode = await request('session/set_mode', { sessionId, modeId });
+    if (setMode.error) {
+      return fail(
+        setMode.error.message ?? `Kimi could not enable ${accessMode} permission mode.`
+      );
+    }
+
+    const response = await request('session/prompt', {
+      sessionId,
+      prompt: [{ type: 'text', text: promptText }],
+    });
+    flushToolEmits();
+    if (response.error) return fail(response.error);
+    const stopReason = response.result?.stopReason;
+    if (stopReason && stopReason !== 'end_turn') {
+      const detail =
+        stopReason === 'refusal'
+          ? 'was refused'
+          : stopReason === 'cancelled'
+            ? 'was cancelled'
+            : stopReason === 'max_tokens'
+              ? 'reached the model token limit'
+              : stopReason === 'max_turn_requests'
+                ? 'reached the maximum turn limit'
+                : `stopped (${stopReason})`;
+      return fail(`Kimi turn ${detail}.`);
+    }
+    callbacks.onTurnEnd(response.result ?? {}, sessionId);
+  };
+
+  const handleMessage = (message) => {
+    if (!message || typeof message !== 'object') return;
+
+    if (message.id !== undefined && !message.method) {
+      const resolve = pendingRequests.get(message.id);
+      if (resolve) {
+        pendingRequests.delete(message.id);
+        resolve(message);
+      }
+      return;
+    }
+
+    if (message.id !== undefined && message.method) {
+      if (message.method === 'session/request_permission') return answerPermission(message);
+      write({
+        jsonrpc: '2.0',
+        id: message.id,
+        error: { code: -32601, message: 'Method not supported' },
+      });
+      return;
+    }
+
+    if (replayingSession) return;
+    const update = message.method === 'session/update' ? message.params?.update : null;
+    if (!update || typeof update !== 'object') return;
+
+    const kind = update.sessionUpdate;
+    if (kind === 'agent_thought_chunk') {
+      const text = update.content?.text;
+      if (typeof text === 'string' && text) callbacks.onReasoning(text);
+      return;
+    }
+    if (kind === 'agent_message_chunk') {
+      const text = update.content?.text;
+      if (typeof text !== 'string' || !text) return;
+      const prefix = pendingTextBreak && textSeen ? '\n\n' : '';
+      pendingTextBreak = false;
+      textSeen = true;
+      callbacks.onText(`${prefix}${text}`);
+      return;
+    }
+    if (kind === 'tool_call' || kind === 'tool_call_update') {
+      // Text resuming after tool activity is a new paragraph.
+      if (textSeen) pendingTextBreak = true;
+      upsertToolCall(update, kind === 'tool_call');
+      return;
+    }
+    if (kind === 'plan') {
+      handlePlanUpdate(update.entries);
+    }
+    // available_commands_update / config_option_update / current_mode_update
+    // are session bookkeeping — nothing to surface.
+  };
+
+  return { start, handleMessage };
+};
+
+// One-shot, tool-free kimi text turn over ACP, used for title generation.
+// Prompt mode (`kimi -p`) auto-approves every tool and rejects --plan
+// ("Cannot combine --prompt with --plan" on 0.26), so hidden background
+// prompts must go through ACP plan mode, which disables tool execution
+// entirely (the driver's read-only permission policy backstops it).
+// Resolves with the accumulated response text, or '' on failure.
+const kimiPlanModeOneShot = (model, promptText, cwd) =>
+  new Promise((resolve) => {
+    const child = spawn(loginShell, ['-lc', 'kimi acp'], {
+      cwd,
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let text = '';
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      try {
+        child.kill('SIGTERM');
+      } catch {}
+      resolve(text);
+    };
+    // The ACP server idles after the prompt resolves and never exits on its
+    // own; cap the whole turn so a wedged server can't leak a process.
+    const deadline = setTimeout(finish, 60_000);
+    const driver = createKimiAcpDriver({
+      child,
+      cwd,
+      model,
+      promptText,
+      resumeSessionId: null,
+      accessMode: 'read-only',
+      callbacks: {
+        onSessionId: () => {},
+        onReasoning: () => {},
+        onActivity: () => {},
+        onResumeFallback: () => {},
+        onText: (delta) => {
+          text += delta;
+        },
+        onTurnEnd: finish,
+        onFatal: finish,
+      },
+    });
+    let buffer = '';
+    child.stdout.on('data', (data) => {
+      buffer += data.toString();
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          driver.handleMessage(JSON.parse(trimmed));
+        } catch {}
+      }
+    });
+    child.stderr.resume();
+    child.on('error', finish);
+    child.on('close', finish);
+    driver.start();
+  });
+
+// ---------------------------------------------------------------------------
 // Codex goal runs (/goal). Codex's goals feature — a persistent objective the
 // agent pursues autonomously across turns, with token budgets and a status
 // machine (active/paused/blocked/usageLimited/budgetLimited/complete) stored
@@ -3089,6 +4094,8 @@ const codexAppServerConfig = (model, input) => {
     input.providerOptions && typeof input.providerOptions === 'object' ? input.providerOptions : {};
   const config = {
     model_reasoning_effort: codexReasoningEffortForModel(model, input.codexReasoningEffort),
+    // Same override as the exec paths: 5.6 models default summaries to none.
+    model_reasoning_summary: 'detailed',
     service_tier: input.codexServiceTier || defaultCodexServiceTier,
   };
   if (options.networkAccess) config['sandbox_workspace_write.network_access'] = true;
@@ -4707,7 +5714,8 @@ const disposeAllClaudeSdkSessions = () => {
 const isTerminalJsonEvent = (providerId, value) =>
   providerId === 'grok' && value?.type === 'end';
 
-const sendsJsonEvents = (providerId) => ['claude', 'codex', 'cursor', 'grok'].includes(providerId);
+const sendsJsonEvents = (providerId) =>
+  ['claude', 'codex', 'cursor', 'grok', 'kimi'].includes(providerId);
 
 // Finder-launched apps inherit launchd's minimal PATH, and most CLI
 // installers (nvm, bun, grok, ...) export PATH from ~/.zshrc, which only
@@ -4806,6 +5814,17 @@ const providerUpdaterConfigs = [
     statusCommand: ['models'],
   },
   {
+    id: 'kimi',
+    label: 'Kimi Code',
+    command: 'kimi',
+    latestVersionUrl: 'https://code.kimi.com/kimi-code/latest',
+    updateCommands: [['upgrade']],
+    manualInstallCommandPattern: /To update manually, run:\s*([^\r\n]+)/i,
+    verifyAfterUpdate: true,
+    authCommands: [['login']],
+    statusCommand: ['provider', 'list'],
+  },
+  {
     id: 'opencode',
     label: 'OpenCode',
     command: 'opencode',
@@ -4853,6 +5872,16 @@ const readNpmLatestVersion = async (packageName) => {
   try {
     const { stdout } = await runShellCommand(`npm view ${shellQuote(packageName)} version`, 20000);
     return parseVersion(stdout);
+  } catch {
+    return null;
+  }
+};
+
+const readRemoteLatestVersion = async (url) => {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!response.ok) return null;
+    return parseVersion(await response.text());
   } catch {
     return null;
   }
@@ -4944,6 +5973,20 @@ const getProviderAuthStatus = async (config) => {
       const authenticated =
         /logged in|available models|default model/i.test(output) &&
         !/not logged|unauthenticated|login required|sign in required/i.test(output);
+      return {
+        authenticated,
+        status: authenticated ? 'authenticated' : lowerOutput ? 'unauthenticated' : 'unknown',
+        label: authenticated ? 'Authenticated' : 'Not authenticated',
+        detail: output.split(/\r?\n/).find((line) => line.trim()) || output,
+      };
+    }
+
+    if (config.id === 'kimi') {
+      // `kimi provider list` prints the managed provider row (source=oauth)
+      // and the default model when the CLI is configured and logged in.
+      const authenticated =
+        /source=oauth|default model/i.test(output) &&
+        !/not logged|login required|unauthenticated|authentication required/i.test(output);
       return {
         authenticated,
         status: authenticated ? 'authenticated' : lowerOutput ? 'unauthenticated' : 'unknown',
@@ -5050,6 +6093,21 @@ const checkProviderUpdate = async (config, enabledProviderIds = null) => {
     };
   }
 
+  if (config.latestVersionUrl) {
+    const latestVersion = await readRemoteLatestVersion(config.latestVersionUrl);
+    const updateAvailable =
+      enabled && currentVersion && latestVersion
+        ? compareVersionStrings(currentVersion, latestVersion) < 0
+        : false;
+
+    return {
+      ...withCurrentVersion,
+      latestVersion,
+      updateAvailable,
+      status: latestVersion ? (updateAvailable ? 'available' : 'current') : 'unknown',
+    };
+  }
+
   return withCurrentVersion;
 };
 
@@ -5083,7 +6141,7 @@ const resolveProviderUpdateCommand = async (config) => {
   return config.updateCommands[0] ?? null;
 };
 
-const updateProviderTool = async (config) => {
+const updateProviderTool = async (config, expectedLatestVersion = null) => {
   const commandPath = await resolveCommandPath(config.command);
   if (!commandPath) {
     return {
@@ -5111,12 +6169,45 @@ const updateProviderTool = async (config) => {
 
   try {
     const { stdout, stderr } = await runShellCommand(updateCommand, 180000);
+    const outputParts = [`${stdout}\n${stderr}`.trim()].filter(Boolean);
+    const manualInstallCommand = config.manualInstallCommandPattern
+      ? outputParts[0]?.match(config.manualInstallCommandPattern)?.[1]?.trim()
+      : null;
+
+    // Some self-updaters only print a source-specific install command when
+    // stdin is not a TTY. Run that command explicitly so the background
+    // update path performs the install instead of reporting a no-op success.
+    if (manualInstallCommand) {
+      const manualResult = await runShellCommand(manualInstallCommand, 180000);
+      const manualOutput = `${manualResult.stdout}\n${manualResult.stderr}`.trim();
+      if (manualOutput) outputParts.push(manualOutput);
+    }
+
+    if (config.verifyAfterUpdate && expectedLatestVersion) {
+      const installedVersion = await readCliVersion(config.command);
+      if (
+        !installedVersion ||
+        compareVersionStrings(installedVersion, expectedLatestVersion) < 0
+      ) {
+        return {
+          id: config.id,
+          label: config.label,
+          command: config.command,
+          ok: false,
+          error: installedVersion
+            ? `${config.label} is still on ${installedVersion}; expected ${expectedLatestVersion}.`
+            : `Could not verify the installed ${config.label} version after updating.`,
+          output: outputParts.join('\n\n'),
+        };
+      }
+    }
+
     return {
       id: config.id,
       label: config.label,
       command: config.command,
       ok: true,
-      output: `${stdout}\n${stderr}`.trim(),
+      output: outputParts.join('\n\n'),
     };
   } catch (error) {
     if (config.packageName) {
@@ -7009,7 +8100,7 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
       continue;
     }
 
-    results.push(await updateProviderTool(config));
+    results.push(await updateProviderTool(config, state.latestVersion));
   }
 
   const state = await checkProviderUpdates(input);
@@ -7178,7 +8269,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     // One spawn of the provider CLI. If resuming a prior session fails before
     // producing output, close() falls back to a single fresh attempt.
-    const useAcp = model.providerId === 'grok';
+    const useAcp = model.providerId === 'grok' || model.providerId === 'kimi';
     // Codex goal runs (/goal) are driven over `codex app-server` JSON-RPC —
     // the goal runtime auto-continues turns only inside a live app-server.
     const useCodexGoal =
@@ -7219,6 +8310,38 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       getRunId: () => runId,
     });
     let codexSpawnWatcher = null;
+    let kimiSpawnWatcher = null;
+    // Kimi subagents live under the session's own directory; watching can
+    // only start once the ACP dialog reports the session id.
+    const ensureKimiSpawnWatcher = async (sessionId, baselineExisting) => {
+      if (kimiSpawnWatcher || model.providerId !== 'kimi' || !sessionId) return;
+      // A brand-new session's index entry may lag the session/new response by
+      // a moment — retry briefly before giving up on subagent tracking.
+      let entry = null;
+      for (let attempt = 0; attempt < 10 && !entry; attempt += 1) {
+        entry = await findKimiSessionIndexEntry(sessionId);
+        if (!entry) await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (finalized) return;
+      }
+      if (!entry?.sessionDir || kimiSpawnWatcher || finalized) return;
+      kimiSpawnWatcher = watchKimiSubagentSpawns({
+        sessionDir: entry.sessionDir,
+        baselineExisting,
+        onSpawn: (spawn) => {
+          subagentTracker.start(
+            {
+              id: spawn.agentId,
+              title: 'Kimi subagent',
+              kind: 'kimi agent',
+            },
+            {
+              resolveFile: async () => (existsSync(spawn.wirePath) ? spawn.wirePath : null),
+              handleLine: handleKimiSubagentLine,
+            }
+          );
+        },
+      });
+    };
     // provisional cursor agentId -> { realAgentId } (see the completed event)
     const cursorSubagentFileRefs = new Map();
     const ensureCodexSpawnWatcher = (parentThreadId) => {
@@ -7332,6 +8455,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
       codexSpawnWatcher?.stop();
+      kimiSpawnWatcher?.stop();
       subagentTracker.dispose(
         wasStopped ? 'stopped' : finalExitCode === 0 ? 'done' : 'error'
       );
@@ -7558,7 +8682,37 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       }
     };
 
-    const acpDriver = useAcp
+    const acpDriver =
+      model.providerId === 'kimi'
+        ? createKimiAcpDriver({
+            child,
+            cwd: input.projectPath,
+            model,
+            promptText: input.prompt,
+            resumeSessionId,
+            accessMode: input.accessMode || 'full-access',
+            callbacks: {
+              ...sharedDriverCallbacks,
+              onSessionId: (sessionId, sessionMeta) => {
+                sharedDriverCallbacks.onSessionId(sessionId);
+                void ensureKimiSpawnWatcher(sessionId, sessionMeta?.resumed === true);
+              },
+              onTurnEnd: (_result, sessionId) => {
+                // The ACP prompt response carries no usage metadata — pull
+                // cumulative session totals from the on-disk wire log before
+                // the run finalizes. kimi flushes the turn's final
+                // usage.record right around the prompt response, so give the
+                // write a moment to land before reading.
+                void (async () => {
+                  await new Promise((resolve) => setTimeout(resolve, 350));
+                  const stats = await kimiStatsFromSessionDisk(sessionId);
+                  if (stats) runStats = stats;
+                  finishDriverRun();
+                })();
+              },
+            },
+          })
+        : useAcp
       ? createGrokAcpDriver({
           child,
           cwd: input.projectPath,
@@ -7736,6 +8890,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         finalized = true;
         clearFinalizeTimers();
         codexSpawnWatcher?.stop();
+        kimiSpawnWatcher?.stop();
         subagentTracker.dispose('error');
         emitAgentEvent(event.sender, {
           runId,
@@ -7922,6 +9077,7 @@ const disposeTerminalSession = (threadId) => {
   if (!session) return false;
   terminalSessions.delete(threadId);
   if (session.sessionWatcher) clearInterval(session.sessionWatcher);
+  disposeTerminalHookSignals(session);
   try {
     if (!session.exited) session.pty.kill();
   } catch {
@@ -8081,6 +9237,90 @@ const startTerminalSessionWatcher = (threadId, session, projectPath) => {
   }, 2500);
 };
 
+// The PTY stays alive between turns, so process exit says nothing about turn
+// completion — the reliable lifecycle signal is Claude Code's own hooks. Each
+// session gets a private settings file (passed via --settings, which layers on
+// top of the user's settings so their own hooks still run) whose
+// UserPromptSubmit/Stop hooks append one line to a per-session signal file.
+// Main watches that file and forwards the lines as terminal:activity events,
+// letting the renderer flip the thread between running and done while the TUI
+// keeps running. Stop does not fire on a user interrupt (esc) — an interrupted
+// thread stays "running" until its next completed turn or PTY exit.
+const TERMINAL_HOOK_DIR = path.join(os.tmpdir(), 'orion-claude-hooks');
+
+const createTerminalHookFiles = async (threadId, epoch) => {
+  const base = `${threadId.replace(/[^a-zA-Z0-9_-]/g, '_')}-${epoch}`;
+  const signalPath = path.join(TERMINAL_HOOK_DIR, `${base}.signals`);
+  const settingsPath = path.join(TERMINAL_HOOK_DIR, `${base}.settings.json`);
+  const appendSignal = (kind) => `printf '${kind}\\n' >> ${shellQuote(signalPath)}`;
+  await fs.mkdir(TERMINAL_HOOK_DIR, { recursive: true });
+  await fs.writeFile(signalPath, '');
+  await fs.writeFile(
+    settingsPath,
+    JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: appendSignal('prompt') }] }],
+        Stop: [{ hooks: [{ type: 'command', command: appendSignal('stop') }] }],
+      },
+    })
+  );
+  return { signalPath, settingsPath };
+};
+
+const startTerminalSignalWatcher = (threadId, session) => {
+  let draining = false;
+  let queued = false;
+  const drain = async () => {
+    if (draining) {
+      queued = true;
+      return;
+    }
+    draining = true;
+    try {
+      do {
+        queued = false;
+        if (terminalSessions.get(threadId) !== session) return;
+        const content = await fs.readFile(session.signalPath, 'utf-8').catch(() => '');
+        // The hooks only ever append; replay lines past the last read offset.
+        const fresh = content.slice(session.signalReadOffset);
+        session.signalReadOffset = content.length;
+        for (const line of fresh.split('\n')) {
+          const kind = line.trim();
+          if (!kind) continue;
+          if (terminalSessions.get(threadId) !== session) return;
+          if (kind === 'prompt') {
+            sendToAllWindows('terminal:activity', { threadId, kind: 'prompt' });
+          } else if (kind === 'stop') {
+            sendToAllWindows('terminal:activity', { threadId, kind: 'turn-complete' });
+          }
+        }
+      } while (queued);
+    } finally {
+      draining = false;
+    }
+  };
+  try {
+    session.signalWatcher = watchFsPath(session.signalPath, () => void drain());
+  } catch (error) {
+    console.warn('terminal hook signal watch failed, polling instead', error);
+    const timer = setInterval(() => void drain(), 1000);
+    session.signalWatcher = { close: () => clearInterval(timer) };
+  }
+};
+
+const disposeTerminalHookSignals = (session) => {
+  if (session.signalWatcher) {
+    try {
+      session.signalWatcher.close();
+    } catch {
+      // already closed
+    }
+    session.signalWatcher = null;
+  }
+  if (session.signalPath) void fs.unlink(session.signalPath).catch(() => {});
+  if (session.settingsPath) void fs.unlink(session.settingsPath).catch(() => {});
+};
+
 const disposeAllTerminalSessions = () => {
   for (const threadId of terminalSessionEpochs.keys()) {
     invalidateTerminalSession(threadId);
@@ -8184,6 +9424,14 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
       }
     }
 
+    const hookFiles = await createTerminalHookFiles(threadId, ensureEpoch).catch((error) => {
+      // Turn-lifecycle signals are an enhancement; a temp-dir failure should
+      // not block the terminal itself.
+      console.warn('terminal hook settings unavailable', error);
+      return null;
+    });
+    if (hookFiles) args.push('--settings', hookFiles.settingsPath);
+
     if ((terminalSessionEpochs.get(threadId) ?? 0) !== ensureEpoch) {
       return { ok: false, error: 'Terminal start was cancelled.' };
     }
@@ -8214,9 +9462,15 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
       sentPrompts: [],
       // Best-effort current input line for prompts typed directly into xterm.
       inputBuffer: '',
+      // Turn-lifecycle signal file appended to by the injected Claude hooks.
+      signalPath: hookFiles?.signalPath ?? null,
+      settingsPath: hookFiles?.settingsPath ?? null,
+      signalReadOffset: 0,
+      signalWatcher: null,
     };
     terminalSessions.set(threadId, session);
     startTerminalSessionWatcher(threadId, session, projectPath);
+    if (session.signalPath) startTerminalSignalWatcher(threadId, session);
     sendToAllWindows('terminal:activity', { threadId, kind: 'started' });
 
     ptyProcess.onData((data) => {
@@ -8239,6 +9493,8 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
         clearInterval(session.sessionWatcher);
         session.sessionWatcher = null;
       }
+      // Exit is itself the terminal status signal; hook signals are moot now.
+      disposeTerminalHookSignals(session);
       sendToAllWindows('terminal:exit', { threadId, exitCode: exitCode ?? null });
     });
 
@@ -8308,6 +9564,27 @@ ipcMain.handle('terminal:kill', (_event, threadId) => {
   return disposeTerminalSession(threadId);
 });
 
+// Normalize a raw model response into a usable one-line thread title,
+// or '' when nothing title-shaped survives.
+const titleFromResponseText = (responseText) => {
+  let candidate = (responseText || '').split(/[\r\n]+/)[0] || '';
+  candidate = candidate.trim();
+  if (!candidate) return '';
+
+  // Clean model output
+  candidate = candidate.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '').trim();
+  candidate = candidate.replace(/^(title\s*[:：]\s*|here\s*(is|is a)\s*(a\s+)?(concise\s+)?title\s*[:：]?\s*|the title (is|should be)\s*[:：]?\s*)/i, '');
+  candidate = candidate.replace(/\s+/g, ' ').trim();
+  candidate = candidate.split(/[\.!?]\s/)[0].trim();
+  if (candidate.length > 70) candidate = candidate.slice(0, 67).trim() + '…';
+
+  // Hard guard: never accept raw protocol / JSON / thought lines as a title
+  if (!candidate || /^[\{\[]/.test(candidate) || /"type"\s*:/i.test(candidate) || /"data"\s*:/i.test(candidate) || /\btype["\s]*:["\s]*thought\b/i.test(candidate)) {
+    return '';
+  }
+  return candidate;
+};
+
 // Generate a short, relevant title for a thread based on the first user prompt.
 // This runs a lightweight non-streaming call and returns just the title string.
 ipcMain.handle('agent:generateTitle', async (_event, input) => {
@@ -8327,6 +9604,19 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
       'No quotes, no explanations, no trailing punctuation. Just the title.\n\n' +
       'Request:\n' +
       input.prompt;
+
+    // kimi's prompt mode auto-approves every tool and rejects --plan, so a
+    // one-shot `kimi -p` would silently run this hidden turn with full write
+    // access. Drive the title turn over ACP plan mode instead, which
+    // disables tool execution.
+    if (model.providerId === 'kimi') {
+      const text = await kimiPlanModeOneShot(
+        model,
+        titleInstruction,
+        input.projectPath || process.cwd()
+      );
+      return titleFromResponseText(text);
+    }
 
     // Reuse command builder but force a read-only-ish access where possible for title gen
     const args = commandForModel(model, {
@@ -8415,27 +9705,7 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
           responseText = stderr;
         }
 
-        let candidate = (responseText || '').split(/[\r\n]+/)[0] || '';
-        candidate = candidate.trim();
-        if (!candidate) {
-          resolve('');
-          return;
-        }
-
-        // Clean model output
-        candidate = candidate.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '').trim();
-        candidate = candidate.replace(/^(title\s*[:：]\s*|here\s*(is|is a)\s*(a\s+)?(concise\s+)?title\s*[:：]?\s*|the title (is|should be)\s*[:：]?\s*)/i, '');
-        candidate = candidate.replace(/\s+/g, ' ').trim();
-        candidate = candidate.split(/[\.!?]\s/)[0].trim();
-        if (candidate.length > 70) candidate = candidate.slice(0, 67).trim() + '…';
-
-        // Hard guard: never accept raw protocol / JSON / thought lines as a title
-        if (!candidate || /^[\{\[]/.test(candidate) || /"type"\s*:/i.test(candidate) || /"data"\s*:/i.test(candidate) || /\btype["\s]*:["\s]*thought\b/i.test(candidate)) {
-          resolve('');
-          return;
-        }
-
-        resolve(candidate);
+        resolve(titleFromResponseText(responseText));
       });
     });
   } catch (e) {

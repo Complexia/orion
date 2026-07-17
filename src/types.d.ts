@@ -261,7 +261,7 @@ type OrionComputerUsePermissions = {
       }>;
       listAgentModels: () => Promise<Array<{
         id: string;
-        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'opencode';
+        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'opencode';
         providerLabel: string;
         label: string;
         slug: string;
@@ -486,7 +486,7 @@ type OrionComputerUsePermissions = {
       onTerminalExit: (cb: (event: { threadId: string; exitCode: number | null }) => void) => () => void;
       onTerminalActivity: (cb: (event: {
         threadId: string;
-        kind: 'started' | 'prompt';
+        kind: 'started' | 'prompt' | 'turn-complete';
       }) => void) => () => void;
       /** The thread's live claude CLI session id, discovered from claude's session store. */
       onTerminalSession: (cb: (event: { threadId: string; sessionId: string }) => void) => () => void;

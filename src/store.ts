@@ -230,7 +230,7 @@ export type OpenFile = {
   isDirty: boolean;
 };
 
-export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'opencode';
+export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'opencode';
 
 // Per-provider harness capabilities, passed through to the CLI invocation.
 export type ProviderRuntimeOptions = {
@@ -262,6 +262,7 @@ export const defaultProviderSettings: ProviderSettings = {
   codex: { enabled: true },
   claude: { enabled: true },
   cursor: { enabled: true },
+  kimi: { enabled: true },
   opencode: { enabled: true },
 };
 
@@ -605,12 +606,20 @@ export const useOrionStore = create<OrionState>()(
             .filter((t) => !t.parentThreadId && !t.subagent)
             .sort((a, b) => threadActivityTime(b) - threadActivityTime(a))[0];
 
+        // Claude Code CLI is a terminal-hosted pseudo-model; it must be picked
+        // deliberately per thread, so new threads fall back to Claude Fable 5
+        // instead of inheriting it.
+        const inheritedModelId =
+          lastProjectThread?.modelId === 'claude:claude-code-cli'
+            ? 'claude:claude-fable-5'
+            : lastProjectThread?.modelId;
+
         const newThread: Thread = {
           id: crypto.randomUUID(),
           projectId,
           title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
           status: 'idle',
-          modelId: options?.modelId ?? lastProjectThread?.modelId ?? 'grok:grok-4.5',
+          modelId: options?.modelId ?? inheritedModelId ?? 'grok:grok-4.5',
           accessMode: options?.accessMode ?? lastProjectThread?.accessMode ?? 'full-access',
           codexReasoningEffort: lastProjectThread?.codexReasoningEffort,
           codexServiceTier: lastProjectThread?.codexServiceTier,
