@@ -34,9 +34,38 @@ contextBridge.exposeInMainWorld('orion', {
   listAgentModels: () => ipcRenderer.invoke('agent:listModels'),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
   stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),
+  // Codex goal ops (pause/clear/status) for threads with no live goal run.
+  codexGoalCommand: (input) => ipcRenderer.invoke('agent:codexGoal', input),
   disposeAgentThread: (threadId) => ipcRenderer.invoke('agent:disposeThread', threadId),
   generateThreadTitle: (input) => ipcRenderer.invoke('agent:generateTitle', input),
   getProviderStatus: () => ipcRenderer.invoke('providers:getStatus'),
+
+  // Claude Code CLI embedded terminal (one PTY per thread, lives in main)
+  terminalEnsure: (input) => ipcRenderer.invoke('terminal:ensure', input),
+  terminalInput: (input) => ipcRenderer.invoke('terminal:input', input),
+  terminalResize: (input) => ipcRenderer.invoke('terminal:resize', input),
+  terminalSendPrompt: (input) => ipcRenderer.invoke('terminal:sendPrompt', input),
+  terminalKill: (threadId) => ipcRenderer.invoke('terminal:kill', threadId),
+  onTerminalData: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('terminal:data', listener);
+    return () => ipcRenderer.removeListener('terminal:data', listener);
+  },
+  onTerminalExit: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('terminal:exit', listener);
+    return () => ipcRenderer.removeListener('terminal:exit', listener);
+  },
+  onTerminalActivity: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('terminal:activity', listener);
+    return () => ipcRenderer.removeListener('terminal:activity', listener);
+  },
+  onTerminalSession: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('terminal:session', listener);
+    return () => ipcRenderer.removeListener('terminal:session', listener);
+  },
   checkProviderUpdates: (input) => ipcRenderer.invoke('providers:checkUpdates', input),
   updateProviders: (input) => ipcRenderer.invoke('providers:updateAll', input),
   authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
@@ -60,9 +89,18 @@ contextBridge.exposeInMainWorld('orion', {
   unlinkBoardTask: (input) => ipcRenderer.invoke('tasks:unlink', input),
   updateBoardTaskThreadStatus: (input) => ipcRenderer.invoke('tasks:threadStatus', input),
 
+  // Orchestration (Orion pseudo-model subagent spawns)
+  reportSubagentResult: (payload) => ipcRenderer.invoke('orchestration:subagentResult', payload),
+  onSubagentSpawnRequest: (callback) => {
+    const listener = (_event, request) => callback(request);
+    ipcRenderer.on('orchestration:spawnRequest', listener);
+    return () => ipcRenderer.removeListener('orchestration:spawnRequest', listener);
+  },
+
   // Computer use permissions (macOS TCC)
   getComputerUsePermissions: () => ipcRenderer.invoke('computerUse:getPermissions'),
   requestComputerUsePermission: (kind) => ipcRenderer.invoke('computerUse:requestPermission', kind),
+  openChromeDebugSetup: () => ipcRenderer.invoke('computerUse:openChromeDebugSetup'),
   relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
 
   // App updates

@@ -18,6 +18,8 @@ import {
   Folder,
   FileText,
   Play,
+  Pause,
+  Target,
   Search,
   Shield,
   Square,
@@ -53,6 +55,7 @@ import {
   ListChecks,
   FilePen,
   BookOpen,
+  Workflow,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
@@ -60,19 +63,24 @@ import remarkGfm from 'remark-gfm';
 import {
   useOrionStore,
   defaultProviderSettings,
+  defaultOrchestrationSettings,
   type AgentActivity,
+  type BtwExchange,
   type ChangedFileSummary,
   type ImageAttachment,
   type LinkedBoardTask,
   type Message,
+  type OrchestrationRoleId,
   type ProviderId,
   type ProviderRuntimeOptions,
   type Thread,
+  type ThreadGoal,
   type TurnTokenStats,
 } from './store';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
+  claudeCodeCliModelId,
   claudeContextWindowOptions,
   claudeReasoningOptions,
   codexReasoningOptionsForModel,
@@ -86,6 +94,8 @@ import {
   grokReasoningOptions,
   fallbackAgentModels,
   findAgentModel,
+  isClaudeCodeCliModelId,
+  isOrionModelId,
   providerFollowUpSupport,
   providerOptionDefs,
   type AgentModel,
@@ -97,6 +107,12 @@ import {
   type GrokReasoningEffort,
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
+
+// Lazy-loaded so xterm (and the TerminalView code) is split into its own
+// chunk and only fetched/parsed when a Claude Code CLI thread is actually
+// opened — the pseudo-model costs nothing at startup. (Its main-process
+// counterpart, node-pty, is likewise only import()ed on first terminal:ensure.)
+const TerminalView = React.lazy(() => import('./TerminalView'));
 
 // Simple recursive file tree component
 interface FileTreeItem {
@@ -193,7 +209,13 @@ type OrionAccountState = {
   expiresAt: string | null;
 };
 
-type SettingsTab = 'account' | 'general' | 'providers' | 'computer-use' | 'cosmetics';
+type SettingsTab =
+  | 'account'
+  | 'general'
+  | 'providers'
+  | 'orchestration'
+  | 'computer-use'
+  | 'cosmetics';
 
 const gitStatusTitles: Record<GitStatusKind, string> = {
   added: 'Added',
@@ -506,6 +528,147 @@ const buildLinkedTaskContext = (
   return lines.join('\n');
 };
 
+// Human labels for the Orion orchestrator's delegation roles — shared by the
+// Settings → Orchestration tab and the orchestration payload/prompt so the
+// names the user configures are the names the orchestrator sees.
+const orchestrationRoleMeta: Array<{
+  id: OrchestrationRoleId;
+  label: string;
+  desc: string;
+  /** How the role is named inside the [Orion orchestration] prompt block. */
+  promptLabel: string;
+}> = [
+  {
+    id: 'mainDriver',
+    label: 'Main driver',
+    desc: 'Coordinates the work, talks to you, and delegates to the other models',
+    promptLabel: 'main driver',
+  },
+  {
+    id: 'computerUse',
+    label: 'Computer use',
+    desc: 'Desktop control and GUI automation tasks',
+    promptLabel: 'computer use',
+  },
+  {
+    id: 'exploring',
+    label: 'Exploring',
+    desc: 'Codebase exploration, research, and read-only investigation',
+    promptLabel: 'exploring',
+  },
+  {
+    id: 'implementation',
+    label: 'Implementation',
+    desc: 'Code changes and implementation work',
+    promptLabel: 'implementation',
+  },
+  {
+    id: 'imageVideoGen',
+    label: 'Image / video generation',
+    desc: 'Generating images, video, and other media assets',
+    promptLabel: 'image/video generation',
+  },
+];
+
+// Context block prepended to every orchestrated turn. main.js writes managed
+// CLAUDE.md/AGENTS.md sections that tell the agent orchestration applies when
+// the prompt contains exactly this [Orion orchestration] marker.
+const buildOrchestrationContext = (
+  roles: Array<{ role: string; modelLabel: string; slug: string }>,
+  generalInstructions: string,
+  accessMode: 'read-only' | 'workspace-write' | 'full-access'
+) => {
+  const roleSummary = orchestrationRoleMeta
+    .filter((meta) => meta.id !== 'mainDriver')
+    .map((meta) => {
+      const entry = roles.find((role) => role.role === meta.id);
+      return entry ? `${meta.promptLabel} → ${entry.modelLabel} (${entry.slug})` : null;
+    })
+    .filter(Boolean)
+    .join('; ');
+  const lines = [
+    '[Orion orchestration]',
+    'You are the Orion orchestrator (main driver). Delegate specialized work to the configured role models and integrate their results; see the "Orion Orchestration" section of CLAUDE.md / AGENTS.md for delegation mechanics.',
+    `Roles: ${roleSummary}.`,
+    'Prefer the spawn_subagent tool when available; otherwise run the provider CLIs directly. Report progress and the integrated final result yourself.',
+  ];
+  if (accessMode === 'read-only') {
+    lines.push(
+      'Access mode: Read only. Every delegated CLI must remain read-only: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`; cursor uses `--mode plan --sandbox enabled`; grok uses `--permission-mode plan`. Never use bypass, force, auto-approve, or browser-control flags.'
+    );
+  } else if (accessMode === 'workspace-write') {
+    lines.push(
+      'Access mode: Workspace write. Delegated CLIs must remain sandboxed to the workspace: codex uses `--sandbox workspace-write`; claude uses `--permission-mode acceptEdits`; cursor uses `--sandbox enabled --force`; grok uses `--permission-mode acceptEdits`. Do not disable a sandbox or use unrestricted bypass flags.'
+    );
+  } else {
+    lines.push(
+      'Access mode: Full access. Delegated CLIs may use their explicit bypass/full-access flags.'
+    );
+  }
+  const trimmedInstructions = generalInstructions.trim();
+  if (trimmedInstructions) lines.push(trimmedInstructions);
+  lines.push('[/Orion orchestration]');
+  return lines.join('\n');
+};
+
+type ModelMention = {
+  modelId: string;
+  providerId: string;
+  slug: string;
+  label: string;
+  token: string;
+};
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Slugs are normally the friendliest mention token. When two providers expose
+// the same slug, qualify it with the provider id so selecting one model cannot
+// silently mention both (for example Claude and Cursor's claude-opus-4-8).
+const modelMentionToken = (model: AgentModel, models: AgentModel[]) =>
+  models.some(
+    (candidate) =>
+      candidate.id !== model.id && candidate.slug.toLowerCase() === model.slug.toLowerCase()
+  )
+    ? model.id
+    : model.slug;
+
+// Scan the user's original text for model mention tokens against the catalog.
+// The token must not continue into a longer slug/id-like value (so
+// "@gpt-5.4-mini" never also matches "@gpt-5.4").
+const parseModelMentions = (text: string, models: AgentModel[]): ModelMention[] => {
+  if (!text.includes('@')) return [];
+  const mentions: ModelMention[] = [];
+  for (const model of models) {
+    // The Orion orchestrator is not a delegation target — "@orion" is never a mention.
+    if (model.providerId === 'orion') continue;
+    const token = modelMentionToken(model, models);
+    const pattern = new RegExp(
+      `(?:^|\\s)@${escapeRegExp(token)}(?![A-Za-z0-9._:/-])`,
+      'i'
+    );
+    if (pattern.test(text)) {
+      mentions.push({
+        modelId: model.id,
+        providerId: model.providerId,
+        slug: model.slug,
+        label: model.label,
+        token,
+      });
+    }
+  }
+  return mentions;
+};
+
+// Context block prepended when the user @-mentions models, on any thread —
+// mentions work when talking to a specific model too, not just Orion.
+const buildModelMentionsContext = (mentions: ModelMention[]) =>
+  [
+    '[Model mentions]',
+    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it: spawn a subagent on that model (spawn_subagent tool with model: "<modelId>", or run its provider CLI as a fallback) and integrate its results into your work.',
+    ...mentions.map((mention) => `- @${mention.token} → ${mention.label} (${mention.modelId})`),
+    '[/Model mentions]',
+  ].join('\n');
+
 const linkedTaskStatusLabel = (status?: string) => {
   switch (status) {
     case 'running':
@@ -681,9 +844,22 @@ const formatShortTime = (date: Date) => {
   return `${months}mo`;
 };
 
-const getThreadActivityTime = (thread: { messages: Message[]; createdAt: string }) => {
+const getThreadActivityTime = (thread: {
+  messages: Message[];
+  createdAt: string;
+  terminalActivityAt?: string;
+}) => {
   const lastMessage = thread.messages.at(-1);
-  return new Date(lastMessage?.ts ?? thread.createdAt);
+  const transcriptTime = new Date(lastMessage?.ts ?? thread.createdAt).getTime();
+  const terminalTime = thread.terminalActivityAt
+    ? new Date(thread.terminalActivityAt).getTime()
+    : Number.NEGATIVE_INFINITY;
+  return new Date(
+    Math.max(
+      Number.isFinite(transcriptTime) ? transcriptTime : 0,
+      Number.isFinite(terminalTime) ? terminalTime : Number.NEGATIVE_INFINITY
+    )
+  );
 };
 
 const isDefaultTitle = (title: string) =>
@@ -952,6 +1128,30 @@ const formatTurnStats = (stats: TurnTokenStats) => {
   const reasoning = formatTokenCount(stats.reasoningTokens);
   if (reasoning && stats.reasoningTokens! > 0) parts.push(`${reasoning} reasoning`);
   return parts.join(' · ');
+};
+
+// Codex goal (/goal) presentation helpers.
+const goalStatusLabels: Record<ThreadGoal['status'], string> = {
+  active: 'Pursuing',
+  paused: 'Paused',
+  blocked: 'Blocked',
+  usageLimited: 'Usage-limited',
+  budgetLimited: 'Budget hit',
+  complete: 'Achieved',
+};
+
+const goalUsageSummary = (goal: ThreadGoal) => {
+  const used = formatTokenCount(goal.tokensUsed ?? 0) ?? '0';
+  const budget =
+    typeof goal.tokenBudget === 'number' ? formatTokenCount(goal.tokenBudget) : null;
+  if (budget) return `${used}/${budget} tokens`;
+  if ((goal.tokensUsed ?? 0) > 0) return `${used} tokens`;
+  return '';
+};
+
+const goalSummaryLine = (goal: ThreadGoal) => {
+  const usage = goalUsageSummary(goal);
+  return `${goalStatusLabels[goal.status] ?? goal.status}: ${goal.objective}${usage ? ` · ${usage}` : ''}`;
 };
 
 // Live task checklist streamed by the agent (grok ACP plan updates).
@@ -1235,26 +1435,49 @@ const AgentActivityCard: React.FC<{
 // reproduces the previous steps-then-text layout.
 type AgentRunSegment =
   | { kind: 'text'; text: string }
-  | { kind: 'activities'; activities: AgentActivity[] };
+  | { kind: 'activities'; activities: AgentActivity[] }
+  | { kind: 'btw'; exchange: BtwExchange };
 
 const buildAgentRunSegments = (
   content: string,
-  activities: AgentActivity[]
+  activities: AgentActivity[],
+  btwExchanges: BtwExchange[] = []
 ): AgentRunSegment[] => {
   const segments: AgentRunSegment[] = [];
   let cursor = 0;
 
-  for (const activity of activities) {
-    const offset = Math.max(cursor, Math.min(activity.contentOffset ?? 0, content.length));
+  const markers = [
+    ...activities.map((activity, index) => ({
+      kind: 'activity' as const,
+      value: activity,
+      offset: activity.contentOffset ?? 0,
+      ts: activity.ts,
+      index,
+    })),
+    ...btwExchanges.map((exchange, index) => ({
+      kind: 'btw' as const,
+      value: exchange,
+      offset: exchange.contentOffset ?? content.length,
+      ts: exchange.createdAt,
+      index: activities.length + index,
+    })),
+  ].sort((a, b) => a.offset - b.offset || a.ts.localeCompare(b.ts) || a.index - b.index);
+
+  for (const marker of markers) {
+    const offset = Math.max(cursor, Math.min(marker.offset, content.length));
     if (offset > cursor) {
       segments.push({ kind: 'text', text: content.slice(cursor, offset) });
       cursor = offset;
     }
+    if (marker.kind === 'btw') {
+      segments.push({ kind: 'btw', exchange: marker.value });
+      continue;
+    }
     const last = segments[segments.length - 1];
     if (last?.kind === 'activities') {
-      last.activities.push(activity);
+      last.activities.push(marker.value);
     } else {
-      segments.push({ kind: 'activities', activities: [activity] });
+      segments.push({ kind: 'activities', activities: [marker.value] });
     }
   }
 
@@ -1358,7 +1581,12 @@ const changedFileStatusLabels: Record<ChangedFileSummary['status'], string> = {
   untracked: 'U',
 };
 
+// Long change lists collapse to the first few files; a toggle reveals the rest.
+const CHANGED_FILES_COLLAPSED_LIMIT = 10;
+
 const ChangedFilesCard: React.FC<{ files: ChangedFileSummary[] }> = ({ files }) => {
+  const [expanded, setExpanded] = useState(false);
+  // Header totals always cover every file, even while the list is collapsed.
   const totals = files.reduce(
     (sum, file) => ({
       additions: sum.additions + file.additions,
@@ -1366,7 +1594,10 @@ const ChangedFilesCard: React.FC<{ files: ChangedFileSummary[] }> = ({ files }) 
     }),
     { additions: 0, deletions: 0 }
   );
-  const groups = files.reduce<Array<{ directory: string; files: ChangedFileSummary[] }>>(
+  const collapsible = files.length > CHANGED_FILES_COLLAPSED_LIMIT;
+  const visibleFiles =
+    collapsible && !expanded ? files.slice(0, CHANGED_FILES_COLLAPSED_LIMIT) : files;
+  const groups = visibleFiles.reduce<Array<{ directory: string; files: ChangedFileSummary[] }>>(
     (result, file) => {
       const lastSlash = file.path.lastIndexOf('/');
       const directory = lastSlash >= 0 ? file.path.slice(0, lastSlash) : '.';
@@ -1420,6 +1651,16 @@ const ChangedFilesCard: React.FC<{ files: ChangedFileSummary[] }> = ({ files }) 
               })}
             </div>
           ))}
+          {collapsible && (
+            <button
+              className="changed-files-show-more"
+              onClick={() => setExpanded((current) => !current)}
+            >
+              {expanded
+                ? 'Show fewer'
+                : `Show all ${files.length} files (${files.length - CHANGED_FILES_COLLAPSED_LIMIT} more)`}
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1436,6 +1677,170 @@ const useRunTicker = (enabled: boolean) => {
   }, [enabled]);
 };
 
+// Live run status docked to the bottom of the chat area, so the user always
+// sees what the agent is doing right now without scrolling back up to the
+// top of the running message.
+const PinnedRunStatus: React.FC<{ message: Message }> = ({ message }) => {
+  useRunTicker(true);
+  const duration = formatRunDuration(message.startedAt, message.completedAt);
+  const latestActivity = message.activities?.length
+    ? message.activities[message.activities.length - 1]
+    : undefined;
+  // Prefer whichever activity is blocked on approval — that's the state the
+  // user can act on — over whatever streamed last.
+  const waitingActivity = message.activities?.find((activity) => activity.status === 'waiting');
+  const runningLabel = waitingActivity
+    ? `Waiting for approval · ${waitingActivity.title}`
+    : latestActivity?.title ?? message.statusText ?? 'Working on it...';
+
+  return (
+    <div className="agent-status-line running pinned">
+      <span className="working-dots" aria-hidden="true"><span /><span /><span /></span>
+      <span>{runningLabel}</span>
+      {duration && <span className="agent-status-elapsed">{duration}</span>}
+    </div>
+  );
+};
+
+// Claude Code-style agents switcher. When the current thread's family (the
+// main run plus every subagent it spawned — provider-native or Orion-spawned)
+// has members, a strip above the composer lists them with live status, so the
+// user can flip between transcripts without losing their place. It renders
+// identically on the main thread and on every subagent thread; only the
+// highlighted row changes, which is what makes switching back and forth
+// seamless.
+const AgentFamilySwitcher: React.FC<{
+  currentThread: Thread;
+  threads: Thread[];
+  onSelect: (threadId: string) => void;
+}> = ({ currentThread, threads, onSelect }) => {
+  // Walk up to the family root — subagents can themselves spawn subagents.
+  const root = useMemo(() => {
+    let node = currentThread;
+    const seen = new Set<string>([node.id]);
+    while (node.parentThreadId) {
+      const parent = threads.find((t) => t.id === node.parentThreadId);
+      if (!parent || seen.has(parent.id)) break;
+      seen.add(parent.id);
+      node = parent;
+    }
+    return node;
+  }, [currentThread, threads]);
+
+  const subagents = useMemo(() => {
+    const collect = (parentId: string, depth: number, out: Array<{ thread: Thread; depth: number }>) => {
+      if (depth > 3) return;
+      const children = threads
+        .filter((t) => t.parentThreadId === parentId)
+        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      for (const child of children) {
+        out.push({ thread: child, depth });
+        collect(child.id, depth + 1, out);
+      }
+    };
+    const out: Array<{ thread: Thread; depth: number }> = [];
+    collect(root.id, 0, out);
+    return out;
+  }, [threads, root.id]);
+
+  const anyRunning =
+    root.status === 'running' || subagents.some(({ thread }) => thread.status === 'running');
+  useRunTicker(anyRunning);
+
+  if (subagents.length === 0) return null;
+
+  const renderRow = (thread: Thread, isMain: boolean, depth: number) => {
+    const lastRun = [...thread.messages].reverse().find((m) => m.kind === 'agent-run');
+    const duration = lastRun
+      ? formatRunDuration(lastRun.startedAt, lastRun.completedAt)
+      : '';
+    const tokens = lastRun?.stats?.totalTokens;
+    const active = thread.id === currentThread.id;
+    const name = isMain
+      ? 'main'
+      : thread.subagent?.kind ?? thread.modelId.split(':')[1] ?? 'agent';
+    const detail = thread.title;
+    return (
+      <button
+        key={thread.id}
+        type="button"
+        className={`agent-switcher-row${active ? ' active' : ''}${isMain ? ' main' : ''}`}
+        style={depth > 1 ? { paddingLeft: 10 + depth * 14 } : undefined}
+        onClick={() => onSelect(thread.id)}
+        title={detail}
+      >
+        <span className={`agent-switcher-dot status-${thread.status}`} aria-hidden="true" />
+        <span className="agent-switcher-name">{name}</span>
+        {!isMain && <span className="agent-switcher-title">{detail}</span>}
+        <span className="agent-switcher-meta">
+          {duration}
+          {typeof tokens === 'number' && tokens > 0 && (
+            <> · ↓ {formatTokenCount(tokens)} tokens</>
+          )}
+        </span>
+      </button>
+    );
+  };
+
+  return (
+    <div className="agent-switcher">
+      {renderRow(root, true, 0)}
+      {subagents.map(({ thread, depth }) => renderRow(thread, false, depth + 1))}
+    </div>
+  );
+};
+
+// Failure text that means the provider CLI is logged out rather than that the
+// turn itself went wrong. Matched against the terminal error text (plus the
+// tail of the streamed output, where stderr lands) so the transcript can offer
+// an Authenticate button instead of a dead-end error. Patterns cover every
+// provider's logged-out phrasing: claude ("Invalid API key · Please run
+// /login", "OAuth session expired"), codex ("Not logged in. Run codex login",
+// 401s), cursor-agent ("Not authenticated"), grok ("login required"), opencode.
+const PROVIDER_AUTH_ERROR_PATTERNS: RegExp[] = [
+  /invalid api key/i,
+  /run \/login/i,
+  /failed to authenticate/i,
+  /authentication (failed|error|required)/i,
+  /not (logged in|authenticated|signed in)/i,
+  /(login|log ?in|sign ?in) (is )?required/i,
+  /(oauth|auth(entication)?) (session|token)[^\n]{0,60}(expired|invalid|revoked)/i,
+  /token (has )?expired/i,
+  /\bunauthenticated\b/i,
+  /\b401\b[^\n]{0,40}unauthorized/i,
+  /unauthorized[^\n]{0,40}\b401\b/i,
+  /run\s+`?(codex|cursor-agent|grok|opencode|claude)\s+(auth\s+)?login/i,
+  /please (log ?in|sign ?in)/i,
+];
+
+const isProviderAuthErrorText = (text: string | null | undefined): boolean =>
+  Boolean(text) && PROVIDER_AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text as string));
+
+/** Inline "this CLI is logged out" prompt shown in place of a dead-end turn error. */
+const ProviderAuthPrompt: React.FC<{
+  providerId: string;
+  onAuthenticate: (providerId: string) => void;
+  busy?: boolean;
+}> = ({ providerId, onAuthenticate, busy }) => {
+  const label =
+    agentProviders.find((provider) => provider.id === providerId)?.label ?? providerId;
+  return (
+    <div className="agent-error agent-auth-error">
+      <span>
+        {label} is logged out. Authenticate, then send your message again.
+      </span>
+      <button
+        type="button"
+        className="provider-auth-button compact"
+        onClick={() => onAuthenticate(providerId)}
+        disabled={busy}
+      >
+        {busy ? 'Authenticating…' : 'Authenticate'}
+      </button>
+    </div>
+  );
+};
+
 const ChatMessage: React.FC<{
   message: Message;
   /** The thread's current linked task, for live status on the message's task chip. */
@@ -1443,7 +1848,21 @@ const ChatMessage: React.FC<{
   taskBusy?: boolean;
   onMarkTaskDone?: () => void;
   onUnlinkTask?: () => void;
-}> = ({ message, liveTask, taskBusy, onMarkTaskDone, onUnlinkTask }) => {
+  btwExchanges?: BtwExchange[];
+  renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
+  onAuthenticateProvider?: (providerId: string) => void;
+  authenticatingProviderId?: string | null;
+}> = ({
+  message,
+  liveTask,
+  taskBusy,
+  onMarkTaskDone,
+  onUnlinkTask,
+  btwExchanges = [],
+  renderBtwAside,
+  onAuthenticateProvider,
+  authenticatingProviderId,
+}) => {
   const attachments = message.attachments ?? [];
   const messageTask = message.linkedTask;
   // Live status/actions only while the chip's task is still the thread's
@@ -1451,20 +1870,10 @@ const ChatMessage: React.FC<{
   const liveMessageTask = messageTask && liveTask?.id === messageTask.id ? liveTask : undefined;
   const isAgentRun = message.role === 'agent' && message.kind === 'agent-run';
   const isRunning = isAgentRun && message.status === 'running';
-  useRunTicker(isRunning);
 
   if (isAgentRun) {
     const duration = formatRunDuration(message.startedAt, message.completedAt);
     const hasContent = message.content.trim().length > 0;
-    const latestActivity = message.activities?.length
-      ? message.activities[message.activities.length - 1]
-      : undefined;
-    // Prefer whichever activity is blocked on approval — that's the state the
-    // user can act on — over whatever streamed last.
-    const waitingActivity = message.activities?.find((activity) => activity.status === 'waiting');
-    const runningLabel = waitingActivity
-      ? `Waiting for approval · ${waitingActivity.title}`
-      : latestActivity?.title ?? message.statusText ?? 'Working on it...';
     const statsSummary = message.stats ? formatTurnStats(message.stats) : '';
 
     return (
@@ -1478,20 +1887,22 @@ const ChatMessage: React.FC<{
             {hasContent && <CopyMessageButton text={message.content} className="in-divider" />}
           </div>
         )}
-        {(message.statusText || isRunning) && (
-          <div className={`agent-status-line ${isRunning ? 'running' : ''}`}>
-            {isRunning && <span className="working-dots" aria-hidden="true"><span /><span /><span /></span>}
-            <span>{isRunning ? runningLabel : message.statusText}</span>
-            {isRunning && duration && <span className="agent-status-elapsed">{duration}</span>}
+        {message.statusText && !isRunning && (
+          <div className="agent-status-line">
+            <span>{message.statusText}</span>
           </div>
         )}
-        {buildAgentRunSegments(message.content, message.activities ?? []).map((segment, index) =>
+        {buildAgentRunSegments(message.content, message.activities ?? [], btwExchanges).map((segment, index) =>
           segment.kind === 'activities' ? (
             <AgentActivityCard
               key={segment.activities[0].id}
               activities={segment.activities}
               runStatus={message.status}
             />
+          ) : segment.kind === 'btw' ? (
+            <React.Fragment key={`btw-${segment.exchange.id}`}>
+              {renderBtwAside?.(segment.exchange)}
+            </React.Fragment>
           ) : segment.text.trim() ? (
             <MarkdownContent key={`text-${index}`} content={segment.text} />
           ) : null
@@ -1502,7 +1913,16 @@ const ChatMessage: React.FC<{
             <div className="agent-empty-output">Waiting for the agent to produce output...</div>
           )}
         {!isRunning && message.changedFiles && <ChangedFilesCard files={message.changedFiles} />}
-        {message.error && <div className="agent-error">{message.error}</div>}
+        {message.error &&
+          (message.authProviderId && onAuthenticateProvider ? (
+            <ProviderAuthPrompt
+              providerId={message.authProviderId}
+              onAuthenticate={onAuthenticateProvider}
+              busy={authenticatingProviderId === message.authProviderId}
+            />
+          ) : (
+            <div className="agent-error">{message.error}</div>
+          ))}
       </div>
     );
   }
@@ -1910,6 +2330,9 @@ const App: React.FC = () => {
     providerSettings,
     setProviderEnabled,
     setProviderOptions,
+    orchestrationSettings,
+    setOrchestrationRoleModel,
+    setOrchestrationGeneralInstructions,
     setThreadAgentSession,
     queueMessageToThread,
     removeQueuedThreadMessage,
@@ -1928,6 +2351,10 @@ const App: React.FC = () => {
   // One agent run may be active per thread; runs in other threads are
   // independent, so starting/stopping one never blocks the rest.
   const [activeRunsByThread, setActiveRunsByThread] = useState<Record<string, string>>({});
+  const activeRunsByThreadRef = useRef(activeRunsByThread);
+  useEffect(() => {
+    activeRunsByThreadRef.current = activeRunsByThread;
+  }, [activeRunsByThread]);
   const activeRunId = selectedThreadId ? activeRunsByThread[selectedThreadId] ?? null : null;
   const isSending = Boolean(activeRunId);
   const clearActiveRun = useCallback((runId: string) => {
@@ -1945,6 +2372,13 @@ const App: React.FC = () => {
   const [agentModels, setAgentModels] = useState<AgentModel[]>(fallbackAgentModels);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState('');
+  // Active @-mention token in the composer: index of the '@' and the query
+  // typed after it (null when the caret isn't inside a mention token).
+  const [chatMention, setChatMention] = useState<{ start: number; query: string } | null>(null);
+  const [chatMentionIndex, setChatMentionIndex] = useState(0);
+  // Start offset of a token dismissed with Escape, so it stays closed until
+  // the user begins a new mention.
+  const chatMentionDismissRef = useRef<number | null>(null);
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
@@ -1966,6 +2400,7 @@ const App: React.FC = () => {
   const [cloudState, setCloudState] = useState<OrionCloudState | null>(null);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
+  const [goalMenuOpen, setGoalMenuOpen] = useState(false);
   const [projectMenuOpenId, setProjectMenuOpenId] = useState<string | null>(null);
   // Keys are namespaced ("shell:<id>", "recent:<id>", "project:<id>") because the
   // same thread can appear in both the Recent agents list and its project list.
@@ -1974,6 +2409,10 @@ const App: React.FC = () => {
   const [projectRenameId, setProjectRenameId] = useState<string | null>(null);
   const [threadListLimits, setThreadListLimits] = useState<Record<string, number>>({});
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
+  // Nested subthread lists (keyed by parent thread id), shared between the
+  // Recent agents list and the project lists.
+  const [collapsedSubthreads, setCollapsedSubthreads] = useState<Record<string, boolean>>({});
+  const [subthreadListLimits, setSubthreadListLimits] = useState<Record<string, number>>({});
   const [recentAgentsOpen, setRecentAgentsOpen] = useState(true);
   const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
   const [editorBottomPadding, setEditorBottomPadding] = useState(280);
@@ -2000,6 +2439,7 @@ const App: React.FC = () => {
   const openWithRef = useRef<HTMLDivElement>(null);
   const threadSearchRef = useRef<HTMLDivElement>(null);
   const threadMenuRef = useRef<HTMLDivElement>(null);
+  const goalMenuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const threadItemMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
@@ -2007,11 +2447,26 @@ const App: React.FC = () => {
   // its transcript. Kept separate from runOutputMessages so aside runs never
   // touch thread status, queued-message dispatch, or the active-run map.
   const btwRuns = useRef(new Map<string, { threadId: string; exchangeId: string }>());
+  // Provider-native subagents streamed by main (subagent/subagent-chunk/
+  // subagent-activity events): `${parentThreadId}:${subagentId}` → the child
+  // thread + agent-run message their transcript streams into.
+  const nativeSubagentTargets = useRef(
+    new Map<string, { threadId: string; messageId: string }>()
+  );
+  const agentModelsRef = useRef<AgentModel[]>(fallbackAgentModels);
+  const startTurnForThreadRef = useRef<
+    | ((threadId: string, promptText: string, attachments: ImageAttachment[]) => {
+        ok: boolean;
+        error?: string;
+      })
+    | null
+  >(null);
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatPinnedRef = useRef(true);
+  const chatScrollTopRef = useRef(0);
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const taskPickerRef = useRef<HTMLDivElement>(null);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
@@ -2068,6 +2523,18 @@ const App: React.FC = () => {
     }
     return null;
   }, [selectedThread]);
+  // The live agent-run message, if any — its status docks to the bottom of
+  // the chat area so the current step never scrolls out of view.
+  const runningAgentMessage = useMemo(() => {
+    const messages = selectedThread?.messages;
+    if (!messages) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role === 'agent' && message.kind === 'agent-run' && message.status === 'running')
+        return message;
+    }
+    return null;
+  }, [selectedThread]);
   const selectedProject =
     projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
   const latestThreadProjectId =
@@ -2103,7 +2570,16 @@ const App: React.FC = () => {
     const draft = composerDraftKey ? composerDraftsRef.current.get(composerDraftKey) : undefined;
     setChatInput(draft?.text ?? '');
     setChatAttachments(draft?.attachments ?? []);
+    // The restored draft has no caret yet, so no mention token can be active.
+    setChatMention(null);
+    chatMentionDismissRef.current = null;
   }, [composerDraftKey]);
+
+  // The spawn-request listener mounts once; it reads the live model catalog
+  // through this ref instead of a stale closure.
+  useEffect(() => {
+    agentModelsRef.current = agentModels;
+  }, [agentModels]);
 
   const canChangeSelectedThreadProject =
     !!selectedThread && selectedThread.messages.length === 0 && selectedThread.status === 'idle' && !isSending;
@@ -2125,6 +2601,13 @@ const App: React.FC = () => {
     agentModels,
     selectedThread?.modelId ?? defaultAgentModelId
   );
+  // Claude Code CLI threads host the interactive `claude` TUI in an embedded
+  // terminal; the composer feeds the PTY instead of dispatching agent turns.
+  const isTerminalThread = selectedAgentModel?.id === claudeCodeCliModelId;
+  // Provider-native subagent transcripts are read-only mirrors of a CLI's
+  // internal agent — there is no session of their own to talk to. Steering
+  // happens from the parent thread.
+  const isNativeSubagentThread = Boolean(selectedThread?.subagent);
   const selectedCodexReasoningOptions = codexReasoningOptionsForModel(selectedAgentModel);
   const selectedCodexReasoning = getEffectiveCodexReasoningEffort(
     selectedAgentModel,
@@ -2156,9 +2639,10 @@ const App: React.FC = () => {
   const selectedGrokReasoningLabel =
     grokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
   const shouldShowAgentSettings =
-    selectedAgentModel?.providerId === 'codex' ||
-    selectedAgentModel?.providerId === 'claude' ||
-    selectedAgentModel?.providerId === 'grok';
+    !isTerminalThread &&
+    (selectedAgentModel?.providerId === 'codex' ||
+      selectedAgentModel?.providerId === 'claude' ||
+      selectedAgentModel?.providerId === 'grok');
   const normalizedProviderSettings = useMemo(
     () => ({
       ...defaultProviderSettings,
@@ -2166,17 +2650,37 @@ const App: React.FC = () => {
     }),
     [providerSettings]
   );
+  // Persisted stores from before orchestration shipped may lack the field, so
+  // merge over the defaults before reading any role model.
+  const normalizedOrchestrationSettings = useMemo(
+    () => ({
+      ...defaultOrchestrationSettings,
+      ...orchestrationSettings,
+      models: {
+        ...defaultOrchestrationSettings.models,
+        ...orchestrationSettings?.models,
+      },
+    }),
+    [orchestrationSettings]
+  );
   const enabledProviderIds = useMemo(
     () =>
       agentProviders
         .map((provider) => provider.id)
-        .filter((id) => normalizedProviderSettings[id as ProviderId]?.enabled !== false),
+        // 'orion' has no providerSettings entry (it's a pseudo-provider, not a
+        // CLI); it is always enabled.
+        .filter(
+          (id) => id === 'orion' || normalizedProviderSettings[id as ProviderId]?.enabled !== false
+        ),
     [normalizedProviderSettings]
   );
   const enabledProviderIdSet = useMemo(() => new Set(enabledProviderIds), [enabledProviderIds]);
   const visibleAgentModels = useMemo(() => {
     const query = modelSearch.trim().toLowerCase();
     return agentModels.filter((model) => {
+      // Claude Code CLI lives as a dedicated overlay button on the Claude tab,
+      // not as a row in the model list.
+      if (model.id === claudeCodeCliModelId) return false;
       const providerMatches = model.providerId === activeProviderTab;
       const providerEnabled = enabledProviderIdSet.has(model.providerId);
       const queryMatches =
@@ -2187,6 +2691,60 @@ const App: React.FC = () => {
       return providerEnabled && providerMatches && queryMatches;
     });
   }, [activeProviderTab, agentModels, enabledProviderIdSet, modelSearch]);
+  const claudeCodeCliModel = useMemo(
+    () => agentModels.find((model) => model.id === claudeCodeCliModelId),
+    [agentModels]
+  );
+  // Composer @-mention candidates: models on enabled providers, 'orion'
+  // excluded (work can't be delegated to the orchestrator itself). An empty
+  // query shows the favorites (or everything), capped at 8 rows.
+  const chatMentionCandidates = useMemo(() => {
+    if (!chatMention) return [];
+    const base = agentModels.filter(
+      (model) =>
+        model.providerId !== 'orion' &&
+        // The Claude Code CLI pseudo-model is an interactive terminal, not a
+        // delegable harness.
+        model.id !== claudeCodeCliModelId &&
+        enabledProviderIdSet.has(model.providerId)
+    );
+    const query = chatMention.query.toLowerCase();
+    if (!query) {
+      const favorites = base.filter((model) => model.favorite);
+      return (favorites.length > 0 ? favorites : base).slice(0, 8);
+    }
+    return base
+      .filter(
+        (model) =>
+          model.id.toLowerCase().includes(query) ||
+          model.label.toLowerCase().includes(query) ||
+          model.slug.toLowerCase().includes(query) ||
+          model.providerLabel.toLowerCase().includes(query)
+      )
+      .slice(0, 8);
+  }, [agentModels, chatMention, enabledProviderIdSet]);
+  const chatMentionOpen = Boolean(chatMention) && chatMentionCandidates.length > 0;
+  // Reset the highlight to the top whenever the candidate list changes.
+  const chatMentionListKey = chatMentionCandidates.map((model) => model.id).join('|');
+  useEffect(() => {
+    setChatMentionIndex(0);
+  }, [chatMentionListKey]);
+  // Role-model options for Settings → Orchestration: every real model grouped
+  // by provider. The Orion pseudo-model can't delegate to itself.
+  const orchestrationModelGroups = useMemo(
+    () =>
+      agentProviders
+        .filter((provider) => provider.id !== 'orion')
+        .map((provider) => ({
+          provider,
+          models: agentModels.filter(
+            (model) =>
+              model.providerId === provider.id && model.id !== claudeCodeCliModelId
+          ),
+        }))
+        .filter((group) => group.models.length > 0),
+    [agentModels]
+  );
   const availableProviderUpdates = useMemo(
     () => providerUpdateState?.providers.filter((provider) => provider.updateAvailable) ?? [],
     [providerUpdateState]
@@ -2265,10 +2823,38 @@ const App: React.FC = () => {
     );
   }, [projects, threads]);
 
+  // Subagent threads nest under the thread that spawned them. A thread is a
+  // child only while its parent still exists — orphans render as top-level.
+  const childThreadsByParent = useMemo(() => {
+    const threadIds = new Set(threads.map((t) => t.id));
+    const byParent = new Map<string, Thread[]>();
+    for (const thread of threads) {
+      if (!thread.parentThreadId || !threadIds.has(thread.parentThreadId)) continue;
+      const siblings = byParent.get(thread.parentThreadId);
+      if (siblings) siblings.push(thread);
+      else byParent.set(thread.parentThreadId, [thread]);
+    }
+    for (const siblings of byParent.values()) {
+      siblings.sort(
+        (a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
+      );
+    }
+    return byParent;
+  }, [threads]);
+
+  const childThreadIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const siblings of childThreadsByParent.values()) {
+      for (const thread of siblings) ids.add(thread.id);
+    }
+    return ids;
+  }, [childThreadsByParent]);
+
   const recentThreads = useMemo(
     () =>
       threads
-        .filter((t) => !t.hiddenFromRecent)
+        // Children never appear top-level; they nest under their parent's row.
+        .filter((t) => !t.hiddenFromRecent && !childThreadIds.has(t.id))
         .sort((a, b) => {
           // Running agents are active "now", so they always rank above
           // finished ones. Among running agents, keep start order so the list
@@ -2282,7 +2868,7 @@ const App: React.FC = () => {
           }
           return getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime();
         }),
-    [threads]
+    [childThreadIds, threads]
   );
 
   const runningAgentCount = useMemo(
@@ -2293,12 +2879,13 @@ const App: React.FC = () => {
   const getProjectThreads = useCallback(
     (projectId: string) =>
       threads
-        .filter((t) => t.projectId === projectId)
+        // Top-level rows only; children render nested under their parent.
+        .filter((t) => t.projectId === projectId && !childThreadIds.has(t.id))
         .sort(
           (a, b) =>
             getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
         ),
-    [threads]
+    [childThreadIds, threads]
   );
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
@@ -2311,22 +2898,88 @@ const App: React.FC = () => {
 
   const deleteThreadWithRuntime = useCallback(
     async (threadId: string) => {
-      await disposeThreadRuntime(threadId);
-      deleteThread(threadId);
+      const state = useOrionStore.getState();
+      const threadIds = new Set([threadId]);
+      // A spawned child has an independent runtime. Deleting its parent must
+      // therefore walk the whole subtree instead of merely orphaning work
+      // that can continue changing the workspace in the background.
+      let foundChild = true;
+      while (foundChild) {
+        foundChild = false;
+        for (const thread of state.threads) {
+          if (
+            thread.parentThreadId &&
+            threadIds.has(thread.parentThreadId) &&
+            !threadIds.has(thread.id)
+          ) {
+            threadIds.add(thread.id);
+            foundChild = true;
+          }
+        }
+      }
+
+      const removedThreads = state.threads.filter((thread) => threadIds.has(thread.id));
+      const runIds: string[] = [];
+      const spawnIds: string[] = [];
+      for (const thread of removedThreads) {
+        const runId = activeRunsByThread[thread.id];
+        if (runId) {
+          runIds.push(runId);
+          runOutputMessages.current.delete(runId);
+          clearActiveRun(runId);
+        }
+        if (thread.spawnId) spawnIds.push(thread.spawnId);
+      }
+
+      await Promise.all(
+        runIds.map((runId) =>
+          window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })
+        )
+      );
+      await Promise.all(removedThreads.map((thread) => disposeThreadRuntime(thread.id)));
+      for (const spawnId of spawnIds) {
+        void window.orion?.reportSubagentResult?.({
+          spawnId,
+          ok: false,
+          result: 'Subagent thread was deleted by the user.',
+        });
+      }
+      // Delete children first so no orphan can briefly surface as a top-level
+      // thread while the persisted store updates.
+      for (const thread of removedThreads.reverse()) deleteThread(thread.id);
     },
-    [deleteThread, disposeThreadRuntime]
+    [activeRunsByThread, clearActiveRun, deleteThread, disposeThreadRuntime]
   );
 
   const removeProjectWithRuntimes = useCallback(
     async (projectId: string) => {
-      const threadIds = useOrionStore
+      const projectThreads = useOrionStore
         .getState()
-        .threads.filter((thread) => thread.projectId === projectId)
-        .map((thread) => thread.id);
-      await Promise.all(threadIds.map(disposeThreadRuntime));
+        .threads.filter((thread) => thread.projectId === projectId);
+      const runIds = projectThreads
+        .map((thread) => activeRunsByThread[thread.id])
+        .filter((runId): runId is string => Boolean(runId));
+      for (const runId of runIds) {
+        runOutputMessages.current.delete(runId);
+        clearActiveRun(runId);
+      }
+      await Promise.all(
+        runIds.map((runId) =>
+          window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })
+        )
+      );
+      await Promise.all(projectThreads.map((thread) => disposeThreadRuntime(thread.id)));
+      for (const thread of projectThreads) {
+        if (!thread.spawnId) continue;
+        void window.orion?.reportSubagentResult?.({
+          spawnId: thread.spawnId,
+          ok: false,
+          result: 'Subagent project was removed by the user.',
+        });
+      }
       removeProject(projectId);
     },
-    [disposeThreadRuntime, removeProject]
+    [activeRunsByThread, clearActiveRun, disposeThreadRuntime, removeProject]
   );
 
   const threadSearchIndex = useMemo<ThreadSearchEntry[]>(() => {
@@ -2411,6 +3064,18 @@ const App: React.FC = () => {
     void refreshProviderUpdates();
   }, [refreshAgentModels, refreshProviderUpdates]);
 
+  // Claude Code CLI terminal threads: main discovers the live CLI session id
+  // from claude's on-disk session store (the interactive TUI ignores
+  // --session-id) and pushes it here. Stored on the thread so later spawns
+  // can --resume it after an app restart. Registered app-wide (not in
+  // TerminalView) so ids aren't missed while the terminal view is unmounted.
+  useEffect(() => {
+    if (!window.orion?.onTerminalSession) return undefined;
+    return window.orion.onTerminalSession((event) => {
+      setThreadAgentSession(event.threadId, 'claude', event.sessionId);
+    });
+  }, [setThreadAgentSession]);
+
   useEffect(() => {
     let mounted = true;
 
@@ -2465,7 +3130,23 @@ const App: React.FC = () => {
     const el = chatScrollRef.current;
     if (!el) return;
     chatPinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    chatScrollTopRef.current = el.scrollTop;
   }, []);
+
+  // The Agents pane unmounts while the Code tab is active, so the chat scroll
+  // container comes back at scrollTop 0. Restore the exact spot the user left
+  // (or the bottom while they were pinned there) before the browser paints.
+  // 'instant' overrides the container's smooth scroll-behavior, which would
+  // otherwise animate the restore from the very top.
+  useLayoutEffect(() => {
+    if (activeTab !== 'agents') return;
+    const el = chatScrollRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: chatPinnedRef.current ? el.scrollHeight : chatScrollTopRef.current,
+      behavior: 'instant',
+    });
+  }, [activeTab]);
 
   useEffect(() => {
     chatPinnedRef.current = true;
@@ -2589,6 +3270,19 @@ const App: React.FC = () => {
       toast.error(error instanceof Error ? error.message : 'Could not request the permission.');
     } finally {
       setComputerUseBusyKind(null);
+    }
+  }, []);
+
+  const handleOpenChromeDebugSetup = useCallback(async () => {
+    try {
+      const result = await window.orion.openChromeDebugSetup();
+      if (result.ok) {
+        toast.success('Opened Chrome — the setup link is also on your clipboard.');
+      } else if (result.error) {
+        toast.error(result.error);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not open Chrome.');
     }
   }, []);
 
@@ -2744,6 +3438,7 @@ const App: React.FC = () => {
       !branchPickerOpen &&
       !threadSearchOpen &&
       !threadMenuOpen &&
+      !goalMenuOpen &&
       !openWithOpen &&
       projectMenuOpenId === null &&
       threadItemMenuKey === null
@@ -2766,6 +3461,9 @@ const App: React.FC = () => {
       if (threadMenuOpen && !threadMenuRef.current?.contains(target)) {
         setThreadMenuOpen(false);
       }
+      if (goalMenuOpen && !goalMenuRef.current?.contains(target)) {
+        setGoalMenuOpen(false);
+      }
       if (projectMenuOpenId !== null && !projectMenuRef.current?.contains(target)) {
         setProjectMenuOpenId(null);
       }
@@ -2780,6 +3478,7 @@ const App: React.FC = () => {
         setBranchPickerOpen(false);
         setThreadSearchOpen(false);
         setThreadMenuOpen(false);
+        setGoalMenuOpen(false);
         setOpenWithOpen(false);
         setProjectMenuOpenId(null);
         setThreadItemMenuKey(null);
@@ -2792,7 +3491,7 @@ const App: React.FC = () => {
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey]);
+  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, goalMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey]);
 
   useEffect(() => {
     setThreadMenuOpen(false);
@@ -2818,13 +3517,17 @@ const App: React.FC = () => {
   // --- Linked board tasks (Orion web kanban) -----------------------------------
 
   const pushLinkedTaskStatus = useCallback(
-    (threadId: string, status: 'running' | 'finished' | 'done' | 'error') => {
+    (
+      threadId: string,
+      status: 'running' | 'finished' | 'done' | 'error',
+      notes?: string
+    ) => {
       const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
       const linked = thread?.linkedTask;
       if (!linked || !window.orion?.updateBoardTaskThreadStatus) return;
       updateThread(threadId, { linkedTask: { ...linked, lastStatus: status } });
       void window.orion
-        .updateBoardTaskThreadStatus({ taskId: linked.id, threadId, status })
+        .updateBoardTaskThreadStatus({ taskId: linked.id, threadId, status, notes })
         .then((result) => {
           if (result.ok || !result.stale) return;
           // The card was unlinked or relinked on the web — drop our side.
@@ -2837,6 +3540,44 @@ const App: React.FC = () => {
     },
     [updateThread]
   );
+
+  // Embedded terminals do not emit agent-run events, so mirror their prompt
+  // and process lifecycle into the persisted thread/board state explicitly.
+  useEffect(() => {
+    if (!window.orion?.onTerminalActivity || !window.orion?.onTerminalExit) return undefined;
+    const offActivity = window.orion.onTerminalActivity((event) => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
+      if (!thread || thread.modelId !== claudeCodeCliModelId) return;
+      if (event.kind === 'started' && thread.status === 'running') return;
+      updateThread(event.threadId, {
+        status: 'running',
+        terminalActivityAt: new Date().toISOString(),
+      });
+      if (
+        event.kind === 'prompt' &&
+        thread.linkedTask &&
+        thread.linkedTask.lastStatus !== 'running'
+      ) {
+        pushLinkedTaskStatus(event.threadId, 'running');
+      }
+    });
+    const offExit = window.orion.onTerminalExit((event) => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
+      if (!thread || thread.modelId !== claudeCodeCliModelId) return;
+      const failed = event.exitCode != null && event.exitCode !== 0;
+      updateThread(event.threadId, {
+        status: failed ? 'error' : 'done',
+        terminalActivityAt: new Date().toISOString(),
+      });
+      if (thread.linkedTask) {
+        pushLinkedTaskStatus(event.threadId, failed ? 'error' : 'finished');
+      }
+    });
+    return () => {
+      offActivity?.();
+      offExit?.();
+    };
+  }, [pushLinkedTaskStatus, updateThread]);
 
   const unlinkTaskFromThread = useCallback(
     (threadId: string) => {
@@ -2885,7 +3626,6 @@ const App: React.FC = () => {
         ...(adoptTitle ? { title: task.title } : {}),
       });
       setTaskPickerOpen(false);
-      toast.success(`Linked "${task.title}"`);
     },
     [updateThread]
   );
@@ -2950,12 +3690,190 @@ const App: React.FC = () => {
           btwRuns.current.delete(event.runId);
         }
         if (event.type === 'error') {
+          // Same logged-out detection as transcript turns: the aside's answer
+          // tail carries the CLI's stderr text.
+          const asideAnswerTail =
+            useOrionStore
+              .getState()
+              .threads.find((thread) => thread.id === btwRun.threadId)
+              ?.btwExchanges?.find((exchange) => exchange.id === btwRun.exchangeId)
+              ?.answer.slice(-1200) ?? '';
+          const asideLoggedOut =
+            isProviderAuthErrorText(event.error) || isProviderAuthErrorText(asideAnswerTail);
           updateBtwExchange(btwRun.threadId, btwRun.exchangeId, {
             status: 'error',
             completedAt: new Date().toISOString(),
             error: event.error,
+            authProviderId:
+              asideLoggedOut && event.providerId !== 'orion' ? event.providerId : undefined,
           });
           btwRuns.current.delete(event.runId);
+        }
+        return;
+      }
+
+      // Goal state belongs to the thread, not to the transcript message. Stop
+      // deliberately untracks a run before IPC so late text/result events
+      // cannot rewrite the stopped message; the persisted paused-goal update
+      // must still land after that untracking.
+      if (event.type === 'goal') {
+        updateThread(event.threadId, { goal: event.goal ?? null });
+        return;
+      }
+
+      // A claude session's background work settled with no re-invocation
+      // coming (task killed/failed, notification suppressed, or the session
+      // itself was disposed): flip a thread left "working — waiting on
+      // background agents" to done. No-op unless the thread is idle-running.
+      if (event.type === 'background-settled') {
+        const retainedRunId = activeRunsByThreadRef.current[event.threadId];
+        // A mapping without a tracked output message is the retained
+        // background-session handle. A mapping with one is a genuine live
+        // foreground turn, which this stale settle event must not finish.
+        if (retainedRunId && runOutputMessages.current.has(retainedRunId)) return;
+        // runOutputMessages updates synchronously when a run starts, so it
+        // also covers the render tick before activeRunsByThreadRef syncs.
+        for (const run of runOutputMessages.current.values()) {
+          if (run.threadId === event.threadId) return;
+        }
+        if (retainedRunId) clearActiveRun(retainedRunId);
+        const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
+        if (!thread || thread.status !== 'running') return;
+        const lastRun = [...thread.messages].reverse().find((m) => m.kind === 'agent-run');
+        updateThread(event.threadId, { status: 'done' });
+        pushLinkedTaskStatus(event.threadId, 'finished', lastRun?.content.trim() || undefined);
+        if (lastRun && lastRun.status === 'done') {
+          updateThreadMessage(event.threadId, lastRun.id, { statusText: 'Finished.' });
+        }
+        return;
+      }
+
+      // Provider-native subagents (claude Agent tool, codex collaboration
+      // spawns, cursor Task tool, grok spawn_subagent): main tails each
+      // subagent's on-disk transcript and streams it here. Every subagent
+      // becomes a hidden child thread of the run's thread, so the agents
+      // switcher can flip between main and subagents uniformly.
+      if (
+        (event.type === 'subagent' && event.subagent) ||
+        ((event.type === 'subagent-chunk' || event.type === 'subagent-activity') &&
+          event.subagentId)
+      ) {
+        const info = event.type === 'subagent' ? event.subagent : undefined;
+        const subagentId = info?.id ?? event.subagentId;
+        if (!subagentId) return;
+        const key = `${event.threadId}:${subagentId}`;
+        const state = useOrionStore.getState();
+        let target = nativeSubagentTargets.current.get(key) ?? null;
+
+        // Rebind after an app reload: the child thread persists, the ref map
+        // doesn't.
+        if (!target) {
+          const existing = state.threads.find(
+            (t) => t.parentThreadId === event.threadId && t.subagent?.id === subagentId
+          );
+          const lastRun = existing
+            ? [...existing.messages].reverse().find((m) => m.kind === 'agent-run')
+            : undefined;
+          if (existing && lastRun) {
+            target = { threadId: existing.id, messageId: lastRun.id };
+            nativeSubagentTargets.current.set(key, target);
+          }
+        }
+
+        if (!target && info) {
+          const parent = state.threads.find((t) => t.id === event.threadId);
+          if (!parent) return;
+          const childThreadId = state.createThread(
+            parent.projectId,
+            info.title || info.kind || 'Subagent',
+            {
+              parentThreadId: parent.id,
+              modelId: parent.modelId,
+              hiddenFromRecent: true,
+              accessMode: parent.accessMode,
+              select: false,
+              subagent: {
+                id: subagentId,
+                providerId: (info.providerId ??
+                  parent.modelId.split(':')[0]) as ProviderId,
+                kind: info.kind,
+                model: info.model,
+                prompt: info.prompt,
+              },
+            }
+          );
+          if (info.prompt) {
+            addMessageToThread(childThreadId, { role: 'user', content: info.prompt });
+          }
+          const messageId = addMessageToThread(childThreadId, {
+            role: 'agent',
+            content: '',
+            kind: 'agent-run',
+            status: 'running',
+            statusText: 'Subagent working…',
+            startedAt: new Date(info.startedAt ?? Date.now()).toISOString(),
+            activities: [],
+          });
+          updateThread(childThreadId, { status: 'running' });
+          target = { threadId: childThreadId, messageId };
+          nativeSubagentTargets.current.set(key, target);
+        }
+        if (!target) return;
+
+        if (event.type === 'subagent-chunk' && event.chunk) {
+          appendToThreadMessage(target.threadId, target.messageId, event.chunk);
+        } else if (event.type === 'subagent-activity' && event.activity) {
+          addActivityToThreadMessage(target.threadId, target.messageId, event.activity);
+        } else if (info) {
+          const fresh = useOrionStore.getState();
+          const childThread = fresh.threads.find((t) => t.id === target.threadId);
+          if (childThread?.subagent && (info.prompt || info.summary)) {
+            updateThread(target.threadId, {
+              subagent: {
+                ...childThread.subagent,
+                ...(info.prompt ? { prompt: info.prompt } : {}),
+                ...(info.summary ? { summary: info.summary } : {}),
+              },
+            });
+          }
+          // A late-arriving prompt (codex delivers it inside the rollout)
+          // fills in the transcript's opening user bubble.
+          if (
+            childThread &&
+            info.prompt &&
+            !childThread.messages.some((m) => m.role === 'user')
+          ) {
+            updateThread(target.threadId, {
+              messages: [
+                {
+                  id: crypto.randomUUID(),
+                  role: 'user',
+                  content: info.prompt,
+                  ts: childThread.messages[0]?.ts ?? new Date().toISOString(),
+                },
+                ...childThread.messages,
+              ],
+            });
+          }
+          if (info.status && info.status !== 'running') {
+            const failed = info.status === 'error';
+            const stopped = info.status === 'stopped';
+            updateThreadMessage(target.threadId, target.messageId, {
+              status: stopped ? 'stopped' : failed ? 'error' : 'done',
+              completedAt: new Date(info.completedAt ?? Date.now()).toISOString(),
+              statusText: stopped
+                ? 'Stopped by user.'
+                : failed
+                  ? 'The subagent stopped with an error.'
+                  : 'Finished.',
+              ...(info.stats?.totalTokens
+                ? { stats: { totalTokens: info.stats.totalTokens } }
+                : {}),
+            });
+            updateThread(target.threadId, {
+              status: stopped ? 'idle' : failed ? 'error' : 'done',
+            });
+          }
         }
         return;
       }
@@ -3025,18 +3943,40 @@ const App: React.FC = () => {
 
       if (event.type === 'done') {
         flushChunkBuffers();
+        // Background subagents/workflows the model is still waiting on: the
+        // turn is over, but the task isn't. Keep the thread in the working
+        // state — the harness re-invokes the model (a `started {background}`
+        // turn) when each task settles, and a `background-settled` event
+        // covers tasks that die without re-invoking.
+        const waitingOn = event.pendingBackgroundTasks ?? [];
+        const waiting = waitingOn.length > 0;
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'done',
           completedAt: new Date().toISOString(),
-          statusText: 'Finished.',
+          statusText: waiting
+            ? `Waiting on ${waitingOn.length} background ${waitingOn.length === 1 ? 'agent' : 'agents'}…`
+            : 'Finished.',
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
         });
-        updateThread(tracked.threadId, { status: 'done' });
-        // Turn finished — surface the work on the board (In Review column).
-        pushLinkedTaskStatus(tracked.threadId, 'finished');
+        if (waiting) {
+          updateThread(tracked.threadId, { status: 'running' });
+        } else {
+          updateThread(tracked.threadId, { status: 'done' });
+          // Turn finished — surface the work on the board (In Review column)
+          // with the response the user sees in this completed agent message.
+          const finalResponse = useOrionStore
+            .getState()
+            .threads.find((thread) => thread.id === tracked.threadId)
+            ?.messages.find((message) => message.id === tracked.messageId)
+            ?.content.trim();
+          pushLinkedTaskStatus(tracked.threadId, 'finished', finalResponse || undefined);
+        }
         runOutputMessages.current.delete(event.runId);
-        clearActiveRun(event.runId);
+        // Keep the completed run id as a cancellable handle while Claude's
+        // background agents are still live. Main recognizes it until the
+        // session settles; the mapping also keeps Stop/queue UI active.
+        if (!waiting) clearActiveRun(event.runId);
       }
 
       if (event.type === 'error') {
@@ -3044,11 +3984,32 @@ const App: React.FC = () => {
         if (event.error) {
           appendToThreadMessage(tracked.threadId, tracked.messageId, `\n\n${event.error}`);
         }
+        // A logged-out provider CLI surfaces as a turn error. Recognize it —
+        // in the terminal error text or in the tail of the streamed output,
+        // where stderr lands — and mark the message so the transcript offers
+        // an Authenticate button instead of a dead-end error.
+        const errorThread = useOrionStore
+          .getState()
+          .threads.find((thread) => thread.id === tracked.threadId);
+        const contentTail =
+          errorThread?.messages
+            .find((message) => message.id === tracked.messageId)
+            ?.content.slice(-1200) ?? '';
+        const looksLoggedOut =
+          isProviderAuthErrorText(event.error) || isProviderAuthErrorText(contentTail);
+        const rawAuthProviderId = looksLoggedOut
+          ? event.providerId ?? errorThread?.modelId.split(':')[0]
+          : undefined;
+        // The Orion pseudo-provider has no CLI of its own to authenticate.
+        const authProviderId = rawAuthProviderId === 'orion' ? undefined : rawAuthProviderId;
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'error',
           completedAt: new Date().toISOString(),
-          statusText: 'The agent stopped with an error.',
+          statusText: authProviderId
+            ? 'The agent is logged out.'
+            : 'The agent stopped with an error.',
           error: event.error,
+          authProviderId,
           changedFiles: event.changedFiles ?? [],
         });
         updateThread(tracked.threadId, { status: 'error' });
@@ -3629,10 +4590,88 @@ const App: React.FC = () => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
+      if (thread.subagent) {
+        return {
+          ok: false,
+          error: 'Subagent transcripts are read-only — steer from the parent thread.',
+        };
+      }
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
-      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
+
+      // Orion pseudo-model: resolve the configured main driver EARLY and
+      // replace `model` with it, so every downstream use (enabled/available
+      // checks, session ids, reasoning params, provider options) applies to
+      // the real provider. thread.modelId stays 'orion:orchestrator'.
+      let orchestration:
+        | {
+            isOrchestrator: boolean;
+            roles: Array<{
+              role: string;
+              roleLabel: string;
+              modelId: string;
+              providerId: string;
+              slug: string;
+              modelLabel: string;
+            }>;
+            generalInstructions: string;
+          }
+        | undefined;
+      if (model.providerId === 'orion' || isOrionModelId(thread.modelId)) {
+        const roleModels = {
+          ...defaultOrchestrationSettings.models,
+          ...state.orchestrationSettings?.models,
+        };
+        const generalInstructions =
+          state.orchestrationSettings?.generalInstructions ??
+          defaultOrchestrationSettings.generalInstructions;
+        let driverModel = agentModels.find((candidate) => candidate.id === roleModels.mainDriver);
+        if (
+          !driverModel ||
+          driverModel.providerId === 'orion' ||
+          driverModel.id === claudeCodeCliModelId
+        ) {
+          // Misconfigured/pseudo driver: fall back to a real agent model.
+          driverModel =
+            agentModels.find((candidate) => candidate.id === defaultAgentModelId) ??
+            agentModels.find(
+              (candidate) =>
+                candidate.providerId !== 'orion' && candidate.id !== claudeCodeCliModelId
+            );
+        }
+        if (
+          !driverModel ||
+          driverModel.providerId === 'orion' ||
+          driverModel.id === claudeCodeCliModelId
+        ) {
+          return { ok: false, error: 'Pick a main driver model in Settings → Orchestration' };
+        }
+        const roles = orchestrationRoleMeta.map((meta) => {
+          const configuredRoleModel = agentModels.find(
+            (candidate) => candidate.id === roleModels[meta.id]
+          );
+          const roleModel =
+            meta.id === 'mainDriver' ||
+            !configuredRoleModel ||
+            configuredRoleModel.providerId === 'orion' ||
+            configuredRoleModel.id === claudeCodeCliModelId
+              ? driverModel
+              : configuredRoleModel;
+          return {
+            role: meta.id,
+            roleLabel: meta.label,
+            modelId: roleModel.id,
+            providerId: roleModel.providerId,
+            slug: roleModel.slug,
+            modelLabel: roleModel.label,
+          };
+        });
+        orchestration = { isOrchestrator: true, roles, generalInstructions };
+        model = driverModel;
+      }
+
       if (normalizedProviderSettings[model.providerId]?.enabled === false) {
         return { ok: false, error: `${model.providerLabel} is disabled` };
       }
@@ -3660,6 +4699,25 @@ const App: React.FC = () => {
           ? `${buildLinkedTaskContext(taskToInject, true)}\n\n${agentPrompt}`
           : buildLinkedTaskContext(taskToInject, false);
         updateThread(threadId, { linkedTask: { ...taskToInject, injected: true } });
+      }
+      // @-model mentions in the user's original text: tell the agent which
+      // models were referenced so it can delegate to them. Works on any
+      // thread, not just Orion ones.
+      const mentionedModels = promptText ? parseModelMentions(promptText, agentModels) : [];
+      if (mentionedModels.length > 0) {
+        const mentionsContext = buildModelMentionsContext(mentionedModels);
+        agentPrompt = agentPrompt ? `${mentionsContext}\n\n${agentPrompt}` : mentionsContext;
+      }
+      if (orchestration) {
+        // Prepended last so it sits before the linked-task context when both apply.
+        const orchestrationContext = buildOrchestrationContext(
+          orchestration.roles,
+          orchestration.generalInstructions,
+          thread.accessMode ?? 'full-access'
+        );
+        agentPrompt = agentPrompt
+          ? `${orchestrationContext}\n\n${agentPrompt}`
+          : orchestrationContext;
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
@@ -3742,6 +4800,8 @@ const App: React.FC = () => {
           ...(model.providerId === 'grok'
             ? { grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort }
             : {}),
+          ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
+          ...(orchestration ? { orchestration } : {}),
         })
         .then((result) => {
           if (result.ok && result.runId) {
@@ -3780,6 +4840,132 @@ const App: React.FC = () => {
     ]
   );
 
+  useEffect(() => {
+    startTurnForThreadRef.current = startTurnForThread;
+  }, [startTurnForThread]);
+
+  // Orchestrator spawn_subagent requests from main: create a hidden child
+  // thread in the driver's project, run the prompt on the requested model,
+  // and report the final output back (which unblocks the driver's MCP tool
+  // call). Mounts once; live state comes from the store and refs.
+  useEffect(() => {
+    if (!window.orion?.onSubagentSpawnRequest) return undefined;
+    const unsubscribe = window.orion.onSubagentSpawnRequest((request) => {
+      const report = (ok: boolean, result: string) => {
+        void window.orion?.reportSubagentResult?.({ spawnId: request.spawnId, ok, result });
+      };
+      const state = useOrionStore.getState();
+      const driverThread = state.threads.find((t) => t.id === request.threadId);
+      const projectId =
+        driverThread?.projectId ??
+        state.projects.find((p) => p.path === request.projectPath)?.id;
+      if (!projectId) {
+        report(false, 'Driver thread/project not found');
+        return;
+      }
+
+      // Resolve the model fuzzily: exact id → exact slug → exact label →
+      // includes on slug/label.
+      const models = agentModelsRef.current;
+      const wanted = request.model.trim();
+      const wantedLower = wanted.toLowerCase();
+      const model =
+        models.find((m) => m.id === wanted) ??
+        models.find((m) => m.slug.toLowerCase() === wantedLower) ??
+        models.find((m) => m.label.toLowerCase() === wantedLower) ??
+        models.find(
+          (m) =>
+            m.slug.toLowerCase().includes(wantedLower) ||
+            m.label.toLowerCase().includes(wantedLower)
+        );
+      if (!model) {
+        const available = models
+          .filter((m) => m.providerId !== 'orion')
+          .slice(0, 10)
+          .map((m) => m.slug)
+          .join(', ');
+        report(false, `Unknown model "${request.model}". Available: ${available}`);
+        return;
+      }
+      if (model.providerId === 'orion' || model.id === claudeCodeCliModelId) {
+        report(
+          false,
+          model.providerId === 'orion'
+            ? 'Cannot spawn a subagent on the Orion orchestrator itself'
+            : 'Claude Code CLI is an interactive terminal and cannot run as a subagent'
+        );
+        return;
+      }
+
+      const promptSlice = request.prompt.trim().slice(0, 44);
+      const roleMeta = orchestrationRoleMeta.find((meta) => meta.id === request.role);
+      const title =
+        request.title ||
+        (roleMeta ? `${roleMeta.label}: ${promptSlice}` : `${model.label}: ${promptSlice}`);
+
+      // createThread selects the new thread; put the user's selection back so
+      // a background spawn never yanks the UI away from their current thread.
+      const prevThreadId = state.selectedThreadId;
+      const prevProjectId = state.selectedProjectId;
+      const childThreadId = state.createThread(projectId, title, {
+        parentThreadId: request.threadId,
+        modelId: model.id,
+        hiddenFromRecent: true,
+        // Persisted on the thread so stop/delete/reload can still resolve the
+        // driver's blocked spawn_subagent call.
+        spawnId: request.spawnId,
+        // Deterministic: subagents run with the driver's access mode, never
+        // whatever an unrelated project thread last used.
+        accessMode: driverThread?.accessMode,
+      });
+      if (prevThreadId) {
+        state.selectThread(prevThreadId);
+      } else {
+        state.selectThread(null);
+        state.selectProject(prevProjectId);
+      }
+
+      // The spawnId was persisted at creation so the completion watcher can't
+      // miss a fast run. Async start failures set the thread status to
+      // 'error', which the watcher reports.
+      const result = startTurnForThreadRef.current?.(childThreadId, request.prompt, []);
+      if (!result?.ok) {
+        state.updateThread(childThreadId, { spawnId: undefined });
+        report(false, result?.error ?? 'The subagent turn could not start');
+      }
+    });
+    return () => {
+      unsubscribe?.();
+    };
+  }, []);
+
+  // A spawned subthread reaching 'done' or 'error' (turn finished, failed to
+  // start, or app-restart recovery) resolves the driver's blocked
+  // spawn_subagent call with the child's final output. The persisted spawnId
+  // is cleared after the first report — later runs on the subthread
+  // (steer/queued follow-ups) fire more transitions, but main also ignores
+  // unknown spawnIds.
+  useEffect(() => {
+    for (const thread of threads) {
+      const spawnId = thread.spawnId;
+      if (!spawnId) continue;
+      if (thread.status !== 'done' && thread.status !== 'error') continue;
+      updateThread(thread.id, { spawnId: undefined });
+      const lastAgentMessage = [...thread.messages]
+        .reverse()
+        .find((message) => message.role === 'agent' && (message.content.trim() || message.error));
+      const output = lastAgentMessage?.content.trim();
+      void window.orion?.reportSubagentResult?.({
+        spawnId,
+        ok: thread.status === 'done',
+        result:
+          thread.status === 'done'
+            ? output || '(no output)'
+            : lastAgentMessage?.error || output || 'The subagent run failed.',
+      });
+    }
+  }, [threads, updateThread]);
+
   // `/btw` — ask the agent a side question without interrupting the thread
   // (Claude Code's /btw). The question runs against a read-only FORK of the
   // thread's Claude session (--resume <id> --fork-session), so it sees the
@@ -3793,7 +4979,17 @@ const App: React.FC = () => {
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
-      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      // Orion threads run on their configured main-driver model. Resolve the
+      // pseudo-model here just as startTurnForThread does so a Claude-backed
+      // orchestrator can fork its live Claude session for /btw.
+      if (model?.providerId === 'orion' || isOrionModelId(thread.modelId)) {
+        const roleModels = {
+          ...defaultOrchestrationSettings.models,
+          ...state.orchestrationSettings?.models,
+        };
+        model = findAgentModel(agentModels, roleModels.mainDriver);
+      }
       if (!model) return { ok: false, error: 'Select an agent model first' };
       if (model.providerId !== 'claude') {
         return { ok: false, error: '/btw is only available on Claude agents for now' };
@@ -3809,6 +5005,12 @@ const App: React.FC = () => {
       }
 
       const sessionId = thread.agentSessionIds?.claude;
+      if (!sessionId) {
+        return {
+          ok: false,
+          error: 'Wait for Claude to start this thread before using /btw.',
+        };
+      }
       const prompt =
         'The user has a quick aside question about this session (asked via /btw). ' +
         'Answer it directly and concisely. Do not make any changes and do not treat ' +
@@ -3816,6 +5018,10 @@ const App: React.FC = () => {
         'session will never see.\n\n' +
         question;
 
+      // Persist any already-received main-turn text before recording the
+      // anchor offset. Chunks that arrive after this point then sort below the
+      // aside even though the main turn continues in the same message.
+      flushChunkBuffers();
       const exchangeId = addBtwExchange(threadId, question);
       const runId = crypto.randomUUID();
       btwRuns.current.set(runId, { threadId, exchangeId });
@@ -3862,7 +5068,214 @@ const App: React.FC = () => {
 
       return { ok: true };
     },
-    [agentModels, normalizedProviderSettings, addBtwExchange, updateBtwExchange]
+    [agentModels, normalizedProviderSettings, addBtwExchange, flushChunkBuffers, updateBtwExchange]
+  );
+
+  // `/goal` — codex goal runs. The whole pursuit (codex auto-continues turns
+  // until the goal completes, blocks, or hits budget) is one agent-run
+  // message driven over `codex app-server`.
+  const startGoalRunForThread = useCallback(
+    (
+      threadId: string,
+      rawText: string,
+      goalAction: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number }
+    ): { ok: boolean; error?: string } => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((t) => t.id === threadId);
+      if (!thread) return { ok: false, error: 'Thread no longer exists' };
+      const project = state.projects.find((p) => p.id === thread.projectId);
+      if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      if (!model) return { ok: false, error: 'Select an agent model first' };
+      if (model.providerId !== 'codex') {
+        return { ok: false, error: '/goal is only available on Codex agents' };
+      }
+      if (normalizedProviderSettings.codex?.enabled === false) {
+        return { ok: false, error: `${model.providerLabel} is disabled` };
+      }
+      if (model.available === false) {
+        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+      }
+      if (!window.orion?.runAgentTurn) {
+        return { ok: false, error: 'Agent runtime is unavailable' };
+      }
+
+      addMessageToThread(threadId, { role: 'user', content: rawText });
+      const messageId = addMessageToThread(threadId, {
+        role: 'agent',
+        content: '',
+        kind: 'agent-run',
+        status: 'running',
+        statusText: 'Pursuing the goal.',
+        startedAt: new Date().toISOString(),
+        activities: [],
+      });
+      const runId = crypto.randomUUID();
+      runOutputMessages.current.set(runId, { threadId, messageId });
+      setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
+      updateThread(threadId, { status: 'running' });
+      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+
+      void window.orion
+        .runAgentTurn({
+          runId,
+          threadId,
+          projectPath: project.path,
+          prompt: goalAction.objective || 'Resume the goal.',
+          modelId: model.id,
+          accessMode: thread.accessMode ?? 'full-access',
+          resumeSessionId: thread.agentSessionIds?.codex,
+          forkSession: Boolean(
+            thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')
+          ),
+          providerOptions: normalizedProviderSettings.codex?.options,
+          codexReasoningEffort: getEffectiveCodexReasoningEffort(
+            model,
+            thread.codexReasoningEffort
+          ),
+          codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
+          codexGoal: goalAction,
+        })
+        .then((result) => {
+          if (result.ok && result.runId) {
+            if (result.runId !== runId) {
+              runOutputMessages.current.delete(runId);
+              runOutputMessages.current.set(result.runId, { threadId, messageId });
+              setActiveRunsByThread((current) =>
+                current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
+              );
+            }
+          } else {
+            runOutputMessages.current.delete(runId);
+            clearActiveRun(runId);
+            appendToThreadMessage(threadId, messageId, result.error ?? 'The agent failed to start.');
+            updateThreadMessage(threadId, messageId, {
+              status: 'error',
+              completedAt: new Date().toISOString(),
+              statusText: 'The agent failed to start.',
+              error: result.error,
+            });
+            updateThread(threadId, { status: 'error' });
+          }
+        });
+
+      return { ok: true };
+    },
+    [
+      agentModels,
+      normalizedProviderSettings,
+      addMessageToThread,
+      appendToThreadMessage,
+      updateThread,
+      updateThreadMessage,
+      clearActiveRun,
+    ]
+  );
+
+  // `/review` — codex's dedicated code reviewer (`codex exec review`). Runs
+  // as a normal one-shot agent-run message; the review session is ephemeral
+  // and never becomes the thread's resumable session.
+  const startReviewForThread = useCallback(
+    (
+      threadId: string,
+      rawText: string,
+      review: { mode: 'uncommitted' | 'base' | 'commit' | 'custom'; base?: string; commit?: string; instructions?: string }
+    ): { ok: boolean; error?: string } => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((t) => t.id === threadId);
+      if (!thread) return { ok: false, error: 'Thread no longer exists' };
+      const project = state.projects.find((p) => p.id === thread.projectId);
+      if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      if (!model) return { ok: false, error: 'Select an agent model first' };
+      if (model.providerId !== 'codex') {
+        return { ok: false, error: '/review is only available on Codex agents' };
+      }
+      if (normalizedProviderSettings.codex?.enabled === false) {
+        return { ok: false, error: `${model.providerLabel} is disabled` };
+      }
+      if (model.available === false) {
+        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+      }
+      if (!window.orion?.runAgentTurn) {
+        return { ok: false, error: 'Agent runtime is unavailable' };
+      }
+
+      const reviewLabel =
+        review.mode === 'base'
+          ? `Code review against ${review.base}`
+          : review.mode === 'commit'
+            ? `Code review of commit ${review.commit}`
+            : review.mode === 'custom'
+              ? 'Code review (custom instructions)'
+              : 'Code review (uncommitted changes)';
+
+      addMessageToThread(threadId, { role: 'user', content: rawText });
+      const messageId = addMessageToThread(threadId, {
+        role: 'agent',
+        content: '',
+        kind: 'agent-run',
+        status: 'running',
+        statusText: 'Reviewing changes.',
+        startedAt: new Date().toISOString(),
+        activities: [],
+      });
+      const runId = crypto.randomUUID();
+      runOutputMessages.current.set(runId, { threadId, messageId });
+      setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
+      updateThread(threadId, { status: 'running' });
+      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+
+      void window.orion
+        .runAgentTurn({
+          runId,
+          threadId,
+          projectPath: project.path,
+          prompt: review.instructions || reviewLabel,
+          modelId: model.id,
+          accessMode: thread.accessMode ?? 'full-access',
+          providerOptions: normalizedProviderSettings.codex?.options,
+          codexReasoningEffort: getEffectiveCodexReasoningEffort(
+            model,
+            thread.codexReasoningEffort
+          ),
+          codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
+          codexReview: review,
+        })
+        .then((result) => {
+          if (result.ok && result.runId) {
+            if (result.runId !== runId) {
+              runOutputMessages.current.delete(runId);
+              runOutputMessages.current.set(result.runId, { threadId, messageId });
+              setActiveRunsByThread((current) =>
+                current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
+              );
+            }
+          } else {
+            runOutputMessages.current.delete(runId);
+            clearActiveRun(runId);
+            appendToThreadMessage(threadId, messageId, result.error ?? 'The review failed to start.');
+            updateThreadMessage(threadId, messageId, {
+              status: 'error',
+              completedAt: new Date().toISOString(),
+              statusText: 'The review failed to start.',
+              error: result.error,
+            });
+            updateThread(threadId, { status: 'error' });
+          }
+        });
+
+      return { ok: true };
+    },
+    [
+      agentModels,
+      normalizedProviderSettings,
+      addMessageToThread,
+      appendToThreadMessage,
+      updateThread,
+      updateThreadMessage,
+      clearActiveRun,
+    ]
   );
 
   // Dismissing a still-running aside also kills its forked run.
@@ -3878,6 +5291,95 @@ const App: React.FC = () => {
     },
     [removeBtwExchange]
   );
+
+  // `/btw` asides render at their chronological spot. Agent-run anchors also
+  // carry a content offset and are interleaved inside ChatMessage, so chunks
+  // from the same response that arrive later appear below the aside.
+  // Pre-anchor data, deleted anchors, and asides asked on an empty thread fall
+  // back to timestamps so later turns still appear below them.
+  const btwAsidesByAnchor = new Map<string, BtwExchange[]>();
+  const leadingBtwAsides: BtwExchange[] = [];
+  const trailingBtwAsides: BtwExchange[] = [];
+  if (selectedThread) {
+    const messageIds = new Set(selectedThread.messages.map((m) => m.id));
+    for (const exchange of selectedThread.btwExchanges ?? []) {
+      let anchorId =
+        exchange.afterMessageId && messageIds.has(exchange.afterMessageId)
+          ? exchange.afterMessageId
+          : undefined;
+      const exchangeTime = new Date(exchange.createdAt).getTime();
+      if (!anchorId && Number.isFinite(exchangeTime)) {
+        anchorId = [...selectedThread.messages]
+          .reverse()
+          .find((message) => {
+            const messageTime = new Date(message.ts).getTime();
+            return Number.isFinite(messageTime) && messageTime <= exchangeTime;
+          })?.id;
+      }
+      if (anchorId) {
+        const anchored = btwAsidesByAnchor.get(anchorId);
+        if (anchored) anchored.push(exchange);
+        else btwAsidesByAnchor.set(anchorId, [exchange]);
+      } else if (Number.isFinite(exchangeTime) && selectedThread.messages.length > 0) {
+        leadingBtwAsides.push(exchange);
+      } else {
+        trailingBtwAsides.push(exchange);
+      }
+    }
+  }
+
+  const renderBtwAside = (exchange: BtwExchange) =>
+    !selectedThread ? null : (
+      <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
+        <div className="btw-aside-bar">
+          <span className="btw-aside-badge">
+            <Sparkles size={11} />
+            BTW
+          </span>
+          <span className="btw-aside-note">
+            aside · answered from a fork · not part of the thread
+          </span>
+          <button
+            type="button"
+            className="btw-aside-dismiss"
+            onClick={() => dismissBtwExchange(selectedThread.id, exchange.id)}
+            title={
+              exchange.status === 'running'
+                ? 'Cancel and dismiss this aside'
+                : 'Dismiss this aside'
+            }
+          >
+            <X size={12} />
+          </button>
+        </div>
+        <div className="btw-aside-question">{exchange.question}</div>
+        {exchange.status === 'running' && !exchange.answer && (
+          <div className="agent-status-line running">
+            <span className="working-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            <span>Answering on the side…</span>
+          </div>
+        )}
+        {exchange.answer && (
+          <div className="btw-aside-answer">
+            <MarkdownContent content={exchange.answer} />
+          </div>
+        )}
+        {exchange.status === 'error' &&
+          (exchange.authProviderId ? (
+            <ProviderAuthPrompt
+              providerId={exchange.authProviderId}
+              onAuthenticate={handleAuthenticateProvider}
+              busy={authenticatingProviderId === exchange.authProviderId}
+            />
+          ) : (
+            <div className="agent-error">{exchange.error ?? 'The aside failed.'}</div>
+          ))}
+      </div>
+    );
 
   // Queued follow-ups dispatch as soon as their thread has no run in flight —
   // after a turn finishes (done or error) and after app-restart recovery. Each
@@ -3898,14 +5400,350 @@ const App: React.FC = () => {
     }
   }, [threads, activeRunsByThread, removeQueuedThreadMessage, startTurnForThread, addMessageToThread]);
 
-  const sendMessage = () => {
+  // Goal pause/clear is an intentional cancellation, so detach the live run
+  // before stopping its app-server. Otherwise the SIGTERM tail can race back
+  // through the normal error handler and turn a successful pause into a
+  // failed transcript entry.
+  const stopTrackedGoalRun = async (runId: string, statusText: string) => {
+    const tracked = runOutputMessages.current.get(runId);
+    runOutputMessages.current.delete(runId);
+    clearActiveRun(runId);
+    flushChunkBuffers();
+    if (tracked) {
+      updateThreadMessage(tracked.threadId, tracked.messageId, {
+        status: 'stopped',
+        completedAt: new Date().toISOString(),
+        statusText,
+      });
+      updateThread(tracked.threadId, { status: 'idle' });
+    }
+    return (await window.orion?.stopAgentTurn?.(runId)) ?? false;
+  };
+
+  // `/goal <objective> [budget:500k]` sets (or replaces) the codex goal and
+  // starts pursuing it; `/goal pause|resume|clear|status` manage it. Stop on
+  // a goal run pauses the goal, so pause and Stop are the same gesture.
+  const handleGoalCommand = (promptText: string, rest: string) => {
     if (!selectedThreadId || !selectedThread) return;
+    const state = useOrionStore.getState();
+    const model = findAgentModel(agentModels, selectedThread.modelId ?? defaultAgentModelId);
+    if (model?.providerId !== 'codex') {
+      toast.error('/goal is only available on Codex agents');
+      return;
+    }
+    const goal = selectedThread.goal;
+    const sessionId = selectedThread.agentSessionIds?.codex;
+    const project = state.projects.find((p) => p.id === selectedThread.projectId);
+    const finishInput = () => {
+      setChatInput('');
+      setChatMention(null);
+    };
+    const sub = rest.toLowerCase();
+
+    if (!rest || sub === 'status') {
+      if (!goal && !sessionId) {
+        toast.error('No goal on this thread yet — set one with “/goal <objective>”.');
+        return;
+      }
+      if (sessionId && project && window.orion?.codexGoalCommand) {
+        void window.orion
+          .codexGoalCommand({ sessionId, projectPath: project.path, action: 'get' })
+          .then((result) => {
+            if (result.ok) updateThread(selectedThreadId, { goal: result.goal ?? null });
+            const latest = result.ok ? result.goal : goal;
+            if (latest) toast.success(goalSummaryLine(latest));
+            else toast.error(result.ok ? 'No goal on this thread.' : result.error ?? 'Could not read the goal.');
+          });
+      } else if (goal) {
+        toast.success(goalSummaryLine(goal));
+      } else {
+        toast.error('No goal on this thread.');
+      }
+      finishInput();
+      return;
+    }
+
+    if (sub === 'pause') {
+      if (!goal || goal.status !== 'active') {
+        toast.error('No active goal to pause.');
+        return;
+      }
+      const activeRun = activeRunsByThread[selectedThreadId];
+      if (activeRun) {
+        // Stopping the goal run pauses the goal (main records it in codex).
+        void stopTrackedGoalRun(activeRun, 'Goal paused.').then((stopped) => {
+          if (!stopped) {
+            toast.error('Could not stop the live goal run.');
+            return;
+          }
+          // The main-process goal event normally installed the authoritative
+          // paused state while stopAgentTurn was awaiting the app-server. Use
+          // a local fallback only if that event did not arrive.
+          const latest = useOrionStore
+            .getState()
+            .threads.find((thread) => thread.id === selectedThreadId)?.goal;
+          if (latest?.status === 'active') {
+            updateThread(selectedThreadId, { goal: { ...latest, status: 'paused' } });
+          }
+          toast.success('Goal paused.');
+        });
+      } else if (sessionId && project && window.orion?.codexGoalCommand) {
+        void window.orion
+          .codexGoalCommand({ sessionId, projectPath: project.path, action: 'pause' })
+          .then((result) => {
+            if (result.ok) {
+              updateThread(selectedThreadId, { goal: result.goal ?? { ...goal, status: 'paused' } });
+              toast.success('Goal paused.');
+            } else {
+              toast.error(result.error ?? 'Could not pause the goal.');
+            }
+          });
+      }
+      finishInput();
+      return;
+    }
+
+    if (sub === 'clear') {
+      if (!goal) {
+        toast.error('No goal to clear.');
+        return;
+      }
+      const clearGoal = () => {
+        if (sessionId && project && window.orion?.codexGoalCommand) {
+          void window.orion
+            .codexGoalCommand({ sessionId, projectPath: project.path, action: 'clear' })
+            .then((result) => {
+              if (result.ok) {
+                updateThread(selectedThreadId, { goal: null });
+                toast.success('Goal cleared.');
+              } else {
+                toast.error(result.error ?? 'Could not clear the goal.');
+              }
+            });
+        } else {
+          updateThread(selectedThreadId, { goal: null });
+        }
+      };
+      const activeRun = activeRunsByThread[selectedThreadId];
+      if (activeRun) {
+        void stopTrackedGoalRun(activeRun, 'Goal stopped.').then((stopped) => {
+          if (!stopped) {
+            toast.error('Could not stop the live goal run.');
+            return;
+          }
+          // Let the killed app-server release the thread before a short-lived
+          // goal-op process resumes it to clear the persisted goal.
+          setTimeout(clearGoal, 500);
+        });
+      } else {
+        clearGoal();
+      }
+      finishInput();
+      return;
+    }
+
+    if (sub === 'resume') {
+      if (!goal) {
+        toast.error('No goal to resume — set one with “/goal <objective>”.');
+        return;
+      }
+      if (isSending) {
+        toast.error('A run is already in flight on this thread.');
+        return;
+      }
+      const result = startGoalRunForThread(selectedThreadId, promptText, { action: 'resume' });
+      if (!result.ok) {
+        toast.error(result.error);
+        return;
+      }
+      finishInput();
+      return;
+    }
+
+    // New objective. Optional trailing "budget:500k" / "budget:2m" caps tokens.
+    if (isSending) {
+      toast.error('Stop or finish the current run before setting a goal.');
+      return;
+    }
+    let objective = rest;
+    let tokenBudget: number | undefined;
+    const budgetMatch = rest.match(/(?:^|\s)budget[:=]\s*(\d+(?:\.\d+)?)\s*([km])?\s*$/i);
+    if (budgetMatch) {
+      const value = parseFloat(budgetMatch[1]);
+      const unit = (budgetMatch[2] ?? '').toLowerCase();
+      tokenBudget = Math.round(value * (unit === 'm' ? 1_000_000 : unit === 'k' ? 1_000 : 1));
+      objective = rest.slice(0, budgetMatch.index).trim();
+    }
+    if (!objective) {
+      toast.error('Describe the goal, e.g. “/goal get all tests passing budget:500k”.');
+      return;
+    }
+    const result = startGoalRunForThread(selectedThreadId, promptText, {
+      action: 'set',
+      objective,
+      ...(tokenBudget ? { tokenBudget } : {}),
+    });
+    if (!result.ok) {
+      toast.error(result.error);
+      return;
+    }
+    finishInput();
+  };
+
+  // `/review` → codex reviewer. Bare = uncommitted changes; `base <branch>`,
+  // `commit <sha>`, anything else = custom instructions (codex's own modes).
+  const dispatchReview = (
+    rawText: string,
+    review: { mode: 'uncommitted' | 'base' | 'commit' | 'custom'; base?: string; commit?: string; instructions?: string }
+  ) => {
+    if (!selectedThreadId) return;
+    if (isSending) {
+      toast.error('Wait for the current run to finish before starting a review.');
+      return;
+    }
+    const result = startReviewForThread(selectedThreadId, rawText, review);
+    if (!result.ok) {
+      toast.error(result.error);
+      return;
+    }
+    setChatInput('');
+    setChatMention(null);
+  };
+
+  const handleReviewCommand = (promptText: string, rest: string) => {
+    if (!selectedThread) return;
+    const model = findAgentModel(agentModels, selectedThread.modelId ?? defaultAgentModelId);
+    if (model?.providerId !== 'codex') {
+      toast.error('/review is only available on Codex agents');
+      return;
+    }
+    if (!rest) {
+      dispatchReview(promptText, { mode: 'uncommitted' });
+      return;
+    }
+    const baseMatch = rest.match(/^base(?:\s+(\S+))?$/i);
+    if (baseMatch) {
+      if (!baseMatch[1]) {
+        toast.error('Name a base branch, e.g. “/review base main”.');
+        return;
+      }
+      dispatchReview(promptText, { mode: 'base', base: baseMatch[1] });
+      return;
+    }
+    const commitMatch = rest.match(/^commit(?:\s+([0-9a-fA-F]{4,40}))?$/i);
+    if (commitMatch) {
+      if (!commitMatch[1]) {
+        toast.error('Name a commit, e.g. “/review commit abc1234”.');
+        return;
+      }
+      dispatchReview(promptText, { mode: 'commit', commit: commitMatch[1] });
+      return;
+    }
+    dispatchReview(promptText, { mode: 'custom', instructions: rest });
+  };
+
+  const sendMessage = async () => {
+    if (!selectedThreadId || !selectedThread) return;
+    // Native subagent transcripts are read-only mirrors — nothing to talk to.
+    if (selectedThread.subagent) {
+      toast.error('This is a read-only subagent transcript. Steer from the parent thread.');
+      return;
+    }
     const promptText = chatInput.trim();
     // A freshly linked board task can be sent on its own — the card is the
     // prompt. Mid-run it can't (queued follow-ups need their own text).
     const canSendLinkedTaskAlone =
       !isSending && Boolean(selectedThread.linkedTask && !selectedThread.linkedTask.injected);
     if (!promptText && chatAttachments.length === 0 && !canSendLinkedTaskAlone) return;
+
+    // Claude Code CLI thread: the composer feeds the embedded terminal —
+    // the draft is delivered to the TUI exactly as if typed there (so claude
+    // slash commands like /compact work too). Nothing goes through runTurn.
+    if (isTerminalThread) {
+      const taskToInject =
+        selectedThread.linkedTask && !selectedThread.linkedTask.injected
+          ? selectedThread.linkedTask
+          : undefined;
+      let text = buildPromptWithAttachments(promptText, chatAttachments);
+      if (taskToInject) {
+        text = text
+          ? `${buildLinkedTaskContext(taskToInject, true)}\n\n${text}`
+          : buildLinkedTaskContext(taskToInject, false);
+      }
+      if (!text) return;
+      const submittedInput = chatInput;
+      const submittedAttachments = chatAttachments;
+      const restoreTerminalDraft = () => {
+        setChatInput((current) =>
+          [submittedInput, current].filter(Boolean).join('\n\n')
+        );
+        setChatAttachments((current) => [...submittedAttachments, ...current]);
+      };
+      // Clear optimistically so repeated clicks cannot submit the same draft
+      // twice; restore it if IPC delivery fails.
+      setChatInput('');
+      setChatMention(null);
+      setChatAttachments([]);
+      let result: Awaited<ReturnType<NonNullable<typeof window.orion>['terminalSendPrompt']>> | undefined;
+      try {
+        result = await window.orion?.terminalSendPrompt?.({ threadId: selectedThreadId, text });
+      } catch (error) {
+        restoreTerminalDraft();
+        toast.error(
+          error instanceof Error ? error.message : 'The Claude Code terminal is not running.'
+        );
+        return;
+      }
+      if (!result?.ok) {
+        restoreTerminalDraft();
+        toast.error(result?.error ?? 'The Claude Code terminal is not running.');
+        return;
+      }
+      if (taskToInject) {
+        const currentLinkedTask = useOrionStore
+          .getState()
+          .threads.find((thread) => thread.id === selectedThreadId)?.linkedTask;
+        if (currentLinkedTask?.id === taskToInject.id && !currentLinkedTask.injected) {
+          updateThread(selectedThreadId, {
+            linkedTask: { ...currentLinkedTask, injected: true },
+          });
+        }
+      }
+      // Terminal threads have no transcript, so seed the sidebar title from
+      // the first prompt sent through the composer.
+      if (isDefaultTitle(selectedThread.title) && promptText) {
+        const initialTitle = deriveTitle(promptText);
+        if (isPlausibleTitle(initialTitle)) {
+          updateThread(selectedThreadId, { title: initialTitle });
+        }
+        void tryGenerateBetterTitle(
+          selectedThreadId,
+          promptText,
+          'claude:claude-haiku-4-5',
+          selectedThreadProject?.path ?? '',
+          updateThread
+        );
+      }
+      return;
+    }
+
+    // `/goal …` — codex goal management. Handled before the mid-run queue
+    // branch: pause/clear act on the live run, and set/resume must never be
+    // queued as plain follow-up text.
+    const goalMatch = promptText.match(/^\/goal(?:\s+([\s\S]+))?$/i);
+    if (goalMatch) {
+      handleGoalCommand(promptText, goalMatch[1]?.trim() ?? '');
+      return;
+    }
+
+    // `/review …` — codex code review (uncommitted / base branch / commit /
+    // custom instructions). Also before the queue branch: it must never be
+    // queued as plain follow-up text.
+    const reviewMatch = promptText.match(/^\/review(?:\s+([\s\S]+))?$/i);
+    if (reviewMatch) {
+      handleReviewCommand(promptText, reviewMatch[1]?.trim() ?? '');
+      return;
+    }
 
     // `/btw <question>` — side question, handled before the mid-run queue
     // branch because asking while the agent works is exactly its use case.
@@ -3922,6 +5760,7 @@ const App: React.FC = () => {
         return;
       }
       setChatInput('');
+      setChatMention(null);
       return;
     }
 
@@ -3930,6 +5769,7 @@ const App: React.FC = () => {
       chatPinnedRef.current = true;
       queueMessageToThread(selectedThreadId, { text: promptText, attachments: chatAttachments });
       setChatInput('');
+      setChatMention(null);
       setChatAttachments([]);
       return;
     }
@@ -3940,6 +5780,7 @@ const App: React.FC = () => {
       return;
     }
     setChatInput('');
+    setChatMention(null);
     setChatAttachments([]);
     setModelPickerOpen(false);
     setCodexSettingsOpen(false);
@@ -3948,8 +5789,13 @@ const App: React.FC = () => {
   // Steering = interrupt the running CLI and immediately resume its session
   // with the new instruction. Needs the harness to have reported a session id
   // (arrives within the first events of a run).
+  // Optional chain: 'orion' has no follow-up-support entry (steering an
+  // orchestrated thread would bypass the driver resolution), so treat it as
+  // unsupported instead of crashing mid-run.
   const steerSupported =
-    isSending && !!selectedAgentModel && providerFollowUpSupport[selectedAgentModel.providerId].steer;
+    isSending &&
+    !!selectedAgentModel &&
+    providerFollowUpSupport[selectedAgentModel.providerId]?.steer === true;
   const steerReady =
     steerSupported &&
     !!selectedAgentModel &&
@@ -3990,6 +5836,7 @@ const App: React.FC = () => {
     const attachments = chatAttachments;
     if (!promptText && attachments.length === 0) return;
     setChatInput('');
+    setChatMention(null);
     setChatAttachments([]);
     await steerWithContent(promptText, attachments);
   };
@@ -4006,11 +5853,11 @@ const App: React.FC = () => {
   };
 
   const stopActiveAgent = async () => {
-    // Stops only the selected thread's run; agents in other threads keep going.
     if (!activeRunId || !window.orion?.stopAgentTurn) return;
     // Stop means "halt everything": queued follow-ups return to the composer
     // instead of auto-dispatching against the stopped run's session.
-    const thread = useOrionStore.getState().threads.find((t) => t.id === selectedThreadId);
+    const state = useOrionStore.getState();
+    const thread = state.threads.find((t) => t.id === selectedThreadId);
     const queued = thread?.queuedMessages ?? [];
     if (thread && queued.length > 0) {
       updateThread(thread.id, { queuedMessages: [] });
@@ -4019,32 +5866,154 @@ const App: React.FC = () => {
       );
       setChatAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
     }
-    // Untrack and mark the message stopped BEFORE the IPC call: stopping now
-    // awaits the interrupt acknowledgement, and the interrupted turn's result
-    // lands during that await — if the run were still tracked, the done
-    // handler would mark the message "Finished." and steal the cleanup.
-    const runId = activeRunId;
-    const tracked = runOutputMessages.current.get(runId);
-    runOutputMessages.current.delete(runId);
-    clearActiveRun(runId);
-    flushChunkBuffers();
-    if (tracked) {
-      appendToThreadMessage(tracked.threadId, tracked.messageId, '\n\nStopped by user.');
-      updateThreadMessage(tracked.threadId, tracked.messageId, {
-        status: 'stopped',
-        completedAt: new Date().toISOString(),
-        statusText: 'Stopped by user.',
-      });
-      updateThread(tracked.threadId, { status: 'idle' });
+    const threadIds = new Set(thread ? [thread.id] : []);
+    let foundChild = true;
+    while (foundChild) {
+      foundChild = false;
+      for (const candidate of state.threads) {
+        if (
+          candidate.parentThreadId &&
+          threadIds.has(candidate.parentThreadId) &&
+          !threadIds.has(candidate.id)
+        ) {
+          threadIds.add(candidate.id);
+          foundChild = true;
+        }
+      }
     }
-    // terminateBackground: unlike a steer (which only interrupts the current
-    // turn), Stop also tears down the thread's persistent claude session so
-    // background subagents stop mutating the working tree.
-    await window.orion.stopAgentTurn(runId, { terminateBackground: true });
+
+    const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
+    const runsToStop = stoppedThreads
+      .map((candidate) => activeRunsByThread[candidate.id])
+      .filter((runId): runId is string => Boolean(runId));
+    const pendingSpawnIds: string[] = [];
+
+    // Untrack and mark every run in the subtree stopped BEFORE the IPC calls:
+    // interrupted result events can otherwise race in and mark them Finished.
+    for (const runId of runsToStop) {
+      const tracked = runOutputMessages.current.get(runId);
+      runOutputMessages.current.delete(runId);
+      clearActiveRun(runId);
+      if (tracked) {
+        appendToThreadMessage(tracked.threadId, tracked.messageId, '\n\nStopped by user.');
+        updateThreadMessage(tracked.threadId, tracked.messageId, {
+          status: 'stopped',
+          completedAt: new Date().toISOString(),
+          statusText: 'Stopped by user.',
+        });
+      }
+    }
+    for (const stoppedThread of stoppedThreads) {
+      if (stoppedThread.status === 'running') updateThread(stoppedThread.id, { status: 'idle' });
+      // Descendant follow-ups must not auto-dispatch as soon as their active
+      // run is cleared. Only the selected/root thread's queue is restored to
+      // the visible composer above.
+      if (stoppedThread.id !== thread?.id && (stoppedThread.queuedMessages?.length ?? 0) > 0) {
+        updateThread(stoppedThread.id, { queuedMessages: [] });
+      }
+      if (stoppedThread.spawnId) {
+        updateThread(stoppedThread.id, { spawnId: undefined });
+        pendingSpawnIds.push(stoppedThread.spawnId);
+      }
+    }
+    flushChunkBuffers();
+
+    // Each Orion child is its own provider runtime, so terminate every active
+    // run and dispose every descendant before unblocking the parent's tool.
+    await Promise.all(
+      runsToStop.map((runId) =>
+        window.orion.stopAgentTurn(runId, { terminateBackground: true })
+      )
+    );
+    await Promise.all(
+      stoppedThreads
+        .filter((candidate) => candidate.id !== thread?.id)
+        .map((candidate) => disposeThreadRuntime(candidate.id))
+    );
+    for (const spawnId of pendingSpawnIds) {
+      void window.orion?.reportSubagentResult?.({
+        spawnId,
+        ok: false,
+        result: 'Subagent run was stopped by the user before completing.',
+      });
+    }
+  };
+
+  // Track the composer's active @-mention token: the last '@' at/before the
+  // caret whose preceding character is start-of-text or whitespace, with no
+  // whitespace between the '@' and the caret.
+  const updateChatMention = useCallback((value: string, caret: number | null) => {
+    let next: { start: number; query: string } | null = null;
+    if (caret !== null) {
+      const beforeCaret = value.slice(0, caret);
+      const atIndex = beforeCaret.lastIndexOf('@');
+      if (atIndex !== -1) {
+        const charBefore = atIndex > 0 ? beforeCaret[atIndex - 1] : '';
+        const query = beforeCaret.slice(atIndex + 1);
+        if ((!charBefore || /\s/.test(charBefore)) && !/\s/.test(query)) {
+          next = { start: atIndex, query };
+        }
+      }
+    }
+    // A token dismissed with Escape stays closed until a new '@' is typed.
+    if (next && chatMentionDismissRef.current === next.start) {
+      setChatMention(null);
+      return;
+    }
+    chatMentionDismissRef.current = null;
+    setChatMention(next);
+  }, []);
+
+  // Selecting a mention replaces the typed token with the model's unambiguous
+  // mention token and puts the caret right after the inserted text.
+  const insertChatMention = (model: AgentModel) => {
+    if (!chatMention) return;
+    const inserted = `@${modelMentionToken(model, agentModels)} `;
+    // Completing mid-token replaces the whole token: consume slug-like
+    // characters after the caret too, so no dangling suffix is left behind.
+    let replaceEnd = chatMention.start + 1 + chatMention.query.length;
+    while (replaceEnd < chatInput.length && /[A-Za-z0-9._:/-]/.test(chatInput[replaceEnd])) {
+      replaceEnd += 1;
+    }
+    const nextValue =
+      chatInput.slice(0, chatMention.start) + inserted + chatInput.slice(replaceEnd);
+    const caret = chatMention.start + inserted.length;
+    setChatInput(nextValue);
+    setChatMention(null);
+    chatMentionDismissRef.current = null;
+    requestAnimationFrame(() => {
+      const el = chatInputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    });
   };
 
   // Handle chat submit: ⏎ sends (or queues mid-run), ⌘⏎ steers mid-run.
   const handleChatKeyDown = (e: React.KeyboardEvent) => {
+    // The open @-mention dropdown captures navigation keys first.
+    if (chatMentionOpen) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const delta = e.key === 'ArrowDown' ? 1 : -1;
+        const count = chatMentionCandidates.length;
+        setChatMentionIndex((index) => (index + delta + count) % count);
+        return;
+      }
+      // Shift+Enter keeps its newline meaning even with the dropdown open;
+      // plain Enter and Tab select the highlighted mention.
+      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+        e.preventDefault();
+        insertChatMention(chatMentionCandidates[chatMentionIndex] ?? chatMentionCandidates[0]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        chatMentionDismissRef.current = chatMention?.start ?? null;
+        setChatMention(null);
+        return;
+      }
+    }
     if (e.key !== 'Enter' || e.shiftKey) return;
     e.preventDefault();
     if ((e.metaKey || e.ctrlKey) && isSending && steerReady) {
@@ -4070,6 +6039,186 @@ const App: React.FC = () => {
     } catch {
       return 'recently';
     }
+  };
+
+  const toggleSubthreadsCollapsed = (parentId: string) => {
+    const isCollapsed = collapsedSubthreads[parentId] ?? false;
+    // Collapsing resets the list back to the default 5 on next expand.
+    if (!isCollapsed) {
+      setSubthreadListLimits((prev) => {
+        if (!(parentId in prev)) return prev;
+        const { [parentId]: _removed, ...rest } = prev;
+        return rest;
+      });
+    }
+    setCollapsedSubthreads((prev) => ({ ...prev, [parentId]: !isCollapsed }));
+  };
+
+  // Tiny CLI mark for Claude Code CLI threads — sits before the title.
+  const renderThreadCliBadge = (thread: Thread) =>
+    isClaudeCodeCliModelId(thread.modelId) ? (
+      <span className="thread-cli-badge" title="Claude Code CLI" aria-label="Claude Code CLI">
+        <Terminal size={10} strokeWidth={2.4} aria-hidden />
+      </span>
+    ) : null;
+
+  // Chevron + count badge shown on a sidebar row whose thread has spawned
+  // subthreads. Shared between the Recent agents list and the project lists.
+  const renderSubthreadToggle = (thread: Thread) => {
+    const children = childThreadsByParent.get(thread.id);
+    if (!children || children.length === 0) return null;
+    const isCollapsed = collapsedSubthreads[thread.id] ?? false;
+    return (
+      <>
+        <button
+          type="button"
+          className="thread-children-toggle"
+          title={isCollapsed ? 'Expand subthreads' : 'Collapse subthreads'}
+          aria-expanded={!isCollapsed}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleSubthreadsCollapsed(thread.id);
+          }}
+        >
+          <ChevronRight
+            size={11}
+            className={`sidebar-section-chevron ${isCollapsed ? '' : 'open'}`}
+          />
+        </button>
+        {isCollapsed && <span className="sidebar-section-count">{children.length}</span>}
+      </>
+    );
+  };
+
+  // Nested subthread rows under a parent sidebar row. Mirrors the top-level
+  // thread-item markup (status dot, rename, ··· menu) and recurses so a
+  // subthread's own children nest another level deeper.
+  const renderThreadChildren = (parent: Thread, keyNamespace: string): React.ReactNode => {
+    const children = childThreadsByParent.get(parent.id);
+    if (!children || children.length === 0 || collapsedSubthreads[parent.id]) return null;
+    const visibleLimit = subthreadListLimits[parent.id] ?? THREADS_VISIBLE_LIMIT;
+    const visibleChildren = children.slice(0, visibleLimit);
+    const hasMoreChildren = children.length > visibleLimit;
+    const isListExpanded =
+      visibleLimit > THREADS_VISIBLE_LIMIT && children.length > THREADS_VISIBLE_LIMIT;
+    return (
+      <div className="thread-children">
+        {visibleChildren.map((thread) => {
+          const rowKey = `${keyNamespace}:${thread.id}`;
+          return (
+            <React.Fragment key={thread.id}>
+              <div
+                className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                onClick={() => {
+                  if (threadRenameKey !== rowKey) selectThread(thread.id);
+                }}
+              >
+                {renderSubthreadToggle(thread)}
+                {threadRenameKey === rowKey ? (
+                  <InlineRenameInput
+                    className="thread-rename-input"
+                    initialValue={thread.title}
+                    onSubmit={(title) => {
+                      updateThread(thread.id, { title });
+                      setThreadRenameKey(null);
+                    }}
+                    onCancel={() => setThreadRenameKey(null)}
+                  />
+                ) : (
+                  <span className="thread-title">
+                    {renderThreadCliBadge(thread)}
+                    <span className="thread-title-text">{thread.title}</span>
+                  </span>
+                )}
+                <span className="thread-time thread-meta">
+                  {thread.status === 'running' ? (
+                    <span className="thread-working-dot" title="Working" />
+                  ) : (
+                    formatShortTime(getThreadActivityTime(thread))
+                  )}
+                </span>
+                <div
+                  className="thread-menu-wrap"
+                  ref={threadItemMenuKey === rowKey ? threadItemMenuRef : undefined}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    className="thread-options-trigger"
+                    title="Thread options"
+                    aria-label={`Options for ${thread.title}`}
+                    aria-haspopup="menu"
+                    aria-expanded={threadItemMenuKey === rowKey}
+                    onClick={() =>
+                      setThreadItemMenuKey((open) => (open === rowKey ? null : rowKey))
+                    }
+                  >
+                    <Ellipsis size={13} />
+                  </button>
+                  {threadItemMenuKey === rowKey && (
+                    <div className="thread-menu thread-item-menu" role="menu">
+                      <button
+                        type="button"
+                        className="project-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setThreadItemMenuKey(null);
+                          setThreadRenameKey(rowKey);
+                        }}
+                      >
+                        <SquarePen size={13} /> Rename
+                      </button>
+                      <button
+                        type="button"
+                        className="project-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setThreadItemMenuKey(null);
+                          branchThread(thread.id);
+                        }}
+                      >
+                        <GitBranch size={13} /> Branch
+                      </button>
+                      <button
+                        type="button"
+                        className="project-menu-item danger"
+                        role="menuitem"
+                        onClick={() => {
+                          setThreadItemMenuKey(null);
+                          if (confirm('Delete this thread?')) {
+                            void deleteThreadWithRuntime(thread.id);
+                          }
+                        }}
+                      >
+                        <Trash2 size={13} /> Delete
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+              {renderThreadChildren(thread, keyNamespace)}
+            </React.Fragment>
+          );
+        })}
+        {(hasMoreChildren || isListExpanded) && (
+          <button
+            type="button"
+            className="threads-show-more"
+            onClick={() =>
+              setSubthreadListLimits((prev) => {
+                if (hasMoreChildren) {
+                  return { ...prev, [parent.id]: children.length };
+                }
+                const { [parent.id]: _removed, ...rest } = prev;
+                return rest;
+              })
+            }
+          >
+            {hasMoreChildren ? 'Show more' : 'Show less'}
+          </button>
+        )}
+      </div>
+    );
   };
 
   const renderSidebarFooter = () => (
@@ -4224,6 +6373,71 @@ const App: React.FC = () => {
               </div>
             ) : (
               <span className="shell-title truncate">{shellTitle}</span>
+            )}
+            {activeTab === 'agents' && selectedThread?.goal && (
+              <div className="goal-chip-wrap" ref={goalMenuRef}>
+                <button
+                  type="button"
+                  className={`goal-chip status-${selectedThread.goal.status}`}
+                  onClick={() => setGoalMenuOpen((open) => !open)}
+                  aria-haspopup="menu"
+                  aria-expanded={goalMenuOpen}
+                  title={goalSummaryLine(selectedThread.goal)}
+                >
+                  <Target size={12} />
+                  <span className="goal-chip-status">
+                    {goalStatusLabels[selectedThread.goal.status] ?? selectedThread.goal.status}
+                  </span>
+                  <span className="goal-chip-objective truncate">
+                    {selectedThread.goal.objective}
+                  </span>
+                  {goalUsageSummary(selectedThread.goal) && (
+                    <span className="goal-chip-usage">
+                      {goalUsageSummary(selectedThread.goal)}
+                    </span>
+                  )}
+                </button>
+                {goalMenuOpen && (
+                  <div className="thread-menu goal-menu" role="menu">
+                    {selectedThread.goal.status === 'active' ? (
+                      <button
+                        type="button"
+                        className="project-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setGoalMenuOpen(false);
+                          handleGoalCommand('/goal pause', 'pause');
+                        }}
+                      >
+                        <Pause size={13} /> Pause goal
+                      </button>
+                    ) : selectedThread.goal.status !== 'complete' ? (
+                      <button
+                        type="button"
+                        className="project-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setGoalMenuOpen(false);
+                          handleGoalCommand('/goal resume', 'resume');
+                        }}
+                      >
+                        <Play size={13} /> Resume goal
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="project-menu-item danger"
+                      role="menuitem"
+                      onClick={() => {
+                        setGoalMenuOpen(false);
+                        handleGoalCommand('/goal clear', 'clear');
+                      }}
+                    >
+                      <X size={13} /> Clear goal
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
             {shellSubtitle && (
               <>
@@ -4584,6 +6798,7 @@ const App: React.FC = () => {
                 { id: 'account', label: 'Account', Icon: UserRound },
                 { id: 'general', label: 'General', Icon: Settings },
                 { id: 'providers', label: 'Providers', Icon: Plug },
+                { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
                 { id: 'computer-use', label: 'Computer Use', Icon: MousePointerClick },
                 { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
               ].map(({ id, label, Icon }) => (
@@ -4614,6 +6829,7 @@ const App: React.FC = () => {
               {settingsTab === 'account' && 'ACCOUNT'}
               {settingsTab === 'general' && 'GENERAL'}
               {settingsTab === 'providers' && 'PROVIDERS'}
+              {settingsTab === 'orchestration' && 'ORCHESTRATION'}
               {settingsTab === 'computer-use' && 'COMPUTER USE'}
               {settingsTab === 'cosmetics' && 'COSMETICS'}
             </div>
@@ -4830,7 +7046,11 @@ const App: React.FC = () => {
                       </button>
                     </div>
                   </div>
-                  {agentProviders.map((provider) => {
+                  {agentProviders
+                    // Orion is a pseudo-provider (the orchestrator), not an
+                    // installable CLI — no row in Providers.
+                    .filter((provider) => provider.id !== 'orion')
+                    .map((provider) => {
                       const Icon = provider.icon;
                       const status = providerStatusById.get(provider.id);
                       const providerEnabled =
@@ -5009,6 +7229,61 @@ const App: React.FC = () => {
                   </>
               )}
 
+              {settingsTab === 'orchestration' && (
+                <>
+                  <div className="setting-row">
+                    <div className="setting-label">
+                      <div className="settings-panel-title">Orchestration</div>
+                      <div className="settings-muted">
+                        Pick “Orion” as a thread’s model and Fable-style orchestration kicks in: the
+                        main driver model coordinates the work, talks to you, and delegates to the
+                        role models below via subagents.
+                      </div>
+                    </div>
+                  </div>
+
+                  {orchestrationRoleMeta.map((role) => (
+                    <div className="setting-row" key={role.id}>
+                      <div className="setting-label">
+                        <div className="setting-label-title">{role.label}</div>
+                        <div className="setting-label-desc">{role.desc}</div>
+                      </div>
+                      <select
+                        className="setting-select"
+                        value={normalizedOrchestrationSettings.models[role.id]}
+                        onChange={(e) => setOrchestrationRoleModel(role.id, e.target.value)}
+                      >
+                        {orchestrationModelGroups.map((group) => (
+                          <optgroup key={group.provider.id} label={group.provider.label}>
+                            {group.models.map((model) => (
+                              <option key={model.id} value={model.id}>
+                                {model.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+
+                  <div className="setting-row setting-row-stacked">
+                    <div className="setting-label">
+                      <div className="setting-label-title">General instructions</div>
+                      <div className="setting-label-desc">
+                        Free-form guidance included in the orchestrator's instructions
+                      </div>
+                    </div>
+                    <textarea
+                      className="setting-textarea"
+                      rows={6}
+                      value={normalizedOrchestrationSettings.generalInstructions}
+                      onChange={(e) => setOrchestrationGeneralInstructions(e.target.value)}
+                      placeholder="e.g. Always run the test suite before reporting a task as done."
+                    />
+                  </div>
+                </>
+              )}
+
               {settingsTab === 'computer-use' && (
                 computerUsePerms && !computerUsePerms.supported ? (
                   <div className="settings-empty-panel">
@@ -5021,11 +7296,11 @@ const App: React.FC = () => {
                   <>
                     <div className="setting-row">
                       <div className="setting-label">
-                        <div className="setting-label-title">Computer use permissions</div>
+                        <div className="setting-label-title">macOS permissions</div>
                         <div className="setting-label-desc">
-                          Agents that control the mouse, keyboard, and screen (such as Codex computer use) need
-                          Orion to hold these macOS permissions. macOS attributes every CLI Orion launches back to
-                          Orion, so granting them here covers all agents.
+                          Agents that control the mouse, keyboard, and screen (Codex computer use and similar) need
+                          Orion to hold these macOS permissions. macOS attributes every CLI Orion launches — codex,
+                          claude, grok, cursor — back to Orion, so granting them here covers all providers.
                         </div>
                       </div>
                     </div>
@@ -5114,6 +7389,126 @@ const App: React.FC = () => {
                         <RefreshCw size={13} />
                         Relaunch Orion
                       </button>
+                    </div>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Browser control</div>
+                        <div className="setting-label-desc">
+                          Codex’s built-in ChatGPT-extension browser only works inside the ChatGPT desktop app, so
+                          Orion gives each provider its own browser tooling instead. These mirror the same options
+                          under Settings → Providers.
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Codex · Browser control</div>
+                        <div className="setting-label-desc">
+                          Full browser control through chrome-devtools-mcp: navigate, click, read pages, screenshot.
+                          Launches a dedicated Chrome with a persistent profile — sign in to sites once there and
+                          logins stick across runs.
+                        </div>
+                      </div>
+                      <div className="setting-row-actions">
+                        <label className="provider-toggle">
+                          <input
+                            type="checkbox"
+                            checked={providerSettings.codex?.options?.browserControl === true}
+                            onChange={(event) => {
+                              setProviderOptions('codex', { browserControl: event.target.checked });
+                            }}
+                          />
+                          <span />
+                        </label>
+                      </div>
+                    </div>
+
+                    {(() => {
+                      const browserControlOn = providerSettings.codex?.options?.browserControl === true;
+                      const autoConnectOn = providerSettings.codex?.options?.browserAutoConnect === true;
+                      const debugStatus = computerUsePerms?.chromeDebug?.status ?? 'disabled';
+                      const chip =
+                        debugStatus === 'enabled'
+                          ? { className: 'authenticated', label: 'Ready' }
+                          : debugStatus === 'stale'
+                            ? { className: '', label: 'Restart Chrome' }
+                            : autoConnectOn
+                              ? { className: 'unauthenticated', label: 'Setup needed' }
+                              : { className: '', label: 'Not set up' };
+                      return (
+                        <div className="setting-row">
+                          <div className="setting-label">
+                            <div className="setting-label-title">Codex · Use your signed-in Chrome</div>
+                            <div className="setting-label-desc">
+                              Attach browser control to your real Chrome profile — existing tabs, logins, and
+                              cookies — instead of the dedicated one. Requires Browser control above.
+                              {autoConnectOn && debugStatus !== 'enabled' && (
+                                <>
+                                  <br />
+                                  One-time setup: 1. Click “Set up in Chrome” (the link is also copied to your
+                                  clipboard — paste it in Chrome’s address bar if no tab opens). 2. On that page,
+                                  turn on “Enable remote debugging” (Chrome 144+). 3. Quit Chrome fully (⌘Q) and
+                                  reopen it — the server only starts on launch. The status here flips to Ready
+                                  automatically.
+                                </>
+                              )}
+                              {autoConnectOn && !browserControlOn && (
+                                <>
+                                  <br />
+                                  Turn on Browser control above for this to take effect.
+                                </>
+                              )}
+                            </div>
+                          </div>
+                          <div className="setting-row-actions">
+                            <span className={`provider-status-chip ${chip.className}`}>{chip.label}</span>
+                            <button
+                              type="button"
+                              className="provider-auth-button"
+                              onClick={() => {
+                                void handleOpenChromeDebugSetup();
+                              }}
+                            >
+                              <SquareArrowOutUpRight size={13} />
+                              Set up in Chrome
+                            </button>
+                            <label className="provider-toggle">
+                              <input
+                                type="checkbox"
+                                checked={autoConnectOn}
+                                onChange={(event) => {
+                                  setProviderOptions('codex', { browserAutoConnect: event.target.checked });
+                                }}
+                              />
+                              <span />
+                            </label>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Claude · Claude in Chrome</div>
+                        <div className="setting-label-desc">
+                          Browser control through the Claude Chrome extension (--chrome): drives your real signed-in
+                          Chrome. Requires the extension to be installed in Chrome.
+                        </div>
+                      </div>
+                      <div className="setting-row-actions">
+                        <label className="provider-toggle">
+                          <input
+                            type="checkbox"
+                            checked={providerSettings.claude?.options?.chrome === true}
+                            onChange={(event) => {
+                              setProviderOptions('claude', { chrome: event.target.checked });
+                            }}
+                          />
+                          <span />
+                        </label>
+                      </div>
                     </div>
                   </>
                 )
@@ -5242,13 +7637,14 @@ const App: React.FC = () => {
                             ? recentThreads
                             : recentThreads.slice(0, THREADS_VISIBLE_LIMIT)
                           ).map((thread) => (
+                            <React.Fragment key={thread.id}>
                             <div
-                              key={thread.id}
                               className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
                               onClick={() => {
                                 if (threadRenameKey !== `recent:${thread.id}`) selectThread(thread.id);
                               }}
                             >
+                              {renderSubthreadToggle(thread)}
                               {threadRenameKey === `recent:${thread.id}` ? (
                                 <InlineRenameInput
                                   className="thread-rename-input"
@@ -5260,7 +7656,10 @@ const App: React.FC = () => {
                                   onCancel={() => setThreadRenameKey(null)}
                                 />
                               ) : (
-                                <span className="thread-title">{thread.title}</span>
+                                <span className="thread-title">
+                                  {renderThreadCliBadge(thread)}
+                                  <span className="thread-title-text">{thread.title}</span>
+                                </span>
                               )}
                               <span className="thread-project-tag thread-meta">
                                 {projects.find((p) => p.id === thread.projectId)?.name}
@@ -5344,6 +7743,8 @@ const App: React.FC = () => {
                                 )}
                               </div>
                             </div>
+                            {renderThreadChildren(thread, 'recent-sub')}
+                            </React.Fragment>
                           ))
                         )}
                       </div>
@@ -5519,13 +7920,14 @@ const App: React.FC = () => {
                             </button>
                           ) : (
                             visibleThreads.map((thread) => (
+                              <React.Fragment key={thread.id}>
                               <div
-                                key={thread.id}
                                 className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
                                 onClick={() => {
                                   if (threadRenameKey !== `project:${thread.id}`) selectThread(thread.id);
                                 }}
                               >
+                                {renderSubthreadToggle(thread)}
                                 {threadRenameKey === `project:${thread.id}` ? (
                                   <InlineRenameInput
                                     className="thread-rename-input"
@@ -5537,7 +7939,10 @@ const App: React.FC = () => {
                                     onCancel={() => setThreadRenameKey(null)}
                                   />
                                 ) : (
-                                  <span className="thread-title">{thread.title}</span>
+                                  <span className="thread-title">
+                                    {renderThreadCliBadge(thread)}
+                                    <span className="thread-title-text">{thread.title}</span>
+                                  </span>
                                 )}
                                 <span className="thread-time thread-meta">
                                   {thread.status === 'running' ? (
@@ -5607,10 +8012,12 @@ const App: React.FC = () => {
                                   )}
                                 </div>
                               </div>
+                              {renderThreadChildren(thread, 'project-sub')}
+                              </React.Fragment>
                             ))
                           )}
                         </div>
-  
+
                         {(hasMoreThreads || isListExpanded) && (
                           <button
                             type="button"
@@ -5659,6 +8066,19 @@ const App: React.FC = () => {
               ) : (
                 <>
                   <div className="panel-content">
+                    {isTerminalThread ? (
+                      <React.Suspense fallback={<div className="terminal-view" />}>
+                        <TerminalView
+                          key={selectedThread.id}
+                          threadId={selectedThread.id}
+                          projectPath={selectedThreadProjectPath ?? ''}
+                          accessMode={selectedThread.accessMode ?? 'full-access'}
+                          resumeSessionId={selectedThread.agentSessionIds?.claude}
+                          forkSession={selectedThread.pendingForkProviders?.includes('claude')}
+                        />
+                      </React.Suspense>
+                    ) : (
+                      <>
                     <div className="chat-scroll-wrap">
                     <div className="chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll}>
                       <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
@@ -5667,15 +8087,26 @@ const App: React.FC = () => {
                           <AgentsWelcome projectName={selectedThreadProject?.name} />
                         )}
 
+                        {leadingBtwAsides.map(renderBtwAside)}
+
                         {selectedThread.messages.map((msg) => (
-                          <ChatMessage
-                            key={msg.id}
-                            message={msg}
-                            liveTask={selectedThread.linkedTask}
-                            taskBusy={isSending}
-                            onMarkTaskDone={() => markLinkedTaskDone(selectedThread.id)}
-                            onUnlinkTask={() => unlinkTaskFromThread(selectedThread.id)}
-                          />
+                          <React.Fragment key={msg.id}>
+                            <ChatMessage
+                              message={msg}
+                              liveTask={selectedThread.linkedTask}
+                              taskBusy={isSending}
+                              onMarkTaskDone={() => markLinkedTaskDone(selectedThread.id)}
+                              onUnlinkTask={() => unlinkTaskFromThread(selectedThread.id)}
+                              btwExchanges={
+                                msg.kind === 'agent-run' ? btwAsidesByAnchor.get(msg.id) : undefined
+                              }
+                              renderBtwAside={renderBtwAside}
+                              onAuthenticateProvider={handleAuthenticateProvider}
+                              authenticatingProviderId={authenticatingProviderId}
+                            />
+                            {msg.kind !== 'agent-run' &&
+                              btwAsidesByAnchor.get(msg.id)?.map(renderBtwAside)}
+                          </React.Fragment>
                         ))}
 
                         {isSending && selectedThread.messages.at(-1)?.role !== 'agent' && (
@@ -5733,52 +8164,7 @@ const App: React.FC = () => {
                           </div>
                         ))}
 
-                        {(selectedThread.btwExchanges ?? []).map((exchange) => (
-                          <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
-                            <div className="btw-aside-bar">
-                              <span className="btw-aside-badge">
-                                <Sparkles size={11} />
-                                BTW
-                              </span>
-                              <span className="btw-aside-note">
-                                aside · answered from a fork · not part of the thread
-                              </span>
-                              <button
-                                type="button"
-                                className="btw-aside-dismiss"
-                                onClick={() => dismissBtwExchange(selectedThread.id, exchange.id)}
-                                title={
-                                  exchange.status === 'running'
-                                    ? 'Cancel and dismiss this aside'
-                                    : 'Dismiss this aside'
-                                }
-                              >
-                                <X size={12} />
-                              </button>
-                            </div>
-                            <div className="btw-aside-question">{exchange.question}</div>
-                            {exchange.status === 'running' && !exchange.answer && (
-                              <div className="agent-status-line running">
-                                <span className="working-dots" aria-hidden="true">
-                                  <span />
-                                  <span />
-                                  <span />
-                                </span>
-                                <span>Answering on the side…</span>
-                              </div>
-                            )}
-                            {exchange.answer && (
-                              <div className="btw-aside-answer">
-                                <MarkdownContent content={exchange.answer} />
-                              </div>
-                            )}
-                            {exchange.status === 'error' && (
-                              <div className="agent-error">
-                                {exchange.error ?? 'The aside failed.'}
-                              </div>
-                            )}
-                          </div>
-                        ))}
+                        {trailingBtwAsides.map(renderBtwAside)}
                         <div ref={chatEndRef} />
                       </div>
                       </MarkdownBaseDirContext.Provider>
@@ -5795,9 +8181,18 @@ const App: React.FC = () => {
                         onDismiss={() => setTasksCardDismissedFor(floatingPlan.messageId)}
                       />
                     )}
+
+                    {runningAgentMessage && <PinnedRunStatus message={runningAgentMessage} />}
                     </div>
+                      </>
+                    )}
 
                     <div className="chat-input-area">
+                      <AgentFamilySwitcher
+                        currentThread={selectedThread}
+                        threads={threads}
+                        onSelect={selectThread}
+                      />
                       <div className="composer-shell">
                         {chatAttachments.length > 0 && (
                           <div className="composer-attachments">
@@ -5854,21 +8249,139 @@ const App: React.FC = () => {
                             </div>
                           </div>
                         )}
-                        {/^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
+                        {!isTerminalThread && /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
+                          <div className="composer-btw-hint">
+                            <SquarePen size={12} />
+                            <span>
+                              {selectedAgentModel?.providerId === 'codex'
+                                ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
+                                : '/review is only available on Codex agents.'}
+                            </span>
+                          </div>
+                        )}
+                        {!isTerminalThread && /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
+                          <div className="composer-btw-hint">
+                            <Target size={12} />
+                            <span>
+                              {selectedAgentModel?.providerId === 'codex'
+                                ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
+                                : '/goal is only available on Codex agents.'}
+                            </span>
+                          </div>
+                        )}
+                        {!isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
                           <div className="composer-btw-hint">
                             <Sparkles size={12} />
                             <span>
-                              {selectedAgentModel?.providerId === 'claude'
+                              {selectedAgentModel?.providerId === 'claude' ||
+                              (isOrionModelId(selectedThread.modelId) &&
+                                findAgentModel(
+                                  agentModels,
+                                  normalizedOrchestrationSettings.models.mainDriver
+                                )?.providerId === 'claude')
                                 ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
                                 : '/btw is only available on Claude agents for now.'}
                             </span>
                           </div>
                         )}
+                        {selectedAgentModel?.providerId === 'codex' &&
+                          /^\/review\s*$/i.test(chatInput.trimStart()) && (
+                            <div className="mention-popover review-popover" role="listbox">
+                              <button
+                                type="button"
+                                role="option"
+                                className="mention-row"
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => dispatchReview('/review', { mode: 'uncommitted' })}
+                              >
+                                <SquarePen size={14} />
+                                <span className="mention-row-label">Review uncommitted changes</span>
+                              </button>
+                              <button
+                                type="button"
+                                role="option"
+                                className="mention-row"
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => setChatInput('/review base ')}
+                              >
+                                <GitBranch size={14} />
+                                <span className="mention-row-label">Review against a base branch</span>
+                              </button>
+                            </div>
+                          )}
+                        {selectedAgentModel?.providerId === 'codex' &&
+                          /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
+                            <div className="mention-popover review-popover" role="listbox">
+                              {(gitState?.branches ?? [])
+                                .filter((branch) => !branch.current)
+                                .slice(0, 12)
+                                .map((branch) => (
+                                  <button
+                                    key={branch.name}
+                                    type="button"
+                                    role="option"
+                                    className="mention-row"
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={() =>
+                                      dispatchReview(`/review base ${branch.name}`, {
+                                        mode: 'base',
+                                        base: branch.name,
+                                      })
+                                    }
+                                  >
+                                    <GitBranch size={14} />
+                                    <span className="mention-row-label">{branch.name}</span>
+                                  </button>
+                                ))}
+                              {!(gitState?.branches ?? []).some((branch) => !branch.current) && (
+                                <div className="mention-row" aria-disabled="true">
+                                  <GitBranch size={14} />
+                                  <span className="mention-row-label">
+                                    No other branches — type a branch name
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        {chatMentionOpen && (
+                          <div className="mention-popover" role="listbox">
+                            {chatMentionCandidates.map((model, index) => {
+                              const ProviderIcon =
+                                agentProviders.find((provider) => provider.id === model.providerId)
+                                  ?.icon ?? Play;
+                              return (
+                                <button
+                                  key={model.id}
+                                  type="button"
+                                  role="option"
+                                  aria-selected={index === chatMentionIndex}
+                                  className={`mention-row ${index === chatMentionIndex ? 'selected' : ''}`}
+                                  onMouseEnter={() => setChatMentionIndex(index)}
+                                  // Keep the textarea focused so selection doesn't blur the composer.
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => insertChatMention(model)}
+                                  title={modelMentionToken(model, agentModels)}
+                                >
+                                  <ProviderIcon size={16} />
+                                  <span className="mention-row-label">{model.label}</span>
+                                  <span className="mention-row-slug">
+                                    {modelMentionToken(model, agentModels)}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
                         <textarea
                           ref={chatInputRef}
                           className="chat-input min-h-[52px]"
+                          disabled={isNativeSubagentThread}
                           placeholder={
-                            isSending
+                            isNativeSubagentThread
+                              ? 'Read-only subagent transcript — steer from the parent thread.'
+                              : isTerminalThread
+                              ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
+                              : isSending
                               ? steerSupported
                                 ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
                                 : 'Queue a follow-up — sends when the agent finishes (⏎)…'
@@ -5879,8 +8392,22 @@ const App: React.FC = () => {
                                   : 'Describe what you want the agent to do...'
                           }
                           value={chatInput}
-                          onChange={(e) => setChatInput(e.target.value)}
+                          onChange={(e) => {
+                            setChatInput(e.target.value);
+                            updateChatMention(e.target.value, e.target.selectionStart);
+                          }}
                           onKeyDown={handleChatKeyDown}
+                          // Caret moves without input still open/close the mention
+                          // dropdown. Dropdown-navigation keys are excluded so a
+                          // handled keydown can't immediately recompute the token.
+                          onKeyUp={(e) => {
+                            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
+                              updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart);
+                            }
+                          }}
+                          onClick={(e) =>
+                            updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart)
+                          }
                           rows={2}
                         />
                         <div className="composer-controls">
@@ -5924,7 +8451,45 @@ const App: React.FC = () => {
                                   );
                                 })}
                               </div>
-                              <div className="model-picker-panel">
+                              <div
+                                className={`model-picker-panel${
+                                  activeProviderTab === 'claude' ? ' has-cli-overlay' : ''
+                                }`}
+                              >
+                                {activeProviderTab === 'claude' && claudeCodeCliModel && (
+                                  <button
+                                    type="button"
+                                    className={`model-cli-overlay${
+                                      selectedThread.modelId === claudeCodeCliModelId
+                                        ? ' selected'
+                                        : ''
+                                    }`}
+                                    onClick={async () => {
+                                      if (selectedThread.modelId === claudeCodeCliModelId) {
+                                        setModelPickerOpen(false);
+                                        setModelSearch('');
+                                        return;
+                                      }
+                                      updateThread(selectedThread.id, {
+                                        modelId: claudeCodeCliModelId,
+                                      });
+                                      setModelPickerOpen(false);
+                                      setModelSearch('');
+                                    }}
+                                    disabled={claudeCodeCliModel.available === false}
+                                    title={
+                                      claudeCodeCliModel.unavailableReason ??
+                                      'Open an interactive Claude Code terminal in this thread'
+                                    }
+                                  >
+                                    <span className="model-cli-overlay-glow" aria-hidden />
+                                    <Terminal size={14} strokeWidth={2.25} />
+                                    <span className="model-cli-overlay-label">Claude Code CLI</span>
+                                    {selectedThread.modelId === claudeCodeCliModelId && (
+                                      <Check size={13} strokeWidth={2.5} />
+                                    )}
+                                  </button>
+                                )}
                                 <div className="model-search">
                                   <Search size={16} />
                                   <input
@@ -5944,8 +8509,24 @@ const App: React.FC = () => {
                                       <button
                                         key={model.id}
                                         className={`model-row ${selected ? 'selected' : ''}`}
-                                        onClick={() => {
-                                          updateThread(selectedThread.id, { modelId: model.id });
+                                        onClick={async () => {
+                                          if (
+                                            selectedThread.modelId === claudeCodeCliModelId &&
+                                            model.id !== claudeCodeCliModelId
+                                          ) {
+                                            try {
+                                              await window.orion?.terminalKill?.(selectedThread.id);
+                                            } catch (error) {
+                                              console.error('Could not stop Claude Code terminal', error);
+                                            }
+                                          }
+                                          updateThread(selectedThread.id, {
+                                            modelId: model.id,
+                                            ...(selectedThread.modelId === claudeCodeCliModelId &&
+                                            model.id !== claudeCodeCliModelId
+                                              ? { status: 'idle' as const }
+                                              : {}),
+                                          });
                                           setModelPickerOpen(false);
                                           setModelSearch('');
                                           if (
@@ -6200,6 +8781,7 @@ const App: React.FC = () => {
                           <ChevronDown size={13} />
                         </label>
 
+                        {!isTerminalThread && (
                         <div className="task-picker-anchor" ref={taskPickerRef}>
                           <button
                             className={`model-trigger task-link-trigger ${selectedThread.linkedTask ? 'linked' : ''}`}
@@ -6222,6 +8804,7 @@ const App: React.FC = () => {
                             />
                           )}
                         </div>
+                        )}
 
                         {isSending ? (
                           <>

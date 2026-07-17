@@ -80,6 +80,12 @@ export type Message = {
   startedAt?: string;
   completedAt?: string;
   error?: string;
+  /**
+   * Set when the turn's error text reads as a logged-out provider CLI: the
+   * transcript offers an Authenticate button for this provider instead of a
+   * dead-end error.
+   */
+  authProviderId?: string;
   changedFiles?: ChangedFileSummary[];
   /** Per-turn token usage, when the provider reports it (grok ACP). */
   stats?: TurnTokenStats;
@@ -106,6 +112,53 @@ export type BtwExchange = {
   createdAt: string;
   completedAt?: string;
   error?: string;
+  /** Set when the aside failed because the provider CLI is logged out — renders an Authenticate button. */
+  authProviderId?: string;
+  /**
+   * Id of the transcript message the aside was asked after, so it renders at
+   * its chronological spot instead of pinned below the whole transcript.
+   * Pre-anchor exchanges (and asides asked on empty threads) fall back to
+   * their timestamp when the renderer rebuilds the combined timeline.
+   */
+  afterMessageId?: string;
+  /**
+   * Character offset inside a streaming agent-run message at which the aside
+   * was asked. Later chunks and tool activity render below the aside even
+   * though they belong to the same message.
+   */
+  contentOffset?: number;
+};
+
+/**
+ * Codex goal (/goal): a persistent objective the agent pursues autonomously
+ * across turns. Owned by codex (~/.codex/goals_1.sqlite, keyed by the
+ * thread's codex session id); this is Orion's mirror for the goal chip and
+ * /goal status. Updated live from `goal` turn events during goal runs.
+ */
+export type ThreadGoal = {
+  objective: string;
+  status: 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+  tokenBudget?: number | null;
+  tokensUsed?: number;
+  timeUsedSeconds?: number;
+  updatedAt?: number;
+};
+
+/**
+ * A provider-native subagent (claude Agent/Task tool, codex collaboration
+ * spawn, cursor Task tool, grok spawn_subagent) rendered as a read-only child
+ * thread. Streamed live from the subagent's on-disk transcript by main.
+ */
+export type NativeSubagentInfo = {
+  /** Provider-side id (claude task_id, codex thread id, cursor agentId, grok child session id). */
+  id: string;
+  providerId: ProviderId;
+  /** Subagent type/role label (Explore, general-purpose, codex nickname role, …). */
+  kind?: string;
+  model?: string;
+  prompt?: string;
+  /** Final output summary, when the provider reports one. */
+  summary?: string;
 };
 
 // A kanban card from the Orion web board linked to this thread. Title and
@@ -149,12 +202,26 @@ export type Thread = {
   pendingForkProviders?: ProviderId[];
   /** Thread this one was branched from, if any. */
   branchedFromThreadId?: string;
+  /** Driver thread that spawned this one as a subagent, if any. */
+  parentThreadId?: string;
+  /** Set when this thread is a provider-native subagent's live transcript (read-only). */
+  subagent?: NativeSubagentInfo;
+  /** Latest start, prompt, or exit observed from an embedded terminal. */
+  terminalActivityAt?: string;
+  /**
+   * Pending spawn_subagent call awaiting this thread's result. Persisted so
+   * stop/delete/reload can still resolve the driver's blocked tool call;
+   * cleared after the first report.
+   */
+  spawnId?: string;
   /** Follow-ups submitted while a run was in flight; dispatched in order when the run ends. */
   queuedMessages?: QueuedMessage[];
   /** `/btw` asides answered by session forks; rendered alongside the transcript, never part of it. */
   btwExchanges?: BtwExchange[];
   /** Kanban card on the Orion web board driving/driven by this thread. */
   linkedTask?: LinkedBoardTask;
+  /** Codex goal (/goal) this thread is pursuing, if any. Null after /goal clear. */
+  goal?: ThreadGoal | null;
 };
 
 export type OpenFile = {
@@ -175,6 +242,12 @@ export type ProviderRuntimeOptions = {
   webSearch?: boolean;
   /** grok: enable cross-session memory (--experimental-memory) */
   experimentalMemory?: boolean;
+  /** claude: browser control via the Claude Chrome extension (--chrome) */
+  chrome?: boolean;
+  /** codex: browser control via chrome-devtools-mcp (the ChatGPT-extension backend is desktop-app-only) */
+  browserControl?: boolean;
+  /** codex: attach browser control to the user's real signed-in Chrome (--autoConnect) instead of a dedicated profile */
+  browserAutoConnect?: boolean;
   /** any provider: extra CLI flags appended to every run */
   extraArgs?: string;
 };
@@ -190,6 +263,33 @@ export const defaultProviderSettings: ProviderSettings = {
   claude: { enabled: true },
   cursor: { enabled: true },
   opencode: { enabled: true },
+};
+
+// Roles the Orion orchestrator pseudo-model delegates to. Each maps to an
+// AgentModel id picked in Settings → Orchestration.
+export type OrchestrationRoleId =
+  | 'mainDriver'
+  | 'computerUse'
+  | 'exploring'
+  | 'implementation'
+  | 'imageVideoGen';
+
+export type OrchestrationSettings = {
+  /** AgentModel id per role, e.g. 'claude:claude-fable-5'. */
+  models: Record<OrchestrationRoleId, string>;
+  /** Extra instructions given to every orchestrated run. */
+  generalInstructions: string;
+};
+
+export const defaultOrchestrationSettings: OrchestrationSettings = {
+  models: {
+    mainDriver: 'claude:claude-fable-5',
+    computerUse: 'codex:gpt-5.6-sol',
+    exploring: 'claude:claude-haiku-4-5',
+    implementation: 'codex:gpt-5.6-sol',
+    imageVideoGen: 'grok:grok-4.5',
+  },
+  generalInstructions: '',
 };
 
 interface OrionState {
@@ -210,18 +310,34 @@ interface OrionState {
   // UI
   expandedProjects: string[];
   providerSettings: ProviderSettings;
+  orchestrationSettings: OrchestrationSettings;
 
   // Actions
   setActiveTab: (tab: 'agents' | 'code') => void;
   setProviderEnabled: (id: ProviderId, enabled: boolean) => void;
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
+  setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
+  setOrchestrationGeneralInstructions: (text: string) => void;
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
   addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
-  createThread: (projectId: string, title?: string) => string; // returns new thread id
+  createThread: (
+    projectId: string,
+    title?: string,
+    options?: {
+      parentThreadId?: string;
+      modelId?: string;
+      hiddenFromRecent?: boolean;
+      spawnId?: string;
+      accessMode?: Thread['accessMode'];
+      subagent?: NativeSubagentInfo;
+      /** false = don't switch the UI to the new thread (background spawns). */
+      select?: boolean;
+    }
+  ) => string; // returns new thread id
   branchThread: (sourceThreadId: string) => string | null; // returns new thread id
   selectProject: (id: string | null) => void;
   selectThread: (id: string | null) => void;
@@ -358,6 +474,7 @@ export const useOrionStore = create<OrionState>()(
       activeFilePath: null,
       expandedProjects: [],
       providerSettings: defaultProviderSettings,
+      orchestrationSettings: defaultOrchestrationSettings,
 
       setActiveTab: (tab) => set({ activeTab: tab }),
       setProviderEnabled: (id, enabled) =>
@@ -382,6 +499,30 @@ export const useOrionStore = create<OrionState>()(
             },
           };
         }),
+      setOrchestrationRoleModel: (role, modelId) =>
+        set((state) => ({
+          orchestrationSettings: {
+            ...defaultOrchestrationSettings,
+            ...state.orchestrationSettings,
+            models: {
+              ...defaultOrchestrationSettings.models,
+              ...state.orchestrationSettings?.models,
+              [role]: modelId,
+            },
+          },
+        })),
+      setOrchestrationGeneralInstructions: (text) =>
+        set((state) => ({
+          orchestrationSettings: {
+            ...defaultOrchestrationSettings,
+            ...state.orchestrationSettings,
+            models: {
+              ...defaultOrchestrationSettings.models,
+              ...state.orchestrationSettings?.models,
+            },
+            generalInstructions: text,
+          },
+        })),
       setThreadAgentSession: (threadId, providerId, sessionId) =>
         set((state) => ({
           threads: state.threads.map((thread) =>
@@ -447,33 +588,46 @@ export const useOrionStore = create<OrionState>()(
           projects: state.projects.map((p) => (p.id === id ? { ...p, name } : p)),
         })),
 
-      createThread: (projectId, title) => {
+      createThread: (projectId, title, options) => {
         // Inherit model + settings from the most recently used thread in the
-        // same project so new threads default to what the user last picked.
+        // same project so new top-level threads default to what the user last
+        // picked. Hidden/background subagents must not become that default;
+        // child threads inherit from their explicit parent instead.
         const threadActivityTime = (t: Thread) =>
           new Date(t.messages.at(-1)?.ts ?? t.createdAt).getTime();
-        const lastProjectThread = get()
-          .threads.filter((t) => t.projectId === projectId)
-          .sort((a, b) => threadActivityTime(b) - threadActivityTime(a))[0];
+        const projectThreads = get().threads.filter((t) => t.projectId === projectId);
+        const parentThread = options?.parentThreadId
+          ? projectThreads.find((t) => t.id === options.parentThreadId)
+          : undefined;
+        const lastProjectThread =
+          parentThread ??
+          projectThreads
+            .filter((t) => !t.parentThreadId && !t.subagent)
+            .sort((a, b) => threadActivityTime(b) - threadActivityTime(a))[0];
 
         const newThread: Thread = {
           id: crypto.randomUUID(),
           projectId,
           title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
           status: 'idle',
-          modelId: lastProjectThread?.modelId ?? 'grok:grok-4.5',
-          accessMode: lastProjectThread?.accessMode ?? 'full-access',
+          modelId: options?.modelId ?? lastProjectThread?.modelId ?? 'grok:grok-4.5',
+          accessMode: options?.accessMode ?? lastProjectThread?.accessMode ?? 'full-access',
           codexReasoningEffort: lastProjectThread?.codexReasoningEffort,
           codexServiceTier: lastProjectThread?.codexServiceTier,
           claudeReasoningEffort: lastProjectThread?.claudeReasoningEffort,
           claudeContextWindow: lastProjectThread?.claudeContextWindow,
           createdAt: new Date().toISOString(),
+          parentThreadId: options?.parentThreadId,
+          spawnId: options?.spawnId,
+          hiddenFromRecent: options?.hiddenFromRecent,
+          subagent: options?.subagent,
           messages: [],
         };
         set((state) => ({
           threads: [newThread, ...state.threads],
-          selectedProjectId: projectId,
-          selectedThreadId: newThread.id,
+          ...(options?.select === false
+            ? {}
+            : { selectedProjectId: projectId, selectedThreadId: newThread.id }),
         }));
         return newThread.id;
       },
@@ -558,8 +712,16 @@ export const useOrionStore = create<OrionState>()(
         };
         set((state) => ({
           threads: state.threads.map((t) =>
-            // New activity puts a thread back in Recent agents even if it was removed.
-            t.id === threadId ? { ...t, messages: [...t.messages, msg], hiddenFromRecent: false } : t
+            // New activity puts a thread back in Recent agents even if it was
+            // removed — except subagent children, which render nested under
+            // their parent and never as top-level Recent rows.
+            t.id === threadId
+              ? {
+                  ...t,
+                  messages: [...t.messages, msg],
+                  hiddenFromRecent: t.parentThreadId ? t.hiddenFromRecent : false,
+                }
+              : t
           ),
         }));
         return msg.id;
@@ -673,12 +835,19 @@ export const useOrionStore = create<OrionState>()(
         })),
 
       addBtwExchange: (threadId, question) => {
+        const thread = get().threads.find((t) => t.id === threadId);
+        const anchorMessage = thread?.messages.at(-1);
+        const afterMessageId = anchorMessage?.id;
         const exchange: BtwExchange = {
           id: crypto.randomUUID(),
           question,
           answer: '',
           status: 'running',
           createdAt: new Date().toISOString(),
+          ...(afterMessageId ? { afterMessageId } : {}),
+          ...(anchorMessage?.kind === 'agent-run'
+            ? { contentOffset: anchorMessage.content.length }
+            : {}),
         };
         set((state) => ({
           threads: state.threads.map((t) =>
@@ -799,6 +968,14 @@ export const useOrionStore = create<OrionState>()(
         providerSettings: {
           ...defaultProviderSettings,
           ...state.providerSettings,
+        },
+        orchestrationSettings: {
+          ...defaultOrchestrationSettings,
+          ...state.orchestrationSettings,
+          models: {
+            ...defaultOrchestrationSettings.models,
+            ...state.orchestrationSettings?.models,
+          },
         },
       }),
     }

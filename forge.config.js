@@ -9,7 +9,10 @@ const macNonCodeResourcePattern = /\.(?:pak|bin|dat|png|jpe?g|gif|icns|ico|ttf|w
 
 module.exports = {
   packagerConfig: {
-    asar: true,
+    // node-pty's spawn-helper is a plain executable (no .node extension), so
+    // the auto-unpack-natives plugin alone won't unpack it — unpack the whole
+    // module. The plugin merges its own '**/*.node' pattern into this.
+    asar: { unpack: '**/node_modules/node-pty/**' },
     icon: path.join(__dirname, 'assets', 'icon'),
     extraResource: [path.join(__dirname, 'assets', 'icon.png')],
     name: 'Orion',
@@ -27,6 +30,25 @@ module.exports = {
     },
   },
   rebuildConfig: {},
+  hooks: {
+    // The Vite plugin packages only the `.vite` bundle (everything else is
+    // ignored), so runtime externals must be copied into the app manually.
+    // node-pty stays external (native module) — copy it and restore the
+    // exec bit on its spawn-helper, which npm strips from prebuilds.
+    packageAfterCopy: async (_forgeConfig, buildPath) => {
+      const fs = require('node:fs');
+      const src = path.join(__dirname, 'node_modules', 'node-pty');
+      const dest = path.join(buildPath, 'node_modules', 'node-pty');
+      fs.cpSync(src, dest, { recursive: true, dereference: true });
+      const prebuilds = path.join(dest, 'prebuilds');
+      if (fs.existsSync(prebuilds)) {
+        for (const dir of fs.readdirSync(prebuilds)) {
+          const helper = path.join(prebuilds, dir, 'spawn-helper');
+          if (fs.existsSync(helper)) fs.chmodSync(helper, 0o755);
+        }
+      }
+    },
+  },
   makers: [
     {
       name: '@electron-forge/maker-squirrel',

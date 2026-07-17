@@ -1,4 +1,5 @@
 import type { SVGProps } from 'react';
+import orionIconUrl from '../assets/icon.png';
 
 export type ProviderIconProps = SVGProps<SVGSVGElement> & {
   size?: number;
@@ -60,6 +61,18 @@ export const OpenCodeBrandIcon = ({ size = 24, className, ...props }: ProviderIc
   <svg viewBox="0 0 24 24" fill="currentColor" {...iconProps(size, className)} {...props}>
     <path d="M18 20H6V12H18V20Z" opacity="0.45" />
     <path d="M18 8H6V20H18V8ZM24 24H0V0H24V24Z" />
+  </svg>
+);
+
+/** Orion's approved circular-arrow product mark. */
+export const OrionBrandIcon = ({ size = 24, className, ...props }: ProviderIconProps) => (
+  <svg viewBox="0 0 1024 1024" {...iconProps(size, className)} {...props}>
+    <image
+      href={orionIconUrl}
+      width="1024"
+      height="1024"
+      preserveAspectRatio="xMidYMid meet"
+    />
   </svg>
 );
 

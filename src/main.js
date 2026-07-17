@@ -1,13 +1,15 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell, systemPreferences } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { copyFileSync, createReadStream, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, createReadStream, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { Readable } from 'node:stream';
 import os from 'node:os';
+import http from 'node:http';
 import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import started from 'electron-squirrel-startup';
+import { z } from 'zod';
 import { autoUpdater } from 'electron-updater';
 import {
   clearCloudRepoLink,
@@ -160,6 +162,16 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 const agentModels = [
+  // Pseudo-model: the renderer resolves it to the configured main-driver
+  // model (and attaches an `orchestration` payload) before agent:runTurn.
+  // No `command` — agent:listModels reports it as always available.
+  {
+    id: 'orion:orchestrator',
+    providerId: 'orion',
+    providerLabel: 'Orion',
+    label: 'Orion',
+    slug: 'orion',
+  },
   {
     id: 'grok:grok-4.5',
     providerId: 'grok',
@@ -307,6 +319,17 @@ const agentModels = [
     slug: 'claude-haiku-4-5',
     command: 'claude',
     shortcut: '⌘8',
+  },
+  {
+    // Embedded-terminal pseudo-model: the thread runs the interactive
+    // `claude` TUI in a PTY (see the terminal:* IPC handlers), never
+    // agent:runTurn.
+    id: 'claude:claude-code-cli',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Code CLI',
+    slug: 'claude-code-cli',
+    command: 'claude',
   },
   ...cursorFallbackModels,
   {
@@ -820,6 +843,12 @@ const parseExtraArgs = (value) => {
   return args;
 };
 
+// Browser control runs through npx rather than Orion's bundled node_modules,
+// so keep the reviewed MCP release explicit. Never use @latest here: that
+// would let a published Orion build silently execute different third-party
+// code on a later run.
+const chromeDevtoolsMcpPackage = 'chrome-devtools-mcp@1.6.0';
+
 const commandForModel = (model, input) => {
   const prompt =
     model.providerId === 'claude' && input.claudeReasoningEffort === 'ultrathink'
@@ -834,7 +863,46 @@ const commandForModel = (model, input) => {
     typeof input.resumeSessionId === 'string' && input.resumeSessionId ? input.resumeSessionId : null;
 
   if (model.providerId === 'codex') {
+    // Goal runs (/goal) speak JSON-RPC over `codex app-server` — model,
+    // sandbox, and config overrides travel in the dialog, not argv.
+    if (input.codexGoal) return ['codex', 'app-server'];
     const reasoningEffort = codexReasoningEffortForModel(model, input.codexReasoningEffort);
+    // Code reviews (/review) run codex's dedicated reviewer. Same JSONL event
+    // stream as `codex exec --json`, so the normal adapter handles it. The
+    // review session is throwaway (--ephemeral): it must never become the
+    // thread's resumable session (session events are suppressed in runTurn).
+    if (input.codexReview && typeof input.codexReview === 'object') {
+      const review = input.codexReview;
+      const reviewAccessArgs =
+        accessMode === 'full-access'
+          ? ['--dangerously-bypass-approvals-and-sandbox']
+          : [
+              '--config',
+              `sandbox_mode="${accessMode === 'read-only' ? 'read-only' : 'workspace-write'}"`,
+            ];
+      const reviewArgs = [
+        'codex',
+        'exec',
+        'review',
+        '--json',
+        '--ephemeral',
+        '--skip-git-repo-check',
+        '--model',
+        modelArg,
+        '--config',
+        `model_reasoning_effort="${reasoningEffort}"`,
+        '--config',
+        `service_tier="${input.codexServiceTier || defaultCodexServiceTier}"`,
+        ...reviewAccessArgs,
+      ];
+      if (review.mode === 'base' && review.base) reviewArgs.push('--base', review.base);
+      else if (review.mode === 'commit' && review.commit) reviewArgs.push('--commit', review.commit);
+      else if (review.mode !== 'custom') reviewArgs.push('--uncommitted');
+      if (typeof review.instructions === 'string' && review.instructions.trim()) {
+        reviewArgs.push(review.instructions.trim());
+      }
+      return reviewArgs;
+    }
     const serviceTier = input.codexServiceTier || defaultCodexServiceTier;
     const configArgs = [
       '--config',
@@ -844,6 +912,45 @@ const commandForModel = (model, input) => {
     ];
     if (options.networkAccess) configArgs.push('--config', 'sandbox_workspace_write.network_access=true');
     if (options.webSearch) configArgs.push('--config', 'tools.web_search=true');
+    // Browser control: the ChatGPT-extension browser backend is hard-gated to
+    // the ChatGPT.app process tree (code-sign ancestry check on its
+    // /tmp/codex-browser-use sockets), so codex spawned by Orion can never use
+    // it. Instead expose Google's chrome-devtools-mcp as a purpose-built
+    // browser connector — the codex chrome plugin docs explicitly prefer
+    // purpose-built connectors over the Chrome plugin. Uses a persistent
+    // profile (~/.cache/chrome-devtools-mcp/chrome-profile), so logins stick
+    // across runs.
+    const browserControlEnabled =
+      options.browserControl === true && accessMode !== 'read-only';
+    if (browserControlEnabled) {
+      // autoConnect attaches to the user's real signed-in Chrome profile
+      // (Chrome 144+, after the one-time chrome://inspect/#remote-debugging
+      // toggle); otherwise chrome-devtools-mcp launches a dedicated Chrome
+      // with its own persistent profile.
+      const mcpArgs = JSON.stringify([
+        '-y',
+        chromeDevtoolsMcpPackage,
+        ...(options.browserAutoConnect ? ['--autoConnect'] : []),
+      ]);
+      configArgs.push(
+        '--config',
+        'mcp_servers.chrome_devtools.command="npx"',
+        '--config',
+        `mcp_servers.chrome_devtools.args=${mcpArgs}`,
+        '--config',
+        'mcp_servers.chrome_devtools.startup_timeout_sec=90',
+      );
+    }
+    // Without this steer, codex's bundled control-chrome skill grabs browser
+    // tasks, hits the dead extension backend, and gives up without ever trying
+    // the chrome_devtools tools (verified empirically). The skill defers to a
+    // user-named alternative, which this note provides.
+    const browserNote = !browserControlEnabled
+      ? ''
+      : options.browserAutoConnect
+        ? `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For any browser task, use the chrome_devtools MCP tools (discover them via tools_search); they attach to the user's real signed-in Chrome, so treat open tabs and logins with care and do not close tabs you did not open. If those tools report "Could not connect to Chrome", tell the user to open chrome://inspect/#remote-debugging in Chrome, turn the remote debugging toggle on, quit and reopen Chrome (the server only starts on launch), and retry — do not attempt workarounds.]\n\n`
+        : `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For any browser task, use the chrome_devtools MCP tools (discover them via tools_search).]\n\n`;
+    const codexPrompt = `${browserNote}${prompt}`;
 
     if (resumeSessionId) {
       // `exec resume` has no --cd/--sandbox/--color flags: cwd comes from the
@@ -864,7 +971,7 @@ const commandForModel = (model, input) => {
         ...configArgs,
         ...accessArgs,
         ...extraArgs,
-        prompt,
+        codexPrompt,
       ];
     }
 
@@ -886,7 +993,7 @@ const commandForModel = (model, input) => {
       ...configArgs,
       ...accessArgs,
       ...extraArgs,
-      prompt,
+      codexPrompt,
     ];
   }
 
@@ -900,10 +1007,25 @@ const commandForModel = (model, input) => {
         ? ['--dangerously-skip-permissions']
         : ['--permission-mode', accessMode === 'read-only' ? 'plan' : 'acceptEdits'];
     // Headless runs can't show permission prompts, so tools outside the
-    // permission mode's defaults must be pre-approved here.
-    const allowedTools = String(options.allowedTools || '').trim();
+    // permission mode's defaults must be pre-approved here. Claude in Chrome
+    // tools are MCP tools, so enabling --chrome also pre-approves its server.
+    const chromeEnabled = options.chrome === true && accessMode !== 'read-only';
+    const chromeArgs = chromeEnabled ? ['--chrome'] : [];
+    const configuredAllowedTools = String(options.allowedTools || '')
+      .split(',')
+      .map((tool) => tool.trim())
+      .filter(
+        (tool) =>
+          Boolean(tool) &&
+          (accessMode !== 'read-only' || !tool.startsWith('mcp__claude-in-chrome'))
+      );
+    const allowedTools = [...configuredAllowedTools, chromeEnabled ? 'mcp__claude-in-chrome' : '']
+      .filter(Boolean)
+      .join(',');
+    // MUST be the single-token --flag=value form: --allowedTools is variadic
+    // (space-separated), so `--allowedTools a,b <prompt>` swallows the prompt.
     const allowedToolsArgs =
-      accessMode !== 'full-access' && allowedTools ? ['--allowedTools', allowedTools] : [];
+      accessMode !== 'full-access' && allowedTools ? [`--allowedTools=${allowedTools}`] : [];
     const resumeArgs = resumeSessionId
       ? ['--resume', resumeSessionId, ...(input.forkSession ? ['--fork-session'] : [])]
       : [];
@@ -920,6 +1042,7 @@ const commandForModel = (model, input) => {
       claudeEffortForCli(reasoningEffort),
       ...settingsArgs,
       ...accessArgs,
+      ...chromeArgs,
       ...allowedToolsArgs,
       ...resumeArgs,
       ...extraArgs,
@@ -994,6 +1117,110 @@ const commandForModel = (model, input) => {
   }
 
   return ['opencode', 'run', '--model', modelArg, ...extraArgs, prompt];
+};
+
+// -------------------- Orion orchestration instruction files --------------------
+
+// Managed blocks written into the project's CLAUDE.md / AGENTS.md so the main
+// driver of an orchestrator turn knows its role table and how to delegate.
+// Everything outside the markers is left untouched.
+const orchestrationBlockStartMarker = '<!-- ORION:ORCHESTRATION:START -->';
+const orchestrationBlockEndMarker = '<!-- ORION:ORCHESTRATION:END -->';
+
+const orchestrationRoleLabels = {
+  mainDriver: 'Main driver',
+  computerUse: 'Computer use',
+  exploring: 'Exploring',
+  implementation: 'Implementation',
+  imageVideoGen: 'Image/video generation',
+};
+
+const buildOrchestrationBlock = (orchestration) => {
+  const roles = Array.isArray(orchestration?.roles) ? orchestration.roles : [];
+  const lines = [
+    orchestrationBlockStartMarker,
+    '# Orion Orchestration',
+    '',
+    'These instructions apply only when this session is the Orion orchestrator (main driver), which is indicated by an `[Orion orchestration]` context block in the user prompt. Otherwise ignore this section entirely.',
+    '',
+    '## Roles',
+    '',
+    '| Role | Model | Provider | Model slug |',
+    '| --- | --- | --- | --- |',
+  ];
+  for (const entry of roles) {
+    const roleLabel = entry.roleLabel || orchestrationRoleLabels[entry.role] || entry.role || '';
+    const suffix = entry.role === 'mainDriver' ? ' (this agent)' : '';
+    lines.push(
+      `| ${roleLabel}${suffix} | ${entry.modelLabel || entry.modelId || ''} | ${entry.providerId || ''} | ${entry.slug || ''} |`
+    );
+  }
+  lines.push(
+    '',
+    '## Delegating to subagents',
+    '',
+    '1. **Preferred — the `spawn_subagent` tool.** If the `spawn_subagent` tool (fully-qualified name `mcp__orion__spawn_subagent`) is available, call it with `{ model, prompt, title?, role? }`. `model` accepts a model id like `codex:gpt-5.6-sol`, a slug, or a label. The task runs on that model as a visible subthread in Orion, and the call blocks until the subagent finishes, returning its final report. Delegate computer-use tasks to the computerUse model, code exploration to the exploring model, code changes to the implementation model, and image/video generation to the imageVideoGen model — unless the user explicitly says otherwise (e.g. via @model mentions).',
+    '2. **Fallback — run the provider CLI from the shell.** When the tool is unavailable (non-Claude drivers), run the target provider CLI directly as a blocking one-shot command and read its output. The current `[Orion orchestration]` prompt supplies mandatory access flags; preserve them exactly and never grant a subagent more access than the driver:',
+    '   - codex: `codex exec --json --cd <cwd> --skip-git-repo-check --color never --model <slug> <access flags> "<task>"`',
+    '   - claude: `claude --print --model <slug> <access flags> "<task>"`',
+    '   - cursor: `cursor-agent --print --trust --workspace <cwd> --model <slug> <access flags> "<task>"`',
+    '   - grok: `grok --cwd <cwd> --model <slug> <access flags> --single "<task>"`',
+    '',
+    '   Iterate: inspect stdout when the command finishes, and follow up with a refined invocation if the result is incomplete.'
+  );
+  const generalInstructions = String(orchestration?.generalInstructions || '').trim();
+  if (generalInstructions) {
+    lines.push('', '## General orchestration instructions', '', orchestration.generalInstructions);
+  }
+  lines.push(orchestrationBlockEndMarker);
+  return lines.join('\n');
+};
+
+const syncOrchestrationInstructionFiles = async (projectPath, orchestration) => {
+  const block = buildOrchestrationBlock(orchestration);
+  for (const fileName of ['CLAUDE.md', 'AGENTS.md']) {
+    const filePath = path.join(projectPath, fileName);
+    let existing = null;
+    try {
+      existing = await fs.readFile(filePath, 'utf-8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+
+    let next;
+    if (existing === null) {
+      next = `${block}\n`;
+    } else {
+      const startIndex = existing.indexOf(orchestrationBlockStartMarker);
+      // The END marker only counts if it closes this START; an END before the
+      // START (or none at all) means the block is corrupt.
+      const endIndex =
+        startIndex === -1
+          ? -1
+          : existing.indexOf(
+              orchestrationBlockEndMarker,
+              startIndex + orchestrationBlockStartMarker.length
+            );
+      if (startIndex !== -1 && endIndex !== -1) {
+        next =
+          existing.slice(0, startIndex) +
+          block +
+          existing.slice(endIndex + orchestrationBlockEndMarker.length);
+      } else {
+        // Strip any orphaned markers so repeated runs converge on exactly one
+        // well-formed block instead of growing the file.
+        const stripped = existing
+          .split(orchestrationBlockStartMarker)
+          .join('')
+          .split(orchestrationBlockEndMarker)
+          .join('');
+        const trimmed = stripped.replace(/\s+$/u, '');
+        next = trimmed ? `${trimmed}\n\n${block}\n` : `${block}\n`;
+      }
+    }
+
+    if (next !== existing) await fs.writeFile(filePath, next, 'utf-8');
+  }
 };
 
 // Branched threads inherit the parent's session id but must never resume it
@@ -1312,6 +1539,27 @@ const codexActivityFromItem = (item, eventType) => {
       status: 'done',
     };
   }
+  if (item.type === 'collab_tool_call') {
+    // Multi-agent collaboration calls (spawn_agent/wait/send_message). The
+    // items carry no receiver thread ids on current codex, so the actual
+    // subagents are detected from their rollout files; this row just shows
+    // the parent's collaboration step.
+    const tool = String(item.tool ?? 'collaboration');
+    const titles = {
+      spawn_agent: 'Spawning subagent',
+      wait: 'Waiting for subagents',
+      send_message: 'Messaging subagent',
+      interrupt_agent: 'Interrupting subagent',
+      close_agent: 'Closing subagent',
+    };
+    return {
+      ...base,
+      type: 'tool',
+      kind: 'task',
+      title: titles[tool] ?? `Subagents - ${tool}`,
+      detail: stringifySummary(item.prompt ?? '', 160),
+    };
+  }
   if (item.type === 'error') {
     // Codex emits its experimental-feature warning ("Under-development features
     // enabled: ...") as an error item on every turn; it is noise, not a failure.
@@ -1565,6 +1813,761 @@ const genericJsonAdapter = {
 };
 
 const jsonAdapterForProvider = (providerId) => providerJsonAdapters[providerId] ?? genericJsonAdapter;
+
+// ---------------------------------------------------------------------------
+// Native provider subagents. Every provider CLI can spawn subagents (claude
+// Agent/Task tool, codex collaboration.spawn_agent, cursor Task tool, grok
+// spawn_subagent), and each one leaves a live transcript on disk:
+//   claude — <tmp>/claude-<uid>/<cwd-slug>/<session>/tasks/<task_id>.output
+//            (session-transcript JSONL; announced by system:task_started)
+//   codex  — ~/.codex/sessions/YYYY/MM/DD/rollout-…-<thread_id>.jsonl whose
+//            session_meta.source.subagent.thread_spawn.parent_thread_id links
+//            it to the parent (exec --json's collab items carry no ids)
+//   cursor — ~/.cursor/projects/<cwd-slug>/agent-transcripts/<agentId>/…jsonl
+//            (announced by the taskToolCall stream event)
+//   grok   — ~/.grok/sessions/<encodeURIComponent(cwd)>/<child_session_id>/
+//            updates.jsonl (raw session/update lines; announced by the
+//            _x.ai subagent_spawned notification)
+// A tracker per run tails those files and re-emits them as subagent-scoped
+// turn events, so the renderer can show every subagent as a switchable live
+// thread — uniformly across providers.
+
+const SUBAGENT_TAIL_POLL_MS = 300;
+const SUBAGENT_FILE_WAIT_MS = 30000;
+
+// Poll-tail a JSONL file: wait for it to exist (resolveFile), then stream
+// appended lines. fs.watch is unreliable across the tmp/home dirs involved,
+// and a 300ms poll is imperceptible next to model latency.
+const createJsonlTailer = ({ resolveFile, onLine }) => {
+  let stopped = false;
+  let filePath = null;
+  let offset = 0;
+  let carry = '';
+  let waitedMs = 0;
+  let polling = false;
+
+  const poll = async () => {
+    if (stopped || polling) return;
+    polling = true;
+    try {
+      if (!filePath) {
+        try {
+          filePath = await resolveFile();
+        } catch {
+          filePath = null;
+        }
+        if (!filePath) {
+          waitedMs += SUBAGENT_TAIL_POLL_MS;
+          if (waitedMs >= SUBAGENT_FILE_WAIT_MS) stop();
+          return;
+        }
+      }
+      let handle;
+      try {
+        handle = await fs.open(filePath, 'r');
+      } catch {
+        return;
+      }
+      try {
+        const { size } = await handle.stat();
+        if (size <= offset) return;
+        const length = size - offset;
+        const buffer = Buffer.alloc(length);
+        await handle.read(buffer, 0, length, offset);
+        offset = size;
+        const text = `${carry}${buffer.toString('utf8')}`;
+        const lines = text.split(/\r?\n/);
+        carry = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          let parsed;
+          try {
+            parsed = JSON.parse(trimmed);
+          } catch {
+            continue;
+          }
+          try {
+            onLine(parsed);
+          } catch {}
+        }
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      polling = false;
+    }
+  };
+
+  const timer = setInterval(() => void poll(), SUBAGENT_TAIL_POLL_MS);
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+  };
+  return {
+    stop,
+    // One last read before stopping — catches lines flushed to disk just
+    // before the provider announced the subagent finished.
+    finish: async () => {
+      await poll();
+      stop();
+    },
+  };
+};
+
+const SUBAGENT_REASONING_EMIT_MS = 200;
+
+const createSubagentTracker = ({ providerId, threadId, getSender, getRunId }) => {
+  const subagents = new Map();
+
+  const emit = (event) => {
+    const sender = getSender();
+    if (!sender || sender.isDestroyed()) return;
+    emitAgentEvent(sender, { runId: getRunId(), threadId, ...event });
+  };
+
+  const emitMeta = (sub, patch = {}) => {
+    Object.assign(sub.meta, patch);
+    emit({ type: 'subagent', subagent: { ...sub.meta } });
+  };
+
+  const sendReasoning = (sub, status = 'running') => {
+    const detail = sub.reasoningText.trim();
+    if (!detail) return;
+    emit({
+      type: 'subagent-activity',
+      subagentId: sub.meta.id,
+      activity: { key: 'reasoning', type: 'thought', title: 'Reasoning', detail, status },
+    });
+  };
+
+  const flushReasoning = (sub, status) => {
+    if (sub.reasoningTimer) {
+      clearTimeout(sub.reasoningTimer);
+      sub.reasoningTimer = null;
+    }
+    sendReasoning(sub, status);
+  };
+
+  // The stream helpers each subagent's line handler writes through. Mirrors
+  // the main-run pipeline: text chunks, throttled reasoning card, tool
+  // activities resolved in place via key/updateForKey.
+  const createApi = (sub) => ({
+    text: (chunk) => {
+      if (!chunk) return;
+      emit({ type: 'subagent-chunk', subagentId: sub.meta.id, chunk });
+    },
+    reasoning: (delta) => {
+      if (!delta) return;
+      sub.reasoningText = `${sub.reasoningText}${delta}`;
+      const elapsed = Date.now() - sub.lastReasoningAt;
+      if (elapsed >= SUBAGENT_REASONING_EMIT_MS) {
+        sub.lastReasoningAt = Date.now();
+        sendReasoning(sub);
+        return;
+      }
+      if (sub.reasoningTimer) return;
+      sub.reasoningTimer = setTimeout(() => {
+        sub.reasoningTimer = null;
+        sub.lastReasoningAt = Date.now();
+        sendReasoning(sub);
+      }, SUBAGENT_REASONING_EMIT_MS - elapsed);
+    },
+    activity: ({ updateForKey, ...activity }) => {
+      if (updateForKey) {
+        const known = sub.knownToolActivities.get(updateForKey);
+        if (known) {
+          emit({
+            type: 'subagent-activity',
+            subagentId: sub.meta.id,
+            activity: {
+              ...known,
+              key: updateForKey,
+              status: activity.status === 'error' || activity.type === 'error' ? 'error' : 'done',
+            },
+          });
+          return;
+        }
+      }
+      if (activity.key) {
+        const { key, status, ...rest } = activity;
+        sub.knownToolActivities.set(key, rest);
+      }
+      emit({ type: 'subagent-activity', subagentId: sub.meta.id, activity });
+    },
+    stats: (stats) => {
+      sub.meta.stats = { ...sub.meta.stats, ...stats };
+    },
+    prompt: (prompt) => {
+      if (!sub.meta.prompt && prompt) emitMeta(sub, { prompt });
+    },
+    finish: (info) => finish(sub.meta.id, info),
+  });
+
+  const start = (meta, { resolveFile, handleLine }) => {
+    if (!meta?.id || subagents.has(meta.id)) return;
+    const sub = {
+      meta: { providerId, status: 'running', startedAt: Date.now(), ...meta },
+      knownToolActivities: new Map(),
+      reasoningText: '',
+      reasoningTimer: null,
+      lastReasoningAt: 0,
+      ctx: {},
+      finished: false,
+      finishTimer: null,
+    };
+    subagents.set(meta.id, sub);
+    emitMeta(sub);
+    const api = createApi(sub);
+    sub.tailer = createJsonlTailer({
+      resolveFile,
+      onLine: (value) => handleLine(value, api, sub.ctx),
+    });
+  };
+
+  const finish = (id, { status = 'done', stats, summary } = {}) => {
+    const sub = subagents.get(id);
+    if (!sub || sub.finished) return;
+    sub.finished = true;
+    if (sub.finishTimer) {
+      clearTimeout(sub.finishTimer);
+      sub.finishTimer = null;
+    }
+    void (async () => {
+      // Some CLIs (cursor) flush the subagent transcript to disk only at
+      // completion, so the "finished" signal can beat the file write. Give
+      // the file a moment before the final read.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      try {
+        await sub.tailer?.finish();
+      } catch {}
+      flushReasoning(sub, 'done');
+      emitMeta(sub, {
+        status,
+        completedAt: Date.now(),
+        ...(stats ? { stats: { ...sub.meta.stats, ...stats } } : {}),
+        ...(summary ? { summary } : {}),
+      });
+    })();
+  };
+
+  // Finish after a short delay unless a richer signal (one carrying stats or
+  // a summary) lands first — e.g. claude's task_updated vs task_notification.
+  const finishSoon = (id, info, delayMs = 2500) => {
+    const sub = subagents.get(id);
+    if (!sub || sub.finished || sub.finishTimer) return;
+    sub.finishTimer = setTimeout(() => {
+      sub.finishTimer = null;
+      finish(id, info);
+    }, delayMs);
+  };
+
+  const dispose = (status = 'done') => {
+    for (const [id, sub] of subagents) {
+      if (!sub.finished) finish(id, { status });
+    }
+  };
+
+  return {
+    start,
+    finish,
+    finishSoon,
+    has: (id) => subagents.has(id),
+    ids: () => [...subagents.keys()],
+    dispose,
+  };
+};
+
+// --- claude: the task output file is session-transcript JSONL ---------------
+
+const claudeTaskOutputCandidates = (projectPath, sessionId, taskId) => {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const slug = String(projectPath).replace(/[^a-zA-Z0-9]/g, '-');
+  const bases = [];
+  if (uid !== null) bases.push(path.join('/tmp', `claude-${uid}`));
+  bases.push(path.join(os.tmpdir(), uid !== null ? `claude-${uid}` : 'claude'));
+  return [...new Set(bases)].map((base) =>
+    path.join(base, slug, sessionId, 'tasks', `${taskId}.output`)
+  );
+};
+
+const handleClaudeSubagentLine = (value, api, ctx) => {
+  if (!value || typeof value !== 'object') return;
+  if (value.type === 'assistant' && Array.isArray(value.message?.content)) {
+    for (const part of value.message.content) {
+      if (!part || typeof part !== 'object') continue;
+      if (part.type === 'text' && typeof part.text === 'string' && part.text) {
+        api.text(ctx.textSeen ? `\n\n${part.text}` : part.text);
+        ctx.textSeen = true;
+      } else if (part.type === 'thinking' && typeof part.thinking === 'string' && part.thinking) {
+        api.reasoning(`${part.thinking}\n\n`);
+      }
+    }
+  }
+  // tool_use blocks (assistant lines) and tool_result blocks (user lines).
+  for (const activity of extractActivitiesFromJsonEvent(value)) api.activity(activity);
+};
+
+// --- cursor: agent-transcripts/<agentId>/<agentId>.jsonl --------------------
+
+const cursorAgentTranscriptFile = async (projectPath, agentId) => {
+  const projectsDir = path.join(os.homedir(), '.cursor', 'projects');
+  const slug = String(projectPath).replace(/^\//, '').replace(/\//g, '-');
+  const direct = path.join(projectsDir, slug, 'agent-transcripts', agentId, `${agentId}.jsonl`);
+  if (existsSync(direct)) return direct;
+  // Slug rules vary across cursor versions; the agentId is globally unique,
+  // so scan the project dirs for it.
+  try {
+    const entries = await fs.readdir(projectsDir);
+    for (const entry of entries) {
+      const candidate = path.join(
+        projectsDir,
+        entry,
+        'agent-transcripts',
+        agentId,
+        `${agentId}.jsonl`
+      );
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {}
+  return null;
+};
+
+const handleCursorSubagentLine = (value, api, ctx) => {
+  if (!value || typeof value !== 'object') return;
+  if (value.type === 'turn_ended') {
+    api.finish({ status: !value.status || value.status === 'success' ? 'done' : 'error' });
+    return;
+  }
+  if (value.role === 'assistant' && Array.isArray(value.message?.content)) {
+    const text = value.message.content
+      .map((part) =>
+        part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string'
+          ? part.text
+          : ''
+      )
+      .join('')
+      // cursor redacts tool-call payloads inside transcript text blocks.
+      .replace(/\n?\[REDACTED\]/g, '')
+      .trim();
+    if (text) {
+      api.text(ctx.textSeen ? `\n\n${text}` : text);
+      ctx.textSeen = true;
+    }
+  }
+  for (const activity of extractActivitiesFromJsonEvent(value)) api.activity(activity);
+};
+
+// --- codex: subagent rollout files under ~/.codex/sessions ------------------
+
+const codexSessionDayDirs = () => {
+  const dirs = [];
+  const now = Date.now();
+  for (const dayOffset of [0, 1]) {
+    const day = new Date(now - dayOffset * 86400000);
+    dirs.push(
+      path.join(
+        os.homedir(),
+        '.codex',
+        'sessions',
+        String(day.getFullYear()),
+        String(day.getMonth() + 1).padStart(2, '0'),
+        String(day.getDate()).padStart(2, '0')
+      )
+    );
+  }
+  return dirs;
+};
+
+const readFirstJsonLine = async (filePath) => {
+  let handle;
+  try {
+    handle = await fs.open(filePath, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    // A rollout's session_meta line embeds the full harness instructions and
+    // can run well past any fixed small buffer — read chunks until the first
+    // newline (capped so a corrupt file can't balloon memory).
+    const CHUNK = 65536;
+    const MAX = 4 * 1024 * 1024;
+    let collected = Buffer.alloc(0);
+    let offset = 0;
+    while (collected.length < MAX) {
+      const buffer = Buffer.alloc(CHUNK);
+      const { bytesRead } = await handle.read(buffer, 0, CHUNK, offset);
+      if (bytesRead <= 0) return null;
+      collected = Buffer.concat([collected, buffer.subarray(0, bytesRead)]);
+      const newline = collected.indexOf(0x0a);
+      if (newline >= 0) return JSON.parse(collected.toString('utf8', 0, newline));
+      if (bytesRead < CHUNK) return null;
+      offset += bytesRead;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    await handle.close();
+  }
+};
+
+// exec --json's collab items never carry receiver thread ids (experimental
+// serialization gap, verified on codex 0.144.5), so spawns are detected from
+// the filesystem: a new rollout whose session_meta names this thread as its
+// spawn parent is a subagent of this run.
+const watchCodexSubagentSpawns = ({ parentThreadId, onSpawn }) => {
+  const seen = new Set();
+  // Baseline every rollout that already exists before this run starts. A
+  // resumed parent keeps the same thread id across turns, so a time-window
+  // lookback would rediscover the previous turn's recent subagents and tail
+  // their transcripts again from offset zero.
+  for (const dir of codexSessionDayDirs()) {
+    try {
+      for (const name of readdirSync(dir)) {
+        if (name.startsWith('rollout-') && name.endsWith('.jsonl')) seen.add(name);
+      }
+    } catch {
+      // Missing day directory; the poller will pick it up if it appears.
+    }
+  }
+  let stopped = false;
+  let polling = false;
+
+  const poll = async () => {
+    if (stopped || polling) return;
+    polling = true;
+    try {
+      for (const dir of codexSessionDayDirs()) {
+        let entries;
+        try {
+          entries = await fs.readdir(dir);
+        } catch {
+          continue;
+        }
+        for (const name of entries) {
+          if (!name.startsWith('rollout-') || !name.endsWith('.jsonl') || seen.has(name)) continue;
+          const filePath = path.join(dir, name);
+          const head = await readFirstJsonLine(filePath);
+          // First line not flushed yet — leave it for the next poll.
+          if (!head) continue;
+          seen.add(name);
+          const spawn = head?.payload?.source?.subagent?.thread_spawn;
+          const childThreadId = head?.payload?.id;
+          if (!spawn || !childThreadId || spawn.parent_thread_id !== parentThreadId) continue;
+          onSpawn({
+            threadId: childThreadId,
+            nickname: typeof spawn.agent_nickname === 'string' ? spawn.agent_nickname : undefined,
+            role: typeof spawn.agent_role === 'string' ? spawn.agent_role : undefined,
+            filePath,
+          });
+        }
+      }
+    } finally {
+      polling = false;
+    }
+  };
+
+  const timer = setInterval(() => void poll(), 1000);
+  void poll();
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+};
+
+const codexRolloutCommandSummary = (raw) => {
+  const command = Array.isArray(raw) ? raw.join(' ') : raw;
+  return stringifySummary(command, 80);
+};
+
+// Subagent rollouts come in two shapes. Fresh-context, role-based spawns hold
+// only the subagent's own transcript (their thread_spawn has agent_role but no
+// agent_path). Collaboration spawns carry an agent_path and replay the parent
+// history before inter_agent_communication_metadata, where the NEW_TASK
+// envelope starts the subagent's own work. Current Codex rollouts do not add a
+// second session_meta before that replay, so the source metadata — not the
+// number of session_meta lines — must decide whether the prefix is live.
+const handleCodexRolloutLine = (value, api, ctx) => {
+  if (!value || typeof value !== 'object') return;
+  if (value.type === 'session_meta') {
+    const spawn = value.payload?.source?.subagent?.thread_spawn;
+    if (spawn && typeof spawn === 'object') {
+      ctx.forked = typeof spawn.agent_path === 'string' && spawn.agent_path.length > 0;
+      ctx.decided = true;
+      ctx.live = !ctx.forked;
+    }
+    return;
+  }
+  if (!ctx.decided) {
+    // Older/unknown rollout sources have no thread_spawn metadata. Preserve
+    // the historical fresh-context behavior for those files.
+    ctx.decided = true;
+    ctx.live = true;
+  }
+  if (value.type === 'inter_agent_communication_metadata') {
+    ctx.live = true;
+    return;
+  }
+  if (!ctx.live) return;
+  const payload = value.payload;
+  if (!payload || typeof payload !== 'object') return;
+
+  if (value.type === 'event_msg') {
+    switch (payload.type) {
+      case 'agent_message': {
+        if (typeof payload.message === 'string' && payload.message) {
+          api.text(ctx.textSeen ? `\n\n${payload.message}` : payload.message);
+          ctx.textSeen = true;
+        }
+        return;
+      }
+      case 'agent_reasoning': {
+        if (typeof payload.text === 'string' && payload.text) api.reasoning(`${payload.text}\n\n`);
+        return;
+      }
+      case 'user_message': {
+        // Fresh-context spawns deliver the spawn prompt as the first user
+        // message of the subagent's own transcript.
+        if (!ctx.promptSeen && typeof payload.message === 'string' && payload.message) {
+          ctx.promptSeen = true;
+          api.prompt(payload.message);
+        }
+        return;
+      }
+      case 'exec_command_begin': {
+        api.activity({
+          key: typeof payload.call_id === 'string' ? payload.call_id : undefined,
+          type: 'command',
+          title: `Command - ${codexRolloutCommandSummary(payload.command)}`,
+          detail: codexRolloutCommandSummary(payload.command),
+          status: 'running',
+        });
+        return;
+      }
+      case 'exec_command_end': {
+        if (typeof payload.call_id === 'string') {
+          api.activity({
+            updateForKey: payload.call_id,
+            type: 'result',
+            title: 'Command finished',
+            status:
+              typeof payload.exit_code === 'number' && payload.exit_code !== 0
+                ? 'error'
+                : 'done',
+          });
+        }
+        return;
+      }
+      case 'patch_apply_end': {
+        api.activity({ type: 'tool', title: 'File changes applied', status: 'done' });
+        return;
+      }
+      case 'token_count': {
+        const total = payload.info?.total_token_usage?.total_tokens;
+        if (typeof total === 'number') api.stats({ totalTokens: total });
+        return;
+      }
+      case 'task_complete': {
+        api.finish({ status: 'done' });
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  if (value.type === 'response_item') {
+    if (payload.type === 'agent_message' && typeof payload.message === 'string') {
+      // The NEW_TASK envelope repeats the spawn prompt — surface it as the
+      // subagent's prompt, not as transcript text.
+      if (!ctx.promptSeen && payload.message.startsWith('Message Type:')) {
+        ctx.promptSeen = true;
+        const idx = payload.message.indexOf('Payload:');
+        if (idx >= 0) api.prompt(payload.message.slice(idx + 'Payload:'.length).trim());
+      }
+      return;
+    }
+    if (payload.type === 'custom_tool_call' || payload.type === 'function_call') {
+      const input = typeof payload.input === 'string' ? payload.input : payload.arguments;
+      api.activity({
+        key: typeof payload.call_id === 'string' ? payload.call_id : undefined,
+        type: payload.name === 'exec' ? 'command' : 'tool',
+        title:
+          payload.name === 'exec'
+            ? `Command - ${stringifySummary(input, 80)}`
+            : `Tool - ${payload.name ?? 'call'}`,
+        detail: stringifySummary(input),
+        status: 'running',
+      });
+      return;
+    }
+    if (payload.type === 'custom_tool_call_output' || payload.type === 'function_call_output') {
+      if (typeof payload.call_id === 'string') {
+        api.activity({
+          updateForKey: payload.call_id,
+          type: 'result',
+          title: 'Tool result',
+          status: 'done',
+        });
+      }
+    }
+  }
+};
+
+// --- grok: <session dir>/updates.jsonl holds raw session/update lines -------
+
+const grokSubagentUpdatesFile = (projectPath, childSessionId) =>
+  path.join(
+    os.homedir(),
+    '.grok',
+    'sessions',
+    encodeURIComponent(String(projectPath)),
+    childSessionId,
+    'updates.jsonl'
+  );
+
+// Compact sibling of the ACP driver's upsertToolCall — same update shapes,
+// minus streaming-argument previews and permission states, which never
+// appear in a subagent's persisted updates file.
+const handleGrokSubagentLine = (value, api, ctx) => {
+  const update = value?.params?.update;
+  if (!update || typeof update !== 'object') return;
+  const kind = update.sessionUpdate;
+
+  if (kind === 'user_message_chunk') {
+    // The first user message is the spawn prompt — surface it as metadata
+    // (the subagent_spawned notification itself only carries a description).
+    if (!ctx.promptSeen) {
+      ctx.promptSeen = true;
+      const text = update.content?.text;
+      if (typeof text === 'string' && text) api.prompt(text);
+    }
+    return;
+  }
+  if (kind === 'agent_thought_chunk') {
+    const text = update.content?.text;
+    if (typeof text === 'string' && text) api.reasoning(text);
+    return;
+  }
+  if (kind === 'agent_message_chunk') {
+    const text = update.content?.text;
+    if (typeof text !== 'string' || !text) return;
+    api.text(ctx.pendingBreak && ctx.textSeen ? `\n\n${text}` : text);
+    ctx.pendingBreak = false;
+    ctx.textSeen = true;
+    return;
+  }
+  if (kind === 'plan') {
+    const list = Array.isArray(update.entries) ? update.entries : [];
+    const completed = list.filter((entry) => entry?.status === 'completed').length;
+    api.activity({
+      key: 'plan',
+      type: 'plan',
+      kind: 'plan',
+      title: `Tasks (${completed}/${list.length})`,
+      status: list.length > 0 && completed === list.length ? 'done' : 'running',
+      plan: list.map((entry) => ({
+        content: String(entry?.content ?? ''),
+        status:
+          entry?.status === 'completed'
+            ? 'completed'
+            : entry?.status === 'in_progress'
+              ? 'in_progress'
+              : 'pending',
+      })),
+    });
+    return;
+  }
+  if (kind !== 'tool_call' && kind !== 'tool_call_update') return;
+
+  if (ctx.textSeen) ctx.pendingBreak = true;
+  const id = update.toolCallId;
+  if (typeof id !== 'string' || !id) return;
+  if (!ctx.calls) ctx.calls = new Map();
+  let state = ctx.calls.get(id);
+  if (!state) {
+    state = { status: 'running' };
+    ctx.calls.set(id, state);
+  }
+
+  const meta = update._meta?.['x.ai/tool'] ?? null;
+  if (typeof meta?.name === 'string') state.toolName = meta.name;
+  else if (kind === 'tool_call' && typeof update.title === 'string' && GROK_TOOL_LABELS[update.title]) {
+    state.toolName = update.title;
+  }
+  const toolKind = update.kind ?? meta?.kind ?? state.kind ?? grokToolKindForName(state.toolName);
+  if (toolKind) state.kind = toolKind === 'write' ? 'edit' : toolKind;
+  if (typeof update.title === 'string' && update.title) state.grokTitle = update.title;
+
+  const rawInput = update.rawInput;
+  if (rawInput && typeof rawInput === 'object') {
+    if (typeof rawInput.command === 'string') state.command = rawInput.command;
+    const filePath = rawInput.file_path ?? rawInput.path;
+    if (typeof filePath === 'string') state.filePath = filePath;
+    if (typeof rawInput.query === 'string') state.query = rawInput.query;
+    if (typeof rawInput.url === 'string') state.query = rawInput.url;
+  }
+  if (Array.isArray(update.content)) {
+    for (const entry of update.content) {
+      if (entry?.type === 'diff' && typeof entry.path === 'string') {
+        state.filePath = entry.path;
+        state.diff = {
+          path: entry.path,
+          additions: countDiffLines(entry.newText),
+          deletions: countDiffLines(entry.oldText),
+        };
+      }
+      if (entry?.type === 'content' && typeof entry.content?.text === 'string' && entry.content.text) {
+        state.output = entry.content.text;
+      }
+    }
+  }
+  const rawOutput = update.rawOutput;
+  if (rawOutput && typeof rawOutput === 'object') {
+    if (typeof rawOutput.exit_code === 'number') state.exitCode = rawOutput.exit_code;
+    if (
+      !state.output &&
+      typeof rawOutput.output_for_prompt === 'string' &&
+      rawOutput.output_for_prompt.trim()
+    ) {
+      state.output = rawOutput.output_for_prompt;
+    }
+  }
+  if (update.status === 'completed') state.status = 'done';
+  else if (update.status === 'failed' || update.status === 'cancelled') state.status = 'error';
+  if (typeof state.exitCode === 'number' && state.exitCode !== 0) state.status = 'error';
+
+  const label = state.toolName
+    ? grokToolLabel(state.toolName)
+    : { execute: 'Command', edit: 'Edit', read: 'Read', search: 'Web search', fetch: 'Web fetch', task: 'Subagent' }[
+        state.kind
+      ] ?? 'Tool';
+  const activity = {
+    key: id,
+    type: state.kind === 'execute' ? 'command' : 'tool',
+    title:
+      state.kind === 'execute' && state.command
+        ? `Command - ${stringifySummary(state.command, 80)}`
+        : (state.kind === 'search' || state.kind === 'fetch') && state.query
+          ? `${label} - ${stringifySummary(state.query, 80)}`
+          : state.filePath
+            ? `${label} - ${stringifySummary(state.filePath, 80)}`
+            : state.grokTitle || label,
+    status: state.status,
+  };
+  if (state.kind) activity.kind = state.kind;
+  if (state.command) activity.detail = state.command;
+  else if (state.query) activity.detail = state.query;
+  else if (state.filePath) activity.detail = state.filePath;
+  if (state.output) activity.output = state.output.slice(-4000);
+  if (typeof state.exitCode === 'number') activity.exitCode = state.exitCode;
+  if (state.diff) activity.diff = state.diff;
+  api.activity(activity);
+};
 
 // ---------------------------------------------------------------------------
 // Grok ACP driver. grok's headless streaming-json format only ever emits
@@ -2054,11 +3057,532 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
       handlePlanUpdate(update.entries);
       return;
     }
+    // Subagent lifecycle (_x.ai notifications): handled by the run's
+    // subagent tracker, which tails the child session's updates.jsonl.
+    if (kind === 'subagent_spawned' || kind === 'subagent_finished') {
+      callbacks.onSubagent?.(update);
+      return;
+    }
     handleXaiUpdate(update);
   };
 
   return { start, handleMessage };
 };
+
+// ---------------------------------------------------------------------------
+// Codex goal runs (/goal). Codex's goals feature — a persistent objective the
+// agent pursues autonomously across turns, with token budgets and a status
+// machine (active/paused/blocked/usageLimited/budgetLimited/complete) stored
+// in ~/.codex/goals_1.sqlite — lives in the app-server's live thread manager:
+// the goal runtime auto-starts continuation turns while the goal is active,
+// so `codex exec` (which exits at turn end) can never drive it. Goal runs
+// therefore speak JSON-RPC (JSONL over stdio) to `codex app-server` and treat
+// the whole pursuit (N turns) as one Orion run. Verified live on codex
+// 0.144.1: thread/goal/set immediately starts a "Pursuing goal" turn, and the
+// app-server resumes exec-created threads, so the thread's existing session
+// id keeps working with `codex exec resume` after the goal run ends.
+
+// Mirrors the --config overrides the codex exec path builds in
+// commandForModel; app-server takes them as a config map on thread/start.
+const codexAppServerConfig = (model, input) => {
+  const options =
+    input.providerOptions && typeof input.providerOptions === 'object' ? input.providerOptions : {};
+  const config = {
+    model_reasoning_effort: codexReasoningEffortForModel(model, input.codexReasoningEffort),
+    service_tier: input.codexServiceTier || defaultCodexServiceTier,
+  };
+  if (options.networkAccess) config['sandbox_workspace_write.network_access'] = true;
+  if (options.webSearch) config['tools.web_search'] = true;
+  if (options.browserControl && input.accessMode !== 'read-only') {
+    config['mcp_servers.chrome_devtools.command'] = 'npx';
+    config['mcp_servers.chrome_devtools.args'] = options.browserAutoConnect
+      ? ['-y', chromeDevtoolsMcpPackage, '--autoConnect']
+      : ['-y', chromeDevtoolsMcpPackage];
+    config['mcp_servers.chrome_devtools.startup_timeout_sec'] = 90;
+  }
+  return config;
+};
+
+// thread/tokenUsage/updated carries cumulative totals for the thread's loaded
+// turns — map the total breakdown onto Orion's TurnTokenStats.
+const codexStatsFromTokenUsage = (tokenUsage, modelId) => {
+  const total = tokenUsage?.total;
+  if (!total || typeof total !== 'object') return null;
+  const stats = { modelId };
+  if (typeof total.totalTokens === 'number') stats.totalTokens = total.totalTokens;
+  if (typeof total.inputTokens === 'number') stats.inputTokens = total.inputTokens;
+  if (typeof total.outputTokens === 'number') stats.outputTokens = total.outputTokens;
+  if (typeof total.cachedInputTokens === 'number') stats.cachedReadTokens = total.cachedInputTokens;
+  if (typeof total.reasoningOutputTokens === 'number') stats.reasoningTokens = total.reasoningOutputTokens;
+  return stats;
+};
+
+// Wire goal → the shape persisted on Thread.goal in the renderer store.
+const codexGoalForRenderer = (goal) => ({
+  objective: String(goal.objective ?? ''),
+  status: goal.status,
+  tokenBudget: typeof goal.tokenBudget === 'number' ? goal.tokenBudget : null,
+  tokensUsed: typeof goal.tokensUsed === 'number' ? goal.tokensUsed : 0,
+  timeUsedSeconds: typeof goal.timeUsedSeconds === 'number' ? goal.timeUsedSeconds : 0,
+  updatedAt: typeof goal.updatedAt === 'number' ? goal.updatedAt : undefined,
+});
+
+// v2 app-server thread items are the camelCase cousins of the exec --json
+// items codexActivityFromItem maps; completion carries aggregated output.
+const codexAppServerActivityFromItem = (item, completed) => {
+  if (!item || typeof item !== 'object') return null;
+  const failed =
+    item.status === 'failed' ||
+    item.status === 'declined' ||
+    (typeof item.exitCode === 'number' && item.exitCode !== 0);
+  const status = failed ? 'error' : completed || item.status === 'completed' ? 'done' : 'running';
+  const base = { key: typeof item.id === 'string' ? item.id : undefined, status };
+
+  if (item.type === 'commandExecution') {
+    const activity = {
+      ...base,
+      type: 'command',
+      kind: 'execute',
+      title: `Command - ${stringifySummary(item.command, 80)}`,
+      detail: stringifySummary(item.command),
+    };
+    if (completed && typeof item.aggregatedOutput === 'string' && item.aggregatedOutput) {
+      activity.output = item.aggregatedOutput.slice(-4000);
+    }
+    if (typeof item.exitCode === 'number') activity.exitCode = item.exitCode;
+    return activity;
+  }
+  if (item.type === 'fileChange') {
+    const paths = Array.isArray(item.changes)
+      ? item.changes.map((change) => change?.path).filter(Boolean)
+      : [];
+    return {
+      ...base,
+      type: 'tool',
+      kind: 'edit',
+      title: `File changes (${paths.length})`,
+      detail: stringifySummary(paths.join(', ')),
+    };
+  }
+  if (item.type === 'mcpToolCall') {
+    const name = [item.server, item.tool].filter(Boolean).join('.');
+    return {
+      ...base,
+      type: 'tool',
+      title: `Tool - ${name || 'MCP'}`,
+      detail: stringifySummary(item.arguments ?? ''),
+    };
+  }
+  if (item.type === 'webSearch') {
+    return {
+      ...base,
+      type: 'tool',
+      kind: 'search',
+      title: `Web search - ${stringifySummary(item.query ?? '', 80)}`,
+      detail: stringifySummary(item.query ?? ''),
+    };
+  }
+  if (item.type === 'imageGeneration') {
+    return { ...base, type: 'tool', title: 'Image generation' };
+  }
+  return null;
+};
+
+const CODEX_GOAL_END_NOTES = {
+  complete: '\n\n_Goal achieved._',
+  paused: '\n\n_Goal paused — send `/goal resume` to continue._',
+  blocked: '\n\n_Goal blocked — the agent can’t make progress without help. `/goal resume` to retry._',
+  usageLimited: '\n\n_Goal hit usage limits — `/goal resume` once limits reset._',
+  budgetLimited: '\n\n_Goal token budget exhausted — `/goal resume` to keep going._',
+};
+
+const createCodexAppServerDriver = ({
+  child,
+  cwd,
+  model,
+  input,
+  goal,
+  resumeSessionId,
+  accessMode,
+  callbacks,
+}) => {
+  let nextRequestId = 1;
+  const pendingRequests = new Map();
+  let threadId = null;
+  let textSeen = false;
+  let pendingTextBreak = false;
+  // Items whose text already streamed via deltas — their item.completed
+  // payload must not be emitted a second time.
+  const streamedTextItems = new Set();
+  const streamedReasoningItems = new Set();
+  let goalStatus = null;
+  let turnActive = false;
+  let activeTurnId = null;
+  let continuationTimer = null;
+  let ended = false;
+
+  // The goal runtime decides whether to continue after each turn; give it
+  // this long to start the next turn (or flip the goal status) before Orion
+  // concludes the pursuit stalled and pauses it.
+  const CONTINUATION_GRACE_MS = 90_000;
+
+  const write = (message) => {
+    try {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    } catch {}
+  };
+
+  const request = (method, params) =>
+    new Promise((resolve) => {
+      const id = nextRequestId++;
+      pendingRequests.set(id, resolve);
+      write({ jsonrpc: '2.0', id, method, params });
+    });
+
+  const emitText = (text) => {
+    if (!text) return;
+    const prefix = pendingTextBreak && textSeen ? '\n\n' : '';
+    pendingTextBreak = false;
+    textSeen = true;
+    callbacks.onText(`${prefix}${text}`);
+  };
+
+  const clearContinuationTimer = () => {
+    if (continuationTimer) {
+      clearTimeout(continuationTimer);
+      continuationTimer = null;
+    }
+  };
+
+  const endRun = (note) => {
+    if (ended) return;
+    ended = true;
+    clearContinuationTimer();
+    if (note) emitText(note);
+    callbacks.onGoalRunEnd();
+  };
+
+  const fail = (error) => {
+    if (ended) return;
+    ended = true;
+    clearContinuationTimer();
+    callbacks.onFatal(
+      typeof error === 'string' ? error : error?.message ?? 'Codex app-server protocol error.'
+    );
+  };
+
+  const armContinuationTimer = () => {
+    clearContinuationTimer();
+    continuationTimer = setTimeout(async () => {
+      continuationTimer = null;
+      if (ended || turnActive) return;
+      // The runtime declined to keep going (idle work rejected, nothing left
+      // to do, …) without flipping the goal status. Pause the stored goal so
+      // it matches the fact that nothing is running, then end gracefully.
+      if (goalStatus === 'active' && threadId) {
+        try {
+          await request('thread/goal/set', { threadId, status: 'paused' });
+        } catch {}
+      }
+      endRun('\n\n_Goal run went idle — paused. Send `/goal resume` to continue._');
+    }, CONTINUATION_GRACE_MS);
+  };
+
+  const handleGoalUpdated = (wireGoal) => {
+    goalStatus = wireGoal.status;
+    callbacks.onGoal(codexGoalForRenderer(wireGoal));
+    if (wireGoal.status !== 'active') {
+      clearContinuationTimer();
+      if (!turnActive) endRun(CODEX_GOAL_END_NOTES[wireGoal.status] ?? '');
+    }
+  };
+
+  const handleTurnCompleted = (params) => {
+    turnActive = false;
+    activeTurnId = null;
+    const turn = params.turn ?? {};
+    if (turn.status === 'failed') {
+      const message = turn.error?.message ?? 'Codex turn failed.';
+      callbacks.onActivity({
+        type: 'error',
+        title: 'Turn failed',
+        detail: stringifySummary(message, 300),
+        status: 'error',
+      });
+      // The goal runtime skips continuation after turn errors — pause the
+      // stored goal so its status matches reality, then end the run.
+      void (async () => {
+        if (goalStatus === 'active' && threadId) {
+          try {
+            const paused = await Promise.race([
+              request('thread/goal/set', { threadId, status: 'paused' }),
+              new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
+            ]);
+            // The adjacent goal-updated notification normally handles this,
+            // but apply the response too in case process output was delayed.
+            if (paused?.result?.goal) handleGoalUpdated(paused.result.goal);
+          } catch {}
+        }
+        endRun('\n\n_Goal run stopped on an error — `/goal resume` to retry._');
+      })();
+      return;
+    }
+    if (ended) return;
+    if (goalStatus && goalStatus !== 'active') {
+      endRun(CODEX_GOAL_END_NOTES[goalStatus] ?? '');
+      return;
+    }
+    // Goal still active: the runtime should start a continuation turn.
+    armContinuationTimer();
+  };
+
+  const handleItem = (params, completed) => {
+    const item = params.item;
+    if (!item || typeof item !== 'object') return;
+    if (item.type === 'agentMessage') {
+      if (completed) {
+        if (!streamedTextItems.has(item.id) && typeof item.text === 'string' && item.text) {
+          emitText(item.text);
+        }
+        pendingTextBreak = true;
+      }
+      return;
+    }
+    if (item.type === 'reasoning') {
+      if (completed && !streamedReasoningItems.has(item.id)) {
+        const parts = [
+          ...(Array.isArray(item.summary) ? item.summary : []),
+          ...(Array.isArray(item.content) ? item.content : []),
+        ].filter((part) => typeof part === 'string' && part);
+        if (parts.length) callbacks.onReasoning(`${parts.join('\n\n')}\n\n`);
+      }
+      return;
+    }
+    const activity = codexAppServerActivityFromItem(item, completed);
+    if (activity) {
+      // Text resuming after tool activity is a new paragraph.
+      if (textSeen) pendingTextBreak = true;
+      callbacks.onActivity(activity);
+    }
+  };
+
+  const handlePlanUpdate = (params) => {
+    const list = Array.isArray(params.plan) ? params.plan : [];
+    const total = list.length;
+    const completedCount = list.filter((step) => step?.status === 'completed').length;
+    const isActive = (step) => step?.status === 'inProgress' || step?.status === 'in_progress';
+    const active = list.find(isActive);
+    callbacks.onActivity({
+      key: 'plan',
+      type: 'plan',
+      kind: 'plan',
+      title: active
+        ? `Tasks (${completedCount}/${total}) - ${stringifySummary(active.step, 60)}`
+        : `Tasks (${completedCount}/${total})`,
+      status: total > 0 && completedCount === total ? 'done' : 'running',
+      plan: list.map((step) => ({
+        content: String(step?.step ?? ''),
+        status: step?.status === 'completed' ? 'completed' : isActive(step) ? 'in_progress' : 'pending',
+      })),
+    });
+  };
+
+  // approvalPolicy 'never' means these should not fire; answer defensively by
+  // access-mode policy so a stray request can never deadlock the run.
+  const answerServerRequest = (message) => {
+    const method = message.method;
+    const respond = (result) => write({ jsonrpc: '2.0', id: message.id, result });
+    if (method === 'item/commandExecution/requestApproval' || method === 'execCommandApproval') {
+      return respond({ decision: accessMode === 'full-access' ? 'accept' : 'decline' });
+    }
+    if (method === 'item/fileChange/requestApproval' || method === 'applyPatchApproval') {
+      return respond({ decision: accessMode === 'read-only' ? 'decline' : 'accept' });
+    }
+    if (method === 'item/permissions/requestApproval') {
+      return respond({ decision: accessMode === 'full-access' ? 'accept' : 'decline' });
+    }
+    write({
+      jsonrpc: '2.0',
+      id: message.id,
+      error: { code: -32601, message: 'Method not supported' },
+    });
+  };
+
+  const start = async () => {
+    const init = await request('initialize', {
+      clientInfo: { name: 'orion', title: 'Orion', version: app.getVersion?.() ?? '0.0.0' },
+      capabilities: { experimentalApi: true, requestAttestation: false },
+    });
+    if (init.error) return fail(init.error);
+    write({ jsonrpc: '2.0', method: 'initialized', params: {} });
+
+    const sandbox =
+      accessMode === 'full-access'
+        ? 'danger-full-access'
+        : accessMode === 'read-only'
+          ? 'read-only'
+          : 'workspace-write';
+    const threadParams = {
+      cwd,
+      model: model.slug,
+      sandbox,
+      approvalPolicy: 'never',
+      config: codexAppServerConfig(model, input),
+    };
+
+    let resolvedThreadId = null;
+    if (resumeSessionId) {
+      const resumed = await request('thread/resume', { threadId: resumeSessionId, ...threadParams });
+      if (resumed.error) callbacks.onResumeFallback?.();
+      else resolvedThreadId = resumed.result?.thread?.id ?? resumeSessionId;
+    }
+    if (!resolvedThreadId) {
+      const started = await request('thread/start', threadParams);
+      resolvedThreadId = started.result?.thread?.id;
+      if (started.error || typeof resolvedThreadId !== 'string') {
+        return fail(started.error ?? 'Codex app-server did not return a thread id.');
+      }
+    }
+    threadId = resolvedThreadId;
+    callbacks.onSessionId(threadId);
+
+    // Goals require a persistent thread; setting one active immediately
+    // starts the pursuit turn — no turn/start call needed.
+    const setParams =
+      goal.action === 'resume'
+        ? { threadId, status: 'active' }
+        : {
+            threadId,
+            objective: goal.objective,
+            ...(typeof goal.tokenBudget === 'number' && goal.tokenBudget > 0
+              ? { tokenBudget: Math.round(goal.tokenBudget) }
+              : {}),
+          };
+    const set = await request('thread/goal/set', setParams);
+    if (set.error) return fail(set.error);
+    if (set.result?.goal) handleGoalUpdated(set.result.goal);
+    // If no turn starts (e.g. the runtime immediately declines idle work),
+    // the continuation watchdog pauses the goal and ends the run.
+    if (!turnActive) armContinuationTimer();
+  };
+
+  // User stop = pause: the goal stays resumable and its stored status
+  // matches the fact that nothing is running anymore.
+  const stopGoalRun = async () => {
+    ended = true;
+    clearContinuationTimer();
+    if (!threadId) return;
+    const withTimeout = (promise, ms) =>
+      Promise.race([promise, new Promise((resolve) => setTimeout(resolve, ms))]);
+    try {
+      const paused = await withTimeout(
+        request('thread/goal/set', { threadId, status: 'paused' }),
+        1500
+      );
+      // Do not depend solely on the adjacent notification: Stop may reap the
+      // app-server before that notification is delivered to the renderer.
+      if (paused?.result?.goal) handleGoalUpdated(paused.result.goal);
+      await withTimeout(
+        request('turn/interrupt', {
+          threadId,
+          ...(activeTurnId ? { turnId: activeTurnId } : {}),
+        }),
+        1000
+      );
+    } catch {}
+  };
+
+  const handleMessage = (message) => {
+    if (!message || typeof message !== 'object') return;
+
+    if (message.id !== undefined && !message.method) {
+      const resolve = pendingRequests.get(message.id);
+      if (resolve) {
+        pendingRequests.delete(message.id);
+        resolve(message);
+      }
+      return;
+    }
+
+    if (message.id !== undefined && message.method) return answerServerRequest(message);
+
+    const params = message.params ?? {};
+    // Defensive: the app-server can host many threads; only ours matters.
+    if (params.threadId && threadId && params.threadId !== threadId) return;
+
+    switch (message.method) {
+      case 'item/agentMessage/delta': {
+        if (typeof params.itemId === 'string') streamedTextItems.add(params.itemId);
+        if (typeof params.delta === 'string') emitText(params.delta);
+        return;
+      }
+      case 'item/reasoning/summaryTextDelta':
+      case 'item/reasoning/textDelta': {
+        if (typeof params.itemId === 'string') streamedReasoningItems.add(params.itemId);
+        if (typeof params.delta === 'string' && params.delta) callbacks.onReasoning(params.delta);
+        return;
+      }
+      case 'item/reasoning/summaryPartAdded':
+        callbacks.onReasoning('\n\n');
+        return;
+      case 'item/started':
+        handleItem(params, false);
+        return;
+      case 'item/completed':
+        handleItem(params, true);
+        return;
+      case 'turn/started': {
+        turnActive = true;
+        activeTurnId = typeof params.turn?.id === 'string' ? params.turn.id : null;
+        clearContinuationTimer();
+        if (textSeen) pendingTextBreak = true;
+        return;
+      }
+      case 'turn/completed':
+        handleTurnCompleted(params);
+        return;
+      case 'turn/plan/updated':
+        handlePlanUpdate(params);
+        return;
+      case 'thread/tokenUsage/updated': {
+        const stats = codexStatsFromTokenUsage(params.tokenUsage, model.id);
+        if (stats) callbacks.onStats(stats);
+        return;
+      }
+      case 'thread/goal/updated': {
+        if (params.goal) handleGoalUpdated(params.goal);
+        return;
+      }
+      case 'thread/goal/cleared': {
+        goalStatus = 'cleared';
+        callbacks.onGoal(null);
+        clearContinuationTimer();
+        if (!turnActive) endRun('\n\n_Goal cleared._');
+        return;
+      }
+      case 'error': {
+        const detail = stringifySummary(params.error?.message ?? '', 300);
+        if (detail) {
+          callbacks.onActivity({
+            type: 'error',
+            title: params.willRetry ? 'Codex retrying' : 'Codex error',
+            detail,
+            status: 'error',
+          });
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  };
+
+  return { start, handleMessage, stopGoalRun };
+};
+
+// Goal runs whose driver must be asked to pause before the process is killed
+// (agent:stopTurn). Keyed by runId; cleaned up in finalizeRun.
+const codexGoalRunDrivers = new Map();
 
 // ---------------------------------------------------------------------------
 // Claude persistent sessions (Agent SDK). The one-shot `claude --print` spawn
@@ -2073,10 +3597,10 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
 // `background` so the renderer can grow the transcript. `/btw` asides and
 // title generation keep the one-shot CLI path.
 
-let claudeSdkQueryPromise = null;
-const loadClaudeSdkQuery = () => {
-  claudeSdkQueryPromise ??= import('@anthropic-ai/claude-agent-sdk').then((sdk) => sdk.query);
-  return claudeSdkQueryPromise;
+let claudeSdkModulePromise = null;
+const loadClaudeSdk = () => {
+  claudeSdkModulePromise ??= import('@anthropic-ai/claude-agent-sdk');
+  return claudeSdkModulePromise;
 };
 
 // The SDK defaults to its own pinned CLI binary; prefer the claude the user
@@ -2091,6 +3615,78 @@ const resolveClaudeBinary = () => {
 };
 
 const claudeSdkSessions = new Map(); // threadId -> session
+// A foreground turn can finish while Claude-owned background agents keep
+// running. Retain that completed run id as a cancellable handle until the
+// background work settles or a new turn takes over.
+const claudeBackgroundRunSessions = new Map(); // runId -> session
+
+const clearClaudeBackgroundRun = (session) => {
+  if (!session.backgroundRunId) return;
+  if (claudeBackgroundRunSessions.get(session.backgroundRunId) === session) {
+    claudeBackgroundRunSessions.delete(session.backgroundRunId);
+  }
+  session.backgroundRunId = null;
+};
+
+const retainClaudeBackgroundRun = (session, runId) => {
+  clearClaudeBackgroundRun(session);
+  session.backgroundRunId = runId;
+  claudeBackgroundRunSessions.set(runId, session);
+};
+
+// Orchestration: spawn_subagent calls waiting on the renderer to run the
+// subthread and report back via the orchestration:subagentResult invoke.
+const pendingSubagentSpawns = new Map(); // spawnId -> { resolve }
+
+// In-process MCP server offered to every Claude SDK session (not only
+// orchestrator ones — @-mentions can request delegation from any thread).
+// The tool asks the renderer to spawn a subthread on another model and
+// blocks until the subagent's final report arrives.
+const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
+  createSdkMcpServer({
+    name: 'orion',
+    version: '1.0.0',
+    tools: [
+      tool(
+        'spawn_subagent',
+        'Spawn an Orion subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation).',
+        {
+          model: z.string().describe('Target model: model id (e.g. "codex:gpt-5.6-sol"), slug, or label'),
+          prompt: z
+            .string()
+            .describe('Complete, self-contained task for the subagent, including all context it needs and what to report back'),
+          title: z.string().optional().describe('Short title for the subthread shown in the sidebar'),
+          role: z
+            .string()
+            .optional()
+            .describe('Orchestration role this delegation fulfils: computerUse | exploring | implementation | imageVideoGen'),
+        },
+        async (args) => {
+          const spawnId = crypto.randomUUID();
+          const resultText = await new Promise((resolve) => {
+            // Read the sender at call time: sessions rebind it when the
+            // window closes and reopens.
+            const sender = session.sender;
+            if (!sender || sender.isDestroyed()) {
+              resolve('Unable to spawn subagent: the Orion window is no longer available.');
+              return;
+            }
+            pendingSubagentSpawns.set(spawnId, { resolve });
+            sender.send('orchestration:spawnRequest', {
+              spawnId,
+              threadId: session.threadId,
+              projectPath: session.projectPath,
+              model: args.model,
+              prompt: args.prompt,
+              ...(args.title ? { title: args.title } : {}),
+              ...(args.role ? { role: args.role } : {}),
+            });
+          });
+          return { content: [{ type: 'text', text: resultText }] };
+        }
+      ),
+    ],
+  });
 
 // Legacy extra-flags string ("--foo bar --baz") -> SDK extraArgs map.
 const claudeExtraArgsMap = (extraArgsString) => {
@@ -2122,20 +3718,36 @@ const claudeSdkOptionsForInput = (model, input) => {
     input.providerOptions && typeof input.providerOptions === 'object' ? input.providerOptions : {};
   const reasoningEffort = input.claudeReasoningEffort || defaultClaudeReasoningEffort;
   const contextWindow = input.claudeContextWindow || defaultClaudeContextWindow;
+  // Browser MCP tools can mutate signed-in external state, so Read only must
+  // not expose or pre-approve them even though the filesystem sandbox would
+  // otherwise remain intact.
+  const chrome = providerOptions.chrome === true && accessMode !== 'read-only';
   const allowedTools =
     accessMode !== 'full-access'
       ? String(providerOptions.allowedTools || '')
           .split(',')
           .map((tool) => tool.trim())
-          .filter(Boolean)
+          .filter(
+            (tool) =>
+              Boolean(tool) &&
+              (accessMode !== 'read-only' || !tool.startsWith('mcp__claude-in-chrome'))
+          )
       : [];
+  // Claude in Chrome tools are MCP tools; headless runs can't show permission
+  // prompts, so Workspace write pre-approves the server. Read only disabled it
+  // above because browser actions are external mutations.
+  if (chrome && accessMode !== 'full-access') allowedTools.push('mcp__claude-in-chrome');
+  const extraArgs = claudeExtraArgsMap(providerOptions.extraArgs);
+  // Browser control via the Claude Chrome extension. Verified to work in
+  // headless --print/stream-json sessions (exposes mcp__claude-in-chrome__*).
+  if (chrome) extraArgs.chrome = null; // bare --chrome flag
   return {
     model: claudeModelArgForContextWindow(model.slug, contextWindow),
     effort: claudeEffortForCli(reasoningEffort),
     accessMode,
     ultracode: reasoningEffort === 'ultracode',
     allowedTools,
-    extraArgs: claudeExtraArgsMap(providerOptions.extraArgs),
+    extraArgs,
   };
 };
 
@@ -2238,10 +3850,181 @@ const finishClaudeTurnReasoning = (session, turn) => {
 
 // Only model output opens a turn on its own; bookkeeping system messages
 // (background_tasks_changed, task_updated, status, ...) between turns don't.
+// task_notification specifically must NOT open a turn: the harness sometimes
+// delivers the notification without re-invoking the model, and a turn opened
+// for it would never receive a `result` — leaving the thread stuck "running"
+// forever (and poisoning the FIFO turn queue for every later turn). Pending
+// notifications are stashed and flushed into the next turn that opens.
 const claudeMessageOpensTurn = (message) =>
-  message?.type === 'assistant' ||
-  message?.type === 'stream_event' ||
-  (message?.type === 'system' && message.subtype === 'task_notification');
+  message?.type === 'assistant' || message?.type === 'stream_event';
+
+// Claude Code's visible task list (the TUI's ctrl+t checklist) is driven by
+// the TaskCreate/TaskUpdate tools (legacy CLIs: TodoWrite). Track them into a
+// session-scoped task map — the CLI's list persists across turns — and emit
+// the same 'plan' activity shape grok's ACP plan updates produce, so the
+// renderer's existing task-checklist card renders Claude tasks unchanged.
+// The raw tool rows are suppressed via session.taskToolUseIds (both the
+// tool_use row and its tool_result update) so the plan card is the only
+// surface, matching the Claude Code TUI.
+const CLAUDE_TASK_TOOLS = new Set(['TaskCreate', 'TaskUpdate', 'TodoWrite']);
+const CLAUDE_TASK_STATUSES = new Set(['pending', 'in_progress', 'completed']);
+
+// Returns true when the session's task list changed.
+const processClaudeTaskMessage = (session, message) => {
+  const content = Array.isArray(message?.message?.content) ? message.message.content : [];
+  let changed = false;
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+
+    if (part.type === 'tool_use' && CLAUDE_TASK_TOOLS.has(part.name)) {
+      if (typeof part.id === 'string') session.taskToolUseIds.add(part.id);
+      if (part.name === 'TodoWrite') {
+        // Legacy full-replacement list: input.todos is the complete new state.
+        const todos = Array.isArray(part.input?.todos) ? part.input.todos : [];
+        session.tasks = new Map(
+          todos.map((todo, index) => [
+            `todo:${index}`,
+            {
+              subject: String(todo?.content ?? ''),
+              status: CLAUDE_TASK_STATUSES.has(todo?.status) ? todo.status : 'pending',
+            },
+          ])
+        );
+        changed = true;
+      } else if (typeof part.id === 'string') {
+        // TaskCreate/TaskUpdate apply on their tool_result: the create result
+        // carries the harness-assigned task id, and applying on the result
+        // also skips calls that errored or were interrupted.
+        session.pendingTaskToolUses.set(part.id, { name: part.name, input: part.input ?? {} });
+      }
+      continue;
+    }
+
+    if (part.type === 'tool_result' && typeof part.tool_use_id === 'string') {
+      const pending = session.pendingTaskToolUses.get(part.tool_use_id);
+      if (!pending) continue;
+      session.pendingTaskToolUses.delete(part.tool_use_id);
+      if (part.is_error === true) continue;
+      // The CLI/SDK put the structured result on the message envelope.
+      const structured = message?.tool_use_result;
+
+      if (pending.name === 'TaskCreate') {
+        const subject = String(pending.input.subject ?? pending.input.description ?? '').trim();
+        let taskId = structured?.task?.id != null ? String(structured.task.id) : null;
+        if (!taskId) {
+          const text = typeof part.content === 'string' ? part.content : '';
+          taskId = /Task #(\S+?):?\s/.exec(`${text} `)?.[1] ?? crypto.randomUUID();
+        }
+        session.tasks.set(taskId, { subject: subject || `Task #${taskId}`, status: 'pending' });
+        changed = true;
+      } else if (pending.name === 'TaskUpdate') {
+        const taskId = pending.input.taskId != null ? String(pending.input.taskId) : null;
+        if (!taskId) continue;
+        const status = String(structured?.statusChange?.to ?? pending.input.status ?? '');
+        const task = session.tasks.get(taskId) ?? { subject: `Task #${taskId}`, status: 'pending' };
+        if (typeof pending.input.subject === 'string' && pending.input.subject.trim()) {
+          task.subject = pending.input.subject.trim();
+        }
+        if (status === 'deleted' || status === 'cancelled') {
+          session.tasks.delete(taskId);
+        } else {
+          if (CLAUDE_TASK_STATUSES.has(status)) task.status = status;
+          session.tasks.set(taskId, task);
+        }
+        changed = true;
+      }
+    }
+  }
+  return changed;
+};
+
+// Same activity shape as grok's handlePlanUpdate so the renderer's plan card
+// (checklist + "Tasks (n/m)" header) applies unchanged.
+const claudeTaskPlanActivity = (session) => {
+  const list = [...session.tasks.values()];
+  const total = list.length;
+  const completed = list.filter((task) => task.status === 'completed').length;
+  const active = list.find((task) => task.status === 'in_progress');
+  return {
+    key: 'plan',
+    type: 'plan',
+    kind: 'plan',
+    title: active
+      ? `Tasks (${completed}/${total}) - ${stringifySummary(active.subject, 60)}`
+      : `Tasks (${completed}/${total})`,
+    status: total > 0 && completed === total ? 'done' : 'running',
+    plan: list.map((task) => ({ content: task.subject, status: task.status })),
+  };
+};
+
+const claudeTaskNotificationActivity = (message) => ({
+  key: `task:${message.task_id ?? crypto.randomUUID()}`,
+  type: 'tool',
+  title: `Background task ${message.status ?? 'update'}`,
+  detail: stringifySummary(message.summary ?? message.task_id, 300),
+  status: 'done',
+});
+
+// Emit any task notifications that arrived while no turn was active into the
+// turn that just opened (the model reacts to them in that turn anyway).
+const flushPendingClaudeTaskNotifications = (session, turn) => {
+  const pending = session.pendingTaskNotifications.splice(0);
+  for (const activity of pending) {
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity,
+    });
+  }
+};
+
+// Background tasks the model is genuinely waiting on: subagents and workflows
+// (local or remote) settle and re-invoke the model via a task notification.
+// local_bash is deliberately excluded — a dev server left running in the
+// background never "finishes" and must not pin the thread in a working state.
+const claudeAwaitedBackgroundTaskTypes = /agent|workflow/i;
+
+const pendingClaudeBackgroundTasks = (session) =>
+  [...session.backgroundTasks.entries()]
+    .filter(
+      ([taskId, task]) =>
+        claudeAwaitedBackgroundTaskTypes.test(task.taskType) &&
+        !session.skipTranscriptTaskIds.has(taskId)
+    )
+    .map(([, task]) => task.description);
+
+// A thread left "working" by a done event that carried pending background
+// tasks normally settles when a finished task's notification re-invokes the
+// model (that turn's own done event finishes the thread). This timer covers
+// the paths that never re-invoke — the task was killed or failed, or its
+// notification was suppressed — so the thread can't hang in the working state.
+// The delay gives an imminent task_notification time to open its turn first.
+const CLAUDE_BACKGROUND_SETTLE_DELAY_MS = 5000;
+const updateClaudeBackgroundSettle = (session) => {
+  const shouldSettle =
+    !session.ended &&
+    session.activeTurns.length === 0 &&
+    pendingClaudeBackgroundTasks(session).length === 0;
+  if (!shouldSettle) {
+    if (session.backgroundSettleTimer) {
+      clearTimeout(session.backgroundSettleTimer);
+      session.backgroundSettleTimer = null;
+    }
+    return;
+  }
+  if (session.backgroundSettleTimer) return;
+  session.backgroundSettleTimer = setTimeout(() => {
+    session.backgroundSettleTimer = null;
+    if (session.activeTurns.length > 0) return;
+    clearClaudeBackgroundRun(session);
+    emitAgentEvent(session.sender, {
+      runId: crypto.randomUUID(),
+      threadId: session.threadId,
+      type: 'background-settled',
+    });
+  }, CLAUDE_BACKGROUND_SETTLE_DELAY_MS);
+};
 
 const finalizeClaudeTurn = async (session, resultMessage) => {
   const turn = session.activeTurns.shift();
@@ -2270,6 +4053,16 @@ const finalizeClaudeTurn = async (session, resultMessage) => {
         ? `Claude ended the turn with an error (${resultMessage.subtype}).`
         : 'Claude reported an error for this turn.');
   }
+  // Background subagents/workflows still running when the turn ended: the
+  // done event carries them so the renderer keeps the thread in the working
+  // state instead of flipping it to Finished between turns. The harness will
+  // re-invoke the model (a synthetic turn) when each task settles.
+  const pendingBackgroundTasks = resultIsError ? [] : pendingClaudeBackgroundTasks(session);
+  if (pendingBackgroundTasks.length > 0) {
+    retainClaudeBackgroundRun(session, turn.runId);
+  } else {
+    clearClaudeBackgroundRun(session);
+  }
   emitAgentEvent(session.sender, {
     runId: turn.runId,
     threadId: session.threadId,
@@ -2278,7 +4071,24 @@ const finalizeClaudeTurn = async (session, resultMessage) => {
     changedFiles,
     ...(stats ? { stats } : {}),
     ...(errorText ? { error: errorText } : {}),
+    ...(pendingBackgroundTasks.length > 0 ? { pendingBackgroundTasks } : {}),
   });
+};
+
+// Lazy per-session tracker for claude-native subagents (the harness's task
+// system). Lives on the session, not a turn: a subagent can span turn
+// boundaries (backgrounded Agent tool), and the tracker survives with it.
+const claudeSessionSubagentTracker = (session) => {
+  if (!session.subagentTracker) {
+    session.subagentTracker = createSubagentTracker({
+      providerId: 'claude',
+      threadId: session.threadId,
+      getSender: () => session.sender,
+      getRunId: () =>
+        session.activeTurns[0]?.runId ?? session.backgroundRunId ?? 'claude-session',
+    });
+  }
+  return session.subagentTracker;
 };
 
 const handleClaudeSessionMessage = async (session, message) => {
@@ -2300,12 +4110,124 @@ const handleClaudeSessionMessage = async (session, message) => {
   }
   if (message?.type === 'system' && message.subtype === 'init') session.sawInit = true;
 
+  // Track the harness's live background tasks so a turn that ends while
+  // subagents are still running doesn't read as Finished. skip_transcript
+  // tasks are ambient housekeeping and never hold the thread open.
+  if (message?.type === 'system' && message.subtype === 'task_started' && message.skip_transcript) {
+    session.skipTranscriptTaskIds.add(message.task_id);
+  }
+  // A spawned subagent: tail its task output file (the subagent's own
+  // session transcript) so the renderer can show it as a live, switchable
+  // subagent thread.
+  if (
+    message?.type === 'system' &&
+    message.subtype === 'task_started' &&
+    !message.skip_transcript &&
+    message.task_id &&
+    /agent/i.test(String(message.task_type ?? ''))
+  ) {
+    const tracker = claudeSessionSubagentTracker(session);
+    const taskId = message.task_id;
+    const fileRef = { path: typeof message.output_file === 'string' ? message.output_file : null };
+    session.subagentFileRefs.set(taskId, fileRef);
+    const candidates = session.sessionId
+      ? claudeTaskOutputCandidates(session.projectPath, session.sessionId, taskId)
+      : [];
+    tracker.start(
+      {
+        id: taskId,
+        title: String(message.description ?? 'Subagent'),
+        kind: typeof message.subagent_type === 'string' ? message.subagent_type : undefined,
+        prompt: typeof message.prompt === 'string' ? message.prompt : undefined,
+      },
+      {
+        resolveFile: async () => {
+          if (fileRef.path && existsSync(fileRef.path)) return fileRef.path;
+          return candidates.find((candidate) => existsSync(candidate)) ?? null;
+        },
+        handleLine: handleClaudeSubagentLine,
+      }
+    );
+  }
+  // Terminal task updates lack the notification's stats/summary — finish
+  // after a grace window unless the richer task_notification lands first.
+  if (
+    message?.type === 'system' &&
+    message.subtype === 'task_updated' &&
+    message.task_id &&
+    session.subagentTracker?.has(message.task_id)
+  ) {
+    const status = message.patch?.status;
+    if (status === 'failed' || status === 'killed') {
+      session.subagentTracker.finish(message.task_id, { status: 'error' });
+    } else if (status === 'completed') {
+      session.subagentTracker.finishSoon(message.task_id, { status: 'done' });
+    }
+  }
+  if (message?.type === 'system' && message.subtype === 'background_tasks_changed') {
+    // REPLACE semantics: the payload is the complete live set after the change.
+    session.backgroundTasks = new Map(
+      (Array.isArray(message.tasks) ? message.tasks : []).map((task) => [
+        task.task_id,
+        {
+          taskType: String(task.task_type ?? ''),
+          description: String(task.description ?? task.task_id ?? ''),
+        },
+      ])
+    );
+    // A tracked subagent that left the live set without a terminal signal
+    // (its notification was suppressed) still has to settle in the UI.
+    if (session.subagentTracker) {
+      for (const taskId of session.subagentTracker.ids()) {
+        if (!session.backgroundTasks.has(taskId)) {
+          session.subagentTracker.finishSoon(taskId, { status: 'done' });
+        }
+      }
+    }
+    updateClaudeBackgroundSettle(session);
+    return;
+  }
+
   let turn = session.activeTurns[0];
+
+  // A task_notification never opens a turn (the harness may not re-invoke the
+  // model for it, and a turn without a coming `result` dangles forever). With
+  // no turn active, stash it; it flushes into the next turn that opens.
+  if (message?.type === 'system' && message.subtype === 'task_notification') {
+    if (message.task_id && session.subagentTracker?.has(message.task_id)) {
+      const fileRef = session.subagentFileRefs.get(message.task_id);
+      if (fileRef && typeof message.output_file === 'string') fileRef.path = message.output_file;
+      session.subagentTracker.finish(message.task_id, {
+        status: message.status === 'completed' ? 'done' : 'error',
+        stats:
+          typeof message.usage?.total_tokens === 'number'
+            ? { totalTokens: message.usage.total_tokens }
+            : undefined,
+        summary: typeof message.summary === 'string' ? message.summary : undefined,
+      });
+    }
+    const activity = claudeTaskNotificationActivity(message);
+    if (turn) {
+      emitAgentEvent(session.sender, {
+        runId: turn.runId,
+        threadId: session.threadId,
+        type: 'activity',
+        activity,
+      });
+    } else {
+      session.pendingTaskNotifications.push(activity);
+    }
+    return;
+  }
+
   if (!turn && claudeMessageOpensTurn(message)) {
     // The harness re-invoked the model between user turns (a background
     // subagent finished). Open a synthetic turn; the renderer adds a message.
     turn = createClaudeTurnState(crypto.randomUUID(), session.lastTurnEndSnapshot);
     session.activeTurns.push(turn);
+    // The CLI owes this harness-initiated turn a result message of its own.
+    session.resultsOwed += 1;
+    updateClaudeBackgroundSettle(session); // a live turn cancels any pending settle
     emitAgentEvent(session.sender, {
       runId: turn.runId,
       threadId: session.threadId,
@@ -2313,24 +4235,9 @@ const handleClaudeSessionMessage = async (session, message) => {
       background: true,
       command: 'claude — background work continued',
     });
+    flushPendingClaudeTaskNotifications(session, turn);
   }
   if (!turn) return;
-
-  if (message?.type === 'system' && message.subtype === 'task_notification') {
-    emitAgentEvent(session.sender, {
-      runId: turn.runId,
-      threadId: session.threadId,
-      type: 'activity',
-      activity: {
-        key: `task:${message.task_id ?? crypto.randomUUID()}`,
-        type: 'tool',
-        title: `Background task ${message.status ?? 'update'}`,
-        detail: stringifySummary(message.summary ?? message.task_id, 300),
-        status: 'done',
-      },
-    });
-    return;
-  }
 
   // The SDK yields the same message shapes the CLI's stream-json emits, so
   // the one-shot path's claude adapter functions apply unchanged.
@@ -2349,7 +4256,25 @@ const handleClaudeSessionMessage = async (session, message) => {
     queueClaudeTurnReasoning(session, turn);
   }
 
+  // Task tools drive the live checklist card instead of generic tool rows.
+  if (processClaudeTaskMessage(session, message)) {
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity: claudeTaskPlanActivity(session),
+    });
+  }
+
   for (const { updateForKey, ...activity } of extractActivitiesFromJsonEvent(message)) {
+    // Task tool calls and their results stay hidden — the plan card above is
+    // their only surface (mirrors the Claude Code TUI).
+    if (
+      (activity.key && session.taskToolUseIds.has(activity.key)) ||
+      (updateForKey && session.taskToolUseIds.has(updateForKey))
+    ) {
+      continue;
+    }
     if (updateForKey) {
       const known = turn.knownToolActivities.get(updateForKey);
       if (known) {
@@ -2390,6 +4315,7 @@ const handleClaudeSessionMessage = async (session, message) => {
   }
 
   if (message?.type === 'result') {
+    session.resultsOwed = Math.max(0, session.resultsOwed - 1);
     await finalizeClaudeTurn(session, message);
   }
 };
@@ -2397,6 +4323,14 @@ const handleClaudeSessionMessage = async (session, message) => {
 const endClaudeSession = (session, error) => {
   if (session.ended) return;
   session.ended = true;
+  clearClaudeBackgroundRun(session);
+  session.subagentTracker?.dispose(
+    session.disposed ? 'stopped' : error ? 'error' : 'done'
+  );
+  if (session.backgroundSettleTimer) {
+    clearTimeout(session.backgroundSettleTimer);
+    session.backgroundSettleTimer = null;
+  }
   if (claudeSdkSessions.get(session.threadId) === session) {
     claudeSdkSessions.delete(session.threadId);
   }
@@ -2452,6 +4386,21 @@ const endClaudeSession = (session, error) => {
       exitCode: session.disposed ? 0 : 1,
       changedFiles: [],
       ...(errorText ? { error: errorText } : {}),
+      // Lets the renderer offer the Authenticate button when the failure text
+      // reads as a logged-out CLI (e.g. "OAuth session expired").
+      ...(session.disposed ? {} : { providerId: 'claude' }),
+    });
+  }
+
+  // A thread left waiting on background agents (its last done event carried
+  // pending tasks, no turn active) must not stay "working" after the session
+  // that owned those agents is gone (stop, options change, process death).
+  // With pending turns the done/error events above already settle the thread.
+  if (pendingTurns.length === 0) {
+    emitAgentEvent(session.sender, {
+      runId: crypto.randomUUID(),
+      threadId: session.threadId,
+      type: 'background-settled',
     });
   }
 };
@@ -2491,6 +4440,25 @@ const createClaudeSdkSession = ({
     sawInit: false,
     firstPrompt: null,
     activeTurns: [],
+    // Task notifications that arrived while no turn was active; flushed as
+    // activities into the next turn that opens.
+    pendingTaskNotifications: [],
+    // How many `result` messages the CLI still owes (one per pushed user turn
+    // and per harness-initiated synthetic turn). When this hits zero, any
+    // turn still queued can never finalize on its own — see
+    // interruptClaudeSdkRun, which uses it to recover instead of interrupting.
+    resultsOwed: 0,
+    backgroundTasks: new Map(), // task_id -> { taskType, description }
+    skipTranscriptTaskIds: new Set(),
+    // Native subagents (Agent/Task tool): created lazily on first spawn.
+    subagentTracker: null,
+    subagentFileRefs: new Map(), // task_id -> { path } (output file, once known)
+    // Visible task list (TaskCreate/TaskUpdate/TodoWrite) → plan activity.
+    tasks: new Map(), // taskId -> { subject, status }
+    pendingTaskToolUses: new Map(), // tool_use id -> { name, input }
+    taskToolUseIds: new Set(), // suppress these ids from generic tool rows
+    backgroundSettleTimer: null,
+    backgroundRunId: null,
     lastTurnEndSnapshot: null,
     inputQueue,
     abortController,
@@ -2502,6 +4470,7 @@ const createClaudeSdkSession = ({
 
   session.pushUserMessage = (text) => {
     if (session.firstPrompt === null) session.firstPrompt = text;
+    session.resultsOwed += 1;
     inputQueue.push({
       type: 'user',
       message: { role: 'user', content: [{ type: 'text', text }] },
@@ -2510,22 +4479,34 @@ const createClaudeSdkSession = ({
   };
 
   session.start = async () => {
-    const [queryFn, claudeBinary] = await Promise.all([loadClaudeSdkQuery(), resolveClaudeBinary()]);
-    session.query = queryFn({
+    const [sdk, claudeBinary] = await Promise.all([loadClaudeSdk(), resolveClaudeBinary()]);
+    const orionMcpServer = createOrionMcpServer(sdk, session);
+    // Headless runs can't show permission prompts, so outside bypass mode the
+    // spawn tool must be pre-approved alongside any user-configured allowlist.
+    const allowedTools =
+      sdkOptions.accessMode === 'full-access'
+        ? sdkOptions.allowedTools
+        : [...new Set([...sdkOptions.allowedTools, 'mcp__orion__spawn_subagent'])];
+    session.query = sdk.query({
       prompt: inputQueue.stream(),
       options: {
         cwd: projectPath,
         model: sdkOptions.model,
         effort: sdkOptions.effort,
         includePartialMessages: true,
+        // Match the CLI's behavior: the SDK defaults to a minimal/empty
+        // system prompt, which drops Claude Code's narration + progress-update
+        // guidance (runs go silent between tool calls without it).
+        systemPrompt: { type: 'preset', preset: 'claude_code' },
         // Match the CLI's behavior: without this the SDK loads no user or
         // project settings — no CLAUDE.md, no skills, no MCP servers.
         settingSources: ['user', 'project', 'local'],
+        mcpServers: { orion: orionMcpServer },
         ...(sdkOptions.ultracode ? { settings: JSON.stringify({ ultracode: true }) } : {}),
         ...(sdkOptions.accessMode === 'full-access'
           ? { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }
           : { permissionMode: sdkOptions.accessMode === 'read-only' ? 'plan' : 'acceptEdits' }),
-        ...(sdkOptions.allowedTools.length > 0 ? { allowedTools: sdkOptions.allowedTools } : {}),
+        ...(allowedTools.length > 0 ? { allowedTools } : {}),
         ...(Object.keys(sdkOptions.extraArgs).length > 0 ? { extraArgs: sdkOptions.extraArgs } : {}),
         ...(resumeSessionId ? { resume: resumeSessionId } : {}),
         ...(forkSession ? { forkSession: true } : {}),
@@ -2552,7 +4533,7 @@ const createClaudeSdkSession = ({
   return session;
 };
 
-const runClaudeSdkTurn = async ({ sender, input, model, runId }) => {
+const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSnapshot }) => {
   const threadId = input.threadId;
   const prompt =
     input.claudeReasoningEffort === 'ultrathink' ? `ultrathink\n\n${input.prompt}` : input.prompt;
@@ -2614,9 +4595,17 @@ const runClaudeSdkTurn = async ({ sender, input, model, runId }) => {
     }
   }
 
-  const snapshot = await captureGitChangeSnapshot(input.projectPath);
+  // A new foreground instruction supersedes any retained "waiting on
+  // background agents" handle. The background work itself remains owned by
+  // this persistent session unless the caller explicitly disposes it.
+  clearClaudeBackgroundRun(session);
+  const snapshot =
+    initialSnapshot === undefined
+      ? await captureGitChangeSnapshot(input.projectPath)
+      : initialSnapshot;
   const turn = createClaudeTurnState(runId, snapshot);
   session.activeTurns.push(turn);
+  updateClaudeBackgroundSettle(session); // a live turn cancels any pending settle
   emitAgentEvent(sender, {
     runId,
     threadId,
@@ -2633,12 +4622,27 @@ const runClaudeSdkTurn = async ({ sender, input, model, runId }) => {
     });
   }
   session.pushUserMessage(prompt);
+  // Notifications that landed while the thread sat idle (and never re-invoked
+  // the model) surface in this turn — the model reads them here anyway.
+  flushPendingClaudeTaskNotifications(session, turn);
   return { ok: true, runId };
 };
 
 const interruptClaudeSdkRun = async (runId, { terminateBackground = false } = {}) => {
   for (const session of claudeSdkSessions.values()) {
     if (session.activeTurns.some((turn) => turn.runId === runId)) {
+      // The CLI owes no results: nothing is running, so there is nothing to
+      // interrupt and the queued turns can never finalize on their own (a
+      // legacy dangling turn, e.g. opened by a task_notification that never
+      // re-invoked the model). Drain them as done so the thread un-wedges
+      // instead of poisoning the FIFO for every later turn.
+      if (session.resultsOwed <= 0) {
+        while (session.activeTurns.length > 0) {
+          await finalizeClaudeTurn(session, null);
+        }
+        if (terminateBackground) disposeClaudeSdkSession(session.threadId);
+        return true;
+      }
       if (terminateBackground) {
         // Explicit Stop: the user wants ALL work halted, including background
         // subagents still mutating the working tree. Interrupt is best-effort
@@ -2668,6 +4672,15 @@ const interruptClaudeSdkRun = async (runId, { terminateBackground = false } = {}
       return true;
     }
   }
+  const backgroundSession = claudeBackgroundRunSessions.get(runId);
+  if (backgroundSession) {
+    clearClaudeBackgroundRun(backgroundSession);
+    if (terminateBackground) disposeClaudeSdkSession(backgroundSession.threadId);
+    // With no foreground turn there is nothing to interrupt. Returning true
+    // still acknowledges the retained handle; a steer may now push a fresh
+    // instruction, while Stop disposes the session above.
+    return true;
+  }
   return false;
 };
 
@@ -2677,6 +4690,7 @@ const disposeClaudeSdkSession = (threadId) => {
   // Remove first so a late pump completion cannot affect a replacement
   // session created for the same thread id.
   claudeSdkSessions.delete(threadId);
+  clearClaudeBackgroundRun(session);
   session.dispose();
   return true;
 };
@@ -2684,6 +4698,7 @@ const disposeClaudeSdkSession = (threadId) => {
 const disposeAllClaudeSdkSessions = () => {
   for (const session of claudeSdkSessions.values()) session.dispose();
   claudeSdkSessions.clear();
+  claudeBackgroundRunSessions.clear();
 };
 
 // grok's stream ends with an explicit {"type":"end","stopReason":...} event,
@@ -3921,6 +5936,7 @@ app.on('window-all-closed', () => {
   // Tear down persistent sessions so their output is not sent to destroyed
   // webContents and background agents cannot keep working invisibly.
   disposeAllClaudeSdkSessions();
+  disposeAllTerminalSessions();
   if (process.platform !== 'darwin') {
     app.quit();
   }
@@ -3930,6 +5946,7 @@ app.on('window-all-closed', () => {
 // processes (and any background subagents inside them) when Orion exits.
 app.on('will-quit', () => {
   disposeAllClaudeSdkSessions();
+  disposeAllTerminalSessions();
 });
 
 // In this file you can include the rest of your app's specific main process
@@ -4673,7 +6690,12 @@ ipcMain.handle('tasks:threadStatus', async (_event, input) => {
     }
     const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`, {
       method: 'POST',
-      body: JSON.stringify({ action: 'thread-status', threadId, status }),
+      body: JSON.stringify({
+        action: 'thread-status',
+        threadId,
+        status,
+        ...(typeof input?.notes === 'string' ? { notes: input.notes } : {}),
+      }),
     });
     return { ok: true, task: result.task };
   } catch (error) {
@@ -4755,6 +6777,46 @@ const probeAutomationStatus = async (timeout = 5000) => {
   return status;
 };
 
+// Chrome's remote-debugging server (the chrome://inspect/#remote-debugging
+// toggle, Chrome 144+) writes DevToolsActivePort into the profile root while
+// it runs. That server is what "Use your signed-in Chrome" (codex browser
+// control via chrome-devtools-mcp --autoConnect) attaches to. File present +
+// port answering = ready; file present but dead port = Chrome not running (or
+// a stale file); no file = the toggle was never enabled.
+const chromeDebugPortFile = () =>
+  path.join(app.getPath('home'), 'Library', 'Application Support', 'Google', 'Chrome', 'DevToolsActivePort');
+const chromeDebugSetupUrl = 'chrome://inspect/#remote-debugging';
+let chromeDebugProbe = { checkedAt: 0, result: null };
+
+const getChromeDebugStatus = async () => {
+  if (process.platform !== 'darwin') return { status: 'unsupported' };
+  if (Date.now() - chromeDebugProbe.checkedAt < 2500 && chromeDebugProbe.result) return chromeDebugProbe.result;
+  let result;
+  try {
+    const port = Number.parseInt((await fs.readFile(chromeDebugPortFile(), 'utf8')).split('\n')[0], 10);
+    if (!Number.isInteger(port) || port <= 0) throw new Error('no port');
+    result = await new Promise((resolve) => {
+      const request = http.get({ host: '127.0.0.1', port, path: '/json/version', timeout: 1500 }, (response) => {
+        let body = '';
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => {
+          try {
+            resolve({ status: 'enabled', browser: JSON.parse(body)?.Browser });
+          } catch {
+            resolve({ status: 'enabled' });
+          }
+        });
+      });
+      request.on('timeout', () => request.destroy(new Error('timeout')));
+      request.on('error', () => resolve({ status: 'stale' }));
+    });
+  } catch {
+    result = { status: 'disabled' };
+  }
+  chromeDebugProbe = { checkedAt: Date.now(), result };
+  return result;
+};
+
 const getComputerUsePermissions = async () => {
   if (process.platform !== 'darwin') {
     return {
@@ -4762,6 +6824,7 @@ const getComputerUsePermissions = async () => {
       accessibility: 'unsupported',
       screenRecording: 'unsupported',
       automation: 'unsupported',
+      chromeDebug: { status: 'unsupported' },
     };
   }
   return {
@@ -4769,6 +6832,7 @@ const getComputerUsePermissions = async () => {
     accessibility: systemPreferences.isTrustedAccessibilityClient(false) ? 'granted' : 'denied',
     screenRecording: systemPreferences.getMediaAccessStatus('screen'),
     automation: (await readAutomationRequested()) ? await probeAutomationStatus() : 'not-determined',
+    chromeDebug: await getChromeDebugStatus(),
   };
 };
 
@@ -4803,6 +6867,30 @@ ipcMain.handle('computerUse:requestPermission', async (_event, kind) => {
     return { ok: true, state: await getComputerUsePermissions() };
   } catch (error) {
     return { ok: false, error: getProcessErrorMessage(error), state: await getComputerUsePermissions() };
+  }
+});
+
+// Chrome refuses chrome:// URLs from outside contexts inconsistently, so this
+// does both: copies the setup URL to the clipboard (paste works everywhere)
+// and asks Chrome to open it, which at minimum brings Chrome to the front.
+ipcMain.handle('computerUse:openChromeDebugSetup', async () => {
+  if (process.platform !== 'darwin') {
+    return { ok: false, error: 'Chrome remote-debugging setup is only wired up on macOS.' };
+  }
+  try {
+    clipboard.writeText(chromeDebugSetupUrl);
+    await new Promise((resolve, reject) => {
+      const child = spawn('open', ['-a', 'Google Chrome', chromeDebugSetupUrl], { stdio: 'ignore' });
+      child.on('error', reject);
+      child.on('exit', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error('Could not open Google Chrome. Is it installed?'));
+      });
+    });
+    chromeDebugProbe = { checkedAt: 0, result: null };
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: getProcessErrorMessage(error) };
   }
 });
 
@@ -4868,7 +6956,7 @@ ipcMain.handle('attachment:saveImage', async (_event, input) => {
 
 ipcMain.handle('agent:listModels', async () => {
   const models = await getAgentModels();
-  const uniqueCommands = [...new Set(models.map((model) => model.command))];
+  const uniqueCommands = [...new Set(models.map((model) => model.command).filter(Boolean))];
   const availability = new Map(
     await Promise.all(
       uniqueCommands.map(async (command) => [command, await checkCommandAvailable(command)])
@@ -4876,6 +6964,8 @@ ipcMain.handle('agent:listModels', async () => {
   );
 
   return models.map(({ command, ...model }) => {
+    // Pseudo-models (Orion orchestrator) have no CLI to probe.
+    if (!command) return { ...model, available: true };
     const available = availability.get(command) === true;
     return {
       ...model,
@@ -4980,6 +7070,20 @@ ipcMain.handle('appUpdate:restart', async () => {
   return true;
 });
 
+// The renderer reports a spawned subagent's outcome here, unblocking the
+// spawn_subagent MCP tool call that requested it.
+ipcMain.handle('orchestration:subagentResult', (_event, payload) => {
+  const pending = pendingSubagentSpawns.get(payload?.spawnId);
+  if (!pending) return { ok: false };
+  pendingSubagentSpawns.delete(payload.spawnId);
+  pending.resolve(
+    payload.ok
+      ? payload.result || '(subagent returned no output)'
+      : `Subagent failed: ${payload.result || 'unknown error'}`
+  );
+  return { ok: true };
+});
+
 ipcMain.handle('agent:runTurn', async (event, input) => {
   try {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
@@ -4992,6 +7096,18 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       return { ok: false, error: `Unknown model: ${input.modelId}` };
     }
 
+    // Safety net: the renderer resolves the Orion pseudo-model to its
+    // configured main-driver model before ever calling runTurn.
+    if (model.providerId === 'orion' || input.modelId === 'orion:orchestrator') {
+      return { ok: false, error: 'Orion orchestrator was not resolved to a driver model' };
+    }
+
+    // Safety net: Claude Code CLI threads run in an embedded terminal
+    // (terminal:* IPC), never as one-shot turns — its slug is not a model.
+    if (input.modelId === 'claude:claude-code-cli') {
+      return { ok: false, error: 'Claude Code CLI runs in the embedded terminal, not as agent turns' };
+    }
+
     const available = await checkCommandAvailable(model.command);
     if (!available) {
       return { ok: false, error: `${model.command} is not installed or not on PATH.` };
@@ -4999,15 +7115,40 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     const runId = input.runId || crypto.randomUUID();
 
+    // Capture before Orion's own managed-file writes so they remain visible
+    // in the run's changed-files summary. Read only must not mutate the
+    // project at all, so it relies solely on the injected prompt context.
+    const shouldSyncOrchestrationFiles =
+      input.orchestration?.isOrchestrator && input.accessMode !== 'read-only';
+    const orchestrationSnapshot = shouldSyncOrchestrationFiles
+      ? await captureGitChangeSnapshot(input.projectPath)
+      : undefined;
+    if (shouldSyncOrchestrationFiles) {
+      try {
+        await syncOrchestrationInstructionFiles(input.projectPath, input.orchestration);
+      } catch (error) {
+        console.warn('agent:runTurn: syncing orchestration instruction files failed', error);
+      }
+    }
+
     // Claude turns run on a persistent Agent SDK session (one CLI process per
     // thread) so background subagents and their task notifications survive
     // turn boundaries. `/btw` asides must not touch the thread's live
     // session, so they keep the one-shot forked-CLI path below.
     if (model.providerId === 'claude' && !input.aside) {
-      return await runClaudeSdkTurn({ sender: event.sender, input, model, runId });
+      return await runClaudeSdkTurn({
+        sender: event.sender,
+        input,
+        model,
+        runId,
+        initialSnapshot: orchestrationSnapshot,
+      });
     }
 
-    const beforeSnapshot = await captureGitChangeSnapshot(input.projectPath);
+    const beforeSnapshot =
+      orchestrationSnapshot === undefined
+        ? await captureGitChangeSnapshot(input.projectPath)
+        : orchestrationSnapshot;
     const jsonMode = sendsJsonEvents(model.providerId);
     const adapter = jsonAdapterForProvider(model.providerId);
     const reasoningActivityKey = `${runId}:reasoning`;
@@ -5038,6 +7179,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // One spawn of the provider CLI. If resuming a prior session fails before
     // producing output, close() falls back to a single fresh attempt.
     const useAcp = model.providerId === 'grok';
+    // Codex goal runs (/goal) are driven over `codex app-server` JSON-RPC —
+    // the goal runtime auto-continues turns only inside a live app-server.
+    const useCodexGoal =
+      model.providerId === 'codex' && Boolean(input.codexGoal) && typeof input.codexGoal === 'object';
     const startAttempt = (resumeSessionId) => {
     const args = commandForModel(model, {
       ...input,
@@ -5053,8 +7198,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         FORCE_COLOR: '0',
         NO_COLOR: '1',
       },
-      // ACP runs speak JSON-RPC over stdin; one-shot CLIs take no input.
-      stdio: [useAcp ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
+      // take no input.
+      stdio: [useAcp || useCodexGoal ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
 
     let stderr = '';
@@ -5062,10 +7208,97 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     let jsonBuffer = '';
     const streamContext = { textSeen: false };
     const knownToolActivities = new Map();
+
+    // Native subagents (codex collaboration spawns, cursor Task tool): tail
+    // each spawned subagent's on-disk transcript and stream it to the
+    // renderer as its own switchable thread.
+    const subagentTracker = createSubagentTracker({
+      providerId: model.providerId,
+      threadId: input.threadId,
+      getSender: () => event.sender,
+      getRunId: () => runId,
+    });
+    let codexSpawnWatcher = null;
+    // provisional cursor agentId -> { realAgentId } (see the completed event)
+    const cursorSubagentFileRefs = new Map();
+    const ensureCodexSpawnWatcher = (parentThreadId) => {
+      if (codexSpawnWatcher || model.providerId !== 'codex' || !parentThreadId) return;
+      codexSpawnWatcher = watchCodexSubagentSpawns({
+        parentThreadId,
+        onSpawn: (spawn) => {
+          subagentTracker.start(
+            {
+              id: spawn.threadId,
+              title: spawn.nickname || 'Codex subagent',
+              kind: spawn.role || 'codex agent',
+            },
+            {
+              resolveFile: async () => spawn.filePath,
+              handleLine: handleCodexRolloutLine,
+            }
+          );
+        },
+      });
+    };
+    // Resumed codex runs emit no thread.started — the resumed session id IS
+    // the parent thread id.
+    if (model.providerId === 'codex' && resumeSessionId) ensureCodexSpawnWatcher(resumeSessionId);
+
+    const inspectForSubagents = (parsed) => {
+      if (model.providerId === 'codex') {
+        if (parsed?.type === 'thread.started' && typeof parsed.thread_id === 'string') {
+          ensureCodexSpawnWatcher(parsed.thread_id);
+        }
+        return;
+      }
+      if (model.providerId !== 'cursor' || parsed?.type !== 'tool_call') return;
+      const task = parsed.tool_call?.taskToolCall;
+      if (!task) return;
+      const args = task.args ?? {};
+      const agentId = typeof args.agentId === 'string' ? args.agentId : null;
+      if (!agentId) return;
+      if (parsed.subtype === 'started') {
+        const subagentType =
+          args.subagentType && typeof args.subagentType === 'object'
+            ? Object.keys(args.subagentType).find((key) => key !== 'unspecified')
+            : undefined;
+        // The started event's agentId is provisional — the transcript on disk
+        // is keyed by the REAL agent id, which only arrives on the completed
+        // event (result.success.agentId). Try both.
+        const fileRef = { realAgentId: null };
+        cursorSubagentFileRefs.set(agentId, fileRef);
+        subagentTracker.start(
+          {
+            id: agentId,
+            title: typeof args.description === 'string' && args.description ? args.description : 'Subagent',
+            kind: subagentType,
+            model: typeof args.model === 'string' ? args.model : undefined,
+            prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
+          },
+          {
+            resolveFile: async () =>
+              (fileRef.realAgentId
+                ? await cursorAgentTranscriptFile(input.projectPath, fileRef.realAgentId)
+                : null) ?? (await cursorAgentTranscriptFile(input.projectPath, agentId)),
+            handleLine: handleCursorSubagentLine,
+          }
+        );
+      } else if (parsed.subtype === 'completed') {
+        const result = task.result ?? {};
+        const realAgentId = result.success?.agentId;
+        const fileRef = cursorSubagentFileRefs.get(agentId);
+        if (fileRef && typeof realAgentId === 'string' && realAgentId) {
+          fileRef.realAgentId = realAgentId;
+        }
+        subagentTracker.finish(agentId, { status: result.success ? 'done' : 'error' });
+      }
+    };
     let reasoningText = '';
     let reasoningEmitTimer = null;
     let lastReasoningEmitAt = 0;
-    let sessionIdReported = false;
+    // Review runs use an ephemeral throwaway session — reporting its id would
+    // overwrite the thread's real resumable codex session.
+    let sessionIdReported = Boolean(input.codexReview);
     let finalized = false;
     let exitFallbackTimer = null;
     let terminalEventTimer = null;
@@ -5087,12 +7320,21 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       }
     };
 
-    const finalizeRun = async (exitCode) => {
+    const finalizeRun = async (exitCode, { wasStopped = false } = {}) => {
       if (finalized) return;
       finalized = true;
+      // Stopping a goal run is a successful pause, not a provider failure.
+      // The renderer normally untracks explicit stops, but normalizing here
+      // keeps any other caller from receiving a false error event.
+      const finalExitCode = wasStopped && useCodexGoal ? 0 : exitCode;
       clearFinalizeTimers();
       activeAgentRuns.delete(runId);
       stoppedAgentRuns.delete(runId);
+      codexGoalRunDrivers.delete(runId);
+      codexSpawnWatcher?.stop();
+      subagentTracker.dispose(
+        wasStopped ? 'stopped' : finalExitCode === 0 ? 'done' : 'error'
+      );
       if (jsonMode && jsonBuffer.trim()) {
         try {
           const parsed = JSON.parse(jsonBuffer.trim());
@@ -5103,7 +7345,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       }
       finishReasoningActivity();
 
-      if (exitCode !== 0 && stderr.trim()) {
+      if (finalExitCode !== 0 && stderr.trim()) {
         emitAgentEvent(event.sender, {
           runId,
           threadId: input.threadId,
@@ -5115,11 +7357,18 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       emitAgentEvent(event.sender, {
         runId,
         threadId: input.threadId,
-        type: exitCode === 0 ? 'done' : 'error',
-        exitCode,
+        type: finalExitCode === 0 ? 'done' : 'error',
+        exitCode: finalExitCode,
         changedFiles: await summarizeChangedFiles(input.projectPath, beforeSnapshot),
         ...(runStats ? { stats: runStats } : {}),
-        ...(exitCode === 0 ? {} : { error: `${model.label} exited with code ${exitCode}.` }),
+        ...(finalExitCode === 0
+          ? {}
+          : {
+              error: `${model.label} exited with code ${finalExitCode}.`,
+              // Lets the renderer offer the right provider's Authenticate
+              // button when the failure text reads as a logged-out CLI.
+              providerId: model.providerId,
+            }),
       });
     };
 
@@ -5193,6 +7442,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     const emitParsedJsonEvent = (parsed) => {
       maybeEmitSessionId(parsed);
+      inspectForSubagents(parsed);
 
       const reasoningDelta = adapter.reasoning(parsed, streamContext);
       if (reasoningDelta) {
@@ -5245,9 +7495,69 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       }
     };
 
-    // ACP runs bypass the pure-function adapters: the driver owns the JSON-RPC
-    // dialog (it must answer permission requests over stdin) and feeds the
-    // same emit helpers the adapter path uses.
+    // ACP and app-server runs bypass the pure-function adapters: the driver
+    // owns the JSON-RPC dialog (it must answer requests over stdin) and feeds
+    // the same emit helpers the adapter path uses.
+    const sharedDriverCallbacks = {
+      onSessionId: (sessionId) => {
+        if (sessionIdReported) return;
+        sessionIdReported = true;
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'session',
+          providerId: model.providerId,
+          sessionId,
+        });
+      },
+      onReasoning: (delta) => {
+        reasoningText = `${reasoningText}${delta}`;
+        queueReasoningActivity();
+      },
+      onText: (text) => {
+        stdoutSeen = true;
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'chunk',
+          chunk: text,
+        });
+      },
+      onActivity: emitActivity,
+      onResumeFallback: () => {
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'chunk',
+          chunk: '_Could not resume the previous session; starting a fresh one._\n\n',
+        });
+      },
+      onFatal: (message) => {
+        if (finalized) return;
+        stdoutSeen = true;
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'chunk',
+          chunk: `${message}\n`,
+        });
+        child.kill('SIGTERM');
+        finalizeRun(1);
+      },
+    };
+    // The driver's completion signal: the server process idles once the work
+    // resolves, so kill it shortly after and finalize the run as done.
+    const finishDriverRun = () => {
+      turnCompleted = true;
+      if (!terminalEventTimer && !finalized) {
+        terminalEventTimer = setTimeout(() => {
+          terminalEventTimer = null;
+          child.kill('SIGTERM');
+          finalizeRun(0);
+        }, 400);
+      }
+    };
+
     const acpDriver = useAcp
       ? createGrokAcpDriver({
           child,
@@ -5256,74 +7566,90 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           resumeSessionId,
           accessMode: input.accessMode || 'full-access',
           callbacks: {
-            onSessionId: (sessionId) => {
-              if (sessionIdReported) return;
-              sessionIdReported = true;
-              emitAgentEvent(event.sender, {
-                runId,
-                threadId: input.threadId,
-                type: 'session',
-                providerId: model.providerId,
-                sessionId,
-              });
-            },
-            onReasoning: (delta) => {
-              reasoningText = `${reasoningText}${delta}`;
-              queueReasoningActivity();
-            },
-            onText: (text) => {
-              stdoutSeen = true;
-              emitAgentEvent(event.sender, {
-                runId,
-                threadId: input.threadId,
-                type: 'chunk',
-                chunk: text,
-              });
-            },
-            onActivity: emitActivity,
-            onResumeFallback: () => {
-              emitAgentEvent(event.sender, {
-                runId,
-                threadId: input.threadId,
-                type: 'chunk',
-                chunk: '_Could not resume the previous session; starting a fresh one._\n\n',
-              });
-            },
+            ...sharedDriverCallbacks,
             onTurnEnd: (result) => {
               const stats = grokStatsFromPromptMeta(result?._meta);
               if (stats) runStats = stats;
-              turnCompleted = true;
-              // The agent process idles waiting for the next request once the
-              // prompt resolves — the response is the completion signal.
-              if (!terminalEventTimer && !finalized) {
-                terminalEventTimer = setTimeout(() => {
-                  terminalEventTimer = null;
-                  child.kill('SIGTERM');
-                  finalizeRun(0);
-                }, 400);
-              }
+              finishDriverRun();
             },
-            onFatal: (message) => {
-              if (finalized) return;
-              stdoutSeen = true;
-              emitAgentEvent(event.sender, {
-                runId,
-                threadId: input.threadId,
-                type: 'chunk',
-                chunk: `${message}\n`,
-              });
-              child.kill('SIGTERM');
-              finalizeRun(1);
+            onSubagent: (update) => {
+              const childId =
+                (typeof update.child_session_id === 'string' && update.child_session_id) ||
+                (typeof update.subagent_id === 'string' && update.subagent_id) ||
+                null;
+              if (!childId) return;
+              if (update.sessionUpdate === 'subagent_spawned') {
+                subagentTracker.start(
+                  {
+                    id: childId,
+                    title:
+                      typeof update.description === 'string' && update.description
+                        ? update.description
+                        : 'Subagent',
+                    kind:
+                      typeof update.subagent_type === 'string' ? update.subagent_type : undefined,
+                    model: typeof update.model === 'string' ? update.model : undefined,
+                  },
+                  {
+                    resolveFile: async () => {
+                      const file = grokSubagentUpdatesFile(input.projectPath, childId);
+                      return existsSync(file) ? file : null;
+                    },
+                    handleLine: handleGrokSubagentLine,
+                  }
+                );
+              } else if (update.sessionUpdate === 'subagent_finished') {
+                subagentTracker.finish(childId, {
+                  status: update.status === 'completed' ? 'done' : 'error',
+                  stats:
+                    typeof update.tokens_used === 'number'
+                      ? { totalTokens: update.tokens_used }
+                      : undefined,
+                  summary:
+                    typeof update.output === 'string' ? update.output.slice(0, 4000) : undefined,
+                });
+              }
             },
           },
         })
-      : null;
+      : useCodexGoal
+        ? createCodexAppServerDriver({
+            child,
+            cwd: input.projectPath,
+            model,
+            input,
+            goal: input.codexGoal,
+            resumeSessionId,
+            accessMode: input.accessMode || 'full-access',
+            callbacks: {
+              ...sharedDriverCallbacks,
+              onStats: (stats) => {
+                runStats = stats;
+              },
+              onGoal: (goal) => {
+                emitAgentEvent(event.sender, {
+                  runId,
+                  threadId: input.threadId,
+                  type: 'goal',
+                  goal,
+                });
+              },
+              onGoalRunEnd: finishDriverRun,
+            },
+          })
+        : null;
+    if (useCodexGoal && acpDriver) codexGoalRunDrivers.set(runId, acpDriver);
 
     emitAgentEvent(event.sender, {
       runId,
       threadId: input.threadId,
       type: 'started',
-      command: `${model.command} ${args.slice(1, -1).join(' ')}`,
+      // Goal runs and flag-only review runs have no trailing prompt to strip.
+      command: `${model.command} ${(
+        useCodexGoal || (input.codexReview && !input.codexReview.instructions)
+          ? args.slice(1)
+          : args.slice(1, -1)
+      ).join(' ')}`,
     });
 
     child.stdout.on('data', (data) => {
@@ -5393,7 +7719,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       if (finalized || exitFallbackTimer) return;
       exitFallbackTimer = setTimeout(() => {
         exitFallbackTimer = null;
-        finalizeRun(exitCode ?? (signal ? 1 : 0));
+        finalizeRun(exitCode ?? (signal ? 1 : 0), {
+          wasStopped: stoppedAgentRuns.has(runId),
+        });
       }, 2000);
     });
 
@@ -5407,6 +7735,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       if (exitCode !== 0 && resumeSessionId && !stdoutSeen && !wasStopped && !turnCompleted) {
         finalized = true;
         clearFinalizeTimers();
+        codexSpawnWatcher?.stop();
+        subagentTracker.dispose('error');
         emitAgentEvent(event.sender, {
           runId,
           threadId: input.threadId,
@@ -5417,7 +7747,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         return;
       }
 
-      await finalizeRun(exitCode);
+      await finalizeRun(exitCode, { wasStopped });
     });
 
     acpDriver?.start();
@@ -5437,14 +7767,545 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
   const child = activeAgentRuns.get(runId);
   if (!child) return false;
   stoppedAgentRuns.add(runId);
+  // Stopping a goal run = pausing the goal: ask the app-server to record the
+  // pause (so the stored goal matches reality and /goal resume works) before
+  // the process goes down.
+  const goalDriver = codexGoalRunDrivers.get(runId);
+  if (goalDriver) {
+    codexGoalRunDrivers.delete(runId);
+    try {
+      await goalDriver.stopGoalRun();
+    } catch {}
+  }
   child.kill('SIGTERM');
   activeAgentRuns.delete(runId);
   return true;
 });
 
+// Goal ops on a thread with no live goal run (pause after the run already
+// ended, clear, status refresh). Runs a short-lived app-server dialog:
+// initialize → thread/resume → goal op → kill.
+const runCodexGoalOp = ({ sessionId, cwd, action }) =>
+  new Promise((resolve) => {
+    const child = spawn(loginShell, ['-lc', 'codex app-server'], {
+      cwd,
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let nextId = 1;
+    let buffer = '';
+    const pending = new Map();
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        child.kill('SIGTERM');
+      } catch {}
+      resolve(value);
+    };
+    const timeout = setTimeout(() => settle({ ok: false, error: 'Codex app-server timed out.' }), 20000);
+    const write = (message) => {
+      try {
+        child.stdin.write(`${JSON.stringify(message)}\n`);
+      } catch {}
+    };
+    const request = (method, params) =>
+      new Promise((res) => {
+        const id = nextId++;
+        pending.set(id, res);
+        write({ jsonrpc: '2.0', id, method, params });
+      });
+    child.on('error', (error) => settle({ ok: false, error: error.message }));
+    child.on('exit', () => settle({ ok: false, error: 'Codex app-server exited early.' }));
+    child.stdout.on('data', (data) => {
+      buffer += data.toString();
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const message = JSON.parse(trimmed);
+          if (message.id !== undefined && !message.method && pending.has(message.id)) {
+            const res = pending.get(message.id);
+            pending.delete(message.id);
+            res(message);
+          }
+        } catch {}
+      }
+    });
+    (async () => {
+      try {
+        const init = await request('initialize', {
+          clientInfo: { name: 'orion', title: 'Orion', version: app.getVersion?.() ?? '0.0.0' },
+          capabilities: { experimentalApi: true, requestAttestation: false },
+        });
+        if (init.error) return settle({ ok: false, error: init.error.message });
+        write({ jsonrpc: '2.0', method: 'initialized', params: {} });
+        const resumed = await request('thread/resume', { threadId: sessionId, cwd });
+        if (resumed.error) return settle({ ok: false, error: resumed.error.message });
+        if (action === 'pause') {
+          const result = await request('thread/goal/set', { threadId: sessionId, status: 'paused' });
+          if (result.error) return settle({ ok: false, error: result.error.message });
+          return settle({ ok: true, goal: result.result?.goal ? codexGoalForRenderer(result.result.goal) : null });
+        }
+        if (action === 'clear') {
+          const result = await request('thread/goal/clear', { threadId: sessionId });
+          if (result.error) return settle({ ok: false, error: result.error.message });
+          return settle({ ok: true, goal: null });
+        }
+        const result = await request('thread/goal/get', { threadId: sessionId });
+        if (result.error) return settle({ ok: false, error: result.error.message });
+        return settle({ ok: true, goal: result.result?.goal ? codexGoalForRenderer(result.result.goal) : null });
+      } catch (error) {
+        settle({ ok: false, error: error?.message ?? String(error) });
+      }
+    })();
+  });
+
+ipcMain.handle('agent:codexGoal', async (_event, input) => {
+  try {
+    if (!input?.sessionId || !input?.projectPath || !input?.action) {
+      return { ok: false, error: 'Missing sessionId, projectPath, or action.' };
+    }
+    if (!['pause', 'clear', 'get'].includes(input.action)) {
+      return { ok: false, error: `Unsupported goal action: ${input.action}` };
+    }
+    const available = await checkCommandAvailable('codex');
+    if (!available) return { ok: false, error: 'codex is not installed or not on PATH.' };
+    return await runCodexGoalOp({
+      sessionId: input.sessionId,
+      cwd: input.projectPath,
+      action: input.action,
+    });
+  } catch (error) {
+    console.error('agent:codexGoal error', error);
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+
 ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
   if (typeof threadId !== 'string' || !threadId) return false;
-  return disposeClaudeSdkSession(threadId);
+  invalidateTerminalSession(threadId);
+  const disposedTerminal = disposeTerminalSession(threadId);
+  return disposeClaudeSdkSession(threadId) || disposedTerminal;
+});
+
+// -------------------- Claude Code CLI terminal sessions --------------------
+// One PTY per thread hosting the interactive `claude` TUI. The PTY lives in
+// main and survives view remounts/thread switches; the renderer reattaches by
+// replaying the scrollback snapshot, then applying data events whose seq is
+// newer than the snapshot's (invoke replies and pushed events aren't strictly
+// ordered, so the per-session seq disambiguates).
+
+const terminalSessions = new Map(); // threadId -> { pty, scrollback, seq, exited, exitCode, accessMode, projectPath, claudeSessionId }
+// Explicit teardown (model switch/thread deletion) can race an async
+// terminal:ensure before it has installed a session. Epochs let teardown
+// invalidate those pending starts so they cannot spawn an invisible PTY.
+const terminalSessionEpochs = new Map();
+const TERMINAL_SCROLLBACK_LIMIT = 400_000; // chars kept for reattach replay
+
+const invalidateTerminalSession = (threadId) => {
+  terminalSessionEpochs.set(threadId, (terminalSessionEpochs.get(threadId) ?? 0) + 1);
+};
+
+const sendToAllWindows = (channel, payload) => {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send(channel, payload);
+  }
+};
+
+const disposeTerminalSession = (threadId) => {
+  const session = terminalSessions.get(threadId);
+  if (!session) return false;
+  terminalSessions.delete(threadId);
+  if (session.sessionWatcher) clearInterval(session.sessionWatcher);
+  try {
+    if (!session.exited) session.pty.kill();
+  } catch {
+    // already gone
+  }
+  return true;
+};
+
+// claude's per-project session store (~/.claude/projects/<encoded-cwd>).
+// The encoding is the realpath'd cwd with every non-alphanumeric replaced by
+// '-'; realpath matters because claude records its own resolved cwd (e.g.
+// /tmp -> /private/tmp on macOS).
+const claudeProjectDirFor = async (projectPath) => {
+  let realProjectPath = projectPath;
+  try {
+    realProjectPath = await fs.realpath(projectPath);
+  } catch {
+    // keep the raw path
+  }
+  return path.join(
+    os.homedir(),
+    '.claude',
+    'projects',
+    realProjectPath.replace(/[^a-zA-Z0-9]/g, '-')
+  );
+};
+
+// A distinctive plain-text slice of a prompt that will appear verbatim inside
+// the session's JSONL (JSON string escaping mangles quotes/newlines/etc., so
+// pick the longest run of unescaped characters).
+const terminalPromptMarker = (text) => {
+  const segments = String(text)
+    .split(/[\\"\n\r\t\u0000-\u001f]+/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length >= 12);
+  segments.sort((a, b) => b.length - a.length);
+  return segments[0]?.slice(0, 120) ?? null;
+};
+
+const rememberTerminalPrompt = (session, text) => {
+  const marker = terminalPromptMarker(text);
+  if (!marker) return;
+  session.sentPrompts.push(marker);
+  if (session.sentPrompts.length > 5) session.sentPrompts.shift();
+};
+
+// xterm's onData stream is usually one character at a time, but paste and
+// IME input can arrive in larger chunks. Keep a lightweight approximation of
+// the current prompt so pressing Enter through the terminal itself records the
+// same transcript marker as the GUI composer. Exact cursor editing is not
+// required for attribution: a distinctive unchanged slice is enough to match
+// the prompt in Claude's JSONL session file.
+const trackTerminalPromptInput = (session, rawData) => {
+  const data = String(rawData ?? '');
+  let submittedPrompt = false;
+  for (let index = 0; index < data.length; index += 1) {
+    const char = data[index];
+
+    if (char === '\x1b') {
+      // Ignore terminal control sequences (arrows, bracketed-paste markers,
+      // function keys). A bare Meta prefix leaves the following character to
+      // be processed normally.
+      const csi = data.slice(index).match(/^\x1b\[[0-?]*[ -/]*[@-~]/);
+      if (csi) {
+        index += csi[0].length - 1;
+        continue;
+      }
+      if (data[index + 1] === 'O' && data[index + 2]) {
+        index += 2;
+        continue;
+      }
+      continue;
+    }
+
+    if (char === '\r' || char === '\n') {
+      submittedPrompt ||= Boolean(session.inputBuffer.trim());
+      rememberTerminalPrompt(session, session.inputBuffer);
+      session.inputBuffer = '';
+      continue;
+    }
+    if (char === '\x7f' || char === '\b') {
+      session.inputBuffer = [...session.inputBuffer].slice(0, -1).join('');
+      continue;
+    }
+    if (char === '\x03' || char === '\x15') {
+      // Ctrl+C / Ctrl+U clear the pending line.
+      session.inputBuffer = '';
+      continue;
+    }
+    if (char === '\x17') {
+      // Ctrl+W deletes the previous word.
+      session.inputBuffer = session.inputBuffer.replace(/\S+\s*$/u, '');
+      continue;
+    }
+    if (char === '\t') {
+      session.inputBuffer += '\t';
+      continue;
+    }
+    if (char < ' ') continue;
+
+    session.inputBuffer += char;
+    if (session.inputBuffer.length > 8000) {
+      session.inputBuffer = session.inputBuffer.slice(-8000);
+    }
+  }
+  return submittedPrompt;
+};
+
+// The interactive claude TUI ignores --session-id (verified: conversations
+// persist under their own fresh id), so the thread's resumable session id has
+// to be discovered from claude's session store: a
+// ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl written after this PTY
+// spawned. Other writers share that directory (SDK threads, other terminals,
+// the user's own claude runs — and claude can flush transcripts minutes
+// late), so a candidate only counts when it contains a prompt this terminal
+// actually submitted. Markers come from both the GUI composer and raw xterm
+// input, avoiding an unsafe "newest transcript wins" guess.
+const startTerminalSessionWatcher = (threadId, session, projectPath) => {
+  const spawnedAt = Date.now();
+  const projectDirPromise = claudeProjectDirFor(projectPath);
+  session.sessionWatcher = setInterval(() => {
+    void (async () => {
+      if (session.exited || session.claudeSessionId) {
+        clearInterval(session.sessionWatcher);
+        session.sessionWatcher = null;
+        return;
+      }
+      // Never guess from the newest project transcript. Multiple Orion and
+      // external Claude processes can write this directory concurrently.
+      if (session.sentPrompts.length === 0) return;
+      try {
+        const dir = await projectDirPromise;
+        const entries = await fs.readdir(dir).catch(() => []);
+        const candidates = [];
+        for (const entry of entries) {
+          if (!entry.endsWith('.jsonl')) continue;
+          const stats = await fs.stat(path.join(dir, entry)).catch(() => null);
+          if (!stats || stats.mtimeMs < spawnedAt) continue;
+          candidates.push({ id: entry.slice(0, -'.jsonl'.length), mtimeMs: stats.mtimeMs });
+        }
+        candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+        for (const candidate of candidates) {
+          const content = await fs
+            .readFile(path.join(dir, `${candidate.id}.jsonl`), 'utf-8')
+            .catch(() => '');
+          if (!session.sentPrompts.some((marker) => content.includes(marker))) continue;
+          session.claudeSessionId = candidate.id;
+          sendToAllWindows('terminal:session', { threadId, sessionId: candidate.id });
+          clearInterval(session.sessionWatcher);
+          session.sessionWatcher = null;
+          break;
+        }
+      } catch {
+        // transient fs error; retry next tick
+      }
+    })();
+  }, 2500);
+};
+
+const disposeAllTerminalSessions = () => {
+  for (const threadId of terminalSessionEpochs.keys()) {
+    invalidateTerminalSession(threadId);
+  }
+  for (const threadId of [...terminalSessions.keys()]) {
+    disposeTerminalSession(threadId);
+  }
+};
+
+// Spawn (or reattach to) the thread's claude TUI. Composer-sent prompts let
+// the watcher discover the CLI's persisted session id for restart/resume.
+ipcMain.handle('terminal:ensure', async (_event, input) => {
+  try {
+    const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
+    const projectPath = typeof input?.projectPath === 'string' ? input.projectPath : '';
+    const accessMode = ['read-only', 'workspace-write', 'full-access'].includes(
+      input?.accessMode
+    )
+      ? input.accessMode
+      : 'full-access';
+    if (!threadId || !projectPath) {
+      return { ok: false, error: 'threadId and projectPath are required' };
+    }
+    // A newer ensure supersedes any older pending start for the same thread
+    // (for example, when access mode changes while node-pty is still loading).
+    const ensureEpoch = (terminalSessionEpochs.get(threadId) ?? 0) + 1;
+    terminalSessionEpochs.set(threadId, ensureEpoch);
+
+    let session = terminalSessions.get(threadId);
+    if (
+      session &&
+      (input?.fresh ||
+        input?.restart ||
+        session.accessMode !== accessMode ||
+        session.projectPath !== projectPath)
+    ) {
+      disposeTerminalSession(threadId);
+      session = null;
+    }
+    if (session) {
+      if (!session.exited) {
+        sendToAllWindows('terminal:activity', { threadId, kind: 'started' });
+      }
+      return {
+        ok: true,
+        reattached: true,
+        claudeSessionId: session.claudeSessionId,
+        snapshot: session.scrollback,
+        seq: session.seq,
+        ...(session.exited
+          ? { exited: true, exitCode: session.exitCode ?? null }
+          : {}),
+      };
+    }
+
+    if (!(await checkCommandAvailable('claude'))) {
+      return { ok: false, error: 'claude is not installed or not on PATH.' };
+    }
+
+    let ptyModule;
+    try {
+      ptyModule = await import('node-pty');
+    } catch (error) {
+      console.error('terminal:ensure node-pty load failed', error);
+      return {
+        ok: false,
+        error: `Terminal support unavailable (node-pty failed to load): ${error?.message ?? error}`,
+      };
+    }
+
+    const isUuid = (value) =>
+      typeof value === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+
+    const accessArgs =
+      accessMode === 'full-access'
+        ? ['--dangerously-skip-permissions']
+        : ['--permission-mode', accessMode === 'read-only' ? 'plan' : 'acceptEdits'];
+    const args = ['claude', ...accessArgs];
+    let claudeSessionId = null;
+    if (!input?.fresh && isUuid(input?.resumeSessionId)) {
+      // Only resume when claude actually persisted that conversation: it
+      // buffers transcripts in memory and can flush minutes late (or never,
+      // for sessions killed early), and --resume on a missing id exits(1).
+      const transcriptPath = path.join(
+        await claudeProjectDirFor(projectPath),
+        `${input.resumeSessionId}.jsonl`
+      );
+      const transcriptExists = await fs
+        .stat(transcriptPath)
+        .then((stats) => stats.isFile())
+        .catch(() => false);
+      if (transcriptExists) {
+        const forkSession = input?.forkSession === true;
+        // A branch resumes the inherited transcript only as the source for a
+        // new conversation. Keep the id unknown until the watcher discovers
+        // Claude's newly-created fork and reports it to the renderer.
+        claudeSessionId = forkSession ? null : input.resumeSessionId;
+        args.push('--resume', input.resumeSessionId);
+        if (forkSession) args.push('--fork-session');
+      }
+    }
+
+    if ((terminalSessionEpochs.get(threadId) ?? 0) !== ensureEpoch) {
+      return { ok: false, error: 'Terminal start was cancelled.' };
+    }
+
+    const commandString = args.map(shellQuote).join(' ');
+    const cols = Math.max(20, Math.floor(Number(input?.cols)) || 120);
+    const rows = Math.max(5, Math.floor(Number(input?.rows)) || 30);
+    const ptyProcess = ptyModule.spawn(loginShell, ['-lc', commandString], {
+      name: 'xterm-256color',
+      cols,
+      rows,
+      cwd: projectPath,
+      env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    });
+
+    session = {
+      pty: ptyProcess,
+      scrollback: '',
+      seq: 0,
+      exited: false,
+      exitCode: null,
+      accessMode,
+      projectPath,
+      claudeSessionId,
+      sessionWatcher: null,
+      // Markers from composer- and xterm-submitted prompts, used by the
+      // session watcher to attribute an on-disk transcript to this terminal.
+      sentPrompts: [],
+      // Best-effort current input line for prompts typed directly into xterm.
+      inputBuffer: '',
+    };
+    terminalSessions.set(threadId, session);
+    startTerminalSessionWatcher(threadId, session, projectPath);
+    sendToAllWindows('terminal:activity', { threadId, kind: 'started' });
+
+    ptyProcess.onData((data) => {
+      // A fresh start/access-mode/project change can replace this PTY before its
+      // final callbacks drain. Never let the superseded process write into
+      // the replacement terminal's renderer stream.
+      if (terminalSessions.get(threadId) !== session) return;
+      session.seq += 1;
+      session.scrollback = (session.scrollback + data).slice(-TERMINAL_SCROLLBACK_LIMIT);
+      sendToAllWindows('terminal:data', { threadId, data, seq: session.seq });
+    });
+    ptyProcess.onExit(({ exitCode }) => {
+      // disposeTerminalSession removes the old session before killing it. If
+      // another PTY now owns this thread id, its view must not receive the
+      // old process's delayed exit event.
+      if (terminalSessions.get(threadId) !== session) return;
+      session.exited = true;
+      session.exitCode = exitCode ?? null;
+      if (session.sessionWatcher) {
+        clearInterval(session.sessionWatcher);
+        session.sessionWatcher = null;
+      }
+      sendToAllWindows('terminal:exit', { threadId, exitCode: exitCode ?? null });
+    });
+
+    return {
+      ok: true,
+      reattached: false,
+      claudeSessionId,
+      snapshot: session.scrollback,
+      seq: session.seq,
+    };
+  } catch (error) {
+    console.error('terminal:ensure error', error);
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+
+// Raw keystrokes from the embedded xterm.
+ipcMain.handle('terminal:input', (_event, input) => {
+  const session = terminalSessions.get(input?.threadId);
+  if (!session || session.exited) return false;
+  const data = String(input?.data ?? '');
+  const submittedPrompt = trackTerminalPromptInput(session, data);
+  session.pty.write(data);
+  if (submittedPrompt) {
+    sendToAllWindows('terminal:activity', { threadId: input.threadId, kind: 'prompt' });
+  }
+  return true;
+});
+
+ipcMain.handle('terminal:resize', (_event, input) => {
+  const session = terminalSessions.get(input?.threadId);
+  if (!session || session.exited) return false;
+  const cols = Math.floor(Number(input?.cols));
+  const rows = Math.floor(Number(input?.rows));
+  if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols < 2 || rows < 2) return false;
+  try {
+    session.pty.resize(cols, rows);
+  } catch {
+    return false;
+  }
+  return true;
+});
+
+// GUI composer → TUI: deliver the draft as a bracketed paste (so multi-line
+// prompts land as one input) and press Enter once the TUI has ingested it —
+// exactly as if the user had typed it in the terminal.
+ipcMain.handle('terminal:sendPrompt', async (_event, input) => {
+  const session = terminalSessions.get(input?.threadId);
+  if (!session || session.exited) {
+    return { ok: false, error: 'The Claude Code terminal is not running.' };
+  }
+  const text = String(input?.text ?? '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return { ok: false, error: 'Nothing to send' };
+  rememberTerminalPrompt(session, text);
+  session.inputBuffer = '';
+  session.pty.write(`\x1b[200~${text}\x1b[201~`);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  if (session.exited) return { ok: false, error: 'The Claude Code terminal exited.' };
+  session.pty.write('\r');
+  sendToAllWindows('terminal:activity', { threadId: input.threadId, kind: 'prompt' });
+  return { ok: true };
+});
+
+ipcMain.handle('terminal:kill', (_event, threadId) => {
+  if (typeof threadId !== 'string' || !threadId) return false;
+  invalidateTerminalSession(threadId);
+  return disposeTerminalSession(threadId);
 });
 
 // Generate a short, relevant title for a thread based on the first user prompt.

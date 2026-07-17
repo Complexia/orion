@@ -14,6 +14,19 @@ type AppUpdateState = {
   error?: string | null;
 };
 
+// A running orchestrator agent asked main to spawn a subagent; the renderer
+// resolves the model fuzzily (id, slug, or label), creates a child thread,
+// runs it, and reports back via reportSubagentResult.
+export type SubagentSpawnRequest = {
+  spawnId: string;
+  threadId: string;      // driver thread id
+  projectPath: string;
+  model: string;         // model id, slug, or label — renderer resolves fuzzily
+  prompt: string;
+  title?: string;
+  role?: string;
+};
+
 declare global {
 type OrionCloudSyncStatus = 'synced' | 'ahead' | 'behind' | 'diverged' | 'unknown';
 
@@ -133,11 +146,18 @@ type OrionComputerUsePermissionStatus =
   | 'unknown'
   | 'unsupported';
 
+type OrionChromeDebugStatus = {
+  /** enabled: debugging server reachable; stale: toggle flipped but Chrome not running; disabled: never enabled */
+  status: 'enabled' | 'stale' | 'disabled' | 'unsupported';
+  browser?: string;
+};
+
 type OrionComputerUsePermissions = {
   supported: boolean;
   accessibility: OrionComputerUsePermissionStatus;
   screenRecording: OrionComputerUsePermissionStatus;
   automation: OrionComputerUsePermissionStatus;
+  chromeDebug?: OrionChromeDebugStatus;
 };
 
   interface Window {
@@ -361,6 +381,7 @@ type OrionComputerUsePermissions = {
         taskId: string;
         threadId: string;
         status: 'running' | 'finished' | 'done' | 'error';
+        notes?: string;
       }) => Promise<OrionTaskActionResult>;
       getComputerUsePermissions: () => Promise<OrionComputerUsePermissions>;
       requestComputerUsePermission: (kind: OrionComputerUsePermissionKind) => Promise<{
@@ -368,6 +389,7 @@ type OrionComputerUsePermissions = {
         error?: string;
         state?: OrionComputerUsePermissions;
       }>;
+      openChromeDebugSetup: () => Promise<{ ok: boolean; error?: string }>;
       openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>;
       relaunchApp: () => Promise<boolean>;
       getAppUpdateState: () => Promise<AppUpdateState>;
@@ -391,13 +413,33 @@ type OrionComputerUsePermissions = {
         forkSession?: boolean;
         /** One-shot side question (/btw): never touches the thread's persistent claude session. */
         aside?: boolean;
+        /** Codex goal run (/goal): drive the turn over `codex app-server` and pursue the goal across turns. */
+        codexGoal?: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number };
+        /** Codex code review (/review): run `codex exec review` (ephemeral session, never resumed). */
+        codexReview?: {
+          mode: 'uncommitted' | 'base' | 'commit' | 'custom';
+          base?: string;
+          commit?: string;
+          instructions?: string;
+        };
         providerOptions?: {
           allowedTools?: string;
           networkAccess?: boolean;
           webSearch?: boolean;
           experimentalMemory?: boolean;
+          chrome?: boolean;
+          browserControl?: boolean;
+          browserAutoConnect?: boolean;
           extraArgs?: string;
         };
+        /** Set when the thread runs the Orion pseudo-model: the roles it may delegate to. */
+        orchestration?: {
+          isOrchestrator: boolean;
+          roles: Array<{ role: string; roleLabel: string; modelId: string; providerId: string; slug: string; modelLabel: string }>;
+          generalInstructions: string;
+        };
+        /** @-mentioned models the agent may delegate to directly. */
+        mentions?: Array<{ modelId: string; providerId: string; slug: string; label: string }>;
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
       stopAgentTurn: (
         runId: string,
@@ -406,6 +448,48 @@ type OrionComputerUsePermissions = {
       ) => Promise<boolean>;
       /** Dispose any persistent agent runtime owned by a deleted thread. */
       disposeAgentThread: (threadId: string) => Promise<boolean>;
+      /** Claude Code CLI embedded terminal (one PTY per thread, lives in main). */
+      terminalEnsure: (input: {
+        threadId: string;
+        projectPath: string;
+        accessMode: 'read-only' | 'workspace-write' | 'full-access';
+        /** Resume this CLI session instead of starting fresh (--resume). */
+        resumeSessionId?: string;
+        cols?: number;
+        rows?: number;
+        /** Kill any existing PTY and start a brand-new session. */
+        fresh?: boolean;
+        /** Restart an exited PTY, optionally resuming resumeSessionId. */
+        restart?: boolean;
+        /** Resume the inherited session into a new id for a branched thread. */
+        forkSession?: boolean;
+      }) => Promise<{
+        ok: boolean;
+        /** True when an already-running PTY was reattached instead of spawned. */
+        reattached?: boolean;
+        /** The session id known so far (resume id, or one discovered by the watcher). */
+        claudeSessionId?: string | null;
+        /** Scrollback to replay into a freshly mounted terminal view. */
+        snapshot?: string;
+        /** Seq of the last data event included in the snapshot. */
+        seq?: number;
+        /** True when the retained PTY exited and awaits an explicit restart. */
+        exited?: boolean;
+        exitCode?: number | null;
+        error?: string;
+      }>;
+      terminalInput: (input: { threadId: string; data: string }) => Promise<boolean>;
+      terminalResize: (input: { threadId: string; cols: number; rows: number }) => Promise<boolean>;
+      terminalSendPrompt: (input: { threadId: string; text: string }) => Promise<{ ok: boolean; error?: string }>;
+      terminalKill: (threadId: string) => Promise<boolean>;
+      onTerminalData: (cb: (event: { threadId: string; data: string; seq: number }) => void) => () => void;
+      onTerminalExit: (cb: (event: { threadId: string; exitCode: number | null }) => void) => () => void;
+      onTerminalActivity: (cb: (event: {
+        threadId: string;
+        kind: 'started' | 'prompt';
+      }) => void) => () => void;
+      /** The thread's live claude CLI session id, discovered from claude's session store. */
+      onTerminalSession: (cb: (event: { threadId: string; sessionId: string }) => void) => () => void;
       generateThreadTitle: (input: {
         prompt: string;
         modelId: string;
@@ -420,9 +504,28 @@ type OrionComputerUsePermissions = {
       onAgentTurnEvent?: (cb: (event: {
         runId: string;
         threadId: string;
-        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done';
+        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'subagent' | 'subagent-chunk' | 'subagent-activity';
         /** started events only: the persistent claude session opened this turn itself (background task finished). */
         background?: boolean;
+        /** subagent events: lifecycle upsert for a provider-native subagent of this thread's run. */
+        subagent?: {
+          id: string;
+          providerId: string;
+          status: 'running' | 'done' | 'error' | 'stopped';
+          title?: string;
+          /** Subagent type/role (Explore, general-purpose, codex nickname role, …). */
+          kind?: string;
+          model?: string;
+          prompt?: string;
+          summary?: string;
+          startedAt?: number;
+          completedAt?: number;
+          stats?: { totalTokens?: number };
+        };
+        /** subagent-chunk / subagent-activity events: which subagent the payload belongs to. */
+        subagentId?: string;
+        /** done events only: background subagents/workflows still running when the turn ended — the thread stays in the working state until they settle. */
+        pendingBackgroundTasks?: string[];
         chunk?: string;
         exitCode?: number | null;
         error?: string;
@@ -456,7 +559,17 @@ type OrionComputerUsePermissions = {
           plan?: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
           status?: 'running' | 'done' | 'error' | 'waiting';
         };
+        /** goal events: the codex goal's latest state (null after clear). */
+        goal?: import('./store').ThreadGoal | null;
       }) => void) => () => void;
+      /** Codex goal ops (pause/clear/status refresh) when no goal run is live. */
+      codexGoalCommand: (input: {
+        sessionId: string;
+        projectPath: string;
+        action: 'pause' | 'clear' | 'get';
+      }) => Promise<{ ok: boolean; goal?: import('./store').ThreadGoal | null; error?: string }>;
+      reportSubagentResult(payload: { spawnId: string; ok: boolean; result: string }): Promise<void>;
+      onSubagentSpawnRequest(callback: (request: SubagentSpawnRequest) => void): () => void;
       onFileChange?: (cb: (data: any) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;

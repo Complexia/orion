@@ -4,10 +4,11 @@ import {
   CursorBrandIcon,
   GrokBrandIcon,
   OpenCodeBrandIcon,
+  OrionBrandIcon,
   type ProviderIconComponent,
 } from './providerIcons';
 
-export type AgentProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'opencode';
+export type AgentProviderId = 'orion' | 'grok' | 'codex' | 'claude' | 'cursor' | 'opencode';
 
 export type AgentModel = {
   id: string;
@@ -141,7 +142,15 @@ export const grokReasoningOptions: Array<{
 ];
 
 export type ProviderOptionDef = {
-  key: 'allowedTools' | 'networkAccess' | 'webSearch' | 'experimentalMemory' | 'extraArgs';
+  key:
+    | 'allowedTools'
+    | 'networkAccess'
+    | 'webSearch'
+    | 'experimentalMemory'
+    | 'chrome'
+    | 'browserControl'
+    | 'browserAutoConnect'
+    | 'extraArgs';
   label: string;
   description: string;
   type: 'boolean' | 'string';
@@ -159,12 +168,21 @@ const extraArgsOption = (command: string): ProviderOptionDef => ({
 // Harness capabilities surfaced per provider. Everything here maps directly
 // onto a CLI flag or config override in main.js's commandForModel.
 export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = {
+  // The Orion orchestrator is a pseudo-model, not a CLI harness — no options.
+  orion: [],
   claude: [
+    {
+      key: 'chrome',
+      label: 'Claude in Chrome',
+      description:
+        'Browser control through the Claude Chrome extension (--chrome): navigate, click, read pages, and screenshot your real signed-in Chrome. Requires the extension. Available in Workspace write and Full access; disabled in Read only.',
+      type: 'boolean',
+    },
     {
       key: 'allowedTools',
       label: 'Auto-allowed tools',
       description:
-        'Tools approved without prompting in Read only / Workspace write modes (headless runs cannot ask). E.g. Bash, WebFetch, WebSearch, mcp__claude-in-chrome. Full Access already allows everything.',
+        'Tools approved without prompting in Read only / Workspace write modes (headless runs cannot ask). E.g. Bash, WebFetch, WebSearch. Browser tools remain disabled in Read only. Full Access already allows everything.',
       type: 'string',
       placeholder: 'Bash, WebFetch, WebSearch',
     },
@@ -182,6 +200,20 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       key: 'webSearch',
       label: 'Web search',
       description: 'Enable the Codex web search tool for all runs.',
+      type: 'boolean',
+    },
+    {
+      key: 'browserControl',
+      label: 'Browser control',
+      description:
+        'First-class browser control through chrome-devtools-mcp (navigate, click, read pages, screenshot). Codex’s own ChatGPT-extension browser only works inside the ChatGPT app, so this exposes a dedicated Chrome instead. Uses a persistent profile — sign in to sites once there and logins stick across runs.',
+      type: 'boolean',
+    },
+    {
+      key: 'browserAutoConnect',
+      label: 'Use your signed-in Chrome',
+      description:
+        'Attach browser control to your real Chrome profile — existing logins, tabs, and cookies — instead of a dedicated one. One-time setup: in Chrome, open chrome://inspect/#remote-debugging and turn the remote debugging toggle on (Chrome 144+), then keep Chrome running. Requires Browser control to be on.',
       type: 'boolean',
     },
     extraArgsOption('codex'),
@@ -210,6 +242,8 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
 // Orion uses accept no stdin mid-run, so interrupt+resume is the steer path;
 // opencode has no session resume wired, so it is queue-only.
 export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; steer: boolean }> = {
+  // Steering an orchestrated thread would bypass the driver resolution.
+  orion: { queue: true, steer: false },
   grok: { queue: true, steer: true },
   codex: { queue: true, steer: true },
   claude: { queue: true, steer: true },
@@ -218,6 +252,7 @@ export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; 
 };
 
 export const agentProviders: AgentProvider[] = [
+  { id: 'orion', label: 'Orion', icon: OrionBrandIcon },
   { id: 'grok', label: 'Grok', icon: GrokBrandIcon },
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },
   { id: 'claude', label: 'Claude', icon: ClaudeBrandIcon },
@@ -226,6 +261,14 @@ export const agentProviders: AgentProvider[] = [
 ];
 
 export const fallbackAgentModels: AgentModel[] = [
+  {
+    id: 'orion:orchestrator',
+    providerId: 'orion',
+    providerLabel: 'Orion',
+    label: 'Orion',
+    slug: 'orion',
+    favorite: true,
+  },
   {
     id: 'grok:grok-4.5',
     providerId: 'grok',
@@ -358,6 +401,13 @@ export const fallbackAgentModels: AgentModel[] = [
     shortcut: '⌘8',
   },
   {
+    id: 'claude:claude-code-cli',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Code CLI',
+    slug: 'claude-code-cli',
+  },
+  {
     id: 'cursor:composer-2.5',
     providerId: 'cursor',
     providerLabel: 'Cursor',
@@ -431,6 +481,21 @@ export const fallbackAgentModels: AgentModel[] = [
 ];
 
 export const defaultAgentModelId = 'grok:grok-4.5';
+
+// The Orion pseudo-model: not a CLI harness, resolved by the renderer into
+// the per-role models configured in Settings → Orchestration.
+export const orionOrchestratorModelId = 'orion:orchestrator';
+
+// Claude Code CLI pseudo-model: the thread hosts the interactive `claude` TUI
+// in an embedded terminal instead of the chat transcript. Turns never go
+// through agent:runTurn — the composer feeds straight into the PTY.
+export const claudeCodeCliModelId = 'claude:claude-code-cli';
+
+export const isClaudeCodeCliModelId = (modelId: string | undefined | null): boolean =>
+  modelId === claudeCodeCliModelId;
+
+export const isOrionModelId = (modelId: string | undefined | null): boolean =>
+  modelId === orionOrchestratorModelId || (modelId ?? '').startsWith('orion:');
 
 export const findAgentModel = (models: AgentModel[], id: string | null | undefined) =>
   models.find((model) => model.id === id) ?? models.find((model) => model.id === defaultAgentModelId) ?? models[0];
