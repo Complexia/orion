@@ -3362,6 +3362,48 @@ const kimiStatsFromSessionDisk = async (sessionId) => {
   }
 };
 
+// kimi's ACP layer reports a failed turn as a clean `end_turn` unless the
+// failure is an auth error (turnEndReasonToStopReason maps `failed` →
+// `end_turn`, verified on kimi-code 0.26.0), so a provider outage or API
+// error looks identical to a successful empty response on the wire. The
+// real error is only recorded in the session's log file:
+//   WARN  acp: turn ended with failed reason  error="{\"code\":...}"
+// Returns that error's message, or null if the session log records no
+// failure at or after `sinceMs` (epoch ms; scopes the scan to the current
+// turn so a resumed session's old failures don't taint a fresh turn).
+const kimiTurnFailureFromSessionDisk = async (sessionId, sinceMs) => {
+  try {
+    const entry = await findKimiSessionIndexEntry(sessionId);
+    if (!entry?.sessionDir) return null;
+    const logPath = path.join(entry.sessionDir, 'logs', 'kimi-code.log');
+    const content = await fs.readFile(logPath, 'utf8');
+    const marker = 'acp: turn ended with failed reason';
+    let lastError = null;
+    for (const line of content.split('\n')) {
+      if (!line.includes(marker)) continue;
+      const loggedAt = Date.parse(line.slice(0, line.indexOf(' ')));
+      if (Number.isFinite(sinceMs) && Number.isFinite(loggedAt) && loggedAt < sinceMs) continue;
+      const match = line.match(/error="(.*)"\s*$/);
+      if (!match) {
+        lastError = 'Kimi turn failed.';
+        continue;
+      }
+      try {
+        // The logged value is a JSON object with backslash-escaped quotes —
+        // a valid JSON string body, so unescape it with one string parse
+        // and then parse the object it contains.
+        const parsed = JSON.parse(JSON.parse(`"${match[1]}"`));
+        lastError = typeof parsed?.message === 'string' && parsed.message ? parsed.message : 'Kimi turn failed.';
+      } catch {
+        lastError = 'Kimi turn failed.';
+      }
+    }
+    return lastError;
+  } catch {
+    return null;
+  }
+};
+
 // --- kimi native subagents (Agent / AgentSwarm tools) ------------------------
 // Each spawned subagent runs as an in-process loop with its own wire log at
 // <sessionDir>/agents/<agentId>/wire.jsonl (the main agent's transcript lives
@@ -3517,6 +3559,10 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
   let replayingSession = false;
   let textSeen = false;
   let pendingTextBreak = false;
+  // kimi reports non-auth turn failures as a clean `end_turn` with no
+  // session/update traffic at all (see kimiTurnFailureFromSessionDisk), so
+  // track whether the turn streamed anything to tell the two apart.
+  let sawTurnActivity = false;
 
   const write = (message) => {
     try {
@@ -3929,6 +3975,7 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
       );
     }
 
+    const turnStartedAt = Date.now();
     const response = await request('session/prompt', {
       sessionId,
       prompt: [{ type: 'text', text: promptText }],
@@ -3948,6 +3995,15 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
                 ? 'reached the maximum turn limit'
                 : `stopped (${stopReason})`;
       return fail(`Kimi turn ${detail}.`);
+    }
+    if (!sawTurnActivity) {
+      // An `end_turn` that streamed nothing is how kimi reports a non-auth
+      // provider failure (e.g. a transient API 404/5xx). The error only
+      // lands in the session's log file; give the write a moment, then
+      // surface it instead of finishing an empty, successful-looking turn.
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const failure = await kimiTurnFailureFromSessionDisk(sessionId, turnStartedAt - 2000);
+      if (failure) return fail(failure);
     }
     callbacks.onTurnEnd(response.result ?? {}, sessionId);
   };
@@ -3979,6 +4035,15 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
     if (!update || typeof update !== 'object') return;
 
     const kind = update.sessionUpdate;
+    if (
+      kind === 'agent_thought_chunk' ||
+      kind === 'agent_message_chunk' ||
+      kind === 'tool_call' ||
+      kind === 'tool_call_update' ||
+      kind === 'plan'
+    ) {
+      sawTurnActivity = true;
+    }
     if (kind === 'agent_thought_chunk') {
       const text = update.content?.text;
       if (typeof text === 'string' && text) callbacks.onReasoning(text);

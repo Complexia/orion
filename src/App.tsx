@@ -4247,8 +4247,6 @@ const App: React.FC = () => {
     // Adding a project means the user wants to work in it now — drop them
     // straight into a fresh thread for it.
     handleCreateThread(projectId);
-
-    toast.success(`Added project: ${name}`);
   };
 
   // Open folder directly for code tab
@@ -4466,10 +4464,13 @@ const App: React.FC = () => {
   // Create new thread for a project
   const handleCreateThread = (projectId: string) => {
     setCollapsedProjects((prev) => (prev[projectId] ? { ...prev, [projectId]: false } : prev));
-    // Prevent spamming empty threads: if selected thread for this project is empty and nothing typed, do nothing
+    // Prevent spamming empty threads: if selected thread for this project is empty and nothing typed, do nothing.
+    // CLI threads are exempt — their conversation lives in the terminal PTY, so
+    // messages.length is always 0 even when the thread is heavily used.
     if (
       selectedThread &&
       selectedThread.projectId === projectId &&
+      selectedThread.modelId !== claudeCodeCliModelId &&
       selectedThread.messages.length === 0 &&
       !chatInput.trim() &&
       chatAttachments.length === 0
