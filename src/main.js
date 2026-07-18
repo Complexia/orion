@@ -14,6 +14,7 @@ import {
 } from 'node:fs';
 import { Readable } from 'node:stream';
 import os from 'node:os';
+import net from 'node:net';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
@@ -29,6 +30,7 @@ import {
   pullRepo,
   pushRepo,
 } from './cloud-sync.js';
+import mcpBridgeShimSource from './mcp-bridge-shim.cjs?raw';
 
 // Set the application name as early as possible.
 // This helps the Dock, menu bar, and tooltips show "Orion" instead of "Electron"
@@ -1042,6 +1044,29 @@ const commandForModel = (model, input) => {
         'mcp_servers.chrome_devtools.startup_timeout_sec=90',
       );
     }
+    // Orion's spawn_subagent bridge (@-mention delegation / orchestration).
+    // A spawned subagent can run for a long time, so lift codex's 60s default
+    // MCP tool timeout well clear of real runs.
+    if (input.orionMcp) {
+      configArgs.push(
+        '--config',
+        `mcp_servers.orion.command=${JSON.stringify(input.orionMcp.command)}`,
+        '--config',
+        `mcp_servers.orion.args=${JSON.stringify(input.orionMcp.args)}`,
+        '--config',
+        'mcp_servers.orion.env={ELECTRON_RUN_AS_NODE = "1"}',
+        '--config',
+        'mcp_servers.orion.startup_timeout_sec=30',
+        '--config',
+        'mcp_servers.orion.tool_timeout_sec=7200',
+        // codex 0.144 gates MCP tools behind an approval prompt that headless
+        // exec runs auto-cancel ("user cancelled MCP tool call") — pre-approve
+        // Orion's own tool. The spawned subthread runs with the driver
+        // thread's access mode, so this grants nothing extra.
+        '--config',
+        'mcp_servers.orion.default_tools_approval_mode="approve"',
+      );
+    }
     // Without this steer, codex's bundled control-chrome skill grabs browser
     // tasks, hits the dead extension backend, and gives up without ever trying
     // the chrome_devtools tools (verified empirically). The skill defers to a
@@ -1154,6 +1179,9 @@ const commandForModel = (model, input) => {
   if (model.providerId === 'cursor') {
     const accessArgs = accessMode === 'read-only' ? ['--mode', 'plan'] : ['--force'];
     const resumeArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
+    const pluginArgs = input.orionMcp?.pluginDir
+      ? ['--plugin-dir', input.orionMcp.pluginDir]
+      : [];
     return [
       'cursor-agent',
       '--print',
@@ -1165,6 +1193,7 @@ const commandForModel = (model, input) => {
       cwd,
       '--model',
       modelArg,
+      ...pluginArgs,
       ...accessArgs,
       ...resumeArgs,
       ...extraArgs,
@@ -1181,12 +1210,16 @@ const commandForModel = (model, input) => {
       const effortArgs = input.grokReasoningEffort
         ? ['--reasoning-effort', input.grokReasoningEffort]
         : [];
+      const pluginArgs = input.orionMcp?.pluginDir
+        ? ['--plugin-dir', input.orionMcp.pluginDir]
+        : [];
       return [
         'grok',
         'agent',
         '-m',
         modelArg,
         ...effortArgs,
+        ...pluginArgs,
         ...(accessMode === 'full-access' ? ['--always-approve'] : []),
         ...extraArgs,
         'stdio',
@@ -1272,8 +1305,8 @@ const buildOrchestrationBlock = (orchestration) => {
     '',
     '## Delegating to subagents',
     '',
-    '1. **Preferred — the `spawn_subagent` tool.** If the `spawn_subagent` tool (fully-qualified name `mcp__orion__spawn_subagent`) is available, call it with `{ model, prompt, title?, role? }`. `model` accepts a model id like `codex:gpt-5.6-sol`, a slug, or a label. The task runs on that model as a visible subthread in Orion, and the call blocks until the subagent finishes, returning its final report. Delegate computer-use tasks to the computerUse model, code exploration to the exploring model, code changes to the implementation model, and image/video generation to the imageVideoGen model — unless the user explicitly says otherwise (e.g. via @model mentions).',
-    '2. **Fallback — run the provider CLI from the shell.** When the tool is unavailable (non-Claude drivers), run the target provider CLI directly as a blocking one-shot command and read its output. The current `[Orion orchestration]` prompt supplies mandatory access flags; preserve them exactly and never grant a subagent more access than the driver:',
+    '1. **Preferred — the `spawn_subagent` tool.** Current Orion drivers expose a `spawn_subagent` tool from Orion\'s MCP server (the fully-qualified name varies by provider and may be `mcp__orion__spawn_subagent`, `orion.spawn_subagent`, or a plugin-prefixed equivalent). Call it with `{ model, prompt, title?, role? }`. `model` accepts a model id like `codex:gpt-5.6-sol`, a slug, or a label. The task runs on that model as a visible subthread in Orion, and the call blocks until the subagent finishes, returning its final report. Delegate computer-use tasks to the computerUse model, code exploration to the exploring model, code changes to the implementation model, and image/video generation to the imageVideoGen model — unless the user explicitly says otherwise (e.g. via @model mentions).',
+    '2. **Fallback — run the provider CLI from the shell.** Only if the spawn_subagent tool is genuinely absent from your tool list, run the target provider CLI directly as a blocking one-shot command and read its output. The current `[Orion orchestration]` prompt supplies mandatory access flags; preserve them exactly and never grant a subagent more access than the driver:',
     '   - codex: `codex exec --json --cd <cwd> --skip-git-repo-check --color never --model <slug> <access flags> "<task>"`',
     '   - claude: `claude --print --model <slug> <access flags> "<task>"`',
     '   - cursor: `cursor-agent --print --trust --workspace <cwd> --model <slug> <access flags> "<task>"`',
@@ -2971,6 +3004,10 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
       if (typeof filePath === 'string') state.filePath = filePath;
       if (typeof rawInput.query === 'string') state.query = rawInput.query;
       if (typeof rawInput.url === 'string') state.query = rawInput.url;
+      // use_tool indirection: the real MCP tool name (e.g.
+      // orion__spawn_subagent) only appears here, and answerPermission needs
+      // it to recognize Orion's own spawn tool.
+      if (typeof rawInput.tool_name === 'string') state.rawInputToolName = rawInput.tool_name;
     }
 
     if (Array.isArray(update.content)) {
@@ -3103,8 +3140,18 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
     const kind = toolCall.kind ?? meta?.kind ?? known?.kind;
     const readOnly =
       meta?.read_only === true || kind === 'read' || kind === 'search' || kind === 'fetch';
+    // Orion's own spawn_subagent MCP tool is safe in every mode: the spawned
+    // subthread runs with the driver thread's access mode, never more. Grok
+    // routes MCP calls through use_tool, whose rawInput.tool_name is the
+    // qualified MCP identity. Titles and wrapper metadata are presentation
+    // fields and must not grant an exemption.
+    const grokMcpToolName =
+      typeof toolCall.rawInput?.tool_name === 'string'
+        ? toolCall.rawInput.tool_name
+        : known?.rawInputToolName;
+    const isOrionSpawn = grokMcpToolName === 'orion__spawn_subagent';
     const allow =
-      accessMode === 'full-access'
+      isOrionSpawn || accessMode === 'full-access'
         ? true
         : accessMode === 'workspace-write'
           ? readOnly || kind !== 'execute'
@@ -3368,21 +3415,40 @@ const kimiStatsFromSessionDisk = async (sessionId) => {
 // error looks identical to a successful empty response on the wire. The
 // real error is only recorded in the session's log file:
 //   WARN  acp: turn ended with failed reason  error="{\"code\":...}"
-// Returns that error's message, or null if the session log records no
-// failure at or after `sinceMs` (epoch ms; scopes the scan to the current
-// turn so a resumed session's old failures don't taint a fresh turn).
-const kimiTurnFailureFromSessionDisk = async (sessionId, sinceMs) => {
+// Capture the current end of the session log before prompting so the
+// completion check can inspect only records appended by this turn. A byte
+// cursor avoids timestamp tolerances that can accidentally include a prior
+// failed turn when the user retries quickly.
+const kimiTurnFailureLogCursor = async (sessionId) => {
+  try {
+    const entry = await findKimiSessionIndexEntry(sessionId);
+    if (!entry?.sessionDir) return 0;
+    const logPath = path.join(entry.sessionDir, 'logs', 'kimi-code.log');
+    const stat = await fs.stat(logPath);
+    return stat.size;
+  } catch {
+    return 0;
+  }
+};
+
+// Returns the error appended after `logCursor`, or null if this turn added no
+// failure. If kimi rotates/truncates the log during the turn, scan the new
+// file from its beginning rather than retaining an invalid cursor.
+const kimiTurnFailureFromSessionDisk = async (sessionId, logCursor = 0) => {
   try {
     const entry = await findKimiSessionIndexEntry(sessionId);
     if (!entry?.sessionDir) return null;
     const logPath = path.join(entry.sessionDir, 'logs', 'kimi-code.log');
-    const content = await fs.readFile(logPath, 'utf8');
+    const bytes = await fs.readFile(logPath);
+    const offset =
+      Number.isSafeInteger(logCursor) && logCursor >= 0 && logCursor <= bytes.length
+        ? logCursor
+        : 0;
+    const content = bytes.subarray(offset).toString('utf8');
     const marker = 'acp: turn ended with failed reason';
     let lastError = null;
     for (const line of content.split('\n')) {
       if (!line.includes(marker)) continue;
-      const loggedAt = Date.parse(line.slice(0, line.indexOf(' ')));
-      if (Number.isFinite(sinceMs) && Number.isFinite(loggedAt) && loggedAt < sinceMs) continue;
       const match = line.match(/error="(.*)"\s*$/);
       if (!match) {
         lastError = 'Kimi turn failed.';
@@ -3549,7 +3615,7 @@ const handleKimiSubagentLine = (value, api, ctx) => {
   }
 };
 
-const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, accessMode, callbacks }) => {
+const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, accessMode, mcpServers = [], callbacks }) => {
   let nextRequestId = 1;
   const pendingRequests = new Map();
   const toolCalls = new Map();
@@ -3559,10 +3625,6 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
   let replayingSession = false;
   let textSeen = false;
   let pendingTextBreak = false;
-  // kimi reports non-auth turn failures as a clean `end_turn` with no
-  // session/update traffic at all (see kimiTurnFailureFromSessionDisk), so
-  // track whether the turn streamed anything to tell the two apart.
-  let sawTurnActivity = false;
 
   const write = (message) => {
     try {
@@ -3854,9 +3916,16 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
       known?.kind ??
       KIMI_TOOL_KINDS[typeof toolCall.title === 'string' ? toolCall.title : ''];
     const readOnly = kind === 'read' || kind === 'search' || kind === 'fetch' || kind === 'think';
+    // Orion's own spawn_subagent MCP tool is safe in every mode: the spawned
+    // subthread runs with the driver thread's access mode, never more. Kimi's
+    // initial ACP tool_call records the qualified MCP identity in toolName;
+    // permission titles are presentation fields and must not grant access.
+    const isOrionSpawn = known?.toolName === 'mcp__orion__spawn_subagent';
     let allow;
     let denialDetail = "mode doesn't permit this tool.";
-    if (accessMode === 'full-access') {
+    if (isOrionSpawn) {
+      allow = true;
+    } else if (accessMode === 'full-access') {
       allow = true;
     } else if (accessMode !== 'workspace-write') {
       allow = readOnly;
@@ -3931,7 +4000,7 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
       const loaded = await request('session/load', {
         sessionId: resumeSessionId,
         cwd,
-        mcpServers: [],
+        mcpServers,
       });
       replayingSession = false;
       if (loaded.error) callbacks.onResumeFallback?.();
@@ -3941,7 +4010,7 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
       }
     }
     if (!sessionId) {
-      const created = await request('session/new', { cwd, mcpServers: [] });
+      const created = await request('session/new', { cwd, mcpServers });
       if (created.error || typeof created.result?.sessionId !== 'string') {
         return fail(created.error ?? 'Kimi agent did not return a session id.');
       }
@@ -3975,7 +4044,7 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
       );
     }
 
-    const turnStartedAt = Date.now();
+    const failureLogCursor = await kimiTurnFailureLogCursor(sessionId);
     const response = await request('session/prompt', {
       sessionId,
       prompt: [{ type: 'text', text: promptText }],
@@ -3996,15 +4065,15 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
                 : `stopped (${stopReason})`;
       return fail(`Kimi turn ${detail}.`);
     }
-    if (!sawTurnActivity) {
-      // An `end_turn` that streamed nothing is how kimi reports a non-auth
-      // provider failure (e.g. a transient API 404/5xx). The error only
-      // lands in the session's log file; give the write a moment, then
-      // surface it instead of finishing an empty, successful-looking turn.
-      await new Promise((resolve) => setTimeout(resolve, 350));
-      const failure = await kimiTurnFailureFromSessionDisk(sessionId, turnStartedAt - 2000);
-      if (failure) return fail(failure);
-    }
+    // kimi reports a non-auth provider failure (e.g. an API 403/5xx) as a
+    // clean `end_turn` — including mid-turn failures after tool calls and
+    // text already streamed (a quota 403 twelve steps in looks like a
+    // finished turn on the wire). The error only lands in the session's log
+    // file; give the write a moment, then surface it instead of finishing a
+    // successful-looking turn.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const failure = await kimiTurnFailureFromSessionDisk(sessionId, failureLogCursor);
+    if (failure) return fail(failure);
     callbacks.onTurnEnd(response.result ?? {}, sessionId);
   };
 
@@ -4035,15 +4104,6 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
     if (!update || typeof update !== 'object') return;
 
     const kind = update.sessionUpdate;
-    if (
-      kind === 'agent_thought_chunk' ||
-      kind === 'agent_message_chunk' ||
-      kind === 'tool_call' ||
-      kind === 'tool_call_update' ||
-      kind === 'plan'
-    ) {
-      sawTurnActivity = true;
-    }
     if (kind === 'agent_thought_chunk') {
       const text = update.content?.text;
       if (typeof text === 'string' && text) callbacks.onReasoning(text);
@@ -4171,6 +4231,15 @@ const codexAppServerConfig = (model, input) => {
       ? ['-y', chromeDevtoolsMcpPackage, '--autoConnect']
       : ['-y', chromeDevtoolsMcpPackage];
     config['mcp_servers.chrome_devtools.startup_timeout_sec'] = 90;
+  }
+  // Orion's spawn_subagent bridge — same overrides as the exec path builds.
+  if (input.orionMcp) {
+    config['mcp_servers.orion.command'] = input.orionMcp.command;
+    config['mcp_servers.orion.args'] = input.orionMcp.args;
+    config['mcp_servers.orion.env'] = { ELECTRON_RUN_AS_NODE: '1' };
+    config['mcp_servers.orion.startup_timeout_sec'] = 30;
+    config['mcp_servers.orion.tool_timeout_sec'] = 7200;
+    config['mcp_servers.orion.default_tools_approval_mode'] = 'approve';
   }
   return config;
 };
@@ -4710,6 +4779,337 @@ const retainClaudeBackgroundRun = (session, runId) => {
 // subthread and report back via the orchestration:subagentResult invoke.
 const pendingSubagentSpawns = new Map(); // spawnId -> { resolve }
 
+// Ask the renderer to run a subagent subthread and resolve with its final
+// report. Failures resolve as text (never reject) so every caller — the
+// Claude SDK tool and the socket bridge below — hands the model a readable
+// outcome instead of a protocol error.
+const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessMode }, args) =>
+  new Promise((resolve) => {
+    // Read the sender at call time: sessions rebind it when the window
+    // closes and reopens.
+    const sender = getSender();
+    if (!sender || sender.isDestroyed()) {
+      resolve('Unable to spawn subagent: the Orion window is no longer available.');
+      return;
+    }
+    const spawnId = crypto.randomUUID();
+    pendingSubagentSpawns.set(spawnId, { resolve });
+    try {
+      sender.send('orchestration:spawnRequest', {
+        spawnId,
+        threadId,
+        projectPath,
+        accessMode,
+        model: String(args.model ?? ''),
+        prompt: String(args.prompt ?? ''),
+        ...(args.title ? { title: String(args.title) } : {}),
+        ...(args.role ? { role: String(args.role) } : {}),
+      });
+    } catch {
+      pendingSubagentSpawns.delete(spawnId);
+      resolve('Unable to spawn subagent: the Orion window is no longer available.');
+    }
+  });
+
+// -------------------- Orion MCP bridge (non-Claude providers) --------------------
+// Claude turns get spawn_subagent from the in-process SDK MCP server below;
+// every other provider CLI is handed the dependency-free stdio shim written
+// to userData. Cursor and Grok receive it through process-only plugins;
+// Codex, Kimi, and OpenCode accept per-run MCP configuration directly. Every
+// path carries an exact token, so concurrent runs never route by cwd.
+const mcpBridgeSessions = new Map(); // token -> { getSender, threadId, projectPath, accessMode }
+
+const mcpBridgeInstanceId = crypto
+  .createHash('sha256')
+  // The single-instance lock already prevents two processes from sharing one
+  // profile. Hashing userData keeps dev and packaged profiles distinct while
+  // leaving one stable socket path that can be unlinked on restart.
+  .update(app.getPath('userData'))
+  .digest('hex')
+  .slice(0, 16);
+const mcpBridgeSocketPath = () =>
+  process.platform === 'win32'
+    ? `\\\\.\\pipe\\orion-mcp-${mcpBridgeInstanceId}`
+    : path.join(app.getPath('userData'), `orion-mcp-${mcpBridgeInstanceId}.sock`);
+
+const handleMcpBridgeConnection = (socket) => {
+  let buffer = '';
+  socket.on('data', (chunk) => {
+    buffer += chunk.toString();
+    let newline;
+    while ((newline = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      let message = null;
+      try {
+        message = JSON.parse(line);
+      } catch {}
+      if (!message || message.id === undefined) continue;
+      const reply = (ok, text) => {
+        try {
+          socket.write(`${JSON.stringify({ id: message.id, ok, text })}\n`);
+        } catch {}
+      };
+      const session =
+        typeof message.token === 'string' && message.token
+          ? mcpBridgeSessions.get(message.token)
+          : undefined;
+      if (!session) {
+        reply(false, 'This Orion agent session token is missing, invalid, or expired.');
+        continue;
+      }
+      if (message.tool !== 'spawn_subagent') {
+        reply(false, `Unknown tool: ${message.tool}`);
+        continue;
+      }
+      const args = message.args && typeof message.args === 'object' ? message.args : {};
+      if (
+        typeof args.model !== 'string' ||
+        !args.model.trim() ||
+        typeof args.prompt !== 'string' ||
+        !args.prompt.trim()
+      ) {
+        reply(false, 'spawn_subagent requires string `model` and `prompt` arguments.');
+        continue;
+      }
+      void requestSubagentSpawn(session, args).then((text) => reply(true, text));
+    }
+  });
+  socket.on('error', () => {});
+};
+
+let mcpBridgePromise = null;
+const ensureMcpBridge = () => {
+  if (!mcpBridgePromise) {
+    mcpBridgePromise = (async () => {
+      const shimPath = path.join(app.getPath('userData'), 'orion-mcp-bridge.cjs');
+      let existing = null;
+      try {
+        existing = await fs.readFile(shimPath, 'utf-8');
+      } catch {}
+      if (existing !== mcpBridgeShimSource) await fs.writeFile(shimPath, mcpBridgeShimSource);
+      const socketPath = mcpBridgeSocketPath();
+      if (process.platform !== 'win32') {
+        try {
+          await fs.unlink(socketPath);
+        } catch {}
+      }
+      const server = net.createServer(handleMcpBridgeConnection);
+      await new Promise((resolve, reject) => {
+        const onStartupError = (error) => reject(error);
+        server.once('error', onStartupError);
+        server.listen(socketPath, () => {
+          server.off('error', onStartupError);
+          server.on('error', (error) => console.error('Orion MCP bridge server error:', error));
+          resolve();
+        });
+      });
+      return { shimPath, socketPath };
+    })().catch((error) => {
+      // Allow a later run to retry a failed setup instead of caching the error.
+      mcpBridgePromise = null;
+      throw error;
+    });
+  }
+  return mcpBridgePromise;
+};
+
+// Registers a run with the bridge and returns everything the provider needs
+// to launch the shim. Returns null when the bridge can't start — the run then
+// simply proceeds without the spawn_subagent tool.
+const isPlainRecord = (value) =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+const mcpBridgePluginConfig = ({ command, args }) => ({
+  mcpServers: {
+    orion: {
+      command,
+      args,
+      env: { ELECTRON_RUN_AS_NODE: '1' },
+    },
+  },
+});
+
+const writeMcpBridgePlugin = async ({ token, command, args }) => {
+  // Keep the leaf directory stable (`orion`) so Cursor's plugin-qualified
+  // server name remains stable, while the token parent isolates every run.
+  const tokenRoot = path.join(app.getPath('userData'), 'mcp-runs', token);
+  const pluginDir = path.join(tokenRoot, 'orion');
+  const cursorManifestDir = path.join(pluginDir, '.cursor-plugin');
+  const grokManifestDir = path.join(pluginDir, '.claude-plugin');
+  await Promise.all([
+    fs.mkdir(cursorManifestDir, { recursive: true, mode: 0o700 }),
+    fs.mkdir(grokManifestDir, { recursive: true, mode: 0o700 }),
+  ]);
+  const manifest = JSON.stringify(
+    { name: 'orion', version: '1.0.0', description: 'Orion subagent bridge' },
+    null,
+    2
+  );
+  const mcpConfig = JSON.stringify(mcpBridgePluginConfig({ command, args }), null, 2);
+  await Promise.all([
+    fs.writeFile(path.join(cursorManifestDir, 'plugin.json'), `${manifest}\n`, { mode: 0o600 }),
+    fs.writeFile(path.join(grokManifestDir, 'plugin.json'), `${manifest}\n`, { mode: 0o600 }),
+    fs.writeFile(path.join(pluginDir, 'mcp.json'), `${mcpConfig}\n`, { mode: 0o600 }),
+    fs.writeFile(path.join(pluginDir, '.mcp.json'), `${mcpConfig}\n`, { mode: 0o600 }),
+  ]);
+  return { pluginDir, tokenRoot };
+};
+
+const runPluginSupportPromises = new Map();
+const providerSupportsRunPlugin = (providerId) => {
+  if (providerId !== 'cursor' && providerId !== 'grok') return Promise.resolve(true);
+  if (!runPluginSupportPromises.has(providerId)) {
+    const helpCommand = providerId === 'cursor' ? 'cursor-agent --help' : 'grok agent --help';
+    runPluginSupportPromises.set(
+      providerId,
+      runShellCommand(helpCommand, 10000)
+        .then(({ stdout, stderr }) => `${stdout}\n${stderr}`.includes('--plugin-dir'))
+        .catch(() => false)
+    );
+  }
+  return runPluginSupportPromises.get(providerId);
+};
+
+const registerMcpBridgeForRun = async ({
+  getSender,
+  threadId,
+  projectPath,
+  providerId,
+  accessMode,
+}) => {
+  try {
+    const { shimPath, socketPath } = await ensureMcpBridge();
+    const token = crypto.randomUUID();
+    // ELECTRON_RUN_AS_NODE turns Orion's own binary into a plain Node runtime;
+    // forge.config.js deliberately keeps that fuse enabled for this shim.
+    const command = process.execPath;
+    const args = [shimPath, '--socket', socketPath, '--token', token];
+    const { pluginDir, tokenRoot } = await writeMcpBridgePlugin({ token, command, args });
+    mcpBridgeSessions.set(token, {
+      getSender,
+      threadId,
+      projectPath,
+      providerId,
+      accessMode,
+    });
+    return {
+      token,
+      socketPath,
+      shimPath,
+      command,
+      args,
+      pluginDir,
+      release: () => {
+        mcpBridgeSessions.delete(token);
+        void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});
+      },
+    };
+  } catch (error) {
+    console.error('Orion MCP bridge unavailable:', error);
+    return null;
+  }
+};
+
+// The ACP wire shape (session/new + session/load mcpServers) for the bridge.
+const orionAcpMcpServers = (orionMcp) =>
+  orionMcp
+    ? [
+        {
+          name: 'orion',
+          command: orionMcp.command,
+          args: orionMcp.args,
+          env: [{ name: 'ELECTRON_RUN_AS_NODE', value: '1' }],
+        },
+      ]
+    : [];
+
+const openCodeMcpConfigContent = (orionMcp, existingContent) => {
+  if (!orionMcp) return null;
+  let base = {};
+  if (typeof existingContent === 'string' && existingContent.trim()) {
+    try {
+      base = JSON.parse(existingContent);
+    } catch (error) {
+      console.error('OpenCode inline config is invalid; Orion MCP bridge omitted:', error);
+      return null;
+    }
+    if (!isPlainRecord(base)) {
+      console.error('OpenCode inline config must be an object; Orion MCP bridge omitted.');
+      return null;
+    }
+  }
+  const existingMcp = base.mcp === undefined ? {} : base.mcp;
+  if (!isPlainRecord(existingMcp)) {
+    console.error('OpenCode inline `mcp` config must be an object; Orion MCP bridge omitted.');
+    return null;
+  }
+  return JSON.stringify({
+    ...base,
+    mcp: {
+      ...existingMcp,
+      orion: {
+        type: 'local',
+        command: [orionMcp.command, ...orionMcp.args],
+        environment: { ELECTRON_RUN_AS_NODE: '1' },
+        enabled: true,
+      },
+    },
+  });
+};
+
+// Remove only the persistent bridge entries written by the short-lived
+// global-config implementation. Current runs use process-only plugins, so
+// leaving these behind would load duplicate/stale Orion servers.
+const grokMcpBlockStart = '# >>> orion mcp bridge >>>';
+const grokMcpBlockEnd = '# <<< orion mcp bridge <<<';
+const cleanupLegacyMcpBridgeConfigs = async () => {
+  // Per-run plugins are disposable. A crash may leave an old tokenized
+  // directory behind, but no active process can legitimately use it after a
+  // fresh app launch.
+  await fs
+    .rm(path.join(app.getPath('userData'), 'mcp-runs'), { recursive: true, force: true })
+    .catch(() => {});
+
+  const grokConfigPath = path.join(os.homedir(), '.grok', 'config.toml');
+  try {
+    const existing = await fs.readFile(grokConfigPath, 'utf-8');
+    const startIndex = existing.indexOf(grokMcpBlockStart);
+    const endIndex =
+      startIndex === -1 ? -1 : existing.indexOf(grokMcpBlockEnd, startIndex);
+    if (startIndex !== -1 && endIndex !== -1) {
+      const afterIndex = endIndex + grokMcpBlockEnd.length;
+      const before = existing.slice(0, startIndex);
+      let after = existing.slice(afterIndex);
+      if (before.endsWith('\n') && after.startsWith('\n')) after = after.slice(1);
+      await fs.writeFile(grokConfigPath, `${before}${after}`);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('Could not remove legacy Grok MCP bridge:', error);
+  }
+
+  const cursorConfigPath = path.join(os.homedir(), '.cursor', 'mcp.json');
+  try {
+    const existing = await fs.readFile(cursorConfigPath, 'utf-8');
+    const config = JSON.parse(existing);
+    const entry = config?.mcpServers?.orion;
+    const legacyArgs = Array.isArray(entry?.args) ? entry.args : [];
+    const isLegacyEntry =
+      typeof entry?.command === 'string' &&
+      legacyArgs.some(
+        (value) => typeof value === 'string' && path.basename(value) === 'orion-mcp-bridge.cjs'
+      ) &&
+      entry?.env?.ELECTRON_RUN_AS_NODE === '1';
+    if (isLegacyEntry) {
+      delete config.mcpServers.orion;
+      await fs.writeFile(cursorConfigPath, `${JSON.stringify(config, null, 2)}\n`);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('Could not remove legacy Cursor MCP bridge:', error);
+  }
+};
+
 // In-process MCP server offered to every Claude SDK session (not only
 // orchestrator ones — @-mentions can request delegation from any thread).
 // The tool asks the renderer to spawn a subthread on another model and
@@ -4734,26 +5134,15 @@ const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
             .describe('Orchestration role this delegation fulfils: computerUse | exploring | implementation | imageVideoGen'),
         },
         async (args) => {
-          const spawnId = crypto.randomUUID();
-          const resultText = await new Promise((resolve) => {
-            // Read the sender at call time: sessions rebind it when the
-            // window closes and reopens.
-            const sender = session.sender;
-            if (!sender || sender.isDestroyed()) {
-              resolve('Unable to spawn subagent: the Orion window is no longer available.');
-              return;
-            }
-            pendingSubagentSpawns.set(spawnId, { resolve });
-            sender.send('orchestration:spawnRequest', {
-              spawnId,
+          const resultText = await requestSubagentSpawn(
+            {
+              getSender: () => session.sender,
               threadId: session.threadId,
               projectPath: session.projectPath,
-              model: args.model,
-              prompt: args.prompt,
-              ...(args.title ? { title: args.title } : {}),
-              ...(args.role ? { role: args.role } : {}),
-            });
-          });
+              accessMode: session.accessMode,
+            },
+            args
+          );
           return { content: [{ type: 'text', text: resultText }] };
         }
       ),
@@ -5504,6 +5893,7 @@ const createClaudeSdkSession = ({
   const session = {
     threadId,
     projectPath,
+    accessMode: sdkOptions.accessMode,
     sender,
     optionsKey: JSON.stringify([projectPath, sdkOptions]),
     createParams: { sender, threadId, projectPath, model, input },
@@ -6966,6 +7356,7 @@ app.whenReady().then(async () => {
   app.setName('Orion');
 
   await syncPathFromUserShell();
+  await cleanupLegacyMcpBridgeConfigs();
 
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({
@@ -7877,6 +8268,18 @@ ipcMain.handle('app:openExternalUrl', async (_event, url) => {
   }
 });
 
+// Clicking a thread-finished notification lands here: surface the window
+// even if it's minimized or behind another app.
+ipcMain.handle('app:focusWindow', () => {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (!win) return false;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  if (process.platform === 'darwin') app.focus({ steal: true });
+  return true;
+});
+
 // Computer use (codex's computer-use plugin and similar) needs macOS TCC
 // grants — Accessibility, Screen Recording, Automation. TCC attributes child
 // processes to their responsible process, so granting Orion covers every CLI
@@ -8339,20 +8742,44 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // the goal runtime auto-continues turns only inside a live app-server.
     const useCodexGoal =
       model.providerId === 'codex' && Boolean(input.codexGoal) && typeof input.codexGoal === 'object';
+    // spawn_subagent for non-Claude drivers: hand the CLI the bridge shim as
+    // an `orion` MCP server. One token per runTurn call — a resume-fallback
+    // reattempt reuses it; the last attempt's finalizeRun releases it.
+    const bridgeProvider = ['codex', 'cursor', 'grok', 'kimi', 'opencode'].includes(
+      model.providerId
+    );
+    const supportsRunPlugin =
+      bridgeProvider && (await providerSupportsRunPlugin(model.providerId));
+    const orionMcp =
+      input.aside || input.codexReview || !bridgeProvider || !supportsRunPlugin
+        ? null
+        : await registerMcpBridgeForRun({
+            getSender: () => event.sender,
+            threadId: input.threadId,
+            projectPath: input.projectPath,
+            providerId: model.providerId,
+            accessMode: input.accessMode || 'full-access',
+          });
     const startAttempt = (resumeSessionId) => {
     const args = commandForModel(model, {
       ...input,
       acp: useAcp,
       resumeSessionId,
       forkSession: forkWithNativeFlag && Boolean(resumeSessionId),
+      orionMcp,
     });
     const commandString = args.map(shellQuote).join(' ');
+    const openCodeConfig =
+      model.providerId === 'opencode'
+        ? openCodeMcpConfigContent(orionMcp, process.env.OPENCODE_CONFIG_CONTENT)
+        : null;
     const child = spawn(loginShell, ['-lc', commandString], {
       cwd: input.projectPath,
       env: {
         ...process.env,
         FORCE_COLOR: '0',
         NO_COLOR: '1',
+        ...(openCodeConfig ? { OPENCODE_CONFIG_CONTENT: openCodeConfig } : {}),
       },
       // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
       // take no input.
@@ -8519,6 +8946,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       activeAgentRuns.delete(runId);
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
+      orionMcp?.release();
       codexSpawnWatcher?.stop();
       kimiSpawnWatcher?.stop();
       subagentTracker.dispose(
@@ -8756,6 +9184,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             promptText: input.prompt,
             resumeSessionId,
             accessMode: input.accessMode || 'full-access',
+            mcpServers: orionAcpMcpServers(orionMcp),
             callbacks: {
               ...sharedDriverCallbacks,
               onSessionId: (sessionId, sessionMeta) => {
@@ -8836,7 +9265,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             child,
             cwd: input.projectPath,
             model,
-            input,
+            input: { ...input, orionMcp },
             goal: input.codexGoal,
             resumeSessionId,
             accessMode: input.accessMode || 'full-access',
@@ -8973,7 +9402,12 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     acpDriver?.start();
     };
 
-    startAttempt(initialResumeId);
+    try {
+      startAttempt(initialResumeId);
+    } catch (error) {
+      orionMcp?.release();
+      throw error;
+    }
 
     return { ok: true, runId };
   } catch (error) {

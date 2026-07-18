@@ -102,6 +102,7 @@ contextBridge.exposeInMainWorld('orion', {
   requestComputerUsePermission: (kind) => ipcRenderer.invoke('computerUse:requestPermission', kind),
   openChromeDebugSetup: () => ipcRenderer.invoke('computerUse:openChromeDebugSetup'),
   relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
+  focusWindow: () => ipcRenderer.invoke('app:focusWindow'),
 
   // App updates
   getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),

@@ -293,6 +293,18 @@ export const defaultOrchestrationSettings: OrchestrationSettings = {
   generalInstructions: '',
 };
 
+export type NotificationSettings = {
+  /** Notify when a thread finishes while the user isn't looking at it. */
+  enabled: boolean;
+  /** Play the system notification sound. */
+  sound: boolean;
+};
+
+export const defaultNotificationSettings: NotificationSettings = {
+  enabled: true,
+  sound: true,
+};
+
 interface OrionState {
   // Tabs
   activeTab: 'agents' | 'code';
@@ -312,6 +324,7 @@ interface OrionState {
   expandedProjects: string[];
   providerSettings: ProviderSettings;
   orchestrationSettings: OrchestrationSettings;
+  notificationSettings: NotificationSettings;
 
   // Actions
   setActiveTab: (tab: 'agents' | 'code') => void;
@@ -319,6 +332,7 @@ interface OrionState {
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
   setOrchestrationGeneralInstructions: (text: string) => void;
+  setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
   addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
@@ -476,6 +490,7 @@ export const useOrionStore = create<OrionState>()(
       expandedProjects: [],
       providerSettings: defaultProviderSettings,
       orchestrationSettings: defaultOrchestrationSettings,
+      notificationSettings: defaultNotificationSettings,
 
       setActiveTab: (tab) => set({ activeTab: tab }),
       setProviderEnabled: (id, enabled) =>
@@ -522,6 +537,14 @@ export const useOrionStore = create<OrionState>()(
               ...state.orchestrationSettings?.models,
             },
             generalInstructions: text,
+          },
+        })),
+      setNotificationSettings: (updates) =>
+        set((state) => ({
+          notificationSettings: {
+            ...defaultNotificationSettings,
+            ...state.notificationSettings,
+            ...updates,
           },
         })),
       setThreadAgentSession: (threadId, providerId, sessionId) =>
@@ -985,6 +1008,10 @@ export const useOrionStore = create<OrionState>()(
             ...defaultOrchestrationSettings.models,
             ...state.orchestrationSettings?.models,
           },
+        },
+        notificationSettings: {
+          ...defaultNotificationSettings,
+          ...state.notificationSettings,
         },
       }),
     }

@@ -21,6 +21,7 @@ export type SubagentSpawnRequest = {
   spawnId: string;
   threadId: string;      // driver thread id
   projectPath: string;
+  accessMode: 'read-only' | 'workspace-write' | 'full-access';
   model: string;         // model id, slug, or label — renderer resolves fuzzily
   prompt: string;
   title?: string;
@@ -392,6 +393,7 @@ type OrionComputerUsePermissions = {
       openChromeDebugSetup: () => Promise<{ ok: boolean; error?: string }>;
       openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>;
       relaunchApp: () => Promise<boolean>;
+      focusWindow: () => Promise<boolean>;
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: () => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;

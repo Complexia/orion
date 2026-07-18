@@ -64,6 +64,7 @@ import {
   useOrionStore,
   defaultProviderSettings,
   defaultOrchestrationSettings,
+  defaultNotificationSettings,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -664,7 +665,7 @@ const parseModelMentions = (text: string, models: AgentModel[]): ModelMention[] 
 const buildModelMentionsContext = (mentions: ModelMention[]) =>
   [
     '[Model mentions]',
-    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it: spawn a subagent on that model (spawn_subagent tool with model: "<modelId>", or run its provider CLI as a fallback) and integrate its results into your work.',
+    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it with the `spawn_subagent` tool from Orion\'s MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt. The task runs as a visible Orion subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list.',
     ...mentions.map((mention) => `- @${mention.token} → ${mention.label} (${mention.modelId})`),
     '[/Model mentions]',
   ].join('\n');
@@ -1783,9 +1784,12 @@ const AgentFamilySwitcher: React.FC<{
   };
 
   return (
-    <div className="agent-switcher">
-      {renderRow(root, true, 0)}
-      {subagents.map(({ thread, depth }) => renderRow(thread, false, depth + 1))}
+    <div className="agent-switcher-wrap">
+      <div className="agent-switcher-label">Subagents</div>
+      <div className="agent-switcher">
+        {renderRow(root, true, 0)}
+        {subagents.map(({ thread, depth }) => renderRow(thread, false, depth + 1))}
+      </div>
     </div>
   );
 };
@@ -2333,6 +2337,8 @@ const App: React.FC = () => {
     orchestrationSettings,
     setOrchestrationRoleModel,
     setOrchestrationGeneralInstructions,
+    notificationSettings,
+    setNotificationSettings,
     setThreadAgentSession,
     queueMessageToThread,
     removeQueuedThreadMessage,
@@ -3541,6 +3547,33 @@ const App: React.FC = () => {
     [updateThread]
   );
 
+  // Desktop notification when a thread finishes. Suppressed while the user is
+  // already looking at that thread (window focused + thread selected). Sound
+  // rides on the OS notification via `silent`, so there is no separate audio
+  // path to keep in sync.
+  const notifyThreadFinished = useCallback((threadId: string, outcome: 'done' | 'error') => {
+    const state = useOrionStore.getState();
+    const settings = { ...defaultNotificationSettings, ...state.notificationSettings };
+    if (!settings.enabled) return;
+    if (document.hasFocus() && state.selectedThreadId === threadId) return;
+    if (typeof Notification === 'undefined' || Notification.permission === 'denied') return;
+    const thread = state.threads.find((t) => t.id === threadId);
+    const notification = new Notification(
+      outcome === 'error' ? 'Agent stopped with an error' : 'Agent finished',
+      {
+        body: thread?.title?.trim() || 'Agent thread',
+        silent: !settings.sound,
+        tag: `thread-finished-${threadId}`,
+      }
+    );
+    notification.onclick = () => {
+      window.orion?.focusWindow?.().catch(() => {});
+      const store = useOrionStore.getState();
+      store.setActiveTab('agents');
+      store.selectThread(threadId);
+    };
+  }, []);
+
   // Embedded terminals do not emit agent-run events, so mirror their prompt
   // and process lifecycle into the persisted thread/board state explicitly.
   useEffect(() => {
@@ -3556,6 +3589,7 @@ const App: React.FC = () => {
           status: 'done',
           terminalActivityAt: new Date().toISOString(),
         });
+        notifyThreadFinished(event.threadId, 'done');
         if (thread.linkedTask && thread.linkedTask.lastStatus === 'running') {
           pushLinkedTaskStatus(event.threadId, 'finished');
         }
@@ -3589,6 +3623,9 @@ const App: React.FC = () => {
         status: failed ? 'error' : 'done',
         terminalActivityAt: new Date().toISOString(),
       });
+      if (thread.status === 'running') {
+        notifyThreadFinished(event.threadId, failed ? 'error' : 'done');
+      }
       if (thread.linkedTask) {
         pushLinkedTaskStatus(event.threadId, failed ? 'error' : 'finished');
       }
@@ -3597,7 +3634,7 @@ const App: React.FC = () => {
       offActivity?.();
       offExit?.();
     };
-  }, [pushLinkedTaskStatus, updateThread]);
+  }, [notifyThreadFinished, pushLinkedTaskStatus, updateThread]);
 
   const unlinkTaskFromThread = useCallback(
     (threadId: string) => {
@@ -3761,6 +3798,7 @@ const App: React.FC = () => {
         if (!thread || thread.status !== 'running') return;
         const lastRun = [...thread.messages].reverse().find((m) => m.kind === 'agent-run');
         updateThread(event.threadId, { status: 'done' });
+        notifyThreadFinished(event.threadId, 'done');
         pushLinkedTaskStatus(event.threadId, 'finished', lastRun?.content.trim() || undefined);
         if (lastRun && lastRun.status === 'done') {
           updateThreadMessage(event.threadId, lastRun.id, { statusText: 'Finished.' });
@@ -3983,6 +4021,7 @@ const App: React.FC = () => {
           updateThread(tracked.threadId, { status: 'running' });
         } else {
           updateThread(tracked.threadId, { status: 'done' });
+          notifyThreadFinished(tracked.threadId, 'done');
           // Turn finished — surface the work on the board (In Review column)
           // with the response the user sees in this completed agent message.
           const finalResponse = useOrionStore
@@ -4033,6 +4072,7 @@ const App: React.FC = () => {
           changedFiles: event.changedFiles ?? [],
         });
         updateThread(tracked.threadId, { status: 'error' });
+        notifyThreadFinished(tracked.threadId, 'error');
         pushLinkedTaskStatus(tracked.threadId, 'error');
         runOutputMessages.current.delete(event.runId);
         clearActiveRun(event.runId);
@@ -4043,7 +4083,7 @@ const App: React.FC = () => {
       unsubscribe?.();
       flushChunkBuffers();
     };
-  }, [addActivityToThreadMessage, addMessageToThread, appendToThreadMessage, appendToBtwExchange, clearActiveRun, flushChunkBuffers, pushLinkedTaskStatus, setThreadAgentSession, updateBtwExchange, updateThread, updateThreadMessage]);
+  }, [addActivityToThreadMessage, addMessageToThread, appendToThreadMessage, appendToBtwExchange, clearActiveRun, flushChunkBuffers, notifyThreadFinished, pushLinkedTaskStatus, setThreadAgentSession, updateBtwExchange, updateThread, updateThreadMessage]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
@@ -4877,11 +4917,13 @@ const App: React.FC = () => {
       };
       const state = useOrionStore.getState();
       const driverThread = state.threads.find((t) => t.id === request.threadId);
-      const projectId =
-        driverThread?.projectId ??
-        state.projects.find((p) => p.path === request.projectPath)?.id;
-      if (!projectId) {
-        report(false, 'Driver thread/project not found');
+      if (!driverThread) {
+        report(false, 'Driver thread not found');
+        return;
+      }
+      const projectId = driverThread.projectId;
+      if (!state.projects.some((project) => project.id === projectId)) {
+        report(false, 'Driver project not found');
         return;
       }
 
@@ -4937,7 +4979,7 @@ const App: React.FC = () => {
         spawnId: request.spawnId,
         // Deterministic: subagents run with the driver's access mode, never
         // whatever an unrelated project thread last used.
-        accessMode: driverThread?.accessMode,
+        accessMode: request.accessMode ?? driverThread.accessMode,
       });
       if (prevThreadId) {
         state.selectThread(prevThreadId);
@@ -6992,6 +7034,37 @@ const App: React.FC = () => {
                     </div>
                     <label className="provider-toggle" title="Assistant output">
                       <input type="checkbox" />
+                      <span />
+                    </label>
+                  </div>
+
+                  <div className="setting-row">
+                    <div className="setting-label">
+                      <div className="setting-label-title">Thread notifications</div>
+                      <div className="setting-label-desc">Show a desktop notification when an agent thread finishes while you're looking elsewhere.</div>
+                    </div>
+                    <label className="provider-toggle" title="Thread notifications">
+                      <input
+                        type="checkbox"
+                        checked={notificationSettings?.enabled ?? true}
+                        onChange={(e) => setNotificationSettings({ enabled: e.target.checked })}
+                      />
+                      <span />
+                    </label>
+                  </div>
+
+                  <div className="setting-row">
+                    <div className="setting-label">
+                      <div className="setting-label-title">Notification sound</div>
+                      <div className="setting-label-desc">Play the system sound with thread-finished notifications.</div>
+                    </div>
+                    <label className="provider-toggle" title="Notification sound">
+                      <input
+                        type="checkbox"
+                        checked={notificationSettings?.sound ?? true}
+                        disabled={!(notificationSettings?.enabled ?? true)}
+                        onChange={(e) => setNotificationSettings({ sound: e.target.checked })}
+                      />
                       <span />
                     </label>
                   </div>
