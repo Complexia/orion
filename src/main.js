@@ -5121,7 +5121,7 @@ const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
     tools: [
       tool(
         'spawn_subagent',
-        'Spawn an Orion subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation).',
+        'Spawn an Orion subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation).',
         {
           model: z.string().describe('Target model: model id (e.g. "codex:gpt-5.6-sol"), slug, or label'),
           prompt: z
@@ -5144,6 +5144,16 @@ const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
             args
           );
           return { content: [{ type: 'text', text: resultText }] };
+        },
+        {
+          // Claude Code only runs MCP tool calls from one assistant message
+          // concurrently when the tool's annotations declare readOnlyHint
+          // (isConcurrencySafe falls back to false otherwise) — without it,
+          // parallel spawn_subagent calls serialize behind the first child's
+          // entire multi-minute run. The hint is honest enough: the call
+          // mutates nothing in the driver's session, and the spawned child
+          // inherits the driver's access mode rather than escalating it.
+          annotations: { readOnlyHint: true },
         }
       ),
     ],

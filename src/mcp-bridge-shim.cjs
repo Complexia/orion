@@ -22,7 +22,12 @@ const token = argValue('--token') || process.env.ORION_MCP_TOKEN || '';
 const spawnSubagentTool = {
   name: 'spawn_subagent',
   description:
-    'Spawn an Orion subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user requested by @-mention.',
+    'Spawn an Orion subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user requested by @-mention.',
+  // Claude-Code-derived clients (grok) only run MCP tool calls concurrently
+  // when readOnlyHint is set; without it parallel spawns serialize behind the
+  // first child's entire run. The call mutates nothing in the driver's
+  // session, and the child inherits the driver's access mode.
+  annotations: { readOnlyHint: true },
   inputSchema: {
     type: 'object',
     properties: {

@@ -229,6 +229,7 @@ const gitStatusTitles: Record<GitStatusKind, string> = {
 };
 
 const THREADS_VISIBLE_LIMIT = 5;
+const AGENT_SWITCHER_VISIBLE_LIMIT = 5;
 
 const filenameLanguageMap: Record<string, string> = {
   '.babelrc': 'json',
@@ -1715,6 +1716,10 @@ const AgentFamilySwitcher: React.FC<{
   threads: Thread[];
   onSelect: (threadId: string) => void;
 }> = ({ currentThread, threads, onSelect }) => {
+  const [expandedRootId, setExpandedRootId] = useState<string | null>(null);
+  // Whole strip open/closed — independent of the "show N more" list truncation.
+  const [sectionOpen, setSectionOpen] = useState(true);
+
   // Walk up to the family root — subagents can themselves spawn subagents.
   const root = useMemo(() => {
     let node = currentThread;
@@ -1729,12 +1734,28 @@ const AgentFamilySwitcher: React.FC<{
   }, [currentThread, threads]);
 
   const subagents = useMemo(() => {
-    const collect = (parentId: string, depth: number, out: Array<{ thread: Thread; depth: number }>) => {
-      if (depth > 3) return;
-      const children = threads
-        .filter((t) => t.parentThreadId === parentId)
-        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-      for (const child of children) {
+    const childrenByParent = new Map<string, Thread[]>();
+    for (const thread of threads) {
+      if (!thread.parentThreadId) continue;
+      const siblings = childrenByParent.get(thread.parentThreadId);
+      if (siblings) siblings.push(thread);
+      else childrenByParent.set(thread.parentThreadId, [thread]);
+    }
+    for (const children of childrenByParent.values()) {
+      children.sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+    }
+
+    const seen = new Set<string>([root.id]);
+    const collect = (
+      parentId: string,
+      depth: number,
+      out: Array<{ thread: Thread; depth: number }>
+    ) => {
+      for (const child of childrenByParent.get(parentId) ?? []) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
         out.push({ thread: child, depth });
         collect(child.id, depth + 1, out);
       }
@@ -1743,6 +1764,20 @@ const AgentFamilySwitcher: React.FC<{
     collect(root.id, 0, out);
     return out;
   }, [threads, root.id]);
+
+  const isExpanded = expandedRootId === root.id;
+  const visibleSubagents = useMemo(() => {
+    if (isExpanded || subagents.length <= AGENT_SWITCHER_VISIBLE_LIMIT) return subagents;
+
+    const firstSubagents = subagents.slice(0, AGENT_SWITCHER_VISIBLE_LIMIT);
+    const currentSubagent = subagents.find(({ thread }) => thread.id === currentThread.id);
+    if (!currentSubagent || firstSubagents.includes(currentSubagent)) return firstSubagents;
+
+    // Keep the selected row visible even when a restored/deep-linked thread
+    // starts in the collapsed view.
+    return [...firstSubagents.slice(0, AGENT_SWITCHER_VISIBLE_LIMIT - 1), currentSubagent];
+  }, [currentThread.id, isExpanded, subagents]);
+  const canToggleExpanded = subagents.length > AGENT_SWITCHER_VISIBLE_LIMIT;
 
   const anyRunning =
     root.status === 'running' || subagents.some(({ thread }) => thread.status === 'running');
@@ -1785,11 +1820,39 @@ const AgentFamilySwitcher: React.FC<{
 
   return (
     <div className="agent-switcher-wrap">
-      <div className="agent-switcher-label">Subagents</div>
-      <div className="agent-switcher">
-        {renderRow(root, true, 0)}
-        {subagents.map(({ thread, depth }) => renderRow(thread, false, depth + 1))}
-      </div>
+      <button
+        type="button"
+        className="agent-switcher-label"
+        onClick={() => setSectionOpen((open) => !open)}
+        aria-expanded={sectionOpen}
+        title={sectionOpen ? 'Collapse subagents' : 'Expand subagents'}
+      >
+        <ChevronDown
+          size={12}
+          className={sectionOpen ? 'open' : ''}
+          aria-hidden="true"
+        />
+        Subagents
+      </button>
+      {sectionOpen && (
+        <div className={`agent-switcher${isExpanded ? ' expanded' : ''}`}>
+          {renderRow(root, true, 0)}
+          {visibleSubagents.map(({ thread, depth }) => renderRow(thread, false, depth + 1))}
+          {canToggleExpanded && (
+            <button
+              type="button"
+              className="agent-switcher-toggle"
+              onClick={() => setExpandedRootId(isExpanded ? null : root.id)}
+              aria-expanded={isExpanded}
+            >
+              <ChevronRight size={12} className={isExpanded ? 'open' : ''} />
+              {isExpanded
+                ? 'Show less'
+                : `Show ${subagents.length - visibleSubagents.length} more`}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 };
@@ -2417,8 +2480,6 @@ const App: React.FC = () => {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
   // Nested subthread lists (keyed by parent thread id), shared between the
   // Recent agents list and the project lists.
-  const [collapsedSubthreads, setCollapsedSubthreads] = useState<Record<string, boolean>>({});
-  const [subthreadListLimits, setSubthreadListLimits] = useState<Record<string, number>>({});
   const [recentAgentsOpen, setRecentAgentsOpen] = useState(true);
   const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
   const [editorBottomPadding, setEditorBottomPadding] = useState(280);
@@ -2829,32 +2890,17 @@ const App: React.FC = () => {
     );
   }, [projects, threads]);
 
-  // Subagent threads nest under the thread that spawned them. A thread is a
-  // child only while its parent still exists — orphans render as top-level.
-  const childThreadsByParent = useMemo(() => {
-    const threadIds = new Set(threads.map((t) => t.id));
-    const byParent = new Map<string, Thread[]>();
-    for (const thread of threads) {
-      if (!thread.parentThreadId || !threadIds.has(thread.parentThreadId)) continue;
-      const siblings = byParent.get(thread.parentThreadId);
-      if (siblings) siblings.push(thread);
-      else byParent.set(thread.parentThreadId, [thread]);
-    }
-    for (const siblings of byParent.values()) {
-      siblings.sort(
-        (a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
-      );
-    }
-    return byParent;
-  }, [threads]);
-
+  // Subagent threads live in the in-thread subagents bar, not the sidebar.
+  // A thread counts as a child only while its parent still exists — orphans
+  // render as top-level.
   const childThreadIds = useMemo(() => {
+    const threadIds = new Set(threads.map((t) => t.id));
     const ids = new Set<string>();
-    for (const siblings of childThreadsByParent.values()) {
-      for (const thread of siblings) ids.add(thread.id);
+    for (const thread of threads) {
+      if (thread.parentThreadId && threadIds.has(thread.parentThreadId)) ids.add(thread.id);
     }
     return ids;
-  }, [childThreadsByParent]);
+  }, [threads]);
 
   const recentThreads = useMemo(
     () =>
@@ -6111,19 +6157,6 @@ const App: React.FC = () => {
     }
   };
 
-  const toggleSubthreadsCollapsed = (parentId: string) => {
-    const isCollapsed = collapsedSubthreads[parentId] ?? false;
-    // Collapsing resets the list back to the default 5 on next expand.
-    if (!isCollapsed) {
-      setSubthreadListLimits((prev) => {
-        if (!(parentId in prev)) return prev;
-        const { [parentId]: _removed, ...rest } = prev;
-        return rest;
-      });
-    }
-    setCollapsedSubthreads((prev) => ({ ...prev, [parentId]: !isCollapsed }));
-  };
-
   // Tiny CLI mark for Claude Code CLI threads — sits before the title.
   const renderThreadCliBadge = (thread: Thread) =>
     isClaudeCodeCliModelId(thread.modelId) ? (
@@ -6131,165 +6164,6 @@ const App: React.FC = () => {
         <Terminal size={10} strokeWidth={2.4} aria-hidden />
       </span>
     ) : null;
-
-  // Chevron + count badge shown on a sidebar row whose thread has spawned
-  // subthreads. Shared between the Recent agents list and the project lists.
-  const renderSubthreadToggle = (thread: Thread) => {
-    const children = childThreadsByParent.get(thread.id);
-    if (!children || children.length === 0) return null;
-    const isCollapsed = collapsedSubthreads[thread.id] ?? false;
-    return (
-      <>
-        <button
-          type="button"
-          className="thread-children-toggle"
-          title={isCollapsed ? 'Expand subthreads' : 'Collapse subthreads'}
-          aria-expanded={!isCollapsed}
-          onClick={(e) => {
-            e.stopPropagation();
-            toggleSubthreadsCollapsed(thread.id);
-          }}
-        >
-          <ChevronRight
-            size={11}
-            className={`sidebar-section-chevron ${isCollapsed ? '' : 'open'}`}
-          />
-        </button>
-        {isCollapsed && <span className="sidebar-section-count">{children.length}</span>}
-      </>
-    );
-  };
-
-  // Nested subthread rows under a parent sidebar row. Mirrors the top-level
-  // thread-item markup (status dot, rename, ··· menu) and recurses so a
-  // subthread's own children nest another level deeper.
-  const renderThreadChildren = (parent: Thread, keyNamespace: string): React.ReactNode => {
-    const children = childThreadsByParent.get(parent.id);
-    if (!children || children.length === 0 || collapsedSubthreads[parent.id]) return null;
-    const visibleLimit = subthreadListLimits[parent.id] ?? THREADS_VISIBLE_LIMIT;
-    const visibleChildren = children.slice(0, visibleLimit);
-    const hasMoreChildren = children.length > visibleLimit;
-    const isListExpanded =
-      visibleLimit > THREADS_VISIBLE_LIMIT && children.length > THREADS_VISIBLE_LIMIT;
-    return (
-      <div className="thread-children">
-        {visibleChildren.map((thread) => {
-          const rowKey = `${keyNamespace}:${thread.id}`;
-          return (
-            <React.Fragment key={thread.id}>
-              <div
-                className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                onClick={() => {
-                  if (threadRenameKey !== rowKey) selectThread(thread.id);
-                }}
-              >
-                {renderSubthreadToggle(thread)}
-                {threadRenameKey === rowKey ? (
-                  <InlineRenameInput
-                    className="thread-rename-input"
-                    initialValue={thread.title}
-                    onSubmit={(title) => {
-                      updateThread(thread.id, { title });
-                      setThreadRenameKey(null);
-                    }}
-                    onCancel={() => setThreadRenameKey(null)}
-                  />
-                ) : (
-                  <span className="thread-title">
-                    {renderThreadCliBadge(thread)}
-                    <span className="thread-title-text">{thread.title}</span>
-                  </span>
-                )}
-                <span className="thread-time thread-meta">
-                  {thread.status === 'running' ? (
-                    <span className="thread-working-dot" title="Working" />
-                  ) : (
-                    formatShortTime(getThreadActivityTime(thread))
-                  )}
-                </span>
-                <div
-                  className="thread-menu-wrap"
-                  ref={threadItemMenuKey === rowKey ? threadItemMenuRef : undefined}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <button
-                    type="button"
-                    className="thread-options-trigger"
-                    title="Thread options"
-                    aria-label={`Options for ${thread.title}`}
-                    aria-haspopup="menu"
-                    aria-expanded={threadItemMenuKey === rowKey}
-                    onClick={() =>
-                      setThreadItemMenuKey((open) => (open === rowKey ? null : rowKey))
-                    }
-                  >
-                    <Ellipsis size={13} />
-                  </button>
-                  {threadItemMenuKey === rowKey && (
-                    <div className="thread-menu thread-item-menu" role="menu">
-                      <button
-                        type="button"
-                        className="project-menu-item"
-                        role="menuitem"
-                        onClick={() => {
-                          setThreadItemMenuKey(null);
-                          setThreadRenameKey(rowKey);
-                        }}
-                      >
-                        <SquarePen size={13} /> Rename
-                      </button>
-                      <button
-                        type="button"
-                        className="project-menu-item"
-                        role="menuitem"
-                        onClick={() => {
-                          setThreadItemMenuKey(null);
-                          branchThread(thread.id);
-                        }}
-                      >
-                        <GitBranch size={13} /> Branch
-                      </button>
-                      <button
-                        type="button"
-                        className="project-menu-item danger"
-                        role="menuitem"
-                        onClick={() => {
-                          setThreadItemMenuKey(null);
-                          if (confirm('Delete this thread?')) {
-                            void deleteThreadWithRuntime(thread.id);
-                          }
-                        }}
-                      >
-                        <Trash2 size={13} /> Delete
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-              {renderThreadChildren(thread, keyNamespace)}
-            </React.Fragment>
-          );
-        })}
-        {(hasMoreChildren || isListExpanded) && (
-          <button
-            type="button"
-            className="threads-show-more"
-            onClick={() =>
-              setSubthreadListLimits((prev) => {
-                if (hasMoreChildren) {
-                  return { ...prev, [parent.id]: children.length };
-                }
-                const { [parent.id]: _removed, ...rest } = prev;
-                return rest;
-              })
-            }
-          >
-            {hasMoreChildren ? 'Show more' : 'Show less'}
-          </button>
-        )}
-      </div>
-    );
-  };
 
   const renderSidebarFooter = () => (
     <div className="sidebar-footer">
@@ -7739,14 +7613,13 @@ const App: React.FC = () => {
                             ? recentThreads
                             : recentThreads.slice(0, THREADS_VISIBLE_LIMIT)
                           ).map((thread) => (
-                            <React.Fragment key={thread.id}>
                             <div
+                              key={thread.id}
                               className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
                               onClick={() => {
                                 if (threadRenameKey !== `recent:${thread.id}`) selectThread(thread.id);
                               }}
                             >
-                              {renderSubthreadToggle(thread)}
                               {threadRenameKey === `recent:${thread.id}` ? (
                                 <InlineRenameInput
                                   className="thread-rename-input"
@@ -7845,8 +7718,6 @@ const App: React.FC = () => {
                                 )}
                               </div>
                             </div>
-                            {renderThreadChildren(thread, 'recent-sub')}
-                            </React.Fragment>
                           ))
                         )}
                       </div>
@@ -8022,14 +7893,13 @@ const App: React.FC = () => {
                             </button>
                           ) : (
                             visibleThreads.map((thread) => (
-                              <React.Fragment key={thread.id}>
                               <div
+                                key={thread.id}
                                 className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
                                 onClick={() => {
                                   if (threadRenameKey !== `project:${thread.id}`) selectThread(thread.id);
                                 }}
                               >
-                                {renderSubthreadToggle(thread)}
                                 {threadRenameKey === `project:${thread.id}` ? (
                                   <InlineRenameInput
                                     className="thread-rename-input"
@@ -8114,8 +7984,6 @@ const App: React.FC = () => {
                                   )}
                                 </div>
                               </div>
-                              {renderThreadChildren(thread, 'project-sub')}
-                              </React.Fragment>
                             ))
                           )}
                         </div>

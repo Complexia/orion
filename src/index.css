@@ -2377,48 +2377,6 @@ body {
   color: var(--text-secondary);
 }
 
-/* Nested subthreads (spawned subagents) under a parent thread row. */
-.thread-children {
-  margin-left: 14px;
-  padding-left: 8px;
-  border-left: 1px solid var(--border-subtle);
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.thread-children .thread-item {
-  min-height: 28px;
-  font-size: 12.5px;
-}
-
-.thread-children-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--text-muted);
-  border-radius: 4px;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: color var(--transition-fast), background var(--transition-fast);
-}
-
-.thread-children-toggle:hover {
-  color: var(--text-primary);
-  background: rgb(255 255 255 / 8%);
-}
-
-/* Child-count badge sits next to the chevron, not pushed to the row's end. */
-.thread-item .sidebar-section-count {
-  margin-left: 0;
-  flex-shrink: 0;
-}
-
 .status-dot {
   width: 7px;
   height: 7px;
@@ -3301,14 +3259,35 @@ body {
 }
 
 .agent-switcher-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   margin: 0 2px 4px;
   padding: 0 2px;
+  border: none;
+  background: transparent;
   font-size: 10.5px;
   font-weight: 500;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--text-muted);
   line-height: 1.2;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.agent-switcher-label:hover {
+  color: var(--text-secondary);
+}
+
+.agent-switcher-label svg {
+  flex-shrink: 0;
+  transition: transform var(--transition-fast);
+  transform: rotate(-90deg);
+}
+
+.agent-switcher-label svg.open {
+  transform: rotate(0deg);
 }
 
 .agent-switcher {
@@ -3320,7 +3299,11 @@ body {
   border-radius: var(--radius-md);
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
-  max-height: 168px;
+  overflow: hidden;
+}
+
+.agent-switcher.expanded {
+  max-height: 320px;
   overflow-y: auto;
 }
 
@@ -3349,6 +3332,34 @@ body {
 .agent-switcher-row.active {
   background: var(--accent-soft);
   color: var(--text-primary);
+}
+
+.agent-switcher-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  align-self: flex-start;
+  margin: 2px 6px 1px;
+  padding: 3px 5px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.agent-switcher-toggle:hover {
+  background: rgb(255 255 255 / 4%);
+  color: var(--text-primary);
+}
+
+.agent-switcher-toggle svg {
+  transition: transform var(--transition-fast);
+}
+
+.agent-switcher-toggle svg.open {
+  transform: rotate(90deg);
 }
 
 .agent-switcher-row.main .agent-switcher-name {
