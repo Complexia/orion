@@ -96,6 +96,13 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('orchestration:spawnRequest', listener);
     return () => ipcRenderer.removeListener('orchestration:spawnRequest', listener);
   },
+  reportSubagentStopResult: (payload) =>
+    ipcRenderer.invoke('orchestration:subagentStopResult', payload),
+  onSubagentStopRequest: (callback) => {
+    const listener = (_event, request) => callback(request);
+    ipcRenderer.on('orchestration:stopRequest', listener);
+    return () => ipcRenderer.removeListener('orchestration:stopRequest', listener);
+  },
 
   // Computer use permissions (macOS TCC)
   getComputerUsePermissions: () => ipcRenderer.invoke('computerUse:getPermissions'),

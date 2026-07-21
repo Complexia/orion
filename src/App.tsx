@@ -5048,6 +5048,205 @@ const App: React.FC = () => {
     };
   }, []);
 
+  // A run id can outlive its runOutputMessages entry: a Claude turn that
+  // finishes while background agents are still live is untracked by the done
+  // handler but keeps its run id in activeRunsByThread as a cancellable
+  // handle. Stopping such a run finds no tracked message to mark, so without
+  // this the thread's last agent-run bubble would say "Waiting on N
+  // background agents…" forever after the runtime is disposed.
+  const markUntrackedRunStopped = useCallback(
+    (threadId: string, statusText: string) => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
+      const lastRun = thread
+        ? [...thread.messages].reverse().find((message) => message.kind === 'agent-run')
+        : undefined;
+      if (!lastRun) return;
+      updateThreadMessage(threadId, lastRun.id, {
+        statusText,
+        completedAt: new Date().toISOString(),
+      });
+    },
+    [updateThreadMessage]
+  );
+
+  // Orchestrator stop_subagent requests from main: match the target among the
+  // driver's running child threads (by model and/or title, or the single
+  // running one when neither is given), halt its runtime like the user's stop
+  // button would, resolve its pending spawn_subagent call, and report what
+  // was stopped back to the driver's blocked stop_subagent call.
+  const stopSubagentsForRequest = useCallback(
+    async (request: {
+      stopId: string;
+      threadId: string;
+      model?: string;
+      title?: string;
+      all?: boolean;
+    }) => {
+      const report = (ok: boolean, result: string) => {
+        void window.orion?.reportSubagentStopResult?.({ stopId: request.stopId, ok, result });
+      };
+      const state = useOrionStore.getState();
+      // activeRunsByThreadRef only catches up in an effect after the next
+      // render, so a stop arriving right after a spawn would miss the child's
+      // just-registered run there and falsely report success without ever
+      // terminating the provider process. runOutputMessages is maintained
+      // synchronously through registration, runId swaps, and completion, so
+      // its entries win over the ref.
+      const runsByThread = new Map<string, string>(
+        Object.entries(activeRunsByThreadRef.current)
+      );
+      for (const [runId, tracked] of runOutputMessages.current) {
+        runsByThread.set(tracked.threadId, runId);
+      }
+      const models = agentModelsRef.current;
+      const describe = (thread: Thread) => {
+        const model = models.find((m) => m.id === thread.modelId);
+        return `"${thread.title}" (${model?.slug ?? thread.modelId})`;
+      };
+
+      // Native subagent mirrors have no independent runtime to stop; the provider CLI owns that subagent.
+      const running = state.threads.filter(
+        (thread) =>
+          thread.parentThreadId === request.threadId &&
+          !thread.subagent &&
+          (thread.status === 'running' || runsByThread.has(thread.id))
+      );
+      if (running.length === 0) {
+        report(false, 'This agent has no running subagents.');
+        return;
+      }
+
+      const wantedModel = request.model?.trim().toLowerCase();
+      const wantedTitle = request.title?.trim().toLowerCase();
+      let targets = running;
+      if (wantedModel) {
+        targets = targets.filter((thread) => {
+          const model = models.find((m) => m.id === thread.modelId);
+          return [thread.modelId, model?.slug, model?.label]
+            .filter((value): value is string => Boolean(value))
+            .some((value) => value.toLowerCase().includes(wantedModel));
+        });
+      }
+      if (wantedTitle) {
+        targets = targets.filter((thread) => thread.title.toLowerCase().includes(wantedTitle));
+      }
+      if (targets.length === 0) {
+        report(
+          false,
+          `No running subagent matches. Running subagents: ${running.map(describe).join(', ')}.`
+        );
+        return;
+      }
+      // A broad selector (or none) must not take down parallel siblings by
+      // accident: multiple matches only proceed when the caller explicitly
+      // asked for every match.
+      if (targets.length > 1 && !request.all) {
+        report(
+          false,
+          `Matched ${targets.length} running subagents — pass a more specific model/title, or all=true to stop every match: ${targets.map(describe).join(', ')}.`
+        );
+        return;
+      }
+
+      // Each target's own spawned children have independent runtimes, so walk
+      // the full subtree — same as the user's stop button.
+      const threadIds = new Set(targets.map((thread) => thread.id));
+      let foundChild = true;
+      while (foundChild) {
+        foundChild = false;
+        for (const candidate of state.threads) {
+          if (
+            candidate.parentThreadId &&
+            threadIds.has(candidate.parentThreadId) &&
+            !threadIds.has(candidate.id)
+          ) {
+            threadIds.add(candidate.id);
+            foundChild = true;
+          }
+        }
+      }
+
+      const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
+      const runsToStop: Array<{ threadId: string; runId: string }> = [];
+      for (const candidate of stoppedThreads) {
+        const runId = runsByThread.get(candidate.id);
+        if (runId) runsToStop.push({ threadId: candidate.id, runId });
+      }
+      const pendingSpawnIds: string[] = [];
+
+      // Untrack and mark every run in the subtree stopped BEFORE the IPC
+      // calls: interrupted result events can otherwise race in and mark them
+      // Finished.
+      for (const { threadId: runThreadId, runId } of runsToStop) {
+        const tracked = runOutputMessages.current.get(runId);
+        runOutputMessages.current.delete(runId);
+        clearActiveRun(runId);
+        if (tracked) {
+          appendToThreadMessage(tracked.threadId, tracked.messageId, '\n\nStopped by the orchestrator.');
+          updateThreadMessage(tracked.threadId, tracked.messageId, {
+            status: 'stopped',
+            completedAt: new Date().toISOString(),
+            statusText: 'Stopped by the orchestrator.',
+          });
+        } else {
+          markUntrackedRunStopped(runThreadId, 'Stopped by the orchestrator.');
+        }
+      }
+      for (const stoppedThread of stoppedThreads) {
+        if (stoppedThread.status === 'running') updateThread(stoppedThread.id, { status: 'idle' });
+        if ((stoppedThread.queuedMessages?.length ?? 0) > 0) {
+          updateThread(stoppedThread.id, { queuedMessages: [] });
+        }
+        if (stoppedThread.spawnId) {
+          updateThread(stoppedThread.id, { spawnId: undefined });
+          pendingSpawnIds.push(stoppedThread.spawnId);
+        }
+      }
+      flushChunkBuffers();
+
+      // Each Orion child is its own provider runtime, so terminate every
+      // active run and dispose every stopped thread before reporting back.
+      await Promise.all(
+        runsToStop.map(({ runId }) =>
+          window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })
+        )
+      );
+      await Promise.all(stoppedThreads.map((candidate) => disposeThreadRuntime(candidate.id)));
+      for (const spawnId of pendingSpawnIds) {
+        void window.orion?.reportSubagentResult?.({
+          spawnId,
+          ok: false,
+          result: 'Subagent run was stopped by the orchestrator.',
+        });
+      }
+      report(true, `Stopped subagent ${targets.map(describe).join(', ')}.`);
+    },
+    [
+      clearActiveRun,
+      appendToThreadMessage,
+      updateThreadMessage,
+      updateThread,
+      flushChunkBuffers,
+      disposeThreadRuntime,
+      markUntrackedRunStopped,
+    ]
+  );
+
+  const stopSubagentsForRequestRef = useRef(stopSubagentsForRequest);
+  useEffect(() => {
+    stopSubagentsForRequestRef.current = stopSubagentsForRequest;
+  }, [stopSubagentsForRequest]);
+
+  useEffect(() => {
+    if (!window.orion?.onSubagentStopRequest) return undefined;
+    const unsubscribe = window.orion.onSubagentStopRequest((request) => {
+      void stopSubagentsForRequestRef.current?.(request);
+    });
+    return () => {
+      unsubscribe?.();
+    };
+  }, []);
+
   // A spawned subthread reaching 'done' or 'error' (turn finished, failed to
   // start, or app-restart recovery) resolves the driver's blocked
   // spawn_subagent call with the child's final output. The persisted spawnId
@@ -5999,14 +6198,16 @@ const App: React.FC = () => {
     }
 
     const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
-    const runsToStop = stoppedThreads
-      .map((candidate) => activeRunsByThread[candidate.id])
-      .filter((runId): runId is string => Boolean(runId));
+    const runsToStop: Array<{ threadId: string; runId: string }> = [];
+    for (const candidate of stoppedThreads) {
+      const runId = activeRunsByThread[candidate.id];
+      if (runId) runsToStop.push({ threadId: candidate.id, runId });
+    }
     const pendingSpawnIds: string[] = [];
 
     // Untrack and mark every run in the subtree stopped BEFORE the IPC calls:
     // interrupted result events can otherwise race in and mark them Finished.
-    for (const runId of runsToStop) {
+    for (const { threadId: runThreadId, runId } of runsToStop) {
       const tracked = runOutputMessages.current.get(runId);
       runOutputMessages.current.delete(runId);
       clearActiveRun(runId);
@@ -6017,6 +6218,8 @@ const App: React.FC = () => {
           completedAt: new Date().toISOString(),
           statusText: 'Stopped by user.',
         });
+      } else {
+        markUntrackedRunStopped(runThreadId, 'Stopped by user.');
       }
     }
     for (const stoppedThread of stoppedThreads) {
@@ -6037,7 +6240,7 @@ const App: React.FC = () => {
     // Each Orion child is its own provider runtime, so terminate every active
     // run and dispose every descendant before unblocking the parent's tool.
     await Promise.all(
-      runsToStop.map((runId) =>
+      runsToStop.map(({ runId }) =>
         window.orion.stopAgentTurn(runId, { terminateBackground: true })
       )
     );

@@ -1305,7 +1305,7 @@ const buildOrchestrationBlock = (orchestration) => {
     '',
     '## Delegating to subagents',
     '',
-    '1. **Preferred — the `spawn_subagent` tool.** Current Orion drivers expose a `spawn_subagent` tool from Orion\'s MCP server (the fully-qualified name varies by provider and may be `mcp__orion__spawn_subagent`, `orion.spawn_subagent`, or a plugin-prefixed equivalent). Call it with `{ model, prompt, title?, role? }`. `model` accepts a model id like `codex:gpt-5.6-sol`, a slug, or a label. The task runs on that model as a visible subthread in Orion, and the call blocks until the subagent finishes, returning its final report. Delegate computer-use tasks to the computerUse model, code exploration to the exploring model, code changes to the implementation model, and image/video generation to the imageVideoGen model — unless the user explicitly says otherwise (e.g. via @model mentions).',
+    '1. **Preferred — the `spawn_subagent` tool.** Current Orion drivers expose a `spawn_subagent` tool from Orion\'s MCP server (the fully-qualified name varies by provider and may be `mcp__orion__spawn_subagent`, `orion.spawn_subagent`, or a plugin-prefixed equivalent). Call it with `{ model, prompt, title?, role? }`. `model` accepts a model id like `codex:gpt-5.6-sol`, a slug, or a label. The task runs on that model as a visible subthread in Orion, and the call blocks until the subagent finishes, returning its final report. Delegate computer-use tasks to the computerUse model, code exploration to the exploring model, code changes to the implementation model, and image/video generation to the imageVideoGen model — unless the user explicitly says otherwise (e.g. via @model mentions). The companion `stop_subagent` tool (`{ model?, title?, all? }`, same server) kills a running subagent you spawned: use it whenever the user asks to cancel a delegation, or when you abandon a stalled subagent and hand its task to another — never leave the replaced subagent running. The selector must match exactly one running subagent (pass `all: true` to stop every match). Stopping a subagent resolves its pending spawn_subagent call with a stopped notice.',
     '2. **Fallback — run the provider CLI from the shell.** Only if the spawn_subagent tool is genuinely absent from your tool list, run the target provider CLI directly as a blocking one-shot command and read its output. The current `[Orion orchestration]` prompt supplies mandatory access flags; preserve them exactly and never grant a subagent more access than the driver:',
     '   - codex: `codex exec --json --cd <cwd> --skip-git-repo-check --color never --model <slug> <access flags> "<task>"`',
     '   - claude: `claude --print --model <slug> <access flags> "<task>"`',
@@ -3140,8 +3140,9 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
     const kind = toolCall.kind ?? meta?.kind ?? known?.kind;
     const readOnly =
       meta?.read_only === true || kind === 'read' || kind === 'search' || kind === 'fetch';
-    // Orion's own spawn_subagent MCP tool is safe in every mode: the spawned
-    // subthread runs with the driver thread's access mode, never more. Grok
+    // Orion's own spawn_subagent/stop_subagent MCP tools are safe in every
+    // mode: the spawned subthread runs with the driver thread's access mode,
+    // never more, and stopping one only halts Orion's own child run. Grok
     // routes MCP calls through use_tool, whose rawInput.tool_name is the
     // qualified MCP identity. Titles and wrapper metadata are presentation
     // fields and must not grant an exemption.
@@ -3149,7 +3150,8 @@ const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMo
       typeof toolCall.rawInput?.tool_name === 'string'
         ? toolCall.rawInput.tool_name
         : known?.rawInputToolName;
-    const isOrionSpawn = grokMcpToolName === 'orion__spawn_subagent';
+    const isOrionSpawn =
+      grokMcpToolName === 'orion__spawn_subagent' || grokMcpToolName === 'orion__stop_subagent';
     const allow =
       isOrionSpawn || accessMode === 'full-access'
         ? true
@@ -3916,11 +3918,14 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
       known?.kind ??
       KIMI_TOOL_KINDS[typeof toolCall.title === 'string' ? toolCall.title : ''];
     const readOnly = kind === 'read' || kind === 'search' || kind === 'fetch' || kind === 'think';
-    // Orion's own spawn_subagent MCP tool is safe in every mode: the spawned
-    // subthread runs with the driver thread's access mode, never more. Kimi's
+    // Orion's own spawn_subagent/stop_subagent MCP tools are safe in every
+    // mode: the spawned subthread runs with the driver thread's access mode,
+    // never more, and stopping one only halts Orion's own child run. Kimi's
     // initial ACP tool_call records the qualified MCP identity in toolName;
     // permission titles are presentation fields and must not grant access.
-    const isOrionSpawn = known?.toolName === 'mcp__orion__spawn_subagent';
+    const isOrionSpawn =
+      known?.toolName === 'mcp__orion__spawn_subagent' ||
+      known?.toolName === 'mcp__orion__stop_subagent';
     let allow;
     let denialDetail = "mode doesn't permit this tool.";
     if (isOrionSpawn) {
@@ -4779,6 +4784,10 @@ const retainClaudeBackgroundRun = (session, runId) => {
 // subthread and report back via the orchestration:subagentResult invoke.
 const pendingSubagentSpawns = new Map(); // spawnId -> { resolve }
 
+// Orchestration: stop_subagent calls waiting on the renderer to halt the
+// subthread and report back via the orchestration:subagentStopResult invoke.
+const pendingSubagentStops = new Map(); // stopId -> { resolve }
+
 // Ask the renderer to run a subagent subthread and resolve with its final
 // report. Failures resolve as text (never reject) so every caller — the
 // Claude SDK tool and the socket bridge below — hands the model a readable
@@ -4808,6 +4817,31 @@ const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessMode }, 
     } catch {
       pendingSubagentSpawns.delete(spawnId);
       resolve('Unable to spawn subagent: the Orion window is no longer available.');
+    }
+  });
+
+// Ask the renderer to stop a running subagent subthread of the calling
+// driver thread. Resolves as text for the same reason as spawns above.
+const requestSubagentStop = ({ getSender, threadId }, args) =>
+  new Promise((resolve) => {
+    const sender = getSender();
+    if (!sender || sender.isDestroyed()) {
+      resolve('Unable to stop subagent: the Orion window is no longer available.');
+      return;
+    }
+    const stopId = crypto.randomUUID();
+    pendingSubagentStops.set(stopId, { resolve });
+    try {
+      sender.send('orchestration:stopRequest', {
+        stopId,
+        threadId,
+        ...(args.model ? { model: String(args.model) } : {}),
+        ...(args.title ? { title: String(args.title) } : {}),
+        ...(args.all === true ? { all: true } : {}),
+      });
+    } catch {
+      pendingSubagentStops.delete(stopId);
+      resolve('Unable to stop subagent: the Orion window is no longer available.');
     }
   });
 
@@ -4859,21 +4893,36 @@ const handleMcpBridgeConnection = (socket) => {
         reply(false, 'This Orion agent session token is missing, invalid, or expired.');
         continue;
       }
-      if (message.tool !== 'spawn_subagent') {
-        reply(false, `Unknown tool: ${message.tool}`);
-        continue;
-      }
       const args = message.args && typeof message.args === 'object' ? message.args : {};
-      if (
-        typeof args.model !== 'string' ||
-        !args.model.trim() ||
-        typeof args.prompt !== 'string' ||
-        !args.prompt.trim()
-      ) {
-        reply(false, 'spawn_subagent requires string `model` and `prompt` arguments.');
+      if (message.tool === 'spawn_subagent') {
+        if (
+          typeof args.model !== 'string' ||
+          !args.model.trim() ||
+          typeof args.prompt !== 'string' ||
+          !args.prompt.trim()
+        ) {
+          reply(false, 'spawn_subagent requires string `model` and `prompt` arguments.');
+          continue;
+        }
+        void requestSubagentSpawn(session, args).then((text) => reply(true, text));
         continue;
       }
-      void requestSubagentSpawn(session, args).then((text) => reply(true, text));
+      if (message.tool === 'stop_subagent') {
+        if (
+          (args.model !== undefined && typeof args.model !== 'string') ||
+          (args.title !== undefined && typeof args.title !== 'string') ||
+          (args.all !== undefined && typeof args.all !== 'boolean')
+        ) {
+          reply(
+            false,
+            'stop_subagent takes optional string `model`/`title` and boolean `all` arguments.'
+          );
+          continue;
+        }
+        void requestSubagentStop(session, args).then((text) => reply(true, text));
+        continue;
+      }
+      reply(false, `Unknown tool: ${message.tool}`);
     }
   });
   socket.on('error', () => {});
@@ -5153,6 +5202,47 @@ const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
           // entire multi-minute run. The hint is honest enough: the call
           // mutates nothing in the driver's session, and the spawned child
           // inherits the driver's access mode rather than escalating it.
+          annotations: { readOnlyHint: true },
+        }
+      ),
+      tool(
+        'stop_subagent',
+        'Stop a running Orion subagent that was started with spawn_subagent. Identify it by model and/or title; the selector must match exactly one running subagent unless `all` is true, which stops every match. With no arguments, stops the single running subagent. Use when the user asks to cancel a delegation or when abandoning a stalled subagent in favor of another. Returns a description of what was stopped, or the list of running subagents when the selector was ambiguous or matched nothing.',
+        {
+          model: z
+            .string()
+            .optional()
+            .describe('Model of the subagent to stop: model id, slug, or label (fuzzy match)'),
+          title: z
+            .string()
+            .optional()
+            .describe('Title (or substring) of the subagent subthread to stop'),
+          all: z
+            .boolean()
+            .optional()
+            .describe(
+              'Stop every running subagent the selector matches (or every running subagent when no selector is given) instead of requiring a unique match'
+            ),
+        },
+        async (args) => {
+          const resultText = await requestSubagentStop(
+            {
+              getSender: () => session.sender,
+              threadId: session.threadId,
+            },
+            args
+          );
+          return { content: [{ type: 'text', text: resultText }] };
+        },
+        {
+          // Same concurrency rationale as spawn_subagent: without the hint
+          // this call would serialize behind a blocking spawn issued in the
+          // same assistant message — exactly the "replace a stalled subagent"
+          // flow it exists for. The hint is deliberate despite the stop being
+          // an effectful operation: no Orion driver keys approval off it
+          // (every driver special-cases the orion tools by qualified name),
+          // so in practice it only governs call scheduling, and it mutates
+          // nothing in the driver's own session.
           annotations: { readOnlyHint: true },
         }
       ),
@@ -5954,11 +6044,18 @@ const createClaudeSdkSession = ({
     const [sdk, claudeBinary] = await Promise.all([loadClaudeSdk(), resolveClaudeBinary()]);
     const orionMcpServer = createOrionMcpServer(sdk, session);
     // Headless runs can't show permission prompts, so outside bypass mode the
-    // spawn tool must be pre-approved alongside any user-configured allowlist.
+    // spawn/stop tools must be pre-approved alongside any user-configured
+    // allowlist.
     const allowedTools =
       sdkOptions.accessMode === 'full-access'
         ? sdkOptions.allowedTools
-        : [...new Set([...sdkOptions.allowedTools, 'mcp__orion__spawn_subagent'])];
+        : [
+            ...new Set([
+              ...sdkOptions.allowedTools,
+              'mcp__orion__spawn_subagent',
+              'mcp__orion__stop_subagent',
+            ]),
+          ];
     session.query = sdk.query({
       prompt: inputQueue.stream(),
       options: {
@@ -8649,6 +8746,20 @@ ipcMain.handle('orchestration:subagentResult', (_event, payload) => {
     payload.ok
       ? payload.result || '(subagent returned no output)'
       : `Subagent failed: ${payload.result || 'unknown error'}`
+  );
+  return { ok: true };
+});
+
+// The renderer reports a subagent stop's outcome here, unblocking the
+// stop_subagent MCP tool call that requested it.
+ipcMain.handle('orchestration:subagentStopResult', (_event, payload) => {
+  const pending = pendingSubagentStops.get(payload?.stopId);
+  if (!pending) return { ok: false };
+  pendingSubagentStops.delete(payload.stopId);
+  pending.resolve(
+    payload.ok
+      ? payload.result || 'Subagent stopped.'
+      : `Could not stop subagent: ${payload.result || 'unknown error'}`
   );
   return { ok: true };
 });

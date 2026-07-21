@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Orion MCP bridge shim: a dependency-free stdio MCP server that provider
 // CLIs (codex, cursor, grok, kimi) spawn as the `orion` MCP server. It
-// exposes the spawn_subagent tool and forwards calls to the Orion desktop
-// app over a local socket; the app runs the subagent as a visible subthread
-// and returns its final report. Claude runs use the in-process SDK server in
-// main.js instead — this file is copied to userData and never bundled.
+// exposes the spawn_subagent/stop_subagent tools and forwards calls to the
+// Orion desktop app over a local socket; the app runs the subagent as a
+// visible subthread and returns its final report. Claude runs use the
+// in-process SDK server in main.js instead — this file is copied to userData
+// and never bundled.
 //
 // Identity travels out-of-band through --socket/--token argv in the per-run
 // MCP configuration. Environment fallbacks are retained for compatibility.
@@ -52,6 +53,38 @@ const spawnSubagentTool = {
   },
 };
 
+const stopSubagentTool = {
+  name: 'stop_subagent',
+  description:
+    'Stop a running Orion subagent that was started with spawn_subagent. Identify it by model and/or title; the selector must match exactly one running subagent unless `all` is true, which stops every match. With no arguments, stops the single running subagent. Use when the user asks to cancel a delegation or when abandoning a stalled subagent in favor of another. Returns a description of what was stopped, or the list of running subagents when the selector was ambiguous or matched nothing.',
+  // Same concurrency rationale as spawn_subagent: without the hint this call
+  // would serialize behind a blocking spawn issued in the same message —
+  // exactly the "replace a stalled subagent" flow it exists for. Deliberate
+  // despite the stop being effectful: no Orion driver keys approval off this
+  // hint (each special-cases the orion tools by qualified name), so it only
+  // governs call scheduling.
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      model: {
+        type: 'string',
+        description: 'Model of the subagent to stop: model id, slug, or label (fuzzy match)',
+      },
+      title: {
+        type: 'string',
+        description: 'Title (or substring) of the subagent subthread to stop',
+      },
+      all: {
+        type: 'boolean',
+        description:
+          'Stop every running subagent the selector matches (or every running subagent when no selector is given) instead of requiring a unique match',
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
 const write = (message) => {
   try {
     process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -62,7 +95,7 @@ const respondError = (id, code, message) => write({ jsonrpc: '2.0', id, error: {
 
 // One socket connection per call; a spawned subagent can run for a long time,
 // so there is deliberately no client-side timeout.
-const callOrion = (args) =>
+const callOrion = (tool, args) =>
   new Promise((resolve) => {
     if (!socketPath) {
       resolve({ ok: false, text: 'The Orion bridge socket path is not configured.' });
@@ -80,9 +113,7 @@ const callOrion = (args) =>
       } catch {}
     };
     socket.on('connect', () => {
-      socket.write(
-        `${JSON.stringify({ id: 1, token, tool: 'spawn_subagent', args })}\n`
-      );
+      socket.write(`${JSON.stringify({ id: 1, token, tool, args })}\n`);
     });
     socket.on('data', (chunk) => {
       buffer += chunk.toString();
@@ -119,17 +150,17 @@ const handleMessage = async (message) => {
   }
   if (typeof method === 'string' && method.startsWith('notifications/')) return;
   if (method === 'tools/list') {
-    respond(message.id, { tools: [spawnSubagentTool] });
+    respond(message.id, { tools: [spawnSubagentTool, stopSubagentTool] });
     return;
   }
   if (method === 'tools/call') {
     const name = message.params?.name;
-    if (name !== 'spawn_subagent') {
+    if (name !== 'spawn_subagent' && name !== 'stop_subagent') {
       respondError(message.id, -32602, `Unknown tool: ${name}`);
       return;
     }
     const rawArgs = message.params?.arguments;
-    const result = await callOrion(rawArgs && typeof rawArgs === 'object' ? rawArgs : {});
+    const result = await callOrion(name, rawArgs && typeof rawArgs === 'object' ? rawArgs : {});
     respond(message.id, { content: [{ type: 'text', text: result.text }], isError: !result.ok });
     return;
   }

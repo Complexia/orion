@@ -28,6 +28,18 @@ export type SubagentSpawnRequest = {
   role?: string;
 };
 
+// A running orchestrator agent asked main to stop one of its spawned
+// subagents; the renderer matches the target among the driver's running
+// children (by model and/or title, or the single running one when neither is
+// given) and reports back via reportSubagentStopResult.
+export type SubagentStopRequest = {
+  stopId: string;
+  threadId: string;      // driver thread id
+  model?: string;        // model id, slug, or label — renderer matches fuzzily
+  title?: string;        // title substring, case-insensitive
+  all?: boolean;         // stop every match instead of requiring a unique one
+};
+
 declare global {
 type OrionCloudSyncStatus = 'synced' | 'ahead' | 'behind' | 'diverged' | 'unknown';
 
@@ -572,6 +584,8 @@ type OrionComputerUsePermissions = {
       }) => Promise<{ ok: boolean; goal?: import('./store').ThreadGoal | null; error?: string }>;
       reportSubagentResult(payload: { spawnId: string; ok: boolean; result: string }): Promise<void>;
       onSubagentSpawnRequest(callback: (request: SubagentSpawnRequest) => void): () => void;
+      reportSubagentStopResult(payload: { stopId: string; ok: boolean; result: string }): Promise<void>;
+      onSubagentStopRequest(callback: (request: SubagentStopRequest) => void): () => void;
       onFileChange?: (cb: (data: any) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;
