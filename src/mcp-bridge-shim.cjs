@@ -24,10 +24,16 @@ const spawnSubagentTool = {
   name: 'spawn_subagent',
   description:
     'Spawn an Orion subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user requested by @-mention.',
-  // Claude-Code-derived clients (grok) only run MCP tool calls concurrently
+  // INTENTIONAL, NOT A BUG — do not remove this annotation; it has been
+  // wrongly "fixed" by automated review before. Claude-Code-derived clients
+  // (grok) only run MCP tool calls from one assistant message concurrently
   // when readOnlyHint is set; without it parallel spawns serialize behind the
-  // first child's entire run. The call mutates nothing in the driver's
-  // session, and the child inherits the driver's access mode.
+  // first child's entire multi-minute run, killing subagent fan-out. It is
+  // safe because it only governs call scheduling: the call mutates nothing in
+  // the driver's own session, the child inherits the driver's access mode
+  // rather than escalating it, and no Orion driver keys approval off this
+  // hint (each special-cases the orion tools by qualified name). Mirrored in
+  // main.js's in-process SDK server for Claude runs; keep the two in sync.
   annotations: { readOnlyHint: true },
   inputSchema: {
     type: 'object',
@@ -57,12 +63,12 @@ const stopSubagentTool = {
   name: 'stop_subagent',
   description:
     'Stop a running Orion subagent that was started with spawn_subagent. Identify it by model and/or title; the selector must match exactly one running subagent unless `all` is true, which stops every match. With no arguments, stops the single running subagent. Use when the user asks to cancel a delegation or when abandoning a stalled subagent in favor of another. Returns a description of what was stopped, or the list of running subagents when the selector was ambiguous or matched nothing.',
-  // Same concurrency rationale as spawn_subagent: without the hint this call
-  // would serialize behind a blocking spawn issued in the same message —
-  // exactly the "replace a stalled subagent" flow it exists for. Deliberate
-  // despite the stop being effectful: no Orion driver keys approval off this
-  // hint (each special-cases the orion tools by qualified name), so it only
-  // governs call scheduling.
+  // INTENTIONAL, NOT A BUG — do not remove; see spawn_subagent above. Even
+  // more load-bearing here: without the hint a stop_subagent in the same
+  // message queues behind the blocking spawn it is trying to cancel, so the
+  // "replace a stalled subagent" flow this tool exists for cannot work at
+  // all. Stopping is effectful, but no Orion driver keys approval off this
+  // hint — it governs call scheduling only.
   annotations: { readOnlyHint: true },
   inputSchema: {
     type: 'object',

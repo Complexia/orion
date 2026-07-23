@@ -2168,11 +2168,31 @@ const FileTreeNode: React.FC<{
   const iconMeta = getFileIconMeta(item.name, item.isDirectory);
   const gitStatusTitle = item.gitStatus ? gitStatusTitles[item.gitStatus] : null;
 
+  // All child listings commit through here so only the newest read may set
+  // children — an automatic refresh can overlap an expand, a focus refresh,
+  // or a post-create re-list, and the older response resolving last would
+  // resurrect deleted entries or stale badges (mirrors loadRoot's guard).
+  const childrenSeqRef = useRef(0);
+  const childrenReadPendingRef = useRef(false);
+  const reloadChildren = useCallback(async () => {
+    const seq = ++childrenSeqRef.current;
+    childrenReadPendingRef.current = true;
+    try {
+      const kids = await loadChildren(item.path);
+      if (childrenSeqRef.current === seq) setChildren(kids);
+    } finally {
+      if (childrenSeqRef.current === seq) childrenReadPendingRef.current = false;
+    }
+  }, [loadChildren, item.path]);
+
   // Re-fetch already-loaded children when the tree is refreshed after a
-  // create/rename/delete elsewhere, without collapsing expanded folders.
+  // create/rename/delete elsewhere, without collapsing expanded folders. A
+  // pending first read counts too: children is still null while an expand's
+  // read is in flight, and skipping would let that pre-refresh listing land
+  // unsuperseded.
   useEffect(() => {
-    if (refreshToken > 0 && children !== null) {
-      loadChildren(item.path).then(setChildren);
+    if (refreshToken > 0 && (children !== null || childrenReadPendingRef.current)) {
+      reloadChildren();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshToken]);
@@ -2182,8 +2202,7 @@ const FileTreeNode: React.FC<{
     if (item.isDirectory) {
       if (!expanded && !children) {
         setLoading(true);
-        const kids = await loadChildren(item.path);
-        setChildren(kids);
+        await reloadChildren();
         setLoading(false);
       }
       setExpanded(!expanded);
@@ -2212,8 +2231,7 @@ const FileTreeNode: React.FC<{
       if (!expanded) {
         if (!children) {
           setLoading(true);
-          const kids = await loadChildren(item.path);
-          setChildren(kids);
+          await reloadChildren();
           setLoading(false);
         }
         setExpanded(true);
@@ -2249,8 +2267,7 @@ const FileTreeNode: React.FC<{
       toast.error(`Could not create ${kind === 'file' ? 'file' : 'folder'}`);
       return;
     }
-    const kids = await loadChildren(item.path);
-    setChildren(kids);
+    await reloadChildren();
     if (kind === 'file') onFileClick(newPath);
   };
 
@@ -2414,6 +2431,10 @@ const App: React.FC = () => {
   const [treeRoot, setTreeRoot] = useState<string | null>(null);
   const [treeItems, setTreeItems] = useState<FileTreeItem[]>([]);
   const [treeRefreshToken, setTreeRefreshToken] = useState(0);
+  // Bumped when a turn completes without the thread leaving 'running' (a
+  // Claude turn still waiting on background agents) — invisible to the
+  // runningAgentCount-based refresh below, but its files are on disk.
+  const [treeTurnRefreshTick, setTreeTurnRefreshTick] = useState(0);
   const [chatInput, setChatInput] = useState('');
   const [chatAttachments, setChatAttachments] = useState<ImageAttachment[]>([]);
   const [draggingImages, setDraggingImages] = useState(false);
@@ -2510,6 +2531,27 @@ const App: React.FC = () => {
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const threadItemMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
+  // Startup IPC resolves long before a normal turn ends. Retain its result for
+  // a short grace window so a steer whose stop lands just after startup failed
+  // can distinguish that failure from a run that completed naturally.
+  const runStartupResults = useRef(
+    new Map<string, Promise<{ ok: boolean; runId?: string; error?: string }>>()
+  );
+  const trackRunStartup = useCallback(
+    (runId: string, startup: Promise<{ ok: boolean; runId?: string; error?: string }>) => {
+      runStartupResults.current.set(runId, startup);
+      const forgetLater = () => {
+        window.setTimeout(() => {
+          if (runStartupResults.current.get(runId) === startup) {
+            runStartupResults.current.delete(runId);
+          }
+        }, 10_000);
+      };
+      void startup.then(forgetLater, forgetLater);
+      return startup;
+    },
+    []
+  );
   // `/btw` side-question runs, routed to a thread's btwExchanges instead of
   // its transcript. Kept separate from runOutputMessages so aside runs never
   // touch thread status, queued-message dispatch, or the active-run map.
@@ -3984,6 +4026,29 @@ const App: React.FC = () => {
 
       const tracked = runOutputMessages.current.get(event.runId);
       if (!tracked) {
+        // A steer interrupt can lose the race with the run settling on its
+        // own: the message was untracked before this terminal event arrived.
+        // Keep late chunks as well as the terminal outcome. A failed CLI run
+        // emits its trailing stderr immediately before `error`; after steer
+        // untracks the message, dropping that chunk would lose both the real
+        // diagnostic and the text used to recognize authentication failures.
+        if (steeringRunsRef.current.has(event.runId)) {
+          const raced = steerLostRaceOutcomes.current.get(event.runId) ?? { chunks: '' };
+          if (event.type === 'chunk' && event.chunk) {
+            raced.chunks += event.chunk;
+            steerLostRaceOutcomes.current.set(event.runId, raced);
+          } else if (event.type === 'done' || event.type === 'error') {
+            steerLostRaceOutcomes.current.set(event.runId, {
+              ...raced,
+              type: event.type,
+              error: event.error,
+              providerId: event.providerId,
+              changedFiles: event.changedFiles,
+              stats: event.stats,
+              pendingBackgroundTasks: event.pendingBackgroundTasks,
+            });
+          }
+        }
         // A persistent claude session can start a turn on its own when a
         // background subagent finishes (task notification re-invokes the
         // model). Grow the transcript with a fresh agent message for it.
@@ -4065,6 +4130,10 @@ const App: React.FC = () => {
         });
         if (waiting) {
           updateThread(tracked.threadId, { status: 'running' });
+          // The thread stays 'running', so the count-based tree refresh
+          // can't see this turn's completion — tick it explicitly so the
+          // files the foreground turn wrote surface in the Code tree.
+          setTreeTurnRefreshTick((t) => t + 1);
         } else {
           updateThread(tracked.threadId, { status: 'done' });
           notifyThreadFinished(tracked.threadId, 'done');
@@ -4168,15 +4237,25 @@ const App: React.FC = () => {
     }
   }, [workspacePath, projects, setWorkspacePath]);
 
-  // Keep treeRoot in sync
+  // Keep treeRoot in sync. The ref mirrors it synchronously so in-flight
+  // directory reads can tell they raced a workspace switch.
+  const treeRootRef = useRef<string | null>(null);
   useEffect(() => {
+    treeRootRef.current = workspacePath;
     setTreeRoot(workspacePath);
   }, [workspacePath]);
 
-  // Load tree when root changes
+  // Load tree when root changes. Only the newest read may set treeItems: the
+  // root check discards reads that raced a workspace switch, and the sequence
+  // check discards an older same-root read resolving after a newer one (the
+  // backend snapshots entries before a potentially slow git status, so the
+  // older listing can finish last and resurrect deleted files).
+  const loadRootSeqRef = useRef(0);
   const loadRoot = useCallback(async (root: string) => {
     if (!root || !window.orion) return;
+    const seq = ++loadRootSeqRef.current;
     const items = await window.orion.readDirectory(root);
+    if (treeRootRef.current !== root || loadRootSeqRef.current !== seq) return;
     setTreeItems(items);
   }, []);
 
@@ -4225,6 +4304,46 @@ const App: React.FC = () => {
     if (treeRoot) loadRoot(treeRoot);
     setTreeRefreshToken((v) => v + 1);
   }, [treeRoot, loadRoot]);
+
+  // There is no filesystem watcher on the workspace, so files created outside
+  // the explorer (typically by agents) only appear on a re-list. Re-list when
+  // the Code tab gains focus; while it stays hidden the tree is unmounted and
+  // the focus refresh covers anything that changed in the meantime.
+  const prevActiveTabRef = useRef(activeTab);
+  useEffect(() => {
+    const gainedFocus = activeTab === 'code' && prevActiveTabRef.current !== 'code';
+    prevActiveTabRef.current = activeTab;
+    if (gainedFocus) refreshTree();
+  }, [activeTab, refreshTree]);
+
+  // Re-list when an agent turn completes while the Code tab is visible.
+  // Debounced so a batch of subagents finishing together re-lists once. The
+  // timer lives in a ref because the effect re-runs when a queued follow-up
+  // starts the next turn (runningAgentCount goes back up) — a cleanup-owned
+  // timer would be cancelled right there and the explorer would stay stale
+  // for that whole turn.
+  const prevRunningAgentCountRef = useRef(runningAgentCount);
+  const prevTreeTurnRefreshTickRef = useRef(treeTurnRefreshTick);
+  const treeRefreshTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    const turnCompleted =
+      runningAgentCount < prevRunningAgentCountRef.current ||
+      treeTurnRefreshTick !== prevTreeTurnRefreshTickRef.current;
+    prevRunningAgentCountRef.current = runningAgentCount;
+    prevTreeTurnRefreshTickRef.current = treeTurnRefreshTick;
+    if (!turnCompleted || activeTab !== 'code') return;
+    if (treeRefreshTimerRef.current !== null) window.clearTimeout(treeRefreshTimerRef.current);
+    treeRefreshTimerRef.current = window.setTimeout(() => {
+      treeRefreshTimerRef.current = null;
+      refreshTree();
+    }, 300);
+  }, [runningAgentCount, treeTurnRefreshTick, activeTab, refreshTree]);
+  useEffect(
+    () => () => {
+      if (treeRefreshTimerRef.current !== null) window.clearTimeout(treeRefreshTimerRef.current);
+    },
+    []
+  );
 
   const isPathWithin = (candidate: string, ancestor: string) =>
     candidate === ancestor ||
@@ -4869,8 +4988,9 @@ const App: React.FC = () => {
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
 
-      void window.orion
-        .runAgentTurn({
+      const startup = trackRunStartup(
+        runId,
+        window.orion.runAgentTurn({
           runId,
           threadId,
           projectPath: project.path,
@@ -4910,28 +5030,29 @@ const App: React.FC = () => {
           ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
           ...(orchestration ? { orchestration } : {}),
         })
-        .then((result) => {
-          if (result.ok && result.runId) {
-            if (result.runId !== runId) {
-              runOutputMessages.current.delete(runId);
-              runOutputMessages.current.set(result.runId, { threadId, messageId });
-              setActiveRunsByThread((current) =>
-                current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
-              );
-            }
-          } else {
+      );
+      void startup.then((result) => {
+        if (result.ok && result.runId) {
+          if (result.runId !== runId) {
             runOutputMessages.current.delete(runId);
-            clearActiveRun(runId);
-            appendToThreadMessage(threadId, messageId, result.error ?? 'The agent failed to start.');
-            updateThreadMessage(threadId, messageId, {
-              status: 'error',
-              completedAt: new Date().toISOString(),
-              statusText: 'The agent failed to start.',
-              error: result.error,
-            });
-            updateThread(threadId, { status: 'error' });
+            runOutputMessages.current.set(result.runId, { threadId, messageId });
+            setActiveRunsByThread((current) =>
+              current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
+            );
           }
-        });
+        } else {
+          runOutputMessages.current.delete(runId);
+          clearActiveRun(runId);
+          appendToThreadMessage(threadId, messageId, result.error ?? 'The agent failed to start.');
+          updateThreadMessage(threadId, messageId, {
+            status: 'error',
+            completedAt: new Date().toISOString(),
+            statusText: 'The agent failed to start.',
+            error: result.error,
+          });
+          updateThread(threadId, { status: 'error' });
+        }
+      });
 
       return { ok: true };
     },
@@ -4944,6 +5065,7 @@ const App: React.FC = () => {
       updateThreadMessage,
       clearActiveRun,
       pushLinkedTaskStatus,
+      trackRunStartup,
     ]
   );
 
@@ -6116,17 +6238,79 @@ const App: React.FC = () => {
     !!selectedAgentModel &&
     !!selectedThread?.agentSessionIds?.[selectedAgentModel.providerId];
 
+  // Runs with an interrupt in flight. Steering claude can take a few seconds
+  // (interrupt ack + finalize wait, possibly a session teardown), and the run
+  // must stay mapped as active for that whole window — otherwise the composer
+  // reads as idle and a message submitted mid-wait starts a new turn inside
+  // the very session the interrupt may be about to dispose, which would kill
+  // or falsely complete it. Kept active, that submission queues instead.
+  const steeringRunsRef = useRef<Set<string>>(new Set());
+  // Terminal events that arrived for a steered run after it was untracked but
+  // before the stop IPC resolved — the run settled on its own and lost the
+  // race. Consumed by steerWithContent so the real outcome (including a
+  // failure) survives instead of being reported as a clean finish.
+  const steerLostRaceOutcomes = useRef<
+    Map<
+      string,
+      {
+        // Chunks can arrive before the terminal event, so `type` stays
+        // optional until the run's final outcome is stashed.
+        type?: 'done' | 'error';
+        chunks: string;
+        error?: string;
+        providerId?: string;
+        changedFiles?: ChangedFileSummary[];
+        stats?: TurnTokenStats;
+        pendingBackgroundTasks?: string[];
+      }
+    >
+  >(new Map());
+  const canSteerNow = () =>
+    !!selectedThreadId &&
+    !!activeRunId &&
+    steerReady &&
+    !!window.orion?.stopAgentTurn &&
+    !steeringRunsRef.current.has(activeRunId);
+
+  // A failed or superseded steer hands the prompt back to its originating
+  // thread. The user may have switched threads during the multi-second
+  // interrupt wait, and the live composer belongs to whichever thread is
+  // selected now — writing into it would let the per-thread draft effect
+  // persist the restored text under the wrong thread, primed for submission
+  // to an unrelated agent. Only touch the live composer while the originating
+  // thread is still selected; otherwise merge into its stored draft, which
+  // the swap effect loads when the user returns to it.
+  const restoreSteerDraft = (threadId: string, promptText: string, attachments: ImageAttachment[]) => {
+    if (composerDraftKeyRef.current === threadId) {
+      setChatInput((current) => [promptText, current].filter(Boolean).join('\n\n'));
+      setChatAttachments((current) => [...attachments, ...current]);
+      return;
+    }
+    const draft = composerDraftsRef.current.get(threadId);
+    composerDraftsRef.current.set(threadId, {
+      text: [promptText, draft?.text ?? ''].filter(Boolean).join('\n\n'),
+      attachments: [...attachments, ...(draft?.attachments ?? [])],
+    });
+  };
+
   const steerWithContent = async (promptText: string, attachments: ImageAttachment[]) => {
-    if (!selectedThreadId || !activeRunId || !steerReady || !window.orion?.stopAgentTurn) return;
+    if (!canSteerNow() || !selectedThreadId || !activeRunId) return;
     if (!promptText && attachments.length === 0) return;
 
     const runId = activeRunId;
     const threadId = selectedThreadId;
-    // Untrack before killing so the dying process's tail events can't write
-    // into the transcript.
+    steeringRunsRef.current.add(runId);
+    // Untrack the transcript message before killing so the dying process's
+    // tail events can't write into it; the run itself stays in
+    // activeRunsByThread until the interrupt settles (see steeringRunsRef).
     const tracked = runOutputMessages.current.get(runId);
+    const trackedMessage = tracked
+      ? useOrionStore
+          .getState()
+          .threads.find((thread) => thread.id === tracked.threadId)
+          ?.messages.find((message) => message.id === tracked.messageId)
+      : undefined;
     runOutputMessages.current.delete(runId);
-    clearActiveRun(runId);
     flushChunkBuffers();
     if (tracked) {
       updateThreadMessage(tracked.threadId, tracked.messageId, {
@@ -6135,18 +6319,186 @@ const App: React.FC = () => {
         statusText: 'Interrupted — steered to a new instruction.',
       });
     }
-    await window.orion.stopAgentTurn(runId);
-    // Give the CLI a beat to flush its session file before we resume it.
-    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    try {
+      const interrupted = await window.orion.stopAgentTurn(runId);
+      if (!interrupted) {
+        // stopAgentTurn returns false only when main no longer knows the
+        // run — no claude session holds it as an active turn and no child
+        // process maps to it — i.e. the run settled naturally between the
+        // untracking above and the interrupt landing. Its final done/error
+        // event was discarded by the untracked-event guard, so nothing else
+        // will ever clear the active-run mapping or the thread status.
+        // Reattaching here (the old failure path) marked the dead run's
+        // message and thread as running again with no future event to clear
+        // them, wedging the thread permanently. Settle the thread instead
+        // and hand the prompt back — with the run's real outcome, which the
+        // untracked-event guard stashed when it discarded the terminal event.
+        // Main forgets a run at the START of finalize, before it awaits the
+        // changed-file summary and emits the terminal event — so the outcome
+        // may still be in flight when the stop resolved false. Main tracks
+        // that gap (agent:isRunFinalizing): while it reports the run as
+        // finalizing, a terminal event is guaranteed, so keep waiting for the
+        // stash (the steering marker stays set here, so the guard keeps
+        // stashing). Terminal events are sent before the finalizing flag
+        // clears and IPC preserves ordering, so once isRunFinalizing resolves
+        // false the stash is authoritative: still empty means no outcome is
+        // coming (e.g. the run settled via background-settled).
+        let outcome = steerLostRaceOutcomes.current.get(runId);
+        while (!outcome?.type) {
+          const finalizing = await window.orion.isRunFinalizing?.(runId);
+          outcome = steerLostRaceOutcomes.current.get(runId);
+          if (outcome?.type || !finalizing) break;
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          outcome = steerLostRaceOutcomes.current.get(runId);
+        }
+        steerLostRaceOutcomes.current.delete(runId);
+        let startupError: string | undefined;
+        let startupFailureAlreadyHandled = false;
+        try {
+          const startupResult = await runStartupResults.current.get(runId);
+          if (startupResult && !startupResult.ok) {
+            startupError = startupResult.error ?? 'The agent failed to start.';
+            // startTurnForThread's startup continuation has already written
+            // this error into the transcript; the steer handoff only needs to
+            // preserve its status, not append the same diagnostic twice.
+            startupFailureAlreadyHandled = true;
+          }
+        } catch (error) {
+          startupError = error instanceof Error ? error.message : 'The agent failed to start.';
+        }
+        const failed = outcome?.type === 'error' || Boolean(startupError);
+        const failureError = outcome?.error ?? startupError;
+        // A racing done event can carry background agents main still awaits;
+        // mirror the normal done handler — waiting caption, thread kept in
+        // the working state, and the run handle retained so Stop keeps
+        // working while those agents may modify the workspace.
+        const waitingOn = (!failed && outcome?.pendingBackgroundTasks) || [];
+        const waiting = waitingOn.length > 0;
+        if (tracked) {
+          if (outcome?.chunks) {
+            appendToThreadMessage(tracked.threadId, tracked.messageId, outcome.chunks);
+          }
+          if (failed && failureError && !startupFailureAlreadyHandled) {
+            appendToThreadMessage(tracked.threadId, tracked.messageId, `\n\n${failureError}`);
+          }
+          const errorThread = useOrionStore
+            .getState()
+            .threads.find((thread) => thread.id === tracked.threadId);
+          const looksLoggedOut =
+            failed &&
+            (isProviderAuthErrorText(failureError) || isProviderAuthErrorText(outcome?.chunks));
+          const rawAuthProviderId = looksLoggedOut
+            ? outcome?.providerId ?? errorThread?.modelId.split(':')[0]
+            : undefined;
+          const authProviderId =
+            rawAuthProviderId === 'orion' ? undefined : rawAuthProviderId;
+          updateThreadMessage(tracked.threadId, tracked.messageId, {
+            status: failed ? 'error' : 'done',
+            completedAt: new Date().toISOString(),
+            statusText: failed
+              ? authProviderId
+                ? 'The agent is logged out.'
+                : 'Failed before the steer could interrupt it.'
+              : waiting
+                ? `Waiting on ${waitingOn.length} background ${waitingOn.length === 1 ? 'agent' : 'agents'}…`
+                : 'Finished before the steer could interrupt it.',
+            ...(failed && failureError ? { error: failureError } : {}),
+            ...(authProviderId ? { authProviderId } : {}),
+            ...(outcome?.changedFiles ? { changedFiles: outcome.changedFiles } : {}),
+            ...(outcome?.stats ? { stats: outcome.stats } : {}),
+          });
+        }
+        if (activeRunsByThreadRef.current[threadId] === runId) {
+          updateThread(threadId, {
+            status: failed ? 'error' : waiting ? 'running' : 'done',
+          });
+          if (waiting) {
+            // Mirror the normal done handler: the thread remains running, so
+            // runningAgentCount cannot reveal that the foreground turn wrote
+            // files which the visible Code tree now needs to re-list.
+            setTreeTurnRefreshTick((t) => t + 1);
+          }
+          // The normal done/error handlers were bypassed (the event was
+          // stashed, not handled) — mirror their side effects, or a linked
+          // Board task stays 'running' forever and no finish notification
+          // fires. Skipped while waiting on background agents, matching the
+          // normal done handler.
+          if (!waiting) {
+            notifyThreadFinished(threadId, failed ? 'error' : 'done');
+            const finalResponse =
+              !failed && tracked
+                ? useOrionStore
+                    .getState()
+                    .threads.find((thread) => thread.id === tracked.threadId)
+                    ?.messages.find((message) => message.id === tracked.messageId)
+                    ?.content.trim()
+                : undefined;
+            pushLinkedTaskStatus(
+              threadId,
+              failed ? 'error' : 'finished',
+              finalResponse || undefined
+            );
+          }
+        }
+        if (!waiting) clearActiveRun(runId);
+        restoreSteerDraft(threadId, promptText, attachments);
+        toast.error(
+          failed
+            ? 'The agent failed before it could be steered — your message is back in the composer.'
+            : 'The agent finished before it could be steered — your message is back in the composer.'
+        );
+        return;
+      }
+      // Give the CLI a beat to flush its session file before we resume it.
+      await new Promise((resolve) => window.setTimeout(resolve, 300));
+    } catch (error) {
+      // A genuine interrupt failure (IPC error): the run may still be live in
+      // main. The prompt may already have been removed from the composer or
+      // its queued bubble. Put it back, and reattach the transcript only if
+      // this is still the active run (Stop/background settlement may have won
+      // the race while the IPC was pending).
+      restoreSteerDraft(threadId, promptText, attachments);
+      if (activeRunsByThreadRef.current[threadId] === runId && tracked) {
+        runOutputMessages.current.set(runId, tracked);
+        updateThreadMessage(tracked.threadId, tracked.messageId, {
+          status: trackedMessage?.status ?? 'running',
+          completedAt: trackedMessage?.completedAt,
+          statusText: trackedMessage?.statusText ?? "I'm working on this now.",
+        });
+        updateThread(tracked.threadId, { status: 'running' });
+      }
+      toast.error(error instanceof Error ? error.message : 'Could not steer the active agent.');
+      return;
+    } finally {
+      steeringRunsRef.current.delete(runId);
+      // A successfully interrupted run's own terminal event may have been
+      // stashed during the flush wait above; it was not lost to a race.
+      steerLostRaceOutcomes.current.delete(runId);
+    }
+    // Someone else settled the run mid-wait (Stop, background-settled):
+    // restarting now would contradict that, so hand the prompt back to the
+    // composer instead of silently dropping it.
+    if (activeRunsByThreadRef.current[threadId] !== runId) {
+      restoreSteerDraft(threadId, promptText, attachments);
+      return;
+    }
+    clearActiveRun(runId);
     const result = startTurnForThread(threadId, promptText, attachments);
     if (!result.ok) {
       toast.error(result.error);
       updateThread(threadId, { status: 'error' });
+      restoreSteerDraft(threadId, promptText, attachments);
+    } else {
+      // The interrupted and replacement runs are swapped in one render, so
+      // runningAgentCount never falls. Explicitly surface files written by
+      // the interrupted turn while the Code tree remains visible.
+      setTreeTurnRefreshTick((t) => t + 1);
     }
   };
 
   // Composer ⚡ / ⌘⏎: steer with the current draft.
   const steerActiveAgent = async () => {
+    if (!canSteerNow()) return;
     const promptText = chatInput.trim();
     const attachments = chatAttachments;
     if (!promptText && attachments.length === 0) return;
@@ -6159,7 +6511,7 @@ const App: React.FC = () => {
   // "Steer now" on a queued transcript bubble: promote that message to an
   // immediate interrupt-and-resume instead of waiting for the turn to end.
   const steerQueuedMessage = async (queuedId: string) => {
-    if (!selectedThreadId || !activeRunId || !steerReady) return;
+    if (!canSteerNow() || !selectedThreadId || !activeRunId) return;
     const thread = useOrionStore.getState().threads.find((t) => t.id === selectedThreadId);
     const queued = thread?.queuedMessages?.find((q) => q.id === queuedId);
     if (!queued) return;

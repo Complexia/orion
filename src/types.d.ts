@@ -177,6 +177,11 @@ type OrionComputerUsePermissions = {
     orion: {
       loadStore: () => Promise<string | null>;
       saveStore: (value: string) => Promise<boolean>;
+      /** ok:false = read/parse failure (suppress thread persistence); value null = file genuinely absent. */
+      loadThreads: () => Promise<{ ok: boolean; value?: string | null }>;
+      saveThreads: (value: string) => Promise<boolean>;
+      /** Blocking quit-time flush — see preload. */
+      saveThreadsSync?: (value: string) => boolean;
       clearStore: () => Promise<boolean>;
       openDirectory: () => Promise<string | null>;
       readDirectory: (dirPath: string) => Promise<Array<{
@@ -460,6 +465,8 @@ type OrionComputerUsePermissions = {
         /** terminateBackground: also dispose the thread's persistent claude session (kills background subagents). Steer omits this. */
         options?: { terminateBackground?: boolean }
       ) => Promise<boolean>;
+      /** True while a forgotten run's terminal event is still being prepared (steer lost-race handoff). */
+      isRunFinalizing?: (runId: string) => Promise<boolean>;
       /** Dispose any persistent agent runtime owned by a deleted thread. */
       disposeAgentThread: (threadId: string) => Promise<boolean>;
       /** Claude Code CLI embedded terminal (one PTY per thread, lives in main). */

@@ -421,13 +421,83 @@ if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', flushStoreSave);
 }
 
+// Threads (full transcripts) are excluded from the persisted store above and
+// live in their own file on a slower save cadence — see the saver below the
+// store definition. State shared with it:
+let threadsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let lastPersistedThreads: Thread[] | null = null;
+// The threads reference at clearStorage time: zustand clears storage without
+// clearing in-memory state, so the savers must not write this exact snapshot
+// back to disk. A later thread change (fresh reference) resumes persistence.
+let clearedThreadsSnapshot: Thread[] | null = null;
+// Set when the threads file exists but could not be read or parsed: the
+// hydrated state then lacks the real transcripts, and any flush would
+// overwrite the (possibly recoverable) file with that lesser snapshot. All
+// thread persistence stays suppressed until an explicit clearStorage.
+let threadsPersistenceBlocked = false;
+
+const cancelQueuedThreadsSave = () => {
+  if (threadsSaveTimer !== null) {
+    clearTimeout(threadsSaveTimer);
+    threadsSaveTimer = null;
+  }
+};
+
+// Graft the separately-persisted threads back into the persisted state so the
+// persist middleware — including its crash-recovery merge — sees one combined
+// snapshot. With no threads file yet (pre-split builds), the store value's own
+// embedded threads are used as-is; the first threads save migrates them out.
+const withThreadsGrafted = async (value: string | null): Promise<string | null> => {
+  const result = await window.orion.loadThreads?.();
+  if (result && !result.ok) {
+    // The file exists but couldn't be read/parsed — hydrating without it is
+    // survivable, but persisting over it is not.
+    threadsPersistenceBlocked = true;
+    return value;
+  }
+  const threadsValue = result?.value;
+  if (!threadsValue) return value;
+  try {
+    const threads = JSON.parse(threadsValue)?.threads;
+    if (!Array.isArray(threads)) {
+      threadsPersistenceBlocked = true;
+      return value;
+    }
+    // A lost/corrupt store file must not take the transcripts with it.
+    let parsed: { state: Record<string, unknown>; version?: number };
+    try {
+      const candidate = value === null ? null : JSON.parse(value);
+      parsed =
+        candidate &&
+        typeof candidate === 'object' &&
+        !Array.isArray(candidate) &&
+        candidate.state &&
+        typeof candidate.state === 'object' &&
+        !Array.isArray(candidate.state)
+          ? candidate
+          : { state: {}, version: 1 };
+    } catch {
+      // The settings envelope is expendable; the separately persisted
+      // transcripts are not. Rebuild a minimal envelope rather than returning
+      // the malformed value and letting hydration flush an empty thread list
+      // over the valid threads file.
+      parsed = { state: {}, version: 1 };
+    }
+    parsed.state = { ...parsed.state, threads };
+    return JSON.stringify(parsed);
+  } catch {
+    threadsPersistenceBlocked = true;
+    return value;
+  }
+};
+
 const orionStorage: StateStorage = {
   getItem: async (name) => {
     if (typeof window === 'undefined' || !window.orion?.loadStore) {
       return memoryStorage.get(name) ?? null;
     }
 
-    const value = await window.orion.loadStore();
+    const value = await withThreadsGrafted(await window.orion.loadStore());
     if (value !== null) {
       memoryStorage.set(name, value);
       return value;
@@ -464,6 +534,17 @@ const orionStorage: StateStorage = {
       clearTimeout(storeSaveTimer);
       storeSaveTimer = null;
     }
+    // A queued or future threads write after the clear would resurrect the
+    // cleared transcripts (zustand leaves them in memory): drop the queued
+    // timer and mark the current snapshot as not-to-be-rewritten, which the
+    // throttled saver (via lastPersistedThreads) and the unload flush (via
+    // clearedThreadsSnapshot) both honor.
+    cancelQueuedThreadsSave();
+    clearedThreadsSnapshot = useOrionStore.getState().threads;
+    lastPersistedThreads = clearedThreadsSnapshot;
+    // An explicit clear discards whatever unreadable file blocked
+    // persistence — new activity may persist fresh snapshots again.
+    threadsPersistenceBlocked = false;
 
     if (typeof window === 'undefined' || !window.orion?.clearStore) {
       return;
@@ -989,10 +1070,14 @@ export const useOrionStore = create<OrionState>()(
       name: 'orion-storage',
       storage: createJSONStorage(() => orionStorage),
       version: 1,
+      // `threads` is deliberately absent: the persist middleware stringifies
+      // this partialized state on EVERY store update, and threads hold every
+      // transcript (multi-MB after a while) — including them made each
+      // streaming chunk an O(entire-history) serialize. They are persisted by
+      // the throttled saver below instead, and grafted back in on hydration.
       partialize: (state) => ({
         activeTab: state.activeTab,
         projects: state.projects,
-        threads: state.threads,
         selectedProjectId: state.selectedProjectId,
         selectedThreadId: state.selectedThreadId,
         workspacePath: state.workspacePath,
@@ -1014,6 +1099,159 @@ export const useOrionStore = create<OrionState>()(
           ...state.notificationSettings,
         },
       }),
+      merge: (persisted, current) => {
+        const merged = { ...current, ...(persisted as Partial<OrionState>) };
+        // Agent runs can't survive an app restart — the CLI processes die with
+        // the app — so any thread or message rehydrated as 'running' is a
+        // leftover from the previous session. Left alone it pins the run
+        // status bar forever, because the run-event handler only flips
+        // messages tracked by runs started in this session.
+        const restartedAt = new Date().toISOString();
+        // A Claude turn can finish while its background agents keep working:
+        // the message persists as 'done' captioned "Waiting on N background
+        // agents…" (the done handler in App.tsx) with the thread 'running'.
+        // Those agents died with the app, so the wait can never settle —
+        // rewrite the caption alongside the status flip. Only while the
+        // thread is still 'running', though: every resolution path (a
+        // background-settled event or the synthetic follow-up turn finishing)
+        // flips the thread off 'running' but leaves the old caption behind as
+        // history, and history must not be rebranded as a restart casualty.
+        const waitingOnBackground = /^Waiting on \d+ background agents?…$/;
+        merged.threads = merged.threads.map((thread) => {
+          const waitUnresolved = thread.status === 'running';
+          const stale =
+            waitUnresolved || thread.messages.some((message) => message.status === 'running');
+          if (!stale) return thread;
+          // Only a currently live wait may be rebranded. Every resolution
+          // path (a background-settled event or a synthetic follow-up turn)
+          // appends a newer agent-run message after the waiting one, while a
+          // resolved wait can keep its historical "Waiting on …" caption. So
+          // the wait is live only when the thread's newest agent-run message
+          // is the one carrying the caption; a captioned message behind a
+          // newer turn — including the running foreground or synthetic turn
+          // that made this thread 'running' — is history from a wait that
+          // already resolved and must not be relabeled as a restart casualty.
+          const lastAgentRun = waitUnresolved
+            ? [...thread.messages].reverse().find((message) => message.kind === 'agent-run')
+            : undefined;
+          const liveWaitId =
+            lastAgentRun &&
+            lastAgentRun.status !== 'running' &&
+            lastAgentRun.statusText != null &&
+            waitingOnBackground.test(lastAgentRun.statusText)
+              ? lastAgentRun.id
+              : undefined;
+          return {
+            ...thread,
+            status: waitUnresolved ? 'idle' : thread.status,
+            messages: thread.messages.map((message) => {
+              if (message.status === 'running') {
+                return {
+                  ...message,
+                  status: 'stopped' as const,
+                  completedAt: message.completedAt ?? restartedAt,
+                  statusText: 'Interrupted by app restart.',
+                };
+              }
+              if (message.id === liveWaitId) {
+                return {
+                  ...message,
+                  statusText: 'Background agents interrupted by app restart.',
+                };
+              }
+              return message;
+            }),
+          };
+        });
+        return merged;
+      },
     }
   )
 );
+
+// The threads saver: serializes transcripts to their own file at most once
+// per THREADS_SAVE_MS (a streaming run mutates threads many times a second),
+// with a flush on unload. Reference equality is enough to detect changes —
+// every store update replaces the threads array.
+const THREADS_SAVE_MS = 5000;
+
+const scheduleThreadsSave = () => {
+  if (threadsSaveTimer !== null) return;
+  threadsSaveTimer = setTimeout(() => {
+    threadsSaveTimer = null;
+    flushThreadsSave();
+  }, THREADS_SAVE_MS);
+};
+
+const flushThreadsSave = () => {
+  cancelQueuedThreadsSave();
+  if (typeof window === 'undefined' || !window.orion?.saveThreads) return;
+  if (threadsPersistenceBlocked) return;
+  // Before hydration the store still holds the initial threads: [] — saving
+  // now would replace the on-disk transcripts with an empty snapshot, which
+  // outranks the legacy embedded threads on the next launch. (Safe on the
+  // post-hydration flush: zustand flips hasHydrated before its
+  // finish-hydration listeners run.)
+  if (!useOrionStore.persist.hasHydrated()) return;
+  const threads = useOrionStore.getState().threads;
+  if (threads === lastPersistedThreads) return;
+  // Claim the marker optimistically so overlapping flushes don't double-save,
+  // but surrender it if the write fails: a snapshot only counts as persisted
+  // on a successful acknowledgement, otherwise nothing would ever retry and
+  // the unload flush would skip it by reference equality — during the split
+  // migration that could orphan the only copy of the transcripts.
+  lastPersistedThreads = threads;
+  const failed = () => {
+    console.warn('Failed to persist orion-threads; retrying');
+    // A newer snapshot may have claimed the marker meanwhile — its own
+    // save owns the retry then.
+    if (lastPersistedThreads === threads) {
+      lastPersistedThreads = null;
+      scheduleThreadsSave();
+    }
+  };
+  void window.orion
+    .saveThreads(JSON.stringify({ version: 1, threads }))
+    .then((saved) => {
+      if (!saved) failed();
+    })
+    .catch(failed);
+};
+
+useOrionStore.subscribe((state) => {
+  if (state.threads === lastPersistedThreads) return;
+  scheduleThreadsSave();
+});
+
+// Materialize the threads file as soon as hydration lands rather than a
+// throttle-window later: the store file stops embedding threads on its first
+// post-hydration save, so until this flush runs the transcripts exist only in
+// memory and a crash would lose them.
+useOrionStore.persist.onFinishHydration(() => flushThreadsSave());
+if (useOrionStore.persist.hasHydrated()) flushThreadsSave();
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    cancelQueuedThreadsSave();
+    // Closing the window mid-hydration must preserve the on-disk snapshot —
+    // the store still holds the initial threads: [] and flushing it would
+    // erase the transcript history. Same when the threads file existed but
+    // failed to load: never overwrite it with the lesser hydrated state.
+    if (threadsPersistenceBlocked || !useOrionStore.persist.hasHydrated()) return;
+    // An async IPC save started here races app teardown — Electron can exit
+    // before the promise settles, dropping up to a throttle-window of
+    // transcript. Block the unload on a synchronous write instead.
+    // Unconditional (no lastPersistedThreads check): an optimistically
+    // claimed in-flight async save may never commit once the process exits.
+    if (window.orion?.saveThreadsSync) {
+      const threads = useOrionStore.getState().threads;
+      // Cleared storage must stay cleared — don't write the lingering
+      // in-memory snapshot back.
+      if (threads === clearedThreadsSnapshot) return;
+      window.orion.saveThreadsSync(JSON.stringify({ version: 1, threads }));
+      lastPersistedThreads = threads;
+    } else {
+      flushThreadsSave();
+    }
+  });
+}

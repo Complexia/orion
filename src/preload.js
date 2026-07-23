@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld('orion', {
   // App persistence
   loadStore: () => ipcRenderer.invoke('storage:load'),
   saveStore: (value) => ipcRenderer.invoke('storage:save', value),
+  loadThreads: () => ipcRenderer.invoke('storage:loadThreads'),
+  saveThreads: (value) => ipcRenderer.invoke('storage:saveThreads', value),
+  // Synchronous on purpose: the quit-time flush must block unload until the
+  // write is on disk (an async invoke would race app teardown).
+  saveThreadsSync: (value) => ipcRenderer.sendSync('storage:saveThreadsSync', value),
   clearStore: () => ipcRenderer.invoke('storage:clear'),
 
   // Dialog
@@ -34,6 +39,7 @@ contextBridge.exposeInMainWorld('orion', {
   listAgentModels: () => ipcRenderer.invoke('agent:listModels'),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
   stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),
+  isRunFinalizing: (runId) => ipcRenderer.invoke('agent:isRunFinalizing', runId),
   // Codex goal ops (pause/clear/status) for threads with no live goal run.
   codexGoalCommand: (input) => ipcRenderer.invoke('agent:codexGoal', input),
   disposeAgentThread: (threadId) => ipcRenderer.invoke('agent:disposeThread', threadId),

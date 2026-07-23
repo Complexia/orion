@@ -10,7 +10,9 @@ import {
   readlinkSync,
   readdirSync,
   realpathSync,
+  renameSync,
   watch as watchFsPath,
+  writeFileSync,
 } from 'node:fs';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -41,18 +43,110 @@ app.setAppUserModelId('com.complexia.orion');
 const execFileAsync = promisify(execFile);
 const hiddenSystemDirectories = new Set(['.git']);
 const storageFileName = 'orion-store.json';
+const threadsFileName = 'orion-threads.json';
 const accountSessionFileName = 'orion-account-session.json';
 const attachmentDirectoryName = 'attachments';
 const attachmentProtocol = 'orion-attachment';
 const appProtocol = 'orion';
 const loginShell = process.env.SHELL || '/bin/zsh';
-const activeAgentRuns = new Map();
+const activeAgentRuns = new Map(); // runId -> { child, threadId }
 // Runs killed on purpose (stop / steer) — their nonzero exit must not trigger
 // the "resume failed, retry fresh" fallback in agent:runTurn.
 const stoppedAgentRuns = new Set();
+// Runs whose agent:runTurn handler is still in async startup (model checks,
+// git snapshots) — registered synchronously at handler entry, before the run
+// is stoppable via activeAgentRuns or a claude session turn. A stop/steer
+// landing in that window marks the entry aborted (and reads as interrupted)
+// so the startup bails instead of launching a run the renderer no longer
+// tracks.
+const startingAgentRuns = new Map(); // runId -> { aborted }
+// ACP/app-server processes (kimi, grok, codex goals) idle forever once their
+// turn resolves, and a SIGTERM alone is not a guarantee: escalate to SIGKILL
+// if the process is still alive shortly after.
+const terminatingAgentChildren = new WeakMap();
+const pendingAgentShutdowns = new Set();
+let quitAfterPendingWork = false;
+let quitBarrierSatisfied = false;
+
+const trackAgentShutdown = (operation) => {
+  let tracked;
+  tracked = Promise.resolve(operation)
+    .catch(() => {})
+    .then(() => pendingAgentShutdowns.delete(tracked));
+  pendingAgentShutdowns.add(tracked);
+  return tracked;
+};
+
+const waitForPendingAgentShutdowns = async () => {
+  while (pendingAgentShutdowns.size > 0) {
+    await Promise.all([...pendingAgentShutdowns]);
+  }
+};
+
+const killAgentChild = (child) => {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  const existing = terminatingAgentChildren.get(child);
+  if (existing) return existing;
+
+  const termination = new Promise((resolve) => {
+    let settled = false;
+    let forceTimer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (forceTimer) clearTimeout(forceTimer);
+      child.removeListener?.('exit', finish);
+      child.removeListener?.('close', finish);
+      resolve();
+    };
+
+    child.once('exit', finish);
+    child.once('close', finish);
+    // The child can exit between the initial check and listener setup.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish();
+      return;
+    }
+
+    forceTimer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish();
+        return;
+      }
+      try {
+        child.kill('SIGKILL');
+      } catch {}
+    }, 2000);
+
+    try {
+      child.kill('SIGTERM');
+    } catch {}
+  });
+  const trackedTermination = trackAgentShutdown(termination);
+  terminatingAgentChildren.set(child, trackedTermination);
+  return trackedTermination;
+};
+// Runs whose terminal event is being prepared: the run has been forgotten
+// (activeAgentRuns / activeTurns) but the emit still awaits git summarization.
+// Lets the renderer's steer race distinguish "outcome in flight" from "no
+// outcome coming" — see agent:isRunFinalizing.
+const finalizingAgentRuns = new Set();
 let pendingDesktopAuth = null;
 let inMemoryAccountSession = null;
 let storageSaveQueue = Promise.resolve();
+let threadsSaveQueue = Promise.resolve();
+// The quit-time synchronous threads flush jumps the async save queue; the
+// sequence pair lets a stale queued write detect it has been superseded so
+// its rename cannot clobber the newer quit-time snapshot. An async rename
+// already submitted to the fs when the sync flush runs can still land after
+// it — the retained sync snapshot lets that writer notice (post-rename seq
+// check) and reinstall the newer data, which matters on macOS where the main
+// process outlives the window and the clobbered file would persist.
+let threadsWriteSeq = 0;
+let threadsCommittedSeq = 0;
+let threadsSyncSnapshot = null; // { seq, value } from the latest sync flush
 let appUpdateState = {
   status: 'idle',
   currentVersion: app.getVersion(),
@@ -390,6 +484,7 @@ const agentModels = [
 ];
 
 const getStorageFilePath = () => path.join(app.getPath('userData'), storageFileName);
+const getThreadsFilePath = () => path.join(app.getPath('userData'), threadsFileName);
 const getAccountSessionFilePath = () => path.join(app.getPath('userData'), accountSessionFileName);
 const getAttachmentDirectoryPath = () => path.join(app.getPath('userData'), attachmentDirectoryName);
 
@@ -4158,9 +4253,7 @@ const kimiPlanModeOneShot = (model, promptText, cwd) =>
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
-      try {
-        child.kill('SIGTERM');
-      } catch {}
+      killAgentChild(child);
       resolve(text);
     };
     // The ACP server idles after the prompt resolves and never exits on its
@@ -5195,13 +5288,32 @@ const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
           return { content: [{ type: 'text', text: resultText }] };
         },
         {
-          // Claude Code only runs MCP tool calls from one assistant message
-          // concurrently when the tool's annotations declare readOnlyHint
-          // (isConcurrencySafe falls back to false otherwise) — without it,
-          // parallel spawn_subagent calls serialize behind the first child's
-          // entire multi-minute run. The hint is honest enough: the call
-          // mutates nothing in the driver's session, and the spawned child
-          // inherits the driver's access mode rather than escalating it.
+          // INTENTIONAL, NOT A BUG — do not remove this annotation. It has
+          // been flagged (and once wrongly "fixed") by automated review as an
+          // unsafe hint on a mutating tool; removing it breaks multi-subagent
+          // orchestration outright.
+          //
+          // Why it exists: Claude Code only runs MCP tool calls from one
+          // assistant message concurrently when the tool's annotations
+          // declare readOnlyHint (isConcurrencySafe falls back to false
+          // otherwise). Since spawn_subagent blocks until its child's entire
+          // multi-minute run completes, removing the hint serializes parallel
+          // spawns behind the first child — killing subagent fan-out — and
+          // queues a same-message stop_subagent behind the very spawn it is
+          // meant to cancel.
+          //
+          // Why it is safe: the hint is honest at the layer it operates on.
+          // The call mutates nothing in the driver's own session, and the
+          // spawned child inherits the driver's access mode rather than
+          // escalating it. No Orion driver keys approval off this hint —
+          // every driver special-cases the orion tools by qualified name —
+          // so in practice it governs call scheduling only, never
+          // permissions. Concurrent children sharing one checkout is a
+          // deliberate, prompt-level tradeoff the orchestrating model
+          // manages, same as any client's native parallel task tools.
+          //
+          // Mirrored in mcp-bridge-shim.cjs for the non-Claude providers;
+          // keep the two in sync.
           annotations: { readOnlyHint: true },
         }
       ),
@@ -5235,14 +5347,15 @@ const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
           return { content: [{ type: 'text', text: resultText }] };
         },
         {
-          // Same concurrency rationale as spawn_subagent: without the hint
-          // this call would serialize behind a blocking spawn issued in the
-          // same assistant message — exactly the "replace a stalled subagent"
-          // flow it exists for. The hint is deliberate despite the stop being
-          // an effectful operation: no Orion driver keys approval off it
-          // (every driver special-cases the orion tools by qualified name),
-          // so in practice it only governs call scheduling, and it mutates
-          // nothing in the driver's own session.
+          // INTENTIONAL, NOT A BUG — do not remove; see the rationale on
+          // spawn_subagent above. This hint matters even more here: without
+          // it, a stop_subagent issued in the same assistant message queues
+          // behind the blocking spawn it is trying to cancel, so the
+          // "replace a stalled subagent" flow this tool exists for cannot
+          // work at all. Yes, stopping is effectful — but no Orion driver
+          // keys approval off this hint (each special-cases the orion tools
+          // by qualified name), so it only governs call scheduling, and the
+          // call mutates nothing in the driver's own session.
           annotations: { readOnlyHint: true },
         }
       ),
@@ -5590,6 +5703,18 @@ const updateClaudeBackgroundSettle = (session) => {
 const finalizeClaudeTurn = async (session, resultMessage) => {
   const turn = session.activeTurns.shift();
   if (!turn) return;
+  // The turn is forgotten but its terminal event still awaits git
+  // summarization below — advertise the gap so a racing steer can wait for
+  // the real outcome (agent:isRunFinalizing).
+  finalizingAgentRuns.add(turn.runId);
+  try {
+    await finalizeClaudeTurnInner(session, resultMessage, turn);
+  } finally {
+    finalizingAgentRuns.delete(turn.runId);
+  }
+};
+
+const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
   finishClaudeTurnReasoning(session, turn);
   let changedFiles = [];
   try {
@@ -5653,6 +5778,7 @@ const claudeSessionSubagentTracker = (session) => {
 };
 
 const handleClaudeSessionMessage = async (session, message) => {
+  session.lastActivityAt = Date.now();
   if (!session.sessionId) {
     const sessionId = extractSessionIdFromJsonEvent('claude', message);
     if (sessionId) {
@@ -6028,10 +6154,14 @@ const createClaudeSdkSession = ({
     stderrTail: '',
     disposed: false,
     ended: false,
+    // Feeds idle eviction: bumped on every user push and every CLI message,
+    // so background-agent chatter counts as activity.
+    lastActivityAt: Date.now(),
   };
 
   session.pushUserMessage = (text) => {
     if (session.firstPrompt === null) session.firstPrompt = text;
+    session.lastActivityAt = Date.now();
     session.resultsOwed += 1;
     inputQueue.push({
       type: 'user',
@@ -6127,6 +6257,12 @@ const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSnapshot }
   if (session) {
     session.sender = sender;
     session.createParams.sender = sender;
+    // Claim the session before the startup awaits below (git snapshot): a
+    // session idling near the eviction threshold must not be disposed out
+    // from under a turn that is about to push into it — the push would land
+    // in a closed input queue and the run would never get a terminal event.
+    // Synchronous with the selection above, so the sweeper can't interleave.
+    session.lastActivityAt = Date.now();
   }
 
   if (existing && !session) {
@@ -6172,6 +6308,24 @@ const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSnapshot }
     initialSnapshot === undefined
       ? await captureGitChangeSnapshot(input.projectPath)
       : initialSnapshot;
+  // A stop/steer raced this startup (session/snapshot awaits above) and
+  // aborted the run before its turn was registered anywhere stoppable —
+  // honor it instead of pushing a turn the renderer already settled.
+  const abortedStart = startingAgentRuns.get(runId);
+  if (abortedStart?.aborted) {
+    // An explicit Stop (terminateBackground) also means the just-started or
+    // reused CLI process must not linger until idle eviction. A steer abort
+    // keeps the session — its follow-up turn reuses it moments later. Stop
+    // disposes the thread's current session even when it owns background
+    // work: terminateBackground explicitly means that work must be aborted.
+    if (
+      abortedStart.terminateBackground &&
+      claudeSdkSessions.get(threadId) === session
+    ) {
+      disposeClaudeSdkSession(threadId);
+    }
+    return { ok: true, runId };
+  }
   const turn = createClaudeTurnState(runId, snapshot);
   session.activeTurns.push(turn);
   updateClaudeBackgroundSettle(session); // a live turn cancels any pending settle
@@ -6238,6 +6392,31 @@ const interruptClaudeSdkRun = async (runId, { terminateBackground = false } = {}
           new Promise((resolve) => setTimeout(resolve, 2000)),
         ]);
       } catch {}
+      // The in-place interrupt only frees the FIFO for the follow-up turn if
+      // the CLI flushes a `result` for the aborted turn (that's what shifts
+      // it off activeTurns). When that result never lands — interrupt
+      // unsupported by the installed CLI, or the ack raced out — the stale
+      // head would swallow every event of the next turn under the dead runId
+      // and the steer hangs on "Waiting for the agent to produce output".
+      // Wait briefly for the finalize; failing that, degrade to the Stop
+      // path's teardown: the follow-up turn resumes the conversation in a
+      // fresh process via the stored session id. Costs any background
+      // subagents, but only on a session that is already wedged.
+      const interrupted = session.activeTurns.find((turn) => turn.runId === runId);
+      if (interrupted) {
+        const deadline = Date.now() + 3000;
+        while (
+          session.activeTurns.includes(interrupted) &&
+          !session.ended &&
+          !session.disposed &&
+          Date.now() < deadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (session.activeTurns.includes(interrupted) && !session.ended && !session.disposed) {
+          disposeClaudeSdkSession(session.threadId);
+        }
+      }
       return true;
     }
   }
@@ -6269,6 +6448,31 @@ const disposeAllClaudeSdkSessions = () => {
   claudeSdkSessions.clear();
   claudeBackgroundRunSessions.clear();
 };
+
+// Each persistent session pins a ~200-450MB CLI process, and threads are
+// rarely deleted — without eviction every thread touched since launch keeps
+// its process forever. Evict sessions idle past the threshold; the next turn
+// cold-starts via --resume with the same conversation. Sessions with a live
+// turn, an owed result, or background agents are never evicted — background
+// work is the reason sessions persist at all.
+const CLAUDE_SESSION_IDLE_EVICT_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const session of claudeSdkSessions.values()) {
+    if (session.ended || session.disposed) continue;
+    if (session.activeTurns.length > 0 || session.resultsOwed > 0) continue;
+    // Only awaited tasks (agent/workflow — the kinds whose completion
+    // re-invokes the model) block eviction. Raw backgroundTasks also holds
+    // non-awaited long-runners like a local_bash dev server, which would pin
+    // the session forever — the exact leak eviction exists to stop.
+    if (session.backgroundRunId || pendingClaudeBackgroundTasks(session).length > 0) continue;
+    if (now - session.lastActivityAt < CLAUDE_SESSION_IDLE_EVICT_MS) continue;
+    // dispose() aborts the SDK query; the pump loop then runs
+    // endClaudeSession, which removes the session from the map and settles
+    // the thread without surfacing an error (disposed sessions end cleanly).
+    session.dispose();
+  }
+}, 60 * 1000);
 
 // grok's stream ends with an explicit {"type":"end","stopReason":...} event,
 // but the process (or a background process it spawned that inherited its
@@ -7033,33 +7237,94 @@ const gitStatusRank = {
   untracked: 6,
 };
 
+const buildGitStatusMaps = (entries, gitRoot) => {
+  const directStatuses = new Map();
+  const aggregateStatuses = new Map();
+
+  for (const entry of entries) {
+    const status = {
+      kind: entry.kind,
+      label: gitStatusLabels[entry.kind],
+    };
+
+    directStatuses.set(entry.fullPath, status);
+
+    let ancestor = path.dirname(entry.fullPath);
+    while (ancestor.startsWith(gitRoot) && ancestor !== gitRoot) {
+      const existing = aggregateStatuses.get(ancestor);
+      if (!existing || gitStatusRank[entry.kind] < gitStatusRank[existing.kind]) {
+        aggregateStatuses.set(ancestor, status);
+      }
+      ancestor = path.dirname(ancestor);
+    }
+  }
+
+  return { directStatuses, aggregateStatuses };
+};
+
+// A tree refresh fans one fs:readDirectory out per expanded folder, and each
+// call needs the same repo-wide status. Without sharing, one agent completion
+// launches dozens of full `git status --untracked-files=all` scans. Both maps
+// depend only on the git root, so concurrent and near-in-time callers share a
+// single scan. A refresh burst lands within one render tick, so the TTL
+// stays short; keeping it under the renderer's 300ms post-turn debounce
+// guarantees the refresh after a completed turn never reuses a scan taken
+// before the agent's final writes, and re-resolves the git root so an agent
+// creating or removing a nested repo is honored on that same refresh (the
+// rev-parse is trivial next to the status scan). The cache is deliberately
+// local to the tree path — change-snapshot and diff logic keep their
+// uncached reads.
+const GIT_TREE_CACHE_TTL_MS = 250;
+const treeGitRootCache = new Map(); // dirPath → { at, promise }
+const treeGitStatusCache = new Map(); // gitRoot → { at, settled, promise }
+
+// Explorer-driven mutations (save, create, delete, rename) reload the tree
+// immediately — inside the TTL — so a surviving pre-mutation scan would pin
+// stale badges until some later refresh. Agent-driven writes don't need this:
+// their refresh is debounced past the TTL.
+const invalidateTreeGitStatusCache = () => {
+  treeGitStatusCache.clear();
+};
+
 const getGitStatusMap = async (dirPath) => {
   try {
-    const gitRoot = await getGitRoot(dirPath);
-    const entries = await readGitStatusEntries(gitRoot);
-
-    const directStatuses = new Map();
-    const aggregateStatuses = new Map();
-
-    for (const entry of entries) {
-      const status = {
-        kind: entry.kind,
-        label: gitStatusLabels[entry.kind],
-      };
-
-      directStatuses.set(entry.fullPath, status);
-
-      let ancestor = path.dirname(entry.fullPath);
-      while (ancestor.startsWith(gitRoot) && ancestor !== gitRoot) {
-        const existing = aggregateStatuses.get(ancestor);
-        if (!existing || gitStatusRank[entry.kind] < gitStatusRank[existing.kind]) {
-          aggregateStatuses.set(ancestor, status);
-        }
-        ancestor = path.dirname(ancestor);
-      }
+    const now = Date.now();
+    let root = treeGitRootCache.get(dirPath);
+    if (!root || now - root.at >= GIT_TREE_CACHE_TTL_MS) {
+      root = { at: now, promise: getGitRoot(dirPath) };
+      root.promise.catch(() => {
+        if (treeGitRootCache.get(dirPath) === root) treeGitRootCache.delete(dirPath);
+      });
+      treeGitRootCache.set(dirPath, root);
     }
+    const gitRoot = await root.promise;
 
-    return { directStatuses, aggregateStatuses };
+    let status = treeGitStatusCache.get(gitRoot);
+    if (!status || now - status.at >= GIT_TREE_CACHE_TTL_MS) {
+      // In a repo whose scan outlives the TTL, an expired-but-pending entry
+      // must not spawn a concurrent duplicate — that recreates the fan-out
+      // this cache exists to prevent. Chain the fresh scan behind it instead:
+      // it starts after the in-flight one finishes (still after this caller
+      // arrived, preserving post-write freshness) and is shared by every
+      // caller that found the old entry expired.
+      const inFlight = status && !status.settled ? status.promise : null;
+      const scan = () =>
+        readGitStatusEntries(gitRoot).then((entries) => buildGitStatusMaps(entries, gitRoot));
+      const entry = { at: now, settled: false, promise: null };
+      entry.promise = inFlight ? inFlight.then(scan, scan) : scan();
+      entry.promise.then(
+        () => {
+          entry.settled = true;
+        },
+        () => {
+          entry.settled = true;
+          if (treeGitStatusCache.get(gitRoot) === entry) treeGitStatusCache.delete(gitRoot);
+        }
+      );
+      treeGitStatusCache.set(gitRoot, entry);
+      status = entry;
+    }
+    return await status.promise;
   } catch {
     return { directStatuses: new Map(), aggregateStatuses: new Map() };
   }
@@ -7197,10 +7462,25 @@ if (!app.isPackaged) {
   const devUserData = `${liveUserData} (dev)`;
   try {
     mkdirSync(devUserData, { recursive: true });
-    const liveStore = path.join(liveUserData, storageFileName);
-    const devStore = path.join(devUserData, storageFileName);
-    if (!existsSync(devStore) && existsSync(liveStore)) {
-      copyFileSync(liveStore, devStore);
+    // Seed only a brand-new dev profile — BOTH files absent. An existing dev
+    // profile owns its history: copying just the installed profile's threads
+    // file into it would graft the installed transcripts over the dev
+    // store's embedded threads on hydration (the pre-split migration path),
+    // and a surviving dev threads file next to a copied installed store
+    // would graft dev transcripts onto unrelated projects/settings. A
+    // partial dev profile recovers through the renderer's own hydration
+    // fallbacks instead.
+    if (
+      !existsSync(path.join(devUserData, storageFileName)) &&
+      !existsSync(path.join(devUserData, threadsFileName))
+    ) {
+      for (const fileName of [storageFileName, threadsFileName]) {
+        const liveFile = path.join(liveUserData, fileName);
+        const devFile = path.join(devUserData, fileName);
+        if (!existsSync(devFile) && existsSync(liveFile)) {
+          copyFileSync(liveFile, devFile);
+        }
+      }
     }
   } catch (error) {
     console.warn('Could not seed dev profile, starting empty:', error);
@@ -7577,7 +7857,15 @@ app.whenReady().then(async () => {
   // dock icon is clicked and there are no other windows open.
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+      // Closing the previous window can still be pausing a live /goal and
+      // patching that state into the separately persisted transcripts. Do not
+      // let a quickly reopened renderer hydrate the older active snapshot and
+      // enqueue a newer save that overwrites the pause.
+      void waitForPendingAgentShutdowns()
+        .then(() => threadsSaveQueue.catch(() => {}))
+        .then(() => {
+          if (BrowserWindow.getAllWindows().length === 0) createWindow();
+        });
     }
   });
 });
@@ -7585,12 +7873,108 @@ app.whenReady().then(async () => {
 // Quit when all windows are closed, except on macOS. There, it's common
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
+// Quit waits for tracked provider termination (including forced escalation)
+// plus any /goal pause requested by a reap, so neither can be cut off by main
+// process exit.
+
+// A shutdown-time goal pause lands after the renderer (and its unload thread
+// flush) is gone: the persisted thread still says goal.status 'active', so a
+// relaunch would show an Active goal with no live run and offer Pause
+// instead of Resume. Patch the persisted transcripts directly; serialized on
+// the threads save queue with a fresh sequence so it cannot fight other
+// writers.
+const patchPersistedGoalPause = (threadIds) => {
+  if (threadIds.length === 0) return;
+  const seq = ++threadsWriteSeq;
+  threadsSaveQueue = threadsSaveQueue
+    .catch(() => {})
+    .then(async () => {
+      const threadsPath = getThreadsFilePath();
+      let parsed;
+      try {
+        parsed = JSON.parse(await fs.readFile(threadsPath, 'utf-8'));
+      } catch {
+        return; // no threads file yet — nothing to patch
+      }
+      if (!Array.isArray(parsed?.threads)) return;
+      let changed = false;
+      for (const thread of parsed.threads) {
+        if (threadIds.includes(thread?.id) && thread?.goal?.status === 'active') {
+          thread.goal.status = 'paused';
+          thread.goal.updatedAt = Date.now();
+          changed = true;
+        }
+      }
+      if (!changed || seq <= threadsCommittedSeq) return;
+      const tempPath = `${threadsPath}.${process.pid}.goal.tmp`;
+      await fs.writeFile(tempPath, JSON.stringify(parsed), 'utf-8');
+      await fs.rename(tempPath, threadsPath);
+      threadsCommittedSeq = Math.max(threadsCommittedSeq, seq);
+    });
+};
+
+const reapActiveAgentRuns = () => {
+  // A run can still be awaiting model/PATH/git setup and therefore have no
+  // child or Claude turn to reap yet. Leave its startup entry in place for
+  // the handler's post-await guard, but make that guard terminal: on macOS
+  // the main process survives the last window and must not launch invisible
+  // work after its renderer has gone away.
+  for (const starting of startingAgentRuns.values()) {
+    starting.aborted = true;
+    starting.terminateBackground = true;
+  }
+  const shutdowns = [];
+  const goalThreadIds = [];
+  for (const [runId, run] of activeAgentRuns) {
+    // Mark the kill as intentional BEFORE it lands: a resumed one-shot run
+    // that dies with no output otherwise satisfies the resume-failure
+    // fallback in its close handler, which would startAttempt(null) a fresh
+    // invisible agent process after the renderer is gone.
+    stoppedAgentRuns.add(runId);
+    const goalDriver = codexGoalRunDrivers.get(runId);
+    if (goalDriver) {
+      codexGoalRunDrivers.delete(runId);
+      goalThreadIds.push(run.threadId);
+      // Mirror agent:stopTurn: ask the app-server to record the pause before
+      // the process goes down — a raw kill leaves codex's goal DB claiming
+      // an active goal that nothing is pursuing. Capped so teardown can't
+      // hang on a wedged app-server.
+      shutdowns.push(
+        Promise.race([
+          (async () => {
+            try {
+              await goalDriver.stopGoalRun();
+            } catch {}
+          })(),
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]).then(() => killAgentChild(run.child))
+      );
+    } else {
+      shutdowns.push(killAgentChild(run.child));
+    }
+  }
+  activeAgentRuns.clear();
+  if (shutdowns.length > 0) {
+    trackAgentShutdown(
+      Promise.all(shutdowns)
+        .then(() => {
+          if (goalThreadIds.length === 0) return undefined;
+          // Reflect goal pauses in the persisted threads too, and hold the
+          // quit barrier open until they are on disk.
+          patchPersistedGoalPause(goalThreadIds);
+          return threadsSaveQueue.catch(() => {});
+        })
+    );
+  }
+};
+
 app.on('window-all-closed', () => {
   // On macOS the main process remains alive after the last window closes.
   // Tear down persistent sessions so their output is not sent to destroyed
   // webContents and background agents cannot keep working invisibly.
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
+  reapActiveAgentRuns();
   if (process.platform !== 'darwin') {
     app.quit();
   }
@@ -7598,9 +7982,27 @@ app.on('window-all-closed', () => {
 
 // Persistent claude sessions outlive individual turns; kill their CLI
 // processes (and any background subagents inside them) when Orion exits.
-app.on('will-quit', () => {
+app.on('will-quit', (event) => {
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
+  reapActiveAgentRuns();
+  if (quitBarrierSatisfied) return;
+
+  // Hold quit open until active children exit (including the SIGKILL
+  // fallback), any /goal pauses are recorded, and the latest transcript
+  // queue has settled. Waiting for the queue after agent shutdown matters:
+  // shutdown can enqueue a goal-pause persistence write of its own.
+  event.preventDefault();
+  if (!quitAfterPendingWork) {
+    quitAfterPendingWork = true;
+    void waitForPendingAgentShutdowns()
+      .then(() => threadsSaveQueue.catch(() => {}))
+      .finally(() => {
+        quitAfterPendingWork = false;
+        quitBarrierSatisfied = true;
+        app.quit();
+      });
+  }
 });
 
 // In this file you can include the rest of your app's specific main process
@@ -7626,7 +8028,10 @@ ipcMain.handle('storage:load', async () => {
 });
 
 ipcMain.handle('storage:save', async (_event, value) => {
-  storageSaveQueue = storageSaveQueue.then(async () => {
+  // Chain on the settled queue (.catch first): a failed write must not leave
+  // the queue permanently rejected, or every later save would skip its write
+  // callback and fail with the stale error even after storage recovers.
+  const save = storageSaveQueue.catch(() => {}).then(async () => {
     const storagePath = getStorageFilePath();
     const tempPath = `${storagePath}.${process.pid}.tmp`;
     const sanitized = sanitizeStoreValue(value) ?? value;
@@ -7634,9 +8039,10 @@ ipcMain.handle('storage:save', async (_event, value) => {
     await fs.writeFile(tempPath, sanitized, 'utf-8');
     await fs.rename(tempPath, storagePath);
   });
+  storageSaveQueue = save;
 
   try {
-    await storageSaveQueue;
+    await save;
     return true;
   } catch (error) {
     console.error('storage:save error', error);
@@ -7644,9 +8050,130 @@ ipcMain.handle('storage:save', async (_event, value) => {
   }
 });
 
-ipcMain.handle('storage:clear', async () => {
+// Threads (whole chat transcripts) dominate the store and are persisted to
+// their own file on a slower cadence than the lightweight settings state —
+// see the renderer's orionStorage for the split.
+// Returns { ok: true, value } with value null for a genuinely absent file.
+// A read failure or an unrepairable file returns { ok: false } instead — the
+// renderer must be able to tell the two apart, because "absent" lets it
+// persist a fresh snapshot while "failed" must suppress persistence (an
+// unconditional post-hydration flush would overwrite the transcripts with
+// the empty hydrated state).
+ipcMain.handle('storage:loadThreads', async () => {
   try {
-    await fs.rm(getStorageFilePath(), { force: true });
+    const threadsPath = getThreadsFilePath();
+    const value = await fs.readFile(threadsPath, 'utf-8');
+    const sanitized = sanitizeStoreValue(value);
+    if (sanitized === null) return { ok: false };
+    if (sanitized !== value) {
+      await fs.writeFile(threadsPath, sanitized, 'utf-8');
+    }
+    return { ok: true, value: sanitized };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, value: null };
+    console.error('storage:loadThreads error', error);
+    return { ok: false };
+  }
+});
+
+ipcMain.handle('storage:saveThreads', async (_event, value) => {
+  // Same settled-queue chaining as storage:save above.
+  const seq = ++threadsWriteSeq;
+  const save = threadsSaveQueue.catch(() => {}).then(async () => {
+    if (seq <= threadsCommittedSeq) return; // superseded by the sync flush
+    const threadsPath = getThreadsFilePath();
+    const tempPath = `${threadsPath}.${process.pid}.tmp`;
+    const sanitized = sanitizeStoreValue(value) ?? value;
+    await fs.mkdir(path.dirname(threadsPath), { recursive: true });
+    await fs.writeFile(tempPath, sanitized, 'utf-8');
+    if (seq <= threadsCommittedSeq) {
+      await fs.rm(tempPath, { force: true });
+      return;
+    }
+    await fs.rename(tempPath, threadsPath);
+    if (seq >= threadsCommittedSeq) {
+      threadsCommittedSeq = seq;
+      return;
+    }
+    // The quit-time sync flush committed a newer snapshot while our rename
+    // was in flight, and our rename may have just clobbered it — reinstall
+    // the newer data (idempotent if our rename actually landed first).
+    const snapshot = threadsSyncSnapshot;
+    if (snapshot && snapshot.seq > seq) {
+      const restorePath = `${threadsPath}.${process.pid}.restore.tmp`;
+      await fs.writeFile(restorePath, snapshot.value, 'utf-8');
+      await fs.rename(restorePath, threadsPath);
+    }
+  });
+  threadsSaveQueue = save;
+
+  try {
+    await save;
+    return true;
+  } catch (error) {
+    console.error('storage:saveThreads error', error);
+    return false;
+  }
+});
+
+// Quit-time flush: an async save started from beforeunload would race app
+// teardown (Electron can exit before the promise settles). The renderer
+// blocks in sendSync until this returns, so the write is on disk before the
+// window can be destroyed.
+ipcMain.on('storage:saveThreadsSync', (event, value) => {
+  try {
+    const seq = ++threadsWriteSeq;
+    const threadsPath = getThreadsFilePath();
+    // Distinct temp name: an in-flight async save may hold the .tmp path.
+    const tempPath = `${threadsPath}.${process.pid}.sync.tmp`;
+    const sanitized = sanitizeStoreValue(value) ?? value;
+    mkdirSync(path.dirname(threadsPath), { recursive: true });
+    writeFileSync(tempPath, sanitized, 'utf-8');
+    renameSync(tempPath, threadsPath);
+    threadsCommittedSeq = seq;
+    // Retained so an in-flight async rename that lands after us can detect
+    // the supersession and reinstall this snapshot.
+    threadsSyncSnapshot = { seq, value: sanitized };
+    event.returnValue = true;
+  } catch (error) {
+    console.error('storage:saveThreadsSync error', error);
+    event.returnValue = false;
+  }
+});
+
+ipcMain.handle('storage:clear', async () => {
+  // Clear participates in both save queues so an older pending write cannot
+  // recreate either file after this handler reports success. Threads also
+  // take a sequence number because the unload-time synchronous flush can
+  // jump the async queue.
+  const threadsSeq = ++threadsWriteSeq;
+  const clearStorage = storageSaveQueue.catch(() => {}).then(() =>
+    fs.rm(getStorageFilePath(), { force: true })
+  );
+  storageSaveQueue = clearStorage;
+
+  const clearThreads = threadsSaveQueue.catch(() => {}).then(async () => {
+    if (threadsSeq <= threadsCommittedSeq) return;
+    const threadsPath = getThreadsFilePath();
+    await fs.rm(threadsPath, { force: true });
+    if (threadsSeq < threadsCommittedSeq) {
+      // A newer synchronous unload flush raced the removal. Reinstall its
+      // snapshot in case the rm landed after that flush's rename.
+      const snapshot = threadsSyncSnapshot;
+      if (snapshot && snapshot.seq > threadsSeq) {
+        const restorePath = `${threadsPath}.${process.pid}.restore.tmp`;
+        await fs.writeFile(restorePath, snapshot.value, 'utf-8');
+        await fs.rename(restorePath, threadsPath);
+      }
+      return;
+    }
+    threadsCommittedSeq = threadsSeq;
+    threadsSyncSnapshot = null;
+  });
+  threadsSaveQueue = clearThreads;
+
+  try {
+    await Promise.all([clearStorage, clearThreads]);
     return true;
   } catch (error) {
     console.error('storage:clear error', error);
@@ -7851,6 +8378,7 @@ ipcMain.handle('fs:readFile', async (_event, filePath) => {
 ipcMain.handle('fs:writeFile', async (_event, filePath, content) => {
   try {
     await fs.writeFile(filePath, content, 'utf-8');
+    invalidateTreeGitStatusCache();
     return true;
   } catch (e) {
     console.error('writeFile error', e);
@@ -7862,6 +8390,7 @@ ipcMain.handle('fs:writeFile', async (_event, filePath, content) => {
 ipcMain.handle('fs:createFile', async (_event, filePath, content = '') => {
   try {
     await fs.writeFile(filePath, content, 'utf-8');
+    invalidateTreeGitStatusCache();
     return true;
   } catch (e) {
     console.error('createFile error', e);
@@ -7873,6 +8402,7 @@ ipcMain.handle('fs:createFile', async (_event, filePath, content = '') => {
 ipcMain.handle('fs:createDirectory', async (_event, dirPath) => {
   try {
     await fs.mkdir(dirPath, { recursive: true });
+    invalidateTreeGitStatusCache();
     return true;
   } catch (e) {
     console.error('createDirectory error', e);
@@ -7884,6 +8414,7 @@ ipcMain.handle('fs:createDirectory', async (_event, dirPath) => {
 ipcMain.handle('fs:deletePath', async (_event, targetPath) => {
   try {
     await fs.rm(targetPath, { recursive: true, force: true });
+    invalidateTreeGitStatusCache();
     return true;
   } catch (e) {
     console.error('deletePath error', e);
@@ -7899,6 +8430,7 @@ ipcMain.handle('fs:renamePath', async (_event, oldPath, newPath) => {
       return { ok: false, error: 'A file or folder with that name already exists.' };
     } catch {}
     await fs.rename(oldPath, newPath);
+    invalidateTreeGitStatusCache();
     return { ok: true };
   } catch (e) {
     console.error('renamePath error', e);
@@ -8765,6 +9297,10 @@ ipcMain.handle('orchestration:subagentStopResult', (_event, payload) => {
 });
 
 ipcMain.handle('agent:runTurn', async (event, input) => {
+  // Synchronous, before the first await: IPC handlers start in arrival
+  // order, so a stop/steer sent after this runTurn is guaranteed to see the
+  // entry (or the fully registered run).
+  if (input?.runId) startingAgentRuns.set(input.runId, { aborted: false });
   try {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
       return { ok: false, error: 'Missing threadId, projectPath, prompt, or modelId.' };
@@ -9043,7 +9579,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // that (e.g. from the SIGTERM that reaps a lingering agent process) must
     // not trigger the resume-failed retry.
     let turnCompleted = false;
-    activeAgentRuns.set(runId, child);
+    activeAgentRuns.set(runId, { child, threadId: input.threadId });
 
     const clearFinalizeTimers = () => {
       if (exitFallbackTimer) {
@@ -9056,14 +9592,30 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       }
     };
 
-    const finalizeRun = async (exitCode, { wasStopped = false } = {}) => {
+    const finalizeRun = async (exitCode, options = {}) => {
       if (finalized) return;
       finalized = true;
+      // The run is about to be forgotten while its terminal event still
+      // awaits git summarization — advertise the gap so a racing steer can
+      // wait for the real outcome (agent:isRunFinalizing).
+      finalizingAgentRuns.add(runId);
+      try {
+        await finalizeRunInner(exitCode, options);
+      } finally {
+        finalizingAgentRuns.delete(runId);
+      }
+    };
+
+    const finalizeRunInner = async (exitCode, { wasStopped = false } = {}) => {
       // Stopping a goal run is a successful pause, not a provider failure.
       // The renderer normally untracks explicit stops, but normalizing here
       // keeps any other caller from receiving a false error event.
       const finalExitCode = wasStopped && useCodexGoal ? 0 : exitCode;
       clearFinalizeTimers();
+      // The run owns its CLI process; whatever path finalized the run, the
+      // process must not outlive it (ACP servers idle forever on their own).
+      // No-op when the process already exited.
+      killAgentChild(child);
       activeAgentRuns.delete(runId);
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
@@ -9227,7 +9779,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         turnCompleted = true;
         terminalEventTimer = setTimeout(() => {
           terminalEventTimer = null;
-          child.kill('SIGTERM');
+          killAgentChild(child);
           finalizeRun(0);
         }, 2000);
       }
@@ -9279,7 +9831,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           type: 'chunk',
           chunk: `${message}\n`,
         });
-        child.kill('SIGTERM');
+        killAgentChild(child);
         finalizeRun(1);
       },
     };
@@ -9290,7 +9842,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       if (!terminalEventTimer && !finalized) {
         terminalEventTimer = setTimeout(() => {
           terminalEventTimer = null;
-          child.kill('SIGTERM');
+          killAgentChild(child);
           finalizeRun(0);
         }, 400);
       }
@@ -9523,6 +10075,14 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     acpDriver?.start();
     };
 
+    // A stop/steer raced the startup above and aborted the run before any
+    // process existed — honor it instead of launching a run the renderer
+    // already settled and untracked.
+    if (startingAgentRuns.get(runId)?.aborted) {
+      orionMcp?.release();
+      return { ok: true, runId };
+    }
+
     try {
       startAttempt(initialResumeId);
     } catch (error) {
@@ -9534,13 +10094,26 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
   } catch (error) {
     console.error('agent:runTurn error', error);
     return { ok: false, error: error?.message ?? String(error) };
+  } finally {
+    if (input?.runId) startingAgentRuns.delete(input.runId);
   }
 });
 
 ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
   if (await interruptClaudeSdkRun(runId, options)) return true;
-  const child = activeAgentRuns.get(runId);
-  if (!child) return false;
+  const run = activeAgentRuns.get(runId);
+  if (!run) {
+    // Still in agent:runTurn's async startup: nothing to kill yet — mark the
+    // startup aborted (it checks before spawning / registering the turn) and
+    // report the run as interrupted.
+    const starting = startingAgentRuns.get(runId);
+    if (starting) {
+      starting.aborted = true;
+      starting.terminateBackground = Boolean(options?.terminateBackground);
+      return true;
+    }
+    return false;
+  }
   stoppedAgentRuns.add(runId);
   // Stopping a goal run = pausing the goal: ask the app-server to record the
   // pause (so the stored goal matches reality and /goal resume works) before
@@ -9552,10 +10125,16 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
       await goalDriver.stopGoalRun();
     } catch {}
   }
-  child.kill('SIGTERM');
+  killAgentChild(run.child);
   activeAgentRuns.delete(runId);
   return true;
 });
+
+// True while a run's terminal event is still being prepared (the run itself
+// is already forgotten). Terminal events are sent before this flips back to
+// false, and IPC preserves ordering — so once this returns false, either the
+// renderer has already received the outcome or none is coming.
+ipcMain.handle('agent:isRunFinalizing', (_event, runId) => finalizingAgentRuns.has(runId));
 
 // Goal ops on a thread with no live goal run (pause after the run already
 // ended, clear, status refresh). Runs a short-lived app-server dialog:
@@ -9575,9 +10154,7 @@ const runCodexGoalOp = ({ sessionId, cwd, action }) =>
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      try {
-        child.kill('SIGTERM');
-      } catch {}
+      killAgentChild(child);
       resolve(value);
     };
     const timeout = setTimeout(() => settle({ ok: false, error: 'Codex app-server timed out.' }), 20000);
@@ -9665,7 +10242,20 @@ ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
   if (typeof threadId !== 'string' || !threadId) return false;
   invalidateTerminalSession(threadId);
   const disposedTerminal = disposeTerminalSession(threadId);
-  return disposeClaudeSdkSession(threadId) || disposedTerminal;
+  // Also reap any live run process for the thread (e.g. a wedged ACP server
+  // whose run the renderer no longer tracks): thread teardown must not leave
+  // an orphaned CLI behind.
+  let killedRun = false;
+  for (const [runId, run] of activeAgentRuns) {
+    if (run.threadId !== threadId) continue;
+    // Marks the exit as intentional so the run finalizes as stopped, not as a
+    // provider error.
+    stoppedAgentRuns.add(runId);
+    activeAgentRuns.delete(runId);
+    killAgentChild(run.child);
+    killedRun = true;
+  }
+  return disposeClaudeSdkSession(threadId) || disposedTerminal || killedRun;
 });
 
 // -------------------- Claude Code CLI terminal sessions --------------------
@@ -10192,7 +10782,21 @@ const titleFromResponseText = (responseText) => {
   if (!candidate) return '';
 
   // Clean model output
-  candidate = candidate.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '').trim();
+  // Strip markdown formatting first (Kimi wraps titles in **bold** / headings)
+  // so the quote/prefix cleanups below see plain text.
+  candidate = candidate.replace(/^#{1,6}\s+/, '');
+  // Paired code/strike/bold delimiters unwrap safely anywhere (the content
+  // survives; bold requires non-space at the inner edges, per Markdown, so a
+  // literal `**kwargs and **args` stays intact). Single * and __ pairs only
+  // unwrap when they enclose the whole title — interior ones are likely
+  // literal (glob patterns like *.ts, identifiers like __init__).
+  candidate = candidate.replace(/`([^`]+)`/g, '$1');
+  candidate = candidate.replace(/~~([^~]+)~~/g, '$1');
+  candidate = candidate.replace(/\*\*(\S(?:[^*]*\S)?)\*\*/g, '$1');
+  candidate = candidate.replace(/^\*([^*]+)\*$/, '$1');
+  candidate = candidate.replace(/^__(.+)__$/, '$1');
+  candidate = candidate.replace(/(^|\s)_([^_]+)_(?=\s|$)/g, '$1$2');
+  candidate = candidate.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
   candidate = candidate.replace(/^(title\s*[:：]\s*|here\s*(is|is a)\s*(a\s+)?(concise\s+)?title\s*[:：]?\s*|the title (is|should be)\s*[:：]?\s*)/i, '');
   candidate = candidate.replace(/\s+/g, ' ').trim();
   candidate = candidate.split(/[\.!?]\s/)[0].trim();
