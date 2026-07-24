@@ -103,12 +103,24 @@ type OrionBoardColumn = {
   position: number;
 };
 
+type OrionBoardAttachment = {
+  id: string;
+  fileName: string;
+  contentType: string;
+  size: number;
+  createdAt: string;
+  /** Local copy downloaded by Orion Desktop for agent access. */
+  localPath?: string;
+  downloadError?: string;
+};
+
 type OrionBoardTask = {
   id: string;
   columnId: string;
   title: string;
   description: string;
   position: number;
+  attachments: OrionBoardAttachment[];
   linked: {
     threadId: string;
     threadTitle: string | null;
@@ -188,7 +200,6 @@ type OrionComputerUsePermissions = {
         name: string;
         path: string;
         isDirectory: boolean;
-        size: number;
         gitStatus: 'added' | 'copied' | 'conflicted' | 'deleted' | 'modified' | 'renamed' | 'untracked' | null;
         gitStatusLabel: string | null;
         hasChildGitStatus: boolean;
@@ -277,7 +288,7 @@ type OrionComputerUsePermissions = {
         };
         error?: string;
       }>;
-      listAgentModels: () => Promise<Array<{
+      listAgentModels: (input?: { force?: boolean }) => Promise<Array<{
         id: string;
         providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'opencode';
         providerLabel: string;
@@ -375,6 +386,9 @@ type OrionComputerUsePermissions = {
         ok: boolean;
         error?: string;
       }>;
+      onProviderAuthenticated: (
+        callback: (event: { providerId: string }) => void
+      ) => () => void;
       getAccountSession: () => Promise<OrionAccountState>;
       startAccountAuth: () => Promise<{
         ok: boolean;
@@ -388,6 +402,7 @@ type OrionComputerUsePermissions = {
       pullFromCloud: (projectPath: string) => Promise<OrionCloudPullResult>;
       openCloudRepoInBrowser: (projectPath: string) => Promise<{ ok: boolean; error?: string }>;
       listBoardTasks: () => Promise<OrionBoardResult>;
+      getBoardTask: (taskId: string) => Promise<OrionTaskActionResult>;
       linkBoardTask: (input: {
         taskId: string;
         threadId: string;
@@ -412,7 +427,7 @@ type OrionComputerUsePermissions = {
       relaunchApp: () => Promise<boolean>;
       focusWindow: () => Promise<boolean>;
       getAppUpdateState: () => Promise<AppUpdateState>;
-      checkForAppUpdate: () => Promise<AppUpdateState>;
+      checkForAppUpdate: (input?: { force?: boolean }) => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
       restartToUpdate: () => Promise<boolean>;
       runAgentTurn: (input: {
@@ -421,6 +436,14 @@ type OrionComputerUsePermissions = {
         projectPath: string;
         prompt: string;
         modelId: string;
+        /** Image metadata used to build native ACP image blocks for Kimi turns. */
+        attachments?: Array<{
+          id: string;
+          name: string;
+          path: string;
+          mimeType: string;
+          size: number;
+        }>;
         accessMode: 'read-only' | 'workspace-write' | 'full-access';
         codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
         codexServiceTier?: 'default' | 'priority';
@@ -434,12 +457,14 @@ type OrionComputerUsePermissions = {
         aside?: boolean;
         /** Codex goal run (/goal): drive the turn over `codex app-server` and pursue the goal across turns. */
         codexGoal?: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number };
-        /** Codex code review (/review): run `codex exec review` (ephemeral session, never resumed). */
+        /** Codex code review (/review): run review/start inline on the current Codex session. */
         codexReview?: {
           mode: 'uncommitted' | 'base' | 'commit' | 'custom';
           base?: string;
           commit?: string;
           instructions?: string;
+          /** Recent Orion transcript supplied because the dedicated reviewer does not inherit it. */
+          threadContext?: string;
         };
         providerOptions?: {
           allowedTools?: string;

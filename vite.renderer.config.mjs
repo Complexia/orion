@@ -7,13 +7,4 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['monaco-editor'],
   },
-  build: {
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          'monaco-editor': ['monaco-editor'],
-        },
-      },
-    },
-  },
 });

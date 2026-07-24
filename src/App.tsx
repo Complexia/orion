@@ -57,9 +57,9 @@ import {
   BookOpen,
   Workflow,
 } from 'lucide-react';
-import Editor from '@monaco-editor/react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useShallow } from 'zustand/react/shallow';
 import {
   useOrionStore,
   defaultProviderSettings,
@@ -72,6 +72,7 @@ import {
   type LinkedBoardTask,
   type Message,
   type OrchestrationRoleId,
+  type Project,
   type ProviderId,
   type ProviderRuntimeOptions,
   type Thread,
@@ -114,6 +115,11 @@ import orionIconUrl from '../assets/icon.png';
 // opened — the pseudo-model costs nothing at startup. (Its main-process
 // counterpart, node-pty, is likewise only import()ed on first terminal:ensure.)
 const TerminalView = React.lazy(() => import('./TerminalView'));
+
+// Keep both @monaco-editor/react and Monaco itself out of the startup graph.
+// MonacoEditor configures the bundled Electron-safe loader when the Code
+// editor is first rendered.
+const MonacoEditor = React.lazy(() => import('./MonacoEditor'));
 
 // Simple recursive file tree component
 interface FileTreeItem {
@@ -158,6 +164,14 @@ type ThreadSearchEntry = {
   haystack: string;
   tokens: string[];
 };
+
+type CachedThreadSearchEntry = {
+  projectName: string;
+  projectPath: string;
+  entry: ThreadSearchEntry;
+};
+
+const THREAD_SEARCH_INDEX_REFRESH_MS = 150;
 
 type ProviderUpdateItem = {
   id: string;
@@ -500,12 +514,40 @@ const buildPromptWithAttachments = (prompt: string, attachments: ImageAttachment
   return trimmedPrompt ? `${trimmedPrompt}\n\n${attachmentText}` : attachmentText;
 };
 
+const linkedTaskFromBoardTask = (task: OrionBoardTask): LinkedBoardTask => ({
+  id: task.id,
+  title: task.title,
+  description: task.description,
+  attachments: (task.attachments ?? []).map((attachment) => ({
+    id: attachment.id,
+    name: attachment.fileName,
+    mimeType: attachment.contentType,
+    size: attachment.size,
+    path: attachment.localPath,
+    downloadError: attachment.downloadError,
+  })),
+  injected: false,
+});
+
+const linkedTaskMediaAttachments = (task: LinkedBoardTask): ImageAttachment[] =>
+  (task.attachments ?? [])
+    .filter(
+      (attachment) =>
+        Boolean(attachment.path) &&
+        (attachment.mimeType.startsWith('image/') || attachment.mimeType.startsWith('video/'))
+    )
+    .map((attachment) => ({
+      id: `board-${task.id}-${attachment.id}`,
+      name: attachment.name,
+      path: attachment.path!,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+    }));
+
 // Context block prepended to the first agent turn of a thread linked to an
-// Orion board task, so the agent knows what card it's working on.
-const buildLinkedTaskContext = (
-  task: { title: string; description: string },
-  hasUserMessage: boolean
-) => {
+// Orion board task, so the agent knows what card it's working on and can read
+// local copies of every board attachment.
+const buildLinkedTaskContext = (task: LinkedBoardTask, hasUserMessage: boolean) => {
   const lines = [
     '## Linked task from the Orion board',
     `Title: ${task.title}`,
@@ -513,6 +555,22 @@ const buildLinkedTaskContext = (
   const description = task.description.trim();
   if (description) {
     lines.push('', 'Description:', description);
+  }
+  const taskAttachments = task.attachments ?? [];
+  if (taskAttachments.length > 0) {
+    lines.push('', 'Attachments:');
+    taskAttachments.forEach((attachment, index) => {
+      if (attachment.path) {
+        lines.push(`${index + 1}. ${attachment.name} (${attachment.mimeType}): ${attachment.path}`);
+      } else {
+        lines.push(
+          `${index + 1}. ${attachment.name} (${attachment.mimeType}): unavailable locally${
+            attachment.downloadError ? ` — ${attachment.downloadError}` : ''
+          }`
+        );
+      }
+    });
+    lines.push('', 'Treat these attachments as part of the task context and inspect them as needed.');
   }
   if (hasUserMessage) {
     lines.push(
@@ -528,6 +586,61 @@ const buildLinkedTaskContext = (
     );
   }
   return lines.join('\n');
+};
+
+// Codex's dedicated reviewer is displayed inline on the resumed thread, but
+// the reviewer model itself does not inherit prior turns. Carry Orion's recent
+// transcript explicitly so references such as "the issues you found" resolve
+// the same way they do in the surrounding chat.
+const REVIEW_THREAD_CONTEXT_MAX_CHARS = 80_000;
+const buildReviewThreadContext = (thread: Thread) => {
+  const entries = thread.messages
+    .filter(
+      (message) =>
+        (message.role === 'user' || message.role === 'agent') && message.content.trim().length > 0
+    )
+    .map((message) => {
+      const role = message.role === 'user' ? 'User' : 'Assistant';
+      const attachments = (message.attachments ?? [])
+        .map((attachment) => `${attachment.name}: ${attachment.path}`)
+        .join('\n');
+      return `${role}:\n${message.content.trim()}${
+        attachments ? `\n\nAttachments:\n${attachments}` : ''
+      }`;
+    });
+
+  const selected: string[] = [];
+  let selectedChars = 0;
+  let truncated = false;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    const separatorChars = selected.length > 0 ? 6 : 0;
+    if (selectedChars + separatorChars + entry.length > REVIEW_THREAD_CONTEXT_MAX_CHARS) {
+      truncated = true;
+      if (selected.length === 0) {
+        selected.push(entry.slice(-REVIEW_THREAD_CONTEXT_MAX_CHARS));
+      }
+      break;
+    }
+    selected.unshift(entry);
+    selectedChars += separatorChars + entry.length;
+  }
+
+  const sections: string[] = [];
+  if (thread.linkedTask) sections.push(buildLinkedTaskContext(thread.linkedTask, false));
+  if (selected.length > 0) {
+    sections.push(
+      [
+        '[Orion thread context]',
+        'These messages preceded the review. Use them to resolve references and understand the intent behind the changes.',
+        ...(truncated ? ['Earlier messages were omitted to fit the review context limit.'] : []),
+        '',
+        selected.join('\n\n---\n\n'),
+        '[/Orion thread context]',
+      ].join('\n')
+    );
+  }
+  return sections.join('\n\n');
 };
 
 // Human labels for the Orion orchestrator's delegation roles — shared by the
@@ -570,6 +683,15 @@ const orchestrationRoleMeta: Array<{
     desc: 'Generating images, video, and other media assets',
     promptLabel: 'image/video generation',
   },
+];
+
+const accessModeOptions: Array<{
+  value: 'read-only' | 'workspace-write' | 'full-access';
+  label: string;
+}> = [
+  { value: 'read-only', label: 'Read only' },
+  { value: 'workspace-write', label: 'Workspace write' },
+  { value: 'full-access', label: 'Full access' },
 ];
 
 // Context block prepended to every orchestrated turn. main.js writes managed
@@ -814,8 +936,8 @@ const TaskPickerPopover = ({
               })}
           </div>
           <div className="task-picker-footer">
-            The task's title and description are added to the agent's context, and the card moves
-            across the board as this thread runs.
+            The task's title, description, and attachments are added to the agent's context, and
+            the card moves across the board as this thread runs.
           </div>
         </>
       )}
@@ -908,6 +1030,42 @@ const normalizeSearchText = (value: string) =>
     .replace(/\s+/g, ' ')
     .trim();
 
+const buildThreadSearchEntry = (
+  thread: Thread,
+  projectName: string,
+  projectPath: string
+): ThreadSearchEntry => {
+  const messageText = thread.messages
+    .map((message) => {
+      const activityText = message.activities
+        ?.map((activity) => `${activity.title} ${activity.detail ?? ''}`)
+        .join(' ');
+      const changedFileText = message.changedFiles
+        ?.map((file) => `${file.path} ${file.status}`)
+        .join(' ');
+      return [message.content, activityText, changedFileText].filter(Boolean).join(' ');
+    })
+    .join(' ');
+  const haystack = normalizeSearchText(
+    [
+      thread.title,
+      projectName,
+      projectPath,
+      thread.modelId,
+      thread.status,
+      messageText,
+    ].join(' ')
+  );
+
+  return {
+    thread,
+    projectName,
+    projectPath,
+    haystack,
+    tokens: Array.from(new Set(haystack.split(' ').filter(Boolean))),
+  };
+};
+
 const fuzzySubsequenceScore = (needle: string, haystack: string) => {
   if (!needle) return 0;
   let searchIndex = 0;
@@ -958,9 +1116,13 @@ const scoreThreadSearchEntry = (entry: ThreadSearchEntry, query: string) => {
 const getThreadSearchExcerpt = (entry: ThreadSearchEntry, query: string) => {
   const normalizedQuery = normalizeSearchText(query);
   const firstToken = normalizedQuery.split(' ').find(Boolean);
-  const lastMessage = [...entry.thread.messages]
-    .reverse()
-    .find((message) => message.content.trim().length > 0);
+  let lastMessage: Message | undefined;
+  for (let index = entry.thread.messages.length - 1; index >= 0; index -= 1) {
+    const message = entry.thread.messages[index];
+    if (message.content.trim().length === 0) continue;
+    lastMessage = message;
+    break;
+  }
   const source = lastMessage?.content.replace(/\s+/g, ' ').trim() || entry.projectPath;
   if (!source) return '';
 
@@ -971,6 +1133,151 @@ const getThreadSearchExcerpt = (entry: ThreadSearchEntry, query: string) => {
   const excerpt = source.slice(start, start + 140).trim();
   return `${start > 0 ? '...' : ''}${excerpt}${source.length > start + 140 ? '...' : ''}`;
 };
+
+type ThreadSearchResultsProps = {
+  projects: Project[];
+  query: string;
+  onSelectThread: (threadId: string) => void;
+};
+
+/**
+ * Mounted only while search is open, so live transcript changes refresh the
+ * index without waking the application shell while search is closed.
+ */
+const ThreadSearchResults = React.memo(function ThreadSearchResults({
+  projects,
+  query,
+  onSelectThread,
+}: ThreadSearchResultsProps) {
+  const threads = useOrionStore((state) => state.threads);
+  const latestThreadsRef = useRef(threads);
+  const indexedThreadsRef = useRef(threads);
+  const [indexedThreads, setIndexedThreads] = useState(threads);
+  const indexRefreshTimerRef = useRef<number | null>(null);
+  const entryCacheRef = useRef(new WeakMap<Thread, CachedThreadSearchEntry>());
+
+  useEffect(() => {
+    latestThreadsRef.current = threads;
+    if (
+      indexedThreadsRef.current === threads ||
+      indexRefreshTimerRef.current !== null
+    ) {
+      return;
+    }
+    indexRefreshTimerRef.current = window.setTimeout(() => {
+      indexRefreshTimerRef.current = null;
+      const latestThreads = latestThreadsRef.current;
+      indexedThreadsRef.current = latestThreads;
+      setIndexedThreads(latestThreads);
+    }, THREAD_SEARCH_INDEX_REFRESH_MS);
+  }, [threads]);
+
+  useEffect(
+    () => () => {
+      if (indexRefreshTimerRef.current !== null) {
+        window.clearTimeout(indexRefreshTimerRef.current);
+      }
+    },
+    []
+  );
+
+  const trimmedQuery = query.trim();
+  const hasQuery = trimmedQuery.length > 0;
+  const projectById = useMemo(
+    () => new Map(projects.map((project) => [project.id, project])),
+    [projects]
+  );
+
+  const recentThreadEntries = useMemo<ThreadSearchEntry[]>(() => {
+    if (hasQuery) return [];
+
+    return indexedThreads
+      .slice()
+      .sort(
+        (a, b) =>
+          getThreadActivityTime(b).getTime() -
+          getThreadActivityTime(a).getTime()
+      )
+      .slice(0, 12)
+      .map((thread) => {
+        const project = projectById.get(thread.projectId);
+        return {
+          thread,
+          projectName: project?.name ?? 'Unknown project',
+          projectPath: project?.path ?? '',
+          haystack: '',
+          tokens: [],
+        };
+      });
+  }, [hasQuery, indexedThreads, projectById]);
+
+  const threadSearchIndex = useMemo<ThreadSearchEntry[]>(() => {
+    if (!hasQuery) return [];
+
+    return indexedThreads.map((thread) => {
+      const project = projectById.get(thread.projectId);
+      const projectName = project?.name ?? 'Unknown project';
+      const projectPath = project?.path ?? '';
+      const cached = entryCacheRef.current.get(thread);
+      if (
+        cached &&
+        cached.projectName === projectName &&
+        cached.projectPath === projectPath
+      ) {
+        return cached.entry;
+      }
+
+      const entry = buildThreadSearchEntry(thread, projectName, projectPath);
+      entryCacheRef.current.set(thread, { projectName, projectPath, entry });
+      return entry;
+    });
+  }, [hasQuery, indexedThreads, projectById]);
+
+  const results = useMemo(() => {
+    if (!hasQuery) {
+      return recentThreadEntries.map((entry) => ({ entry, score: 1 }));
+    }
+
+    return threadSearchIndex
+      .map((entry) => ({
+        entry,
+        score: scoreThreadSearchEntry(entry, trimmedQuery),
+      }))
+      .filter((result) => result.score > 0)
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return (
+          getThreadActivityTime(b.entry.thread).getTime() -
+          getThreadActivityTime(a.entry.thread).getTime()
+        );
+      })
+      .slice(0, 30);
+  }, [hasQuery, recentThreadEntries, threadSearchIndex, trimmedQuery]);
+
+  return (
+    <>
+      {results.map(({ entry }) => (
+        <button
+          key={entry.thread.id}
+          type="button"
+          className="thread-search-result"
+          onClick={() => onSelectThread(entry.thread.id)}
+        >
+          <span className="thread-search-title">{entry.thread.title}</span>
+          <span className="thread-search-meta">
+            {entry.projectName} · {formatShortTime(getThreadActivityTime(entry.thread))}
+          </span>
+          <span className="thread-search-excerpt">
+            {getThreadSearchExcerpt(entry, query)}
+          </span>
+        </button>
+      ))}
+      {results.length === 0 && (
+        <div className="thread-search-empty">No matching threads</div>
+      )}
+    </>
+  );
+});
 
 const tryGenerateBetterTitle = async (
   threadId: string,
@@ -999,6 +1306,7 @@ const tryGenerateBetterTitle = async (
 };
 
 const projectIconCache = new Map<string, string | null>();
+const projectIconRequestCache = new Map<string, Promise<string | null>>();
 const claudeOneMillionOnlyModelSlugs = new Set(['claude-fable-5', 'claude-sonnet-5']);
 
 const getDefaultClaudeReasoningEffort = (model: AgentModel | undefined): ClaudeReasoningEffort =>
@@ -1040,10 +1348,28 @@ const ProjectIcon: React.FC<{ projectPath: string; size?: number; className?: st
       return;
     }
 
-    window.orion.findProjectIcon(projectPath).then((url) => {
-      projectIconCache.set(projectPath, url);
-      if (!cancelled) setIconUrl(url);
-    });
+    let request = projectIconRequestCache.get(projectPath);
+    if (!request) {
+      const iconRequest = window.orion.findProjectIcon(projectPath).then((url) => {
+        projectIconCache.set(projectPath, url);
+        return url;
+      });
+      const sharedRequest = iconRequest.finally(() => {
+        if (projectIconRequestCache.get(projectPath) === sharedRequest) {
+          projectIconRequestCache.delete(projectPath);
+        }
+      });
+      projectIconRequestCache.set(projectPath, sharedRequest);
+      request = sharedRequest;
+    }
+
+    void request
+      .then((url) => {
+        if (!cancelled) setIconUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setIconUrl(null);
+      });
 
     return () => {
       cancelled = true;
@@ -1908,7 +2234,7 @@ const ProviderAuthPrompt: React.FC<{
   );
 };
 
-const ChatMessage: React.FC<{
+type ChatMessageProps = {
   message: Message;
   /** The thread's current linked task, for live status on the message's task chip. */
   liveTask?: LinkedBoardTask;
@@ -1919,7 +2245,9 @@ const ChatMessage: React.FC<{
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
-}> = ({
+};
+
+const ChatMessage = React.memo(function ChatMessage({
   message,
   liveTask,
   taskBusy,
@@ -1929,7 +2257,7 @@ const ChatMessage: React.FC<{
   renderBtwAside,
   onAuthenticateProvider,
   authenticatingProviderId,
-}) => {
+}: ChatMessageProps) {
   const attachments = message.attachments ?? [];
   const messageTask = message.linkedTask;
   // Live status/actions only while the chip's task is still the thread's
@@ -2050,7 +2378,7 @@ const ChatMessage: React.FC<{
       )}
     </div>
   );
-};
+});
 
 const AgentsWelcome: React.FC<{
   projectName?: string | null;
@@ -2064,6 +2392,541 @@ const AgentsWelcome: React.FC<{
     </h2>
   </div>
 );
+
+type ChatTranscriptProps = {
+  threadId: string;
+  projectName?: string | null;
+  mediaBaseDirs: string[];
+  isSending: boolean;
+  steerSupported: boolean;
+  steerReady: boolean;
+  authenticatingProviderId: string | null;
+  chatScrollRef: React.RefObject<HTMLDivElement | null>;
+  chatEndRef: React.RefObject<HTMLDivElement | null>;
+  chatPinnedRef: React.MutableRefObject<boolean>;
+  chatScrollTopRef: React.MutableRefObject<number>;
+  tasksCardPosition: { x: number; y: number } | null;
+  tasksCardCollapsed: boolean;
+  tasksCardDismissedFor: string | null;
+  onMoveTasksCard: (position: { x: number; y: number }) => void;
+  onToggleTasksCard: () => void;
+  onDismissTasksCard: (messageId: string) => void;
+  onMarkTaskDone: (threadId: string) => void;
+  onUnlinkTask: (threadId: string) => void;
+  onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
+  onAuthenticateProvider: (providerId: string) => void;
+  onSteerQueuedMessage: (queuedId: string) => void;
+};
+
+/**
+ * Owns the high-frequency selected-thread subscription. Streaming chunks now
+ * re-render this boundary only; memoized historical messages retain their
+ * object identity and are skipped by React.
+ */
+const ChatTranscript = React.memo(function ChatTranscript({
+  threadId,
+  projectName,
+  mediaBaseDirs,
+  isSending,
+  steerSupported,
+  steerReady,
+  authenticatingProviderId,
+  chatScrollRef,
+  chatEndRef,
+  chatPinnedRef,
+  chatScrollTopRef,
+  tasksCardPosition,
+  tasksCardCollapsed,
+  tasksCardDismissedFor,
+  onMoveTasksCard,
+  onToggleTasksCard,
+  onDismissTasksCard,
+  onMarkTaskDone,
+  onUnlinkTask,
+  onDismissBtwExchange,
+  onAuthenticateProvider,
+  onSteerQueuedMessage,
+}: ChatTranscriptProps) {
+  const { thread, removeQueuedThreadMessage } = useOrionStore(
+    useShallow((state) => ({
+      thread: state.threads.find((candidate) => candidate.id === threadId),
+      removeQueuedThreadMessage: state.removeQueuedThreadMessage,
+    }))
+  );
+  const floatingPlan = useMemo(() => {
+    const messages = thread?.messages;
+    if (!messages) return null;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (message.role !== 'agent' || message.kind !== 'agent-run') continue;
+      const activity = message.activities?.find((entry) => entry.type === 'plan');
+      if (!activity || (activity.plan?.length ?? 0) === 0) return null;
+      return { messageId: message.id, activity, running: message.status === 'running' };
+    }
+    return null;
+  }, [thread?.messages]);
+
+  const runningAgentMessage = useMemo(() => {
+    const messages = thread?.messages;
+    if (!messages) return null;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (message.role === 'agent' && message.kind === 'agent-run' && message.status === 'running') {
+        return message;
+      }
+    }
+    return null;
+  }, [thread?.messages]);
+
+  const { btwAsidesByAnchor, leadingBtwAsides, trailingBtwAsides } = useMemo(() => {
+    const byAnchor = new Map<string, BtwExchange[]>();
+    const leading: BtwExchange[] = [];
+    const trailing: BtwExchange[] = [];
+    if (!thread) {
+      return {
+        btwAsidesByAnchor: byAnchor,
+        leadingBtwAsides: leading,
+        trailingBtwAsides: trailing,
+      };
+    }
+
+    const messageIds = new Set(thread.messages.map((message) => message.id));
+    for (const exchange of thread.btwExchanges ?? []) {
+      let anchorId =
+        exchange.afterMessageId && messageIds.has(exchange.afterMessageId)
+          ? exchange.afterMessageId
+          : undefined;
+      const exchangeTime = new Date(exchange.createdAt).getTime();
+      if (!anchorId && Number.isFinite(exchangeTime)) {
+        anchorId = [...thread.messages]
+          .reverse()
+          .find((message) => {
+            const messageTime = new Date(message.ts).getTime();
+            return Number.isFinite(messageTime) && messageTime <= exchangeTime;
+          })?.id;
+      }
+      if (anchorId) {
+        const anchored = byAnchor.get(anchorId);
+        if (anchored) anchored.push(exchange);
+        else byAnchor.set(anchorId, [exchange]);
+      } else if (Number.isFinite(exchangeTime) && thread.messages.length > 0) {
+        leading.push(exchange);
+      } else {
+        trailing.push(exchange);
+      }
+    }
+
+    return {
+      btwAsidesByAnchor: byAnchor,
+      leadingBtwAsides: leading,
+      trailingBtwAsides: trailing,
+    };
+  }, [thread]);
+
+  const handleChatScroll = useCallback(() => {
+    const element = chatScrollRef.current;
+    if (!element) return;
+    chatPinnedRef.current =
+      element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+    chatScrollTopRef.current = element.scrollTop;
+  }, [chatPinnedRef, chatScrollRef, chatScrollTopRef]);
+
+  useLayoutEffect(() => {
+    const element = chatScrollRef.current;
+    if (!element) return;
+    element.scrollTo({
+      top: chatPinnedRef.current ? element.scrollHeight : chatScrollTopRef.current,
+      behavior: 'instant',
+    });
+  }, [chatPinnedRef, chatScrollRef, chatScrollTopRef]);
+
+  useEffect(() => {
+    if (!chatPinnedRef.current) return;
+    chatEndRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' });
+  }, [
+    chatEndRef,
+    chatPinnedRef,
+    isSending,
+    thread?.messages,
+    thread?.queuedMessages,
+    thread?.btwExchanges,
+  ]);
+
+  const handleMarkTaskDone = useCallback(
+    () => onMarkTaskDone(threadId),
+    [onMarkTaskDone, threadId]
+  );
+  const handleUnlinkTask = useCallback(
+    () => onUnlinkTask(threadId),
+    [onUnlinkTask, threadId]
+  );
+  const handleDismissTasksCard = useCallback(() => {
+    if (floatingPlan) onDismissTasksCard(floatingPlan.messageId);
+  }, [floatingPlan, onDismissTasksCard]);
+  const renderBtwAside = useCallback(
+    (exchange: BtwExchange) => (
+      <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
+        <div className="btw-aside-bar">
+          <span className="btw-aside-badge">
+            <Sparkles size={11} />
+            BTW
+          </span>
+          <span className="btw-aside-note">
+            aside · answered from a fork · not part of the thread
+          </span>
+          <button
+            type="button"
+            className="btw-aside-dismiss"
+            onClick={() => onDismissBtwExchange(threadId, exchange.id)}
+            title={
+              exchange.status === 'running'
+                ? 'Cancel and dismiss this aside'
+                : 'Dismiss this aside'
+            }
+          >
+            <X size={12} />
+          </button>
+        </div>
+        <div className="btw-aside-question">{exchange.question}</div>
+        {exchange.status === 'running' && !exchange.answer && (
+          <div className="agent-status-line running">
+            <span className="working-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            <span>Answering on the side…</span>
+          </div>
+        )}
+        {exchange.answer && (
+          <div className="btw-aside-answer">
+            <MarkdownContent content={exchange.answer} />
+          </div>
+        )}
+        {exchange.status === 'error' &&
+          (exchange.authProviderId ? (
+            <ProviderAuthPrompt
+              providerId={exchange.authProviderId}
+              onAuthenticate={onAuthenticateProvider}
+              busy={authenticatingProviderId === exchange.authProviderId}
+            />
+          ) : (
+            <div className="agent-error">{exchange.error ?? 'The aside failed.'}</div>
+          ))}
+      </div>
+    ),
+    [
+      authenticatingProviderId,
+      onAuthenticateProvider,
+      onDismissBtwExchange,
+      threadId,
+    ]
+  );
+
+  if (!thread) return null;
+
+  return (
+    <div className="chat-scroll-wrap">
+      <div className="chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll}>
+        <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
+          <div className="chat-container">
+            {thread.messages.length === 0 && <AgentsWelcome projectName={projectName} />}
+
+            {leadingBtwAsides.map(renderBtwAside)}
+
+            {thread.messages.map((message) => (
+              <React.Fragment key={message.id}>
+                <ChatMessage
+                  message={message}
+                  liveTask={thread.linkedTask}
+                  taskBusy={isSending}
+                  onMarkTaskDone={handleMarkTaskDone}
+                  onUnlinkTask={handleUnlinkTask}
+                  btwExchanges={
+                    message.kind === 'agent-run'
+                      ? btwAsidesByAnchor.get(message.id)
+                      : undefined
+                  }
+                  renderBtwAside={renderBtwAside}
+                  onAuthenticateProvider={onAuthenticateProvider}
+                  authenticatingProviderId={authenticatingProviderId}
+                />
+                {message.kind !== 'agent-run' &&
+                  btwAsidesByAnchor.get(message.id)?.map(renderBtwAside)}
+              </React.Fragment>
+            ))}
+
+            {isSending && thread.messages.at(-1)?.role !== 'agent' && (
+              <div className="message agent opacity-70">Starting agent...</div>
+            )}
+
+            {(thread.queuedMessages ?? []).map((queued) => (
+              <div key={queued.id} className="message user queued">
+                {queued.text && (
+                  <div className="whitespace-pre-wrap break-words">{queued.text}</div>
+                )}
+                {(queued.attachments?.length ?? 0) > 0 && (
+                  <div className="message-attachments">
+                    {queued.attachments!.map((attachment) => (
+                      <div
+                        key={attachment.id}
+                        className="message-attachment"
+                        title={attachment.path}
+                      >
+                        <AttachmentThumb attachment={attachment} />
+                        <span>{attachment.name}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="queued-message-bar">
+                  <span className="queued-message-badge">Queued</span>
+                  {steerSupported && (
+                    <button
+                      type="button"
+                      className="queued-message-action steer"
+                      onClick={() => onSteerQueuedMessage(queued.id)}
+                      disabled={!steerReady}
+                      title={
+                        steerReady
+                          ? 'Interrupt the agent and send this now'
+                          : 'Steer becomes available once the agent reports its session'
+                      }
+                    >
+                      <Zap size={12} />
+                      Steer now
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="queued-message-action remove"
+                    onClick={() => removeQueuedThreadMessage(threadId, queued.id)}
+                    title="Remove queued message"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              </div>
+            ))}
+
+            {trailingBtwAsides.map(renderBtwAside)}
+            <div ref={chatEndRef} />
+          </div>
+        </MarkdownBaseDirContext.Provider>
+      </div>
+
+      {floatingPlan && tasksCardDismissedFor !== floatingPlan.messageId && (
+        <FloatingTasksCard
+          activity={floatingPlan.activity}
+          running={floatingPlan.running}
+          position={tasksCardPosition}
+          onMove={onMoveTasksCard}
+          collapsed={tasksCardCollapsed}
+          onToggleCollapsed={onToggleTasksCard}
+          onDismiss={handleDismissTasksCard}
+        />
+      )}
+
+      {runningAgentMessage && <PinnedRunStatus message={runningAgentMessage} />}
+    </div>
+  );
+});
+
+/**
+ * Keeps Monaco's per-keystroke updates inside the code pane. The shell only
+ * observes tab metadata (path/dirty state), so editing no longer re-renders
+ * the sidebar, transcript, settings, or composer.
+ */
+const CodeEditorPane = React.memo(function CodeEditorPane() {
+  const { activeFilePath, activeFile, closeFile, updateOpenFileContent, markFileSaved } =
+    useOrionStore(
+      useShallow((state) => ({
+        activeFilePath: state.activeFilePath,
+        activeFile: state.openFiles.find((file) => file.path === state.activeFilePath),
+        closeFile: state.closeFile,
+        updateOpenFileContent: state.updateOpenFileContent,
+        markFileSaved: state.markFileSaved,
+      }))
+    );
+  const openFilePaths = useOrionStore(
+    useShallow((state) => state.openFiles.map((file) => file.path))
+  );
+  const editorContainerRef = useRef<HTMLDivElement>(null);
+  const buffersRef = useRef(new Map<string, string>());
+  const dirtyPathsRef = useRef(new Set<string>());
+  const savedContentsRef = useRef(new Map<string, string>());
+  const previousActiveFilePathRef = useRef(activeFilePath);
+  const [editorBottomPadding, setEditorBottomPadding] = useState(280);
+
+  if (activeFilePath && activeFile && !buffersRef.current.has(activeFilePath)) {
+    buffersRef.current.set(activeFilePath, activeFile.content);
+    if (activeFile.isDirty) {
+      dirtyPathsRef.current.add(activeFilePath);
+    } else {
+      savedContentsRef.current.set(activeFilePath, activeFile.content);
+    }
+  }
+
+  const flushFileBuffer = useCallback(
+    (path: string) => {
+      if (!dirtyPathsRef.current.has(path)) return;
+      const content = buffersRef.current.get(path);
+      if (content === undefined) return;
+      const sharedFile = useOrionStore.getState().openFiles.find((file) => file.path === path);
+      if (!sharedFile || (sharedFile.isDirty && sharedFile.content === content)) return;
+      updateOpenFileContent(path, content);
+    },
+    [updateOpenFileContent]
+  );
+
+  useEffect(() => {
+    const editorContainer = editorContainerRef.current;
+    if (!editorContainer) return undefined;
+
+    const updatePadding = () => {
+      const nextPadding = Math.round(editorContainer.clientHeight * 0.5);
+      if (nextPadding > 0) setEditorBottomPadding(nextPadding);
+    };
+
+    updatePadding();
+    const resizeObserver = new ResizeObserver(updatePadding);
+    resizeObserver.observe(editorContainer);
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  // Monaco owns the live model while a tab is active. Commit its final buffer
+  // to shared state only when the active editor tab changes.
+  useLayoutEffect(() => {
+    const previousPath = previousActiveFilePathRef.current;
+    if (previousPath && previousPath !== activeFilePath) {
+      flushFileBuffer(previousPath);
+    }
+    previousActiveFilePathRef.current = activeFilePath;
+  }, [activeFilePath, flushFileBuffer]);
+
+  // Leaving Code unmounts this pane, so flush dirty buffers once before the
+  // localized cache disappears. This preserves every unsaved editor tab.
+  useEffect(
+    () => () => {
+      for (const path of dirtyPathsRef.current) flushFileBuffer(path);
+    },
+    [flushFileBuffer]
+  );
+
+  // Closed tabs must not leave a stale unsaved buffer that could be revived if
+  // the same path is opened again later in this Code session.
+  useEffect(() => {
+    const openPaths = new Set(openFilePaths);
+    for (const path of buffersRef.current.keys()) {
+      if (openPaths.has(path)) continue;
+      buffersRef.current.delete(path);
+      dirtyPathsRef.current.delete(path);
+      savedContentsRef.current.delete(path);
+    }
+  }, [openFilePaths]);
+
+  const saveActiveFile = useCallback(async () => {
+    const path = useOrionStore.getState().activeFilePath;
+    if (!path || !window.orion) return;
+    const currentFile = useOrionStore.getState().openFiles.find((file) => file.path === path);
+    const content = buffersRef.current.get(path) ?? currentFile?.content;
+    if (content === undefined) return;
+
+    const success = await window.orion.writeFile(path, content);
+    if (success) {
+      savedContentsRef.current.set(path, content);
+      const latestContent = buffersRef.current.get(path) ?? content;
+      if (latestContent === content) {
+        dirtyPathsRef.current.delete(path);
+        markFileSaved(path, content);
+      } else {
+        // Edits made while the write was in flight remain dirty against the
+        // content that actually reached disk.
+        dirtyPathsRef.current.add(path);
+        updateOpenFileContent(path, latestContent);
+      }
+    } else {
+      toast.error('Failed to save file');
+    }
+  }, [markFileSaved, updateOpenFileContent]);
+
+  const handleEditorChange = useCallback(
+    (value: string | undefined) => {
+      if (value === undefined || !activeFilePath) return;
+      buffersRef.current.set(activeFilePath, value);
+
+      const wasDirty = dirtyPathsRef.current.has(activeFilePath);
+      const hasSavedContent = savedContentsRef.current.has(activeFilePath);
+      const isDirty =
+        !hasSavedContent || value !== savedContentsRef.current.get(activeFilePath);
+      if (isDirty === wasDirty) return;
+
+      if (isDirty) {
+        dirtyPathsRef.current.add(activeFilePath);
+        updateOpenFileContent(activeFilePath, value);
+      } else {
+        dirtyPathsRef.current.delete(activeFilePath);
+        markFileSaved(activeFilePath, value);
+      }
+    },
+    [activeFilePath, markFileSaved, updateOpenFileContent]
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        if (activeFilePath) void saveActiveFile();
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'w' && activeFilePath) {
+        event.preventDefault();
+        closeFile(activeFilePath);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
+  }, [activeFilePath, closeFile, saveActiveFile]);
+
+  const currentLanguage = activeFilePath ? getLanguageFromPath(activeFilePath) : 'plaintext';
+  const activeBuffer =
+    activeFilePath && activeFile
+      ? (buffersRef.current.get(activeFilePath) ?? activeFile.content)
+      : undefined;
+
+  return (
+    <div className="editor-container" ref={editorContainerRef}>
+      {activeFilePath && activeFile ? (
+        <React.Suspense fallback={<div className="editor-loading" />}>
+          <MonacoEditor
+            height="100%"
+            language={currentLanguage}
+            value={activeBuffer}
+            onChange={handleEditorChange}
+            theme="vs-dark"
+            options={{
+              fontSize: 13,
+              minimap: { enabled: true },
+              scrollBeyondLastLine: false,
+              padding: { bottom: editorBottomPadding },
+              automaticLayout: true,
+              tabSize: 2,
+              wordWrap: 'on',
+            }}
+          />
+        </React.Suspense>
+      ) : (
+        <div className="empty-state">
+          <FileText size={42} className="opacity-30" />
+          <div>Open a file from the explorer</div>
+          <div className="text-xs mt-1 text-[#555]">VSCode-powered editor (Monaco)</div>
+        </div>
+      )}
+    </div>
+  );
+});
 
 const getFileIconMeta = (name: string, isDirectory: boolean) => {
   if (isDirectory) return { kind: 'folder', label: '' };
@@ -2380,12 +3243,55 @@ const FileTreeNode: React.FC<{
   );
 };
 
+// Keep the shell/sidebar subscription independent from transcript payloads.
+// A token chunk replaces a Thread object, but none of these metadata fields,
+// so useShallow keeps App asleep while ChatTranscript handles the update.
+const threadShellSignatureCache = new WeakMap<Thread, string>();
+const threadShellSignature = (thread: Thread): string => {
+  const cached = threadShellSignatureCache.get(thread);
+  if (cached !== undefined) return cached;
+
+  const lastMessage = thread.messages.at(-1);
+  const queuedIds = thread.queuedMessages?.map((message) => message.id).join(',') ?? '';
+  const signature = [
+    thread.id,
+    thread.projectId,
+    thread.title,
+    thread.status,
+    thread.modelId,
+    thread.accessMode,
+    thread.codexReasoningEffort,
+    thread.codexServiceTier,
+    thread.claudeReasoningEffort,
+    thread.claudeContextWindow,
+    thread.grokReasoningEffort,
+    thread.createdAt,
+    thread.hiddenFromRecent ? '1' : '0',
+    thread.parentThreadId,
+    thread.branchedFromThreadId,
+    thread.spawnId,
+    thread.terminalActivityAt,
+    thread.messages.length,
+    lastMessage?.id,
+    lastMessage?.ts,
+    lastMessage?.status,
+    lastMessage?.completedAt,
+    queuedIds,
+    JSON.stringify(thread.agentSessionIds ?? null),
+    JSON.stringify(thread.pendingForkProviders ?? null),
+    JSON.stringify(thread.subagent ?? null),
+    JSON.stringify(thread.goal ?? null),
+    JSON.stringify(thread.linkedTask ?? null),
+  ].join('\u0000');
+  threadShellSignatureCache.set(thread, signature);
+  return signature;
+};
+
 const App: React.FC = () => {
   const {
     activeTab,
     setActiveTab,
     projects,
-    threads,
     selectedProjectId,
     selectedThreadId,
     addProject,
@@ -2403,13 +3309,10 @@ const App: React.FC = () => {
     addActivityToThreadMessage,
     workspacePath,
     setWorkspacePath,
-    openFiles,
     activeFilePath,
     openFile,
     closeFile,
     setActiveFile,
-    updateOpenFileContent,
-    markFileSaved,
     closeAllFiles,
     providerSettings,
     setProviderEnabled,
@@ -2426,7 +3329,66 @@ const App: React.FC = () => {
     appendToBtwExchange,
     updateBtwExchange,
     removeBtwExchange,
-  } = useOrionStore();
+  } = useOrionStore(
+    useShallow((state) => ({
+      activeTab: state.activeTab,
+      setActiveTab: state.setActiveTab,
+      projects: state.projects,
+      selectedProjectId: state.selectedProjectId,
+      selectedThreadId: state.selectedThreadId,
+      addProject: state.addProject,
+      removeProject: state.removeProject,
+      renameProject: state.renameProject,
+      createThread: state.createThread,
+      branchThread: state.branchThread,
+      selectProject: state.selectProject,
+      selectThread: state.selectThread,
+      updateThread: state.updateThread,
+      deleteThread: state.deleteThread,
+      addMessageToThread: state.addMessageToThread,
+      appendToThreadMessage: state.appendToThreadMessage,
+      updateThreadMessage: state.updateThreadMessage,
+      addActivityToThreadMessage: state.addActivityToThreadMessage,
+      workspacePath: state.workspacePath,
+      setWorkspacePath: state.setWorkspacePath,
+      activeFilePath: state.activeFilePath,
+      openFile: state.openFile,
+      closeFile: state.closeFile,
+      setActiveFile: state.setActiveFile,
+      closeAllFiles: state.closeAllFiles,
+      providerSettings: state.providerSettings,
+      setProviderEnabled: state.setProviderEnabled,
+      setProviderOptions: state.setProviderOptions,
+      orchestrationSettings: state.orchestrationSettings,
+      setOrchestrationRoleModel: state.setOrchestrationRoleModel,
+      setOrchestrationGeneralInstructions: state.setOrchestrationGeneralInstructions,
+      notificationSettings: state.notificationSettings,
+      setNotificationSettings: state.setNotificationSettings,
+      setThreadAgentSession: state.setThreadAgentSession,
+      queueMessageToThread: state.queueMessageToThread,
+      removeQueuedThreadMessage: state.removeQueuedThreadMessage,
+      addBtwExchange: state.addBtwExchange,
+      appendToBtwExchange: state.appendToBtwExchange,
+      updateBtwExchange: state.updateBtwExchange,
+      removeBtwExchange: state.removeBtwExchange,
+    }))
+  );
+  const threadShellSignatures = useOrionStore(
+    useShallow((state) => state.threads.map(threadShellSignature))
+  );
+  const threads = useMemo(
+    () => useOrionStore.getState().threads,
+    [threadShellSignatures]
+  );
+  const openFileShellSignatures = useOrionStore(
+    useShallow((state) =>
+      state.openFiles.map((file) => `${file.path}\u0000${file.isDirty ? '1' : '0'}`)
+    )
+  );
+  const openFiles = useMemo(
+    () => useOrionStore.getState().openFiles,
+    [openFileShellSignatures]
+  );
 
   const [treeRoot, setTreeRoot] = useState<string | null>(null);
   const [treeItems, setTreeItems] = useState<FileTreeItem[]>([]);
@@ -2458,7 +3420,6 @@ const App: React.FC = () => {
       return changed ? next : current;
     });
   }, []);
-  const [currentEditorValue, setCurrentEditorValue] = useState<string>('');
   const [agentModels, setAgentModels] = useState<AgentModel[]>(fallbackAgentModels);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState('');
@@ -2471,9 +3432,14 @@ const App: React.FC = () => {
   const chatMentionDismissRef = useRef<number | null>(null);
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
+  const [accessModeOpen, setAccessModeOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [branchPickerOpen, setBranchPickerOpen] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
+
+  useEffect(() => {
+    if (isSending) setAccessModeOpen(false);
+  }, [isSending]);
 
   useEffect(() => {
     if (!branchPickerOpen) setCreatingBranch(false);
@@ -2503,7 +3469,6 @@ const App: React.FC = () => {
   // Recent agents list and the project lists.
   const [recentAgentsOpen, setRecentAgentsOpen] = useState(true);
   const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
-  const [editorBottomPadding, setEditorBottomPadding] = useState(280);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
@@ -2564,12 +3529,17 @@ const App: React.FC = () => {
   );
   const agentModelsRef = useRef<AgentModel[]>(fallbackAgentModels);
   const startTurnForThreadRef = useRef<
-    | ((threadId: string, promptText: string, attachments: ImageAttachment[]) => {
-        ok: boolean;
-        error?: string;
-      })
+    | ((
+        threadId: string,
+        promptText: string,
+        attachments: ImageAttachment[]
+      ) => Promise<{ ok: boolean; error?: string }>)
     | null
   >(null);
+  const linkedTaskRefreshesRef = useRef(
+    new Map<string, { taskId: string; promise: Promise<void> }>()
+  );
+  const pendingTurnStartsRef = useRef(new Set<string>());
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -2581,7 +3551,7 @@ const App: React.FC = () => {
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
-  const editorContainerRef = useRef<HTMLDivElement>(null);
+  const accessModeRef = useRef<HTMLDivElement>(null);
 
   // The Agents pane unmounts while the Code tab is active, so the textarea must
   // be re-measured when it remounts, not only when the text changes.
@@ -2591,6 +3561,11 @@ const App: React.FC = () => {
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
   }, [chatInput, activeTab]);
+
+  useEffect(() => {
+    chatPinnedRef.current = true;
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [selectedThreadId]);
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
   const selectedThreadProject = selectedThread
@@ -2612,45 +3587,32 @@ const App: React.FC = () => {
     }
     return dirs;
   }, [selectedThreadProjectPath, selectedThreadGrokSessionId]);
-  // Floating Tasks card: position/collapse persist across turns and threads
-  // for the session (the user parks it once); dismissal is per-message so the
-  // card comes back when a new turn streams a fresh task list.
-  const [tasksCardPos, setTasksCardPos] = useState<{ x: number; y: number } | null>(null);
+  // The card's placement is shell-level so it survives switching to Code and
+  // back; only its plan lookup/rendering lives in the streaming chat boundary.
+  const [tasksCardPosition, setTasksCardPosition] = useState<{ x: number; y: number } | null>(null);
   const [tasksCardCollapsed, setTasksCardCollapsed] = useState(false);
   const [tasksCardDismissedFor, setTasksCardDismissedFor] = useState<string | null>(null);
-  const floatingPlan = useMemo(() => {
-    const messages = selectedThread?.messages;
-    if (!messages) return null;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      if (message.role !== 'agent' || message.kind !== 'agent-run') continue;
-      // Only the latest turn counts: if it didn't emit a plan, show nothing
-      // rather than pinning a stale task list from an earlier turn.
-      const activity = message.activities?.find((entry) => entry.type === 'plan');
-      if (!activity || (activity.plan?.length ?? 0) === 0) return null;
-      return { messageId: message.id, activity, running: message.status === 'running' };
-    }
-    return null;
-  }, [selectedThread]);
-  // The live agent-run message, if any — its status docks to the bottom of
-  // the chat area so the current step never scrolls out of view.
-  const runningAgentMessage = useMemo(() => {
-    const messages = selectedThread?.messages;
-    if (!messages) return null;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      if (message.role === 'agent' && message.kind === 'agent-run' && message.status === 'running')
-        return message;
-    }
-    return null;
-  }, [selectedThread]);
+  const toggleTasksCard = useCallback(
+    () => setTasksCardCollapsed((current) => !current),
+    []
+  );
+  const dismissTasksCard = useCallback((messageId: string) => {
+    setTasksCardDismissedFor(messageId);
+  }, []);
   const selectedProject =
     projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
-  const latestThreadProjectId =
-    threads
-      .slice()
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
-      ?.projectId ?? null;
+  const latestThreadProjectId = useMemo(() => {
+    let latestProjectId: string | null = null;
+    let latestCreatedAt = -Infinity;
+    for (const thread of threads) {
+      const createdAt = new Date(thread.createdAt).getTime();
+      if (createdAt > latestCreatedAt) {
+        latestCreatedAt = createdAt;
+        latestProjectId = thread.projectId;
+      }
+    }
+    return latestProjectId;
+  }, [threads]);
   const defaultNewThreadProject =
     selectedProject ??
     projects.find((project) => project.id === latestThreadProjectId) ??
@@ -2693,7 +3655,6 @@ const App: React.FC = () => {
   const canChangeSelectedThreadProject =
     !!selectedThread && selectedThread.messages.length === 0 && selectedThread.status === 'idle' && !isSending;
 
-  const activeFile = openFiles.find((f) => f.path === activeFilePath);
   const shellTitle =
     activeTab === 'agents'
       ? selectedThread?.title ?? 'New thread'
@@ -2747,6 +3708,9 @@ const App: React.FC = () => {
   const selectedGrokReasoning = selectedThread?.grokReasoningEffort ?? defaultGrokReasoningEffort;
   const selectedGrokReasoningLabel =
     grokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
+  const selectedAccessMode = selectedThread?.accessMode ?? 'full-access';
+  const selectedAccessModeLabel =
+    accessModeOptions.find((option) => option.value === selectedAccessMode)?.label ?? 'Full access';
   const shouldShowAgentSettings =
     !isTerminalThread &&
     (selectedAgentModel?.providerId === 'codex' ||
@@ -2970,15 +3934,24 @@ const App: React.FC = () => {
     [threads]
   );
 
-  const getProjectThreads = useCallback(
-    (projectId: string) =>
-      threads
+  const projectThreadsByProject = useMemo(
+    () => {
+      const grouped = new Map<string, Thread[]>();
+      for (const thread of threads) {
         // Top-level rows only; children render nested under their parent.
-        .filter((t) => t.projectId === projectId && !childThreadIds.has(t.id))
-        .sort(
+        if (childThreadIds.has(thread.id)) continue;
+        const projectThreads = grouped.get(thread.projectId);
+        if (projectThreads) projectThreads.push(thread);
+        else grouped.set(thread.projectId, [thread]);
+      }
+      for (const projectThreads of grouped.values()) {
+        projectThreads.sort(
           (a, b) =>
             getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
-        ),
+        );
+      }
+      return grouped;
+    },
     [childThreadIds, threads]
   );
 
@@ -3076,66 +4049,10 @@ const App: React.FC = () => {
     [activeRunsByThread, clearActiveRun, disposeThreadRuntime, removeProject]
   );
 
-  const threadSearchIndex = useMemo<ThreadSearchEntry[]>(() => {
-    const projectById = new Map(projects.map((project) => [project.id, project]));
-
-    return threads.map((thread) => {
-      const project = projectById.get(thread.projectId);
-      const messageText = thread.messages
-        .map((message) => {
-          const activityText = message.activities
-            ?.map((activity) => `${activity.title} ${activity.detail ?? ''}`)
-            .join(' ');
-          const changedFileText = message.changedFiles
-            ?.map((file) => `${file.path} ${file.status}`)
-            .join(' ');
-          return [message.content, activityText, changedFileText].filter(Boolean).join(' ');
-        })
-        .join(' ');
-      const haystack = normalizeSearchText(
-        [
-          thread.title,
-          project?.name ?? '',
-          project?.path ?? '',
-          thread.modelId,
-          thread.status,
-          messageText,
-        ].join(' ')
-      );
-      return {
-        thread,
-        projectName: project?.name ?? 'Unknown project',
-        projectPath: project?.path ?? '',
-        haystack,
-        tokens: Array.from(new Set(haystack.split(' ').filter(Boolean))),
-      };
-    });
-  }, [projects, threads]);
-
-  const threadSearchResults = useMemo(() => {
-    const query = threadSearchQuery.trim();
-    if (!query) {
-      return threadSearchIndex
-        .slice()
-        .sort((a, b) => getThreadActivityTime(b.thread).getTime() - getThreadActivityTime(a.thread).getTime())
-        .slice(0, 12)
-        .map((entry) => ({ entry, score: 1 }));
-    }
-
-    return threadSearchIndex
-      .map((entry) => ({ entry, score: scoreThreadSearchEntry(entry, query) }))
-      .filter((result) => result.score > 0)
-      .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        return getThreadActivityTime(b.entry.thread).getTime() - getThreadActivityTime(a.entry.thread).getTime();
-      })
-      .slice(0, 30);
-  }, [threadSearchIndex, threadSearchQuery]);
-
-  const refreshAgentModels = useCallback(async () => {
+  const refreshAgentModels = useCallback(async (force = false) => {
     if (!window.orion?.listAgentModels) return;
     try {
-      const models = await window.orion.listAgentModels();
+      const models = await window.orion.listAgentModels({ force });
       if (models.length > 0) {
         setAgentModels(models);
       }
@@ -3156,6 +4073,14 @@ const App: React.FC = () => {
   useEffect(() => {
     void refreshAgentModels();
     void refreshProviderUpdates();
+  }, [refreshAgentModels, refreshProviderUpdates]);
+
+  useEffect(() => {
+    if (!window.orion?.onProviderAuthenticated) return undefined;
+    return window.orion.onProviderAuthenticated(() => {
+      void refreshAgentModels(true);
+      void refreshProviderUpdates();
+    });
   }, [refreshAgentModels, refreshProviderUpdates]);
 
   // Claude Code CLI terminal threads: main discovers the live CLI session id
@@ -3219,42 +4144,6 @@ const App: React.FC = () => {
       unsubscribe?.();
     };
   }, []);
-
-  const handleChatScroll = useCallback(() => {
-    const el = chatScrollRef.current;
-    if (!el) return;
-    chatPinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    chatScrollTopRef.current = el.scrollTop;
-  }, []);
-
-  // The Agents pane unmounts while the Code tab is active, so the chat scroll
-  // container comes back at scrollTop 0. Restore the exact spot the user left
-  // (or the bottom while they were pinned there) before the browser paints.
-  // 'instant' overrides the container's smooth scroll-behavior, which would
-  // otherwise animate the restore from the very top.
-  useLayoutEffect(() => {
-    if (activeTab !== 'agents') return;
-    const el = chatScrollRef.current;
-    if (!el) return;
-    el.scrollTo({
-      top: chatPinnedRef.current ? el.scrollHeight : chatScrollTopRef.current,
-      behavior: 'instant',
-    });
-  }, [activeTab]);
-
-  useEffect(() => {
-    chatPinnedRef.current = true;
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [selectedThreadId]);
-
-  // Follow streaming output (chunks and activities mutate the messages array)
-  // while the user stays pinned near the bottom; never fight a manual scroll.
-  // 'instant' overrides the container's smooth scroll-behavior, which would
-  // otherwise restart its animation on every streamed chunk.
-  useEffect(() => {
-    if (!chatPinnedRef.current) return;
-    chatEndRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' });
-  }, [selectedThread?.messages, selectedThread?.queuedMessages, selectedThread?.btwExchanges, isSending]);
 
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
@@ -3324,6 +4213,29 @@ const App: React.FC = () => {
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [codexSettingsOpen]);
+
+  useEffect(() => {
+    if (!accessModeOpen) return undefined;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!accessModeRef.current?.contains(event.target as Node)) {
+        setAccessModeOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setAccessModeOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [accessModeOpen]);
 
   useEffect(() => {
     if (!shouldShowAgentSettings) {
@@ -3466,7 +4378,7 @@ const App: React.FC = () => {
         return;
       }
 
-      await window.orion?.checkForAppUpdate?.();
+      await window.orion?.checkForAppUpdate?.({ force: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Could not update Orion');
       setAppUpdateBusy(false);
@@ -3513,9 +4425,6 @@ const App: React.FC = () => {
       const result = await window.orion.authenticateProvider(providerId);
       if (result.ok) {
         toast.info('Authentication started');
-        window.setTimeout(() => {
-          void refreshProviderUpdates();
-        }, 2500);
       } else {
         toast.error(result.error ?? 'Could not start authentication');
       }
@@ -3524,7 +4433,7 @@ const App: React.FC = () => {
     } finally {
       setAuthenticatingProviderId(null);
     }
-  }, [authenticatingProviderId, refreshProviderUpdates]);
+  }, [authenticatingProviderId]);
 
   useEffect(() => {
     if (
@@ -3766,42 +4675,96 @@ const App: React.FC = () => {
       if (previous && previous.id !== task.id) {
         void window.orion.unlinkBoardTask?.({ taskId: previous.id, threadId: thread.id }).catch(() => {});
       }
+      const linkedTask = linkedTaskFromBoardTask(result.task ?? task);
       updateThread(thread.id, {
-        linkedTask: { id: task.id, title: task.title, description: task.description, injected: false },
+        linkedTask,
         ...(adoptTitle ? { title: task.title } : {}),
       });
+      const unavailableCount = linkedTask.attachments?.filter((attachment) => !attachment.path).length ?? 0;
+      if (unavailableCount > 0) {
+        toast.warning(
+          `${unavailableCount} task attachment${unavailableCount === 1 ? '' : 's'} could not be downloaded.`
+        );
+      }
       setTaskPickerOpen(false);
     },
     [updateThread]
   );
 
-  // Refresh the linked-task snapshot (and detect web-side unlink or deletion)
-  // whenever a thread whose task context hasn't been injected yet is selected,
-  // so the agent gets the latest title/description from the board.
+  // Refresh and locally download the linked-task snapshot (and detect web-side
+  // unlink or deletion) whenever a thread whose context has not been injected
+  // is selected, so the agent gets current text and attachments.
+  const refreshLinkedTaskSnapshot = useCallback(
+    (threadId: string, linked: LinkedBoardTask): Promise<void> => {
+      if (!window.orion?.getBoardTask) return Promise.resolve();
+
+      const existing = linkedTaskRefreshesRef.current.get(threadId);
+      if (existing?.taskId === linked.id) return existing.promise;
+
+      const refresh = window.orion
+        .getBoardTask(linked.id)
+        .then((result) => {
+          const current = useOrionStore
+            .getState()
+            .threads.find((thread) => thread.id === threadId)?.linkedTask;
+          if (!current || current.id !== linked.id || current.injected) return;
+
+          if (!result.ok) {
+            if (result.stale) {
+              updateThread(threadId, { linkedTask: undefined });
+            }
+            return;
+          }
+
+          const fresh = result.task;
+          if (!fresh || fresh.linked?.threadId !== threadId) {
+            updateThread(threadId, { linkedTask: undefined });
+            return;
+          }
+          updateThread(threadId, {
+            linkedTask: {
+              ...linkedTaskFromBoardTask(fresh),
+              lastStatus: current.lastStatus,
+            },
+          });
+        })
+        .catch(() => {});
+      const sharedRefresh = refresh.finally(() => {
+        if (linkedTaskRefreshesRef.current.get(threadId)?.promise === sharedRefresh) {
+          linkedTaskRefreshesRef.current.delete(threadId);
+        }
+      });
+      linkedTaskRefreshesRef.current.set(threadId, {
+        taskId: linked.id,
+        promise: sharedRefresh,
+      });
+      return sharedRefresh;
+    },
+    [updateThread]
+  );
+
+  const refreshLinkedTaskBeforeDispatch = useCallback(
+    async (threadId: string) => {
+      const linked = useOrionStore
+        .getState()
+        .threads.find((thread) => thread.id === threadId)?.linkedTask;
+      if (!linked || linked.injected) return;
+      await refreshLinkedTaskSnapshot(threadId, linked);
+    },
+    [refreshLinkedTaskSnapshot]
+  );
+
   useEffect(() => {
     const threadId = selectedThread?.id;
     const linked = selectedThread?.linkedTask;
-    if (!threadId || !linked || linked.injected || !window.orion?.listBoardTasks) return undefined;
-    let cancelled = false;
-    void window.orion.listBoardTasks().then((result) => {
-      if (cancelled || !result.ok) return;
-      const current = useOrionStore.getState().threads.find((t) => t.id === threadId)?.linkedTask;
-      if (!current || current.id !== linked.id || current.injected) return;
-      const fresh = result.tasks?.find((t) => t.id === linked.id);
-      if (!fresh || fresh.linked?.threadId !== threadId) {
-        updateThread(threadId, { linkedTask: undefined });
-        return;
-      }
-      if (fresh.title !== current.title || fresh.description !== current.description) {
-        updateThread(threadId, {
-          linkedTask: { ...current, title: fresh.title, description: fresh.description },
-        });
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedThread?.id, selectedThread?.linkedTask?.id, selectedThread?.linkedTask?.injected, updateThread]);
+    if (!threadId || !linked || linked.injected) return;
+    void refreshLinkedTaskSnapshot(threadId, linked);
+  }, [
+    selectedThread?.id,
+    selectedThread?.linkedTask?.id,
+    selectedThread?.linkedTask?.injected,
+    refreshLinkedTaskSnapshot,
+  ]);
 
   const flushChunkBuffers = useCallback(() => {
     if (chunkFlushTimer.current !== null) {
@@ -4267,30 +5230,11 @@ const App: React.FC = () => {
     }
   }, [treeRoot, loadRoot]);
 
-  useEffect(() => {
-    const editorContainer = editorContainerRef.current;
-    if (!editorContainer) return undefined;
-
-    const updatePadding = () => {
-      const nextPadding = Math.round(editorContainer.clientHeight * 0.5);
-      if (nextPadding > 0) {
-        setEditorBottomPadding(nextPadding);
-      }
-    };
-
-    updatePadding();
-
-    const resizeObserver = new ResizeObserver(updatePadding);
-    resizeObserver.observe(editorContainer);
-    return () => resizeObserver.disconnect();
-  }, [activeTab]);
-
   // Load a file into editor (from Code tab)
   const handleOpenFile = async (filePath: string) => {
     if (!window.orion) return;
     const content = await window.orion.readFile(filePath);
     openFile(filePath, content);
-    setCurrentEditorValue(content);
   };
 
   // Load children for tree nodes
@@ -4382,60 +5326,6 @@ const App: React.FC = () => {
     }
     refreshTree();
   };
-
-  // Save current file
-  const saveActiveFile = useCallback(async () => {
-    if (!activeFile || !window.orion) return;
-
-    const success = await window.orion.writeFile(activeFile.path, currentEditorValue);
-    if (success) {
-      updateOpenFileContent(activeFile.path, currentEditorValue);
-      markFileSaved(activeFile.path);
-    } else {
-      toast.error('Failed to save file');
-    }
-  }, [activeFile, currentEditorValue, markFileSaved, updateOpenFileContent]);
-
-  // Handle editor changes
-  const handleEditorChange = (value: string | undefined) => {
-    if (value === undefined) return;
-    setCurrentEditorValue(value);
-    if (activeFilePath) {
-      updateOpenFileContent(activeFilePath, value);
-    }
-  };
-
-  // Keyboard save
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        e.stopPropagation();
-        e.stopImmediatePropagation();
-        if (activeTab === 'code' && activeFilePath) {
-          void saveActiveFile();
-        }
-        return;
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'w') {
-        if (activeTab === 'code' && activeFilePath) {
-          e.preventDefault();
-          closeFile(activeFilePath);
-        }
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [activeTab, activeFilePath, closeFile, saveActiveFile]);
-
-  // When switching active file, load its content into local editor state
-  useEffect(() => {
-    if (activeFile) {
-      setCurrentEditorValue(activeFile.content);
-    } else {
-      setCurrentEditorValue('');
-    }
-  }, [activeFilePath]);
 
   // Add a project
   const handleAddProject = async () => {
@@ -4804,15 +5694,24 @@ const App: React.FC = () => {
   };
 
   // Start a turn on any thread — not just the selected one — so queued
-  // follow-ups can dispatch for threads running in the background. Preflight
-  // and transcript setup are synchronous; the CLI spawn result is handled in
-  // the continuation.
+  // follow-ups can dispatch for threads running in the background. Linked-task
+  // freshness is awaited first; transcript setup stays synchronous once that
+  // snapshot is ready, and the CLI spawn result is handled in the continuation.
   const startTurnForThread = useCallback(
-    (
+    async (
       threadId: string,
       promptText: string,
       attachments: ImageAttachment[]
-    ): { ok: boolean; error?: string } => {
+    ): Promise<{ ok: boolean; error?: string }> => {
+      if (pendingTurnStartsRef.current.has(threadId)) {
+        return { ok: false, error: 'An agent turn is already starting' };
+      }
+      pendingTurnStartsRef.current.add(threadId);
+      try {
+        await refreshLinkedTaskBeforeDispatch(threadId);
+      } finally {
+        pendingTurnStartsRef.current.delete(threadId);
+      }
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
@@ -4918,6 +5817,8 @@ const App: React.FC = () => {
         return { ok: false, error: 'Type a message first' };
       }
 
+      const taskMediaAttachments = taskToInject ? linkedTaskMediaAttachments(taskToInject) : [];
+      const turnAttachments = [...taskMediaAttachments, ...attachments];
       const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
       let agentPrompt = buildPromptWithAttachments(promptText, attachments);
       if (taskToInject) {
@@ -4961,7 +5862,7 @@ const App: React.FC = () => {
       addMessageToThread(threadId, {
         role: 'user',
         content: userContent,
-        attachments,
+        attachments: turnAttachments,
         ...(taskToInject
           ? {
               linkedTask: {
@@ -5005,6 +5906,13 @@ const App: React.FC = () => {
               thread.pendingForkProviders?.includes(model.providerId)
           ),
           providerOptions: normalizedProviderSettings[model.providerId]?.options,
+          // Kimi's ACP adapter accepts native image content blocks. Preserve
+          // the text/path context as a fallback, but also pass the attachment
+          // metadata so main can read the bytes without routing them through
+          // the renderer or relying on Kimi to reproduce a Unicode file path.
+          ...(model.providerId === 'kimi' && turnAttachments.length > 0
+            ? { attachments: turnAttachments }
+            : {}),
           ...(model.providerId === 'codex'
             ? {
                 codexReasoningEffort: getEffectiveCodexReasoningEffort(
@@ -5066,6 +5974,7 @@ const App: React.FC = () => {
       clearActiveRun,
       pushLinkedTaskStatus,
       trackRunStartup,
+      refreshLinkedTaskBeforeDispatch,
     ]
   );
 
@@ -5159,11 +6068,26 @@ const App: React.FC = () => {
       // The spawnId was persisted at creation so the completion watcher can't
       // miss a fast run. Async start failures set the thread status to
       // 'error', which the watcher reports.
-      const result = startTurnForThreadRef.current?.(childThreadId, request.prompt, []);
-      if (!result?.ok) {
+      const start = startTurnForThreadRef.current?.(childThreadId, request.prompt, []);
+      if (!start) {
         state.updateThread(childThreadId, { spawnId: undefined });
-        report(false, result?.error ?? 'The subagent turn could not start');
+        report(false, 'The subagent turn could not start');
+        return;
       }
+      void start.then(
+        (result) => {
+          if (result.ok) return;
+          state.updateThread(childThreadId, { spawnId: undefined });
+          report(false, result.error ?? 'The subagent turn could not start');
+        },
+        (error) => {
+          state.updateThread(childThreadId, { spawnId: undefined });
+          report(
+            false,
+            error instanceof Error ? error.message : 'The subagent turn could not start'
+          );
+        }
+      );
     });
     return () => {
       unsubscribe?.();
@@ -5602,9 +6526,8 @@ const App: React.FC = () => {
     ]
   );
 
-  // `/review` — codex's dedicated code reviewer (`codex exec review`). Runs
-  // as a normal one-shot agent-run message; the review session is ephemeral
-  // and never becomes the thread's resumable session.
+  // `/review` — Codex's dedicated reviewer, run inline on the current native
+  // Codex session so it can see the conversation that led to the changes.
   const startReviewForThread = useCallback(
     (
       threadId: string,
@@ -5671,13 +6594,20 @@ const App: React.FC = () => {
           prompt: review.instructions || reviewLabel,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
+          resumeSessionId: thread.agentSessionIds?.codex,
+          forkSession: Boolean(
+            thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')
+          ),
           providerOptions: normalizedProviderSettings.codex?.options,
           codexReasoningEffort: getEffectiveCodexReasoningEffort(
             model,
             thread.codexReasoningEffort
           ),
           codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
-          codexReview: review,
+          codexReview: {
+            ...review,
+            threadContext: buildReviewThreadContext(thread),
+          },
         })
         .then((result) => {
           if (result.ok && result.runId) {
@@ -5729,95 +6659,6 @@ const App: React.FC = () => {
     [removeBtwExchange]
   );
 
-  // `/btw` asides render at their chronological spot. Agent-run anchors also
-  // carry a content offset and are interleaved inside ChatMessage, so chunks
-  // from the same response that arrive later appear below the aside.
-  // Pre-anchor data, deleted anchors, and asides asked on an empty thread fall
-  // back to timestamps so later turns still appear below them.
-  const btwAsidesByAnchor = new Map<string, BtwExchange[]>();
-  const leadingBtwAsides: BtwExchange[] = [];
-  const trailingBtwAsides: BtwExchange[] = [];
-  if (selectedThread) {
-    const messageIds = new Set(selectedThread.messages.map((m) => m.id));
-    for (const exchange of selectedThread.btwExchanges ?? []) {
-      let anchorId =
-        exchange.afterMessageId && messageIds.has(exchange.afterMessageId)
-          ? exchange.afterMessageId
-          : undefined;
-      const exchangeTime = new Date(exchange.createdAt).getTime();
-      if (!anchorId && Number.isFinite(exchangeTime)) {
-        anchorId = [...selectedThread.messages]
-          .reverse()
-          .find((message) => {
-            const messageTime = new Date(message.ts).getTime();
-            return Number.isFinite(messageTime) && messageTime <= exchangeTime;
-          })?.id;
-      }
-      if (anchorId) {
-        const anchored = btwAsidesByAnchor.get(anchorId);
-        if (anchored) anchored.push(exchange);
-        else btwAsidesByAnchor.set(anchorId, [exchange]);
-      } else if (Number.isFinite(exchangeTime) && selectedThread.messages.length > 0) {
-        leadingBtwAsides.push(exchange);
-      } else {
-        trailingBtwAsides.push(exchange);
-      }
-    }
-  }
-
-  const renderBtwAside = (exchange: BtwExchange) =>
-    !selectedThread ? null : (
-      <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
-        <div className="btw-aside-bar">
-          <span className="btw-aside-badge">
-            <Sparkles size={11} />
-            BTW
-          </span>
-          <span className="btw-aside-note">
-            aside · answered from a fork · not part of the thread
-          </span>
-          <button
-            type="button"
-            className="btw-aside-dismiss"
-            onClick={() => dismissBtwExchange(selectedThread.id, exchange.id)}
-            title={
-              exchange.status === 'running'
-                ? 'Cancel and dismiss this aside'
-                : 'Dismiss this aside'
-            }
-          >
-            <X size={12} />
-          </button>
-        </div>
-        <div className="btw-aside-question">{exchange.question}</div>
-        {exchange.status === 'running' && !exchange.answer && (
-          <div className="agent-status-line running">
-            <span className="working-dots" aria-hidden="true">
-              <span />
-              <span />
-              <span />
-            </span>
-            <span>Answering on the side…</span>
-          </div>
-        )}
-        {exchange.answer && (
-          <div className="btw-aside-answer">
-            <MarkdownContent content={exchange.answer} />
-          </div>
-        )}
-        {exchange.status === 'error' &&
-          (exchange.authProviderId ? (
-            <ProviderAuthPrompt
-              providerId={exchange.authProviderId}
-              onAuthenticate={handleAuthenticateProvider}
-              busy={authenticatingProviderId === exchange.authProviderId}
-            />
-          ) : (
-            <div className="agent-error">{exchange.error ?? 'The aside failed.'}</div>
-          ))}
-      </div>
-    );
-
   // Queued follow-ups dispatch as soon as their thread has no run in flight —
   // after a turn finishes (done or error) and after app-restart recovery. Each
   // dispatch resumes the provider session, so the agent keeps its context.
@@ -5825,15 +6666,31 @@ const App: React.FC = () => {
     for (const thread of threads) {
       const next = thread.queuedMessages?.[0];
       if (!next) continue;
-      if (thread.status === 'running' || activeRunsByThread[thread.id]) continue;
-      removeQueuedThreadMessage(thread.id, next.id);
-      const result = startTurnForThread(thread.id, next.text, next.attachments ?? []);
-      if (!result.ok) {
-        addMessageToThread(thread.id, {
-          role: 'system',
-          content: `Could not send the queued message: ${result.error}`,
-        });
+      if (
+        thread.status === 'running' ||
+        activeRunsByThread[thread.id] ||
+        pendingTurnStartsRef.current.has(thread.id)
+      ) {
+        continue;
       }
+      removeQueuedThreadMessage(thread.id, next.id);
+      void startTurnForThread(thread.id, next.text, next.attachments ?? []).then(
+        (result) => {
+          if (result.ok) return;
+          addMessageToThread(thread.id, {
+            role: 'system',
+            content: `Could not send the queued message: ${result.error}`,
+          });
+        },
+        (error) => {
+          addMessageToThread(thread.id, {
+            role: 'system',
+            content: `Could not send the queued message: ${
+              error instanceof Error ? error.message : 'unknown error'
+            }`,
+          });
+        }
+      );
     }
   }, [threads, activeRunsByThread, removeQueuedThreadMessage, startTurnForThread, addMessageToThread]);
 
@@ -6079,6 +6936,26 @@ const App: React.FC = () => {
     dispatchReview(promptText, { mode: 'custom', instructions: rest });
   };
 
+  // Async delivery can outlive the originating thread selection. Restore a
+  // failed submission to that thread's draft rather than overwriting whatever
+  // the user is currently composing elsewhere.
+  const restoreComposerDraft = (
+    threadId: string,
+    promptText: string,
+    attachments: ImageAttachment[]
+  ) => {
+    if (composerDraftKeyRef.current === threadId) {
+      setChatInput((current) => [promptText, current].filter(Boolean).join('\n\n'));
+      setChatAttachments((current) => [...attachments, ...current]);
+      return;
+    }
+    const draft = composerDraftsRef.current.get(threadId);
+    composerDraftsRef.current.set(threadId, {
+      text: [promptText, draft?.text ?? ''].filter(Boolean).join('\n\n'),
+      attachments: [...attachments, ...(draft?.attachments ?? [])],
+    });
+  };
+
   const sendMessage = async () => {
     if (!selectedThreadId || !selectedThread) return;
     // Native subagent transcripts are read-only mirrors — nothing to talk to.
@@ -6097,39 +6974,62 @@ const App: React.FC = () => {
     // the draft is delivered to the TUI exactly as if typed there (so claude
     // slash commands like /compact work too). Nothing goes through runTurn.
     if (isTerminalThread) {
+      if (pendingTurnStartsRef.current.has(selectedThreadId)) return;
+      const submittedThreadId = selectedThreadId;
+      const submittedInput = chatInput;
+      const submittedAttachments = chatAttachments;
+      // Clear before the linked-task refresh so edits made during that wait
+      // belong to the current composer and are never erased by this submission.
+      setChatInput('');
+      setChatMention(null);
+      setChatAttachments([]);
+      pendingTurnStartsRef.current.add(selectedThreadId);
+      try {
+        await refreshLinkedTaskBeforeDispatch(submittedThreadId);
+      } catch (error) {
+        restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
+        toast.error(
+          error instanceof Error ? error.message : 'The linked task could not be refreshed'
+        );
+        return;
+      } finally {
+        pendingTurnStartsRef.current.delete(submittedThreadId);
+      }
+      const currentThread = useOrionStore
+        .getState()
+        .threads.find((thread) => thread.id === submittedThreadId);
       const taskToInject =
-        selectedThread.linkedTask && !selectedThread.linkedTask.injected
-          ? selectedThread.linkedTask
+        currentThread?.linkedTask && !currentThread.linkedTask.injected
+          ? currentThread.linkedTask
           : undefined;
-      let text = buildPromptWithAttachments(promptText, chatAttachments);
+      let text = buildPromptWithAttachments(promptText, submittedAttachments);
       if (taskToInject) {
         text = text
           ? `${buildLinkedTaskContext(taskToInject, true)}\n\n${text}`
           : buildLinkedTaskContext(taskToInject, false);
       }
-      if (!text) return;
-      const submittedInput = chatInput;
-      const submittedAttachments = chatAttachments;
+      if (!text) {
+        restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
+        return;
+      }
       const restoreTerminalDraft = () => {
-        setChatInput((current) =>
-          [submittedInput, current].filter(Boolean).join('\n\n')
-        );
-        setChatAttachments((current) => [...submittedAttachments, ...current]);
+        restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
       };
-      // Clear optimistically so repeated clicks cannot submit the same draft
-      // twice; restore it if IPC delivery fails.
-      setChatInput('');
-      setChatMention(null);
-      setChatAttachments([]);
       let result: Awaited<ReturnType<NonNullable<typeof window.orion>['terminalSendPrompt']>> | undefined;
+      pendingTurnStartsRef.current.add(submittedThreadId);
       try {
-        result = await window.orion?.terminalSendPrompt?.({ threadId: selectedThreadId, text });
+        result = await window.orion?.terminalSendPrompt?.({
+          threadId: submittedThreadId,
+          text,
+        });
       } catch (error) {
         restoreTerminalDraft();
         toast.error(
           error instanceof Error ? error.message : 'The Claude Code terminal is not running.'
         );
         return;
+      } finally {
+        pendingTurnStartsRef.current.delete(submittedThreadId);
       }
       if (!result?.ok) {
         restoreTerminalDraft();
@@ -6139,22 +7039,22 @@ const App: React.FC = () => {
       if (taskToInject) {
         const currentLinkedTask = useOrionStore
           .getState()
-          .threads.find((thread) => thread.id === selectedThreadId)?.linkedTask;
+          .threads.find((thread) => thread.id === submittedThreadId)?.linkedTask;
         if (currentLinkedTask?.id === taskToInject.id && !currentLinkedTask.injected) {
-          updateThread(selectedThreadId, {
+          updateThread(submittedThreadId, {
             linkedTask: { ...currentLinkedTask, injected: true },
           });
         }
       }
       // Terminal threads have no transcript, so seed the sidebar title from
       // the first prompt sent through the composer.
-      if (isDefaultTitle(selectedThread.title) && promptText) {
+      if (currentThread && isDefaultTitle(currentThread.title) && promptText) {
         const initialTitle = deriveTitle(promptText);
         if (isPlausibleTitle(initialTitle)) {
-          updateThread(selectedThreadId, { title: initialTitle });
+          updateThread(submittedThreadId, { title: initialTitle });
         }
         void tryGenerateBetterTitle(
-          selectedThreadId,
+          submittedThreadId,
           promptText,
           'claude:claude-haiku-4-5',
           selectedThreadProject?.path ?? '',
@@ -6211,16 +7111,32 @@ const App: React.FC = () => {
       return;
     }
 
-    const result = startTurnForThread(selectedThreadId, promptText, chatAttachments);
-    if (!result.ok) {
-      toast.error(result.error);
-      return;
-    }
+    const submittedThreadId = selectedThreadId;
+    const submittedInput = chatInput;
+    const submittedAttachments = chatAttachments;
     setChatInput('');
     setChatMention(null);
     setChatAttachments([]);
+    let result: { ok: boolean; error?: string };
+    try {
+      result = await startTurnForThread(
+        submittedThreadId,
+        promptText,
+        submittedAttachments
+      );
+    } catch (error) {
+      restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
+      toast.error(error instanceof Error ? error.message : 'The agent turn could not start');
+      return;
+    }
+    if (!result.ok) {
+      restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
+      toast.error(result.error);
+      return;
+    }
     setModelPickerOpen(false);
     setCodexSettingsOpen(false);
+    setAccessModeOpen(false);
   };
 
   // Steering = interrupt the running CLI and immediately resume its session
@@ -6271,27 +7187,6 @@ const App: React.FC = () => {
     steerReady &&
     !!window.orion?.stopAgentTurn &&
     !steeringRunsRef.current.has(activeRunId);
-
-  // A failed or superseded steer hands the prompt back to its originating
-  // thread. The user may have switched threads during the multi-second
-  // interrupt wait, and the live composer belongs to whichever thread is
-  // selected now — writing into it would let the per-thread draft effect
-  // persist the restored text under the wrong thread, primed for submission
-  // to an unrelated agent. Only touch the live composer while the originating
-  // thread is still selected; otherwise merge into its stored draft, which
-  // the swap effect loads when the user returns to it.
-  const restoreSteerDraft = (threadId: string, promptText: string, attachments: ImageAttachment[]) => {
-    if (composerDraftKeyRef.current === threadId) {
-      setChatInput((current) => [promptText, current].filter(Boolean).join('\n\n'));
-      setChatAttachments((current) => [...attachments, ...current]);
-      return;
-    }
-    const draft = composerDraftsRef.current.get(threadId);
-    composerDraftsRef.current.set(threadId, {
-      text: [promptText, draft?.text ?? ''].filter(Boolean).join('\n\n'),
-      attachments: [...attachments, ...(draft?.attachments ?? [])],
-    });
-  };
 
   const steerWithContent = async (promptText: string, attachments: ImageAttachment[]) => {
     if (!canSteerNow() || !selectedThreadId || !activeRunId) return;
@@ -6441,7 +7336,7 @@ const App: React.FC = () => {
           }
         }
         if (!waiting) clearActiveRun(runId);
-        restoreSteerDraft(threadId, promptText, attachments);
+        restoreComposerDraft(threadId, promptText, attachments);
         toast.error(
           failed
             ? 'The agent failed before it could be steered — your message is back in the composer.'
@@ -6457,7 +7352,7 @@ const App: React.FC = () => {
       // its queued bubble. Put it back, and reattach the transcript only if
       // this is still the active run (Stop/background settlement may have won
       // the race while the IPC was pending).
-      restoreSteerDraft(threadId, promptText, attachments);
+      restoreComposerDraft(threadId, promptText, attachments);
       if (activeRunsByThreadRef.current[threadId] === runId && tracked) {
         runOutputMessages.current.set(runId, tracked);
         updateThreadMessage(tracked.threadId, tracked.messageId, {
@@ -6479,15 +7374,15 @@ const App: React.FC = () => {
     // restarting now would contradict that, so hand the prompt back to the
     // composer instead of silently dropping it.
     if (activeRunsByThreadRef.current[threadId] !== runId) {
-      restoreSteerDraft(threadId, promptText, attachments);
+      restoreComposerDraft(threadId, promptText, attachments);
       return;
     }
     clearActiveRun(runId);
-    const result = startTurnForThread(threadId, promptText, attachments);
+    const result = await startTurnForThread(threadId, promptText, attachments);
     if (!result.ok) {
       toast.error(result.error);
       updateThread(threadId, { status: 'error' });
-      restoreSteerDraft(threadId, promptText, attachments);
+      restoreComposerDraft(threadId, promptText, attachments);
     } else {
       // The interrupted and replacement runs are swapped in one render, so
       // runningAgentCount never falls. Explicitly surface files written by
@@ -6510,7 +7405,8 @@ const App: React.FC = () => {
 
   // "Steer now" on a queued transcript bubble: promote that message to an
   // immediate interrupt-and-resume instead of waiting for the turn to end.
-  const steerQueuedMessage = async (queuedId: string) => {
+  const steerQueuedMessageRef = useRef<(queuedId: string) => Promise<void>>(async () => {});
+  steerQueuedMessageRef.current = async (queuedId: string) => {
     if (!canSteerNow() || !selectedThreadId || !activeRunId) return;
     const thread = useOrionStore.getState().threads.find((t) => t.id === selectedThreadId);
     const queued = thread?.queuedMessages?.find((q) => q.id === queuedId);
@@ -6518,6 +7414,9 @@ const App: React.FC = () => {
     removeQueuedThreadMessage(selectedThreadId, queuedId);
     await steerWithContent(queued.text, queued.attachments ?? []);
   };
+  const steerQueuedMessage = useCallback((queuedId: string) => {
+    void steerQueuedMessageRef.current(queuedId);
+  }, []);
 
   const stopActiveAgent = async () => {
     if (!activeRunId || !window.orion?.stopAgentTurn) return;
@@ -6693,8 +7592,6 @@ const App: React.FC = () => {
     }
     sendMessage();
   };
-
-  const currentLanguage = activeFilePath ? getLanguageFromPath(activeFilePath) : 'plaintext';
 
   const formatCheckedTime = (iso: string): string => {
     try {
@@ -8105,29 +9002,15 @@ const App: React.FC = () => {
                             />
                           </div>
                           <div className="thread-search-results">
-                            {threadSearchResults.map(({ entry }) => (
-                              <button
-                                key={entry.thread.id}
-                                type="button"
-                                className="thread-search-result"
-                                onClick={() => {
-                                  selectThread(entry.thread.id);
-                                  setActiveTab('agents');
-                                  setThreadSearchOpen(false);
-                                }}
-                              >
-                                <span className="thread-search-title">{entry.thread.title}</span>
-                                <span className="thread-search-meta">
-                                  {entry.projectName} · {formatShortTime(getThreadActivityTime(entry.thread))}
-                                </span>
-                                <span className="thread-search-excerpt">
-                                  {getThreadSearchExcerpt(entry, threadSearchQuery)}
-                                </span>
-                              </button>
-                            ))}
-                            {threadSearchResults.length === 0 && (
-                              <div className="thread-search-empty">No matching threads</div>
-                            )}
+                            <ThreadSearchResults
+                              projects={projects}
+                              query={threadSearchQuery}
+                              onSelectThread={(threadId) => {
+                                selectThread(threadId);
+                                setActiveTab('agents');
+                                setThreadSearchOpen(false);
+                              }}
+                            />
                           </div>
                         </div>
                       )}
@@ -8305,7 +9188,7 @@ const App: React.FC = () => {
                 )}
 
                 {sortedProjects.map((project) => {
-                  const projectThreads = getProjectThreads(project.id);
+                  const projectThreads = projectThreadsByProject.get(project.id) ?? [];
                   const isActiveProject = selectedProject?.id === project.id;
                   const isCollapsed = collapsedProjects[project.id] ?? false;
                   const visibleLimit = threadListLimits[project.id] ?? THREADS_VISIBLE_LIMIT;
@@ -8604,111 +9487,30 @@ const App: React.FC = () => {
                       </React.Suspense>
                     ) : (
                       <>
-                    <div className="chat-scroll-wrap">
-                    <div className="chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll}>
-                      <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
-                      <div className="chat-container">
-                        {selectedThread.messages.length === 0 && (
-                          <AgentsWelcome projectName={selectedThreadProject?.name} />
-                        )}
-
-                        {leadingBtwAsides.map(renderBtwAside)}
-
-                        {selectedThread.messages.map((msg) => (
-                          <React.Fragment key={msg.id}>
-                            <ChatMessage
-                              message={msg}
-                              liveTask={selectedThread.linkedTask}
-                              taskBusy={isSending}
-                              onMarkTaskDone={() => markLinkedTaskDone(selectedThread.id)}
-                              onUnlinkTask={() => unlinkTaskFromThread(selectedThread.id)}
-                              btwExchanges={
-                                msg.kind === 'agent-run' ? btwAsidesByAnchor.get(msg.id) : undefined
-                              }
-                              renderBtwAside={renderBtwAside}
-                              onAuthenticateProvider={handleAuthenticateProvider}
-                              authenticatingProviderId={authenticatingProviderId}
-                            />
-                            {msg.kind !== 'agent-run' &&
-                              btwAsidesByAnchor.get(msg.id)?.map(renderBtwAside)}
-                          </React.Fragment>
-                        ))}
-
-                        {isSending && selectedThread.messages.at(-1)?.role !== 'agent' && (
-                          <div className="message agent opacity-70">Starting agent...</div>
-                        )}
-
-                        {(selectedThread.queuedMessages ?? []).map((queued) => (
-                          <div key={queued.id} className="message user queued">
-                            {queued.text && (
-                              <div className="whitespace-pre-wrap break-words">{queued.text}</div>
-                            )}
-                            {(queued.attachments?.length ?? 0) > 0 && (
-                              <div className="message-attachments">
-                                {queued.attachments!.map((attachment) => (
-                                  <div
-                                    key={attachment.id}
-                                    className="message-attachment"
-                                    title={attachment.path}
-                                  >
-                                    <AttachmentThumb attachment={attachment} />
-                                    <span>{attachment.name}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                            <div className="queued-message-bar">
-                              <span className="queued-message-badge">Queued</span>
-                              {steerSupported && (
-                                <button
-                                  type="button"
-                                  className="queued-message-action steer"
-                                  onClick={() => steerQueuedMessage(queued.id)}
-                                  disabled={!steerReady}
-                                  title={
-                                    steerReady
-                                      ? 'Interrupt the agent and send this now'
-                                      : 'Steer becomes available once the agent reports its session'
-                                  }
-                                >
-                                  <Zap size={12} />
-                                  Steer now
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                className="queued-message-action remove"
-                                onClick={() =>
-                                  removeQueuedThreadMessage(selectedThread.id, queued.id)
-                                }
-                                title="Remove queued message"
-                              >
-                                <X size={12} />
-                              </button>
-                            </div>
-                          </div>
-                        ))}
-
-                        {trailingBtwAsides.map(renderBtwAside)}
-                        <div ref={chatEndRef} />
-                      </div>
-                      </MarkdownBaseDirContext.Provider>
-                    </div>
-
-                    {floatingPlan && tasksCardDismissedFor !== floatingPlan.messageId && (
-                      <FloatingTasksCard
-                        activity={floatingPlan.activity}
-                        running={floatingPlan.running}
-                        position={tasksCardPos}
-                        onMove={setTasksCardPos}
-                        collapsed={tasksCardCollapsed}
-                        onToggleCollapsed={() => setTasksCardCollapsed((current) => !current)}
-                        onDismiss={() => setTasksCardDismissedFor(floatingPlan.messageId)}
-                      />
-                    )}
-
-                    {runningAgentMessage && <PinnedRunStatus message={runningAgentMessage} />}
-                    </div>
+                        <ChatTranscript
+                          threadId={selectedThread.id}
+                          projectName={selectedThreadProject?.name}
+                          mediaBaseDirs={mediaBaseDirs}
+                          isSending={isSending}
+                          steerSupported={steerSupported}
+                          steerReady={steerReady}
+                          authenticatingProviderId={authenticatingProviderId}
+                          chatScrollRef={chatScrollRef}
+                          chatEndRef={chatEndRef}
+                          chatPinnedRef={chatPinnedRef}
+                          chatScrollTopRef={chatScrollTopRef}
+                          tasksCardPosition={tasksCardPosition}
+                          tasksCardCollapsed={tasksCardCollapsed}
+                          tasksCardDismissedFor={tasksCardDismissedFor}
+                          onMoveTasksCard={setTasksCardPosition}
+                          onToggleTasksCard={toggleTasksCard}
+                          onDismissTasksCard={dismissTasksCard}
+                          onMarkTaskDone={markLinkedTaskDone}
+                          onUnlinkTask={unlinkTaskFromThread}
+                          onDismissBtwExchange={dismissBtwExchange}
+                          onAuthenticateProvider={handleAuthenticateProvider}
+                          onSteerQueuedMessage={steerQueuedMessage}
+                        />
                       </>
                     )}
 
@@ -9288,23 +10090,50 @@ const App: React.FC = () => {
                           </div>
                         )}
 
-                        <label className="access-select">
-                          <Shield size={15} />
-                          <select
-                            value={selectedThread.accessMode ?? 'full-access'}
-                            onChange={(event) =>
-                              updateThread(selectedThread.id, {
-                                accessMode: event.target.value as typeof selectedThread.accessMode,
-                              })
-                            }
+                        <div className="access-mode-anchor" ref={accessModeRef}>
+                          <button
+                            type="button"
+                            className="access-select"
+                            onClick={() => setAccessModeOpen((open) => !open)}
                             disabled={isSending}
+                            title="Access level"
                           >
-                            <option value="read-only">Read only</option>
-                            <option value="workspace-write">Workspace write</option>
-                            <option value="full-access">Full access</option>
-                          </select>
-                          <ChevronDown size={13} />
-                        </label>
+                            <Shield size={15} />
+                            <span>{selectedAccessModeLabel}</span>
+                            <ChevronDown
+                              size={13}
+                              className={`model-trigger-chevron ${accessModeOpen ? 'open' : ''}`}
+                            />
+                          </button>
+
+                          {accessModeOpen && !isSending && (
+                            <div className="access-mode-popover">
+                              <div className="codex-settings-options">
+                                {accessModeOptions.map((option) => {
+                                  const selected = selectedAccessMode === option.value;
+                                  return (
+                                    <button
+                                      key={option.value}
+                                      type="button"
+                                      className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                      onClick={() => {
+                                        updateThread(selectedThread.id, {
+                                          accessMode: option.value,
+                                        });
+                                        setAccessModeOpen(false);
+                                      }}
+                                    >
+                                      <span className="settings-check">
+                                        {selected && <Check size={17} />}
+                                      </span>
+                                      <span>{option.label}</span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
 
                         {!isTerminalThread && (
                         <div className="task-picker-anchor" ref={taskPickerRef}>
@@ -9499,34 +10328,7 @@ const App: React.FC = () => {
                 </div>
               )}
 
-              <div className="editor-container" ref={editorContainerRef}>
-                {activeFilePath && activeFile ? (
-                  <Editor
-                    height="100%"
-                    language={currentLanguage}
-                    value={currentEditorValue}
-                    onChange={handleEditorChange}
-                    theme="vs-dark"
-                    options={{
-                      fontSize: 13,
-                      minimap: { enabled: true },
-                      scrollBeyondLastLine: false,
-                      padding: { bottom: editorBottomPadding },
-                      automaticLayout: true,
-                      tabSize: 2,
-                      wordWrap: 'on',
-                    }}
-                  />
-                ) : (
-                  <div className="empty-state">
-                    <FileText size={42} className="opacity-30" />
-                    <div>Open a file from the explorer</div>
-                    <div className="text-xs mt-1 text-[#555]">
-                      VSCode-powered editor (Monaco)
-                    </div>
-                  </div>
-                )}
-              </div>
+              <CodeEditorPane />
             </div>
           </>
         )}

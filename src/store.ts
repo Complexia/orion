@@ -162,12 +162,22 @@ export type NativeSubagentInfo = {
 };
 
 // A kanban card from the Orion web board linked to this thread. Title and
-// description are snapshotted at link time (refreshed just before injection)
-// and fed to the agent as context on the first linked turn.
+// description plus attachment paths are snapshotted at link time (refreshed
+// just before injection) and fed to the agent on the first linked turn.
+export type LinkedBoardTaskAttachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  path?: string;
+  downloadError?: string;
+};
+
 export type LinkedBoardTask = {
   id: string;
   title: string;
   description: string;
+  attachments?: LinkedBoardTaskAttachment[];
   /** True once the task context has been injected into an agent turn. */
   injected?: boolean;
   /** Last thread status pushed to the board (running | finished | done | error). */
@@ -389,7 +399,7 @@ interface OrionState {
   closeFile: (path: string) => void;
   setActiveFile: (path: string) => void;
   updateOpenFileContent: (path: string, content: string) => void;
-  markFileSaved: (path: string) => void;
+  markFileSaved: (path: string, content?: string) => void;
   closeAllFiles: () => void;
 }
 
@@ -1051,18 +1061,32 @@ export const useOrionStore = create<OrionState>()(
       setActiveFile: (path) => set({ activeFilePath: path }),
 
       updateOpenFileContent: (path, content) =>
-        set((state) => ({
-          openFiles: state.openFiles.map((f) =>
-            f.path === path ? { ...f, content, isDirty: true } : f
-          ),
-        })),
+        set((state) => {
+          const file = state.openFiles.find((candidate) => candidate.path === path);
+          if (!file || (file.isDirty && file.content === content)) return state;
+          return {
+            openFiles: state.openFiles.map((candidate) =>
+              candidate.path === path
+                ? { ...candidate, content, isDirty: true }
+                : candidate
+            ),
+          };
+        }),
 
-      markFileSaved: (path) =>
-        set((state) => ({
-          openFiles: state.openFiles.map((f) =>
-            f.path === path ? { ...f, isDirty: false } : f
-          ),
-        })),
+      markFileSaved: (path, content) =>
+        set((state) => {
+          const file = state.openFiles.find((candidate) => candidate.path === path);
+          if (!file) return state;
+          const nextContent = content ?? file.content;
+          if (!file.isDirty && file.content === nextContent) return state;
+          return {
+            openFiles: state.openFiles.map((candidate) =>
+              candidate.path === path
+                ? { ...candidate, content: nextContent, isDirty: false }
+                : candidate
+            ),
+          };
+        }),
 
       closeAllFiles: () => set({ openFiles: [], activeFilePath: null }),
     }),

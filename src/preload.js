@@ -36,7 +36,7 @@ contextBridge.exposeInMainWorld('orion', {
   commitAndPush: (projectPath) => ipcRenderer.invoke('git:commitAndPush', projectPath),
 
   // Agent runtime
-  listAgentModels: () => ipcRenderer.invoke('agent:listModels'),
+  listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
   stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),
   isRunFinalizing: (runId) => ipcRenderer.invoke('agent:isRunFinalizing', runId),
@@ -75,6 +75,11 @@ contextBridge.exposeInMainWorld('orion', {
   checkProviderUpdates: (input) => ipcRenderer.invoke('providers:checkUpdates', input),
   updateProviders: (input) => ipcRenderer.invoke('providers:updateAll', input),
   authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
+  onProviderAuthenticated: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('providers:authenticated', listener);
+    return () => ipcRenderer.removeListener('providers:authenticated', listener);
+  },
 
   // Orion account
   getAccountSession: () => ipcRenderer.invoke('account:getSession'),
@@ -91,6 +96,7 @@ contextBridge.exposeInMainWorld('orion', {
 
   // Orion board tasks (kanban on the web app)
   listBoardTasks: () => ipcRenderer.invoke('tasks:list'),
+  getBoardTask: (taskId) => ipcRenderer.invoke('tasks:get', taskId),
   linkBoardTask: (input) => ipcRenderer.invoke('tasks:link', input),
   unlinkBoardTask: (input) => ipcRenderer.invoke('tasks:unlink', input),
   updateBoardTaskThreadStatus: (input) => ipcRenderer.invoke('tasks:threadStatus', input),
@@ -119,7 +125,7 @@ contextBridge.exposeInMainWorld('orion', {
 
   // App updates
   getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
-  checkForAppUpdate: () => ipcRenderer.invoke('appUpdate:check'),
+  checkForAppUpdate: (input) => ipcRenderer.invoke('appUpdate:check', input),
   downloadAppUpdate: () => ipcRenderer.invoke('appUpdate:download'),
   restartToUpdate: () => ipcRenderer.invoke('appUpdate:restart'),
 

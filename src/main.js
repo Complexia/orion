@@ -22,8 +22,6 @@ import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import started from 'electron-squirrel-startup';
-import { z } from 'zod';
-import { autoUpdater } from 'electron-updater';
 import {
   clearCloudRepoLink,
   getCloudRepoLink,
@@ -155,9 +153,16 @@ let appUpdateState = {
   progress: null,
   error: null,
 };
-let appUpdateInitialized = false;
+let appUpdaterInitializationPromise = null;
 let appUpdateCheckTimer = null;
 let appUpdateDownloadedVersion = null;
+let appUpdateCheckPromise = null;
+let lastAppUpdateCheckAt = 0;
+let appUpdateRetryTimer = null;
+let shellPathSyncPromise = Promise.resolve();
+let legacyMcpCleanupPromise = Promise.resolve();
+const APP_UPDATE_CHECK_DEDUP_MS = 60 * 1000;
+const APP_UPDATE_RETRY_MS = 30 * 1000;
 
 const defaultCodexReasoningEffort = 'medium';
 // The GPT-5.6 family defaults to high effort and is the only one that accepts
@@ -998,7 +1003,11 @@ const spliceProviderModels = (models, providerId, replacements) => {
   ];
 };
 
-const getAgentModels = async () => {
+const discoverAgentModels = async () => {
+  // Finder-launched builds start with launchd's minimal PATH. The renderer can
+  // request models as soon as its window loads, so do not let that first
+  // request cache fallback catalogs before the interactive-shell PATH arrives.
+  await shellPathSyncPromise;
   const [discoveredCursorModels, discoveredKimiModels] = await Promise.all([
     listCursorAgentModels(),
     listKimiModels(),
@@ -1006,6 +1015,44 @@ const getAgentModels = async () => {
   let models = spliceProviderModels(agentModels, 'cursor', discoveredCursorModels);
   models = spliceProviderModels(models, 'kimi', discoveredKimiModels);
   return models;
+};
+
+const AGENT_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+let agentModelsDiscoveryPromise = null;
+let cachedAgentModels = null;
+let cachedAgentModelsAt = 0;
+let agentModelsCacheGeneration = 0;
+const invalidateAgentModelsCache = () => {
+  agentModelsCacheGeneration += 1;
+  agentModelsDiscoveryPromise = null;
+  cachedAgentModels = null;
+  cachedAgentModelsAt = 0;
+};
+
+const getAgentModels = () => {
+  if (
+    cachedAgentModels &&
+    Date.now() - cachedAgentModelsAt < AGENT_MODELS_CACHE_TTL_MS
+  ) {
+    return Promise.resolve(cachedAgentModels);
+  }
+  if (agentModelsDiscoveryPromise) return agentModelsDiscoveryPromise;
+
+  const cacheGeneration = agentModelsCacheGeneration;
+  const discovery = discoverAgentModels().then((models) => {
+    if (cacheGeneration === agentModelsCacheGeneration) {
+      cachedAgentModels = models;
+      cachedAgentModelsAt = Date.now();
+    }
+    return models;
+  });
+  const sharedDiscovery = discovery.finally(() => {
+    if (agentModelsDiscoveryPromise === sharedDiscovery) {
+      agentModelsDiscoveryPromise = null;
+    }
+  });
+  agentModelsDiscoveryPromise = sharedDiscovery;
+  return agentModelsDiscoveryPromise;
 };
 
 const claudeEffortForCli = (reasoningEffort = defaultClaudeReasoningEffort) => {
@@ -1056,46 +1103,13 @@ const commandForModel = (model, input) => {
     // sandbox, and config overrides travel in the dialog, not argv.
     if (input.codexGoal) return ['codex', 'app-server'];
     const reasoningEffort = codexReasoningEffortForModel(model, input.codexReasoningEffort);
-    // Code reviews (/review) run codex's dedicated reviewer. Same JSONL event
-    // stream as `codex exec --json`, so the normal adapter handles it. The
-    // review session is throwaway (--ephemeral): it must never become the
-    // thread's resumable session (session events are suppressed in runTurn).
+    // Inline code reviews (/review) need the current Codex thread so the
+    // reviewer can see the conversation that led to the changes. The
+    // app-server's review/start method resumes that thread and runs the
+    // dedicated reviewer in place; `codex exec review` always starts a
+    // context-free session.
     if (input.codexReview && typeof input.codexReview === 'object') {
-      const review = input.codexReview;
-      const reviewAccessArgs =
-        accessMode === 'full-access'
-          ? ['--dangerously-bypass-approvals-and-sandbox']
-          : [
-              '--config',
-              `sandbox_mode="${accessMode === 'read-only' ? 'read-only' : 'workspace-write'}"`,
-            ];
-      const reviewArgs = [
-        'codex',
-        'exec',
-        'review',
-        '--json',
-        '--ephemeral',
-        '--skip-git-repo-check',
-        '--model',
-        modelArg,
-        '--config',
-        `model_reasoning_effort="${reasoningEffort}"`,
-        // GPT-5.6 models default to model_reasoning_summary="none" on the
-        // CLI, which silences the reviewer's narration between commands (the
-        // desktop app requests summaries). Ask for them explicitly.
-        '--config',
-        'model_reasoning_summary="detailed"',
-        '--config',
-        `service_tier="${input.codexServiceTier || defaultCodexServiceTier}"`,
-        ...reviewAccessArgs,
-      ];
-      if (review.mode === 'base' && review.base) reviewArgs.push('--base', review.base);
-      else if (review.mode === 'commit' && review.commit) reviewArgs.push('--commit', review.commit);
-      else if (review.mode !== 'custom') reviewArgs.push('--uncommitted');
-      if (typeof review.instructions === 'string' && review.instructions.trim()) {
-        reviewArgs.push(review.instructions.trim());
-      }
-      return reviewArgs;
+      return ['codex', 'app-server'];
     }
     const serviceTier = input.codexServiceTier || defaultCodexServiceTier;
     const configArgs = [
@@ -1776,6 +1790,43 @@ const extractCodexReasoningFromJsonEvent = (value) => {
   return typeof text === 'string' && text ? `${text}\n\n` : '';
 };
 
+// Normalize codex's plan surfaces onto the same activity shape used by grok
+// and kimi. `codex exec --json` currently flattens update_plan statuses to
+// `{ text, completed }`; app-server and rollout records can retain explicit
+// pending/in-progress/completed statuses. When the stream only has booleans,
+// the first unfinished step is the best available active-step signal.
+const codexPlanActivity = (items) => {
+  const plan = (Array.isArray(items) ? items : [])
+    .map((item) => {
+      const content = String(item?.text ?? item?.step ?? item?.content ?? '').trim();
+      const rawStatus = item?.status;
+      const completed = item?.completed === true || rawStatus === 'completed';
+      const inProgress =
+        rawStatus === 'in_progress' || rawStatus === 'inProgress' || rawStatus === 'active';
+      return {
+        content,
+        status: completed ? 'completed' : inProgress ? 'in_progress' : 'pending',
+      };
+    })
+    .filter((item) => item.content);
+  if (plan.length === 0) return null;
+
+  if (!plan.some((item) => item.status === 'in_progress')) {
+    const firstPending = plan.find((item) => item.status === 'pending');
+    if (firstPending) firstPending.status = 'in_progress';
+  }
+
+  const completed = plan.filter((item) => item.status === 'completed').length;
+  return {
+    key: 'plan',
+    type: 'plan',
+    kind: 'plan',
+    title: `Plan - ${completed}/${plan.length} done`,
+    status: completed === plan.length ? 'done' : 'running',
+    plan,
+  };
+};
+
 const codexActivityFromItem = (item, eventType) => {
   if (!item || typeof item !== 'object') return null;
 
@@ -1825,15 +1876,7 @@ const codexActivityFromItem = (item, eventType) => {
     };
   }
   if (item.type === 'todo_list') {
-    const todos = Array.isArray(item.items) ? item.items : [];
-    const doneCount = todos.filter((todo) => todo?.completed).length;
-    return {
-      ...base,
-      type: 'tool',
-      title: `Plan - ${doneCount}/${todos.length} done`,
-      detail: stringifySummary(todos.map((todo) => todo?.text).filter(Boolean).join(' · ')),
-      status: 'done',
-    };
+    return codexPlanActivity(item.items);
   }
   if (item.type === 'collab_tool_call') {
     // Multi-agent collaboration calls (spawn_agent/wait/send_message). The
@@ -2711,6 +2754,21 @@ const handleCodexRolloutLine = (value, api, ctx) => {
     }
     if (payload.type === 'custom_tool_call' || payload.type === 'function_call') {
       const input = typeof payload.input === 'string' ? payload.input : payload.arguments;
+      if (payload.name === 'update_plan') {
+        let args;
+        try {
+          args = typeof input === 'string' ? JSON.parse(input) : input;
+        } catch {
+          args = null;
+        }
+        const activity = codexPlanActivity(args?.plan);
+        if (activity) api.activity(activity);
+        if (typeof payload.call_id === 'string') {
+          if (!ctx.planCallIds) ctx.planCallIds = new Set();
+          ctx.planCallIds.add(payload.call_id);
+        }
+        return;
+      }
       api.activity({
         key: typeof payload.call_id === 'string' ? payload.call_id : undefined,
         type: payload.name === 'exec' ? 'command' : 'tool',
@@ -2724,6 +2782,13 @@ const handleCodexRolloutLine = (value, api, ctx) => {
       return;
     }
     if (payload.type === 'custom_tool_call_output' || payload.type === 'function_call_output') {
+      if (
+        typeof payload.call_id === 'string' &&
+        ctx.planCallIds?.has(payload.call_id)
+      ) {
+        ctx.planCallIds.delete(payload.call_id);
+        return;
+      }
       if (typeof payload.call_id === 'string') {
         api.activity({
           updateForKey: payload.call_id,
@@ -3712,7 +3777,43 @@ const handleKimiSubagentLine = (value, api, ctx) => {
   }
 };
 
-const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, accessMode, mcpServers = [], callbacks }) => {
+const buildKimiPromptBlocks = async (promptText, attachments = []) => {
+  const blocks = [{ type: 'text', text: promptText }];
+  for (const attachment of Array.isArray(attachments) ? attachments : []) {
+    const filePath = typeof attachment?.path === 'string' ? attachment.path : '';
+    if (!filePath) continue;
+
+    const declaredMimeType = String(attachment?.mimeType || '').trim().toLowerCase();
+    const inferredMimeType = getMimeTypeForMediaPath(filePath);
+    const mimeType =
+      declaredMimeType.startsWith('image/') && declaredMimeType !== 'image/*'
+        ? declaredMimeType
+        : inferredMimeType;
+    if (!mimeType.startsWith('image/')) continue;
+
+    try {
+      const data = await fs.readFile(filePath);
+      blocks.push({ type: 'image', data: data.toString('base64'), mimeType });
+    } catch (error) {
+      // The text prompt still contains the local path, so a failed inline read
+      // can fall back to Kimi's ReadMediaFile tool instead of failing the turn.
+      console.warn(`Kimi could not inline attachment "${filePath}".`, error);
+    }
+  }
+  return blocks;
+};
+
+const createKimiAcpDriver = ({
+  child,
+  cwd,
+  model,
+  promptText,
+  attachments = [],
+  resumeSessionId,
+  accessMode,
+  mcpServers = [],
+  callbacks,
+}) => {
   let nextRequestId = 1;
   const pendingRequests = new Map();
   const toolCalls = new Map();
@@ -4145,9 +4246,10 @@ const createKimiAcpDriver = ({ child, cwd, model, promptText, resumeSessionId, a
     }
 
     const failureLogCursor = await kimiTurnFailureLogCursor(sessionId);
+    const prompt = await buildKimiPromptBlocks(promptText, attachments);
     const response = await request('session/prompt', {
       sessionId,
-      prompt: [{ type: 'text', text: promptText }],
+      prompt,
     });
     flushToolEmits();
     if (response.error) return fail(response.error);
@@ -4298,17 +4400,11 @@ const kimiPlanModeOneShot = (model, promptText, cwd) =>
   });
 
 // ---------------------------------------------------------------------------
-// Codex goal runs (/goal). Codex's goals feature — a persistent objective the
-// agent pursues autonomously across turns, with token budgets and a status
-// machine (active/paused/blocked/usageLimited/budgetLimited/complete) stored
-// in ~/.codex/goals_1.sqlite — lives in the app-server's live thread manager:
-// the goal runtime auto-starts continuation turns while the goal is active,
-// so `codex exec` (which exits at turn end) can never drive it. Goal runs
-// therefore speak JSON-RPC (JSONL over stdio) to `codex app-server` and treat
-// the whole pursuit (N turns) as one Orion run. Verified live on codex
-// 0.144.1: thread/goal/set immediately starts a "Pursuing goal" turn, and the
-// app-server resumes exec-created threads, so the thread's existing session
-// id keeps working with `codex exec resume` after the goal run ends.
+// Codex app-server runs. Goals (/goal) live in the app-server's thread manager:
+// the runtime auto-starts continuation turns while a goal is active, so
+// `codex exec` cannot drive them. Inline reviews (/review) also belong here:
+// review/start can resume the current thread, preserving the conversation
+// context that `codex exec review` would discard.
 
 // Mirrors the --config overrides the codex exec path builds in
 // commandForModel; app-server takes them as a config map on thread/start.
@@ -4435,12 +4531,42 @@ const CODEX_GOAL_END_NOTES = {
   budgetLimited: '\n\n_Goal token budget exhausted — `/goal resume` to keep going._',
 };
 
+const codexReviewTarget = (review) => {
+  const threadContext =
+    typeof review?.threadContext === 'string' ? review.threadContext.trim() : '';
+  if (threadContext) {
+    const scope =
+      review?.mode === 'base' && review.base
+        ? `Review the changes against the base branch ${review.base}.`
+        : review?.mode === 'commit' && review.commit
+          ? `Review the changes introduced by commit ${review.commit}.`
+          : review?.mode === 'custom' && review.instructions
+            ? String(review.instructions).trim()
+            : 'Review all staged, unstaged, and untracked changes in the current repository.';
+    return {
+      type: 'custom',
+      instructions: `${scope}\n\n${threadContext}`,
+    };
+  }
+  if (review?.mode === 'base' && review.base) {
+    return { type: 'baseBranch', branch: review.base };
+  }
+  if (review?.mode === 'commit' && review.commit) {
+    return { type: 'commit', sha: review.commit };
+  }
+  if (review?.mode === 'custom') {
+    return { type: 'custom', instructions: String(review.instructions ?? '').trim() };
+  }
+  return { type: 'uncommittedChanges' };
+};
+
 const createCodexAppServerDriver = ({
   child,
   cwd,
   model,
   input,
   goal,
+  review,
   resumeSessionId,
   accessMode,
   callbacks,
@@ -4498,7 +4624,7 @@ const createCodexAppServerDriver = ({
     ended = true;
     clearContinuationTimer();
     if (note) emitText(note);
-    callbacks.onGoalRunEnd();
+    callbacks.onRunEnd();
   };
 
   const fail = (error) => {
@@ -4548,6 +4674,10 @@ const createCodexAppServerDriver = ({
         detail: stringifySummary(message, 300),
         status: 'error',
       });
+      if (review) {
+        fail(message);
+        return;
+      }
       // The goal runtime skips continuation after turn errors — pause the
       // stored goal so its status matches reality, then end the run.
       void (async () => {
@@ -4567,6 +4697,10 @@ const createCodexAppServerDriver = ({
       return;
     }
     if (ended) return;
+    if (review) {
+      endRun();
+      return;
+    }
     if (goalStatus && goalStatus !== 'active') {
       endRun(CODEX_GOAL_END_NOTES[goalStatus] ?? '');
       return;
@@ -4684,6 +4818,16 @@ const createCodexAppServerDriver = ({
     }
     threadId = resolvedThreadId;
     callbacks.onSessionId(threadId);
+
+    if (review) {
+      const startedReview = await request('review/start', {
+        threadId,
+        delivery: 'inline',
+        target: codexReviewTarget(review),
+      });
+      if (startedReview.error) return fail(startedReview.error);
+      return;
+    }
 
     // Goals require a persistent thread; setting one active immediately
     // starts the pursuit turn — no turn/start call needed.
@@ -4842,14 +4986,18 @@ const loadClaudeSdk = () => {
   return claudeSdkModulePromise;
 };
 
+let zodModulePromise = null;
+const loadZod = () => {
+  zodModulePromise ??= import('zod');
+  return zodModulePromise;
+};
+
 // The SDK defaults to its own pinned CLI binary; prefer the claude the user
 // installed so persistent sessions run the same version, login, and settings
 // the one-shot spawn path used. Falls back to the SDK's binary if missing.
 let claudeBinaryPromise = null;
 const resolveClaudeBinary = () => {
-  claudeBinaryPromise ??= execFileAsync(loginShell, ['-lc', 'command -v claude'], { timeout: 4000 })
-    .then(({ stdout }) => stdout.trim().split('\n').pop()?.trim() || null)
-    .catch(() => null);
+  claudeBinaryPromise ??= resolveCommandPath('claude');
   return claudeBinaryPromise;
 };
 
@@ -5122,6 +5270,7 @@ const registerMcpBridgeForRun = async ({
   accessMode,
 }) => {
   try {
+    await legacyMcpCleanupPromise;
     const { shimPath, socketPath } = await ensureMcpBridge();
     const token = crypto.randomUUID();
     // ELECTRON_RUN_AS_NODE turns Orion's own binary into a plain Node runtime;
@@ -5256,7 +5405,7 @@ const cleanupLegacyMcpBridgeConfigs = async () => {
 // orchestrator ones — @-mentions can request delegation from any thread).
 // The tool asks the renderer to spawn a subthread on another model and
 // blocks until the subagent's final report arrives.
-const createOrionMcpServer = ({ createSdkMcpServer, tool }, session) =>
+const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, session) =>
   createSdkMcpServer({
     name: 'orion',
     version: '1.0.0',
@@ -6171,8 +6320,12 @@ const createClaudeSdkSession = ({
   };
 
   session.start = async () => {
-    const [sdk, claudeBinary] = await Promise.all([loadClaudeSdk(), resolveClaudeBinary()]);
-    const orionMcpServer = createOrionMcpServer(sdk, session);
+    const [sdk, zod, claudeBinary] = await Promise.all([
+      loadClaudeSdk(),
+      loadZod(),
+      resolveClaudeBinary(),
+    ]);
+    const orionMcpServer = createOrionMcpServer(sdk, zod, session);
     // Headless runs can't show permission prompts, so outside bypass mode the
     // spawn/stop tools must be pre-approved alongside any user-configured
     // allowlist.
@@ -6510,17 +6663,6 @@ const syncPathFromUserShell = async () => {
   }
 };
 
-const checkCommandAvailable = async (command) => {
-  try {
-    const { stdout } = await execFileAsync(loginShell, ['-lc', `command -v ${shellQuote(command)}`], {
-      timeout: 4000,
-    });
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
-};
-
 const runShellCommand = async (command, timeout = 30000) => {
   const { stdout, stderr } = await execFileAsync(loginShell, ['-lc', command], {
     timeout,
@@ -6534,14 +6676,53 @@ const runShellCommand = async (command, timeout = 30000) => {
   return { stdout: stdout || '', stderr: stderr || '' };
 };
 
-const resolveCommandPath = async (command) => {
-  try {
-    const { stdout } = await runShellCommand(`command -v ${shellQuote(command)}`, 4000);
-    return stdout.trim() || null;
-  } catch {
-    return null;
+const COMMAND_PATH_CACHE_TTL_MS = 5 * 60 * 1000;
+const COMMAND_PATH_MISS_CACHE_TTL_MS = 5 * 1000;
+const commandPathCache = new Map();
+const commandPathPromises = new Map();
+const parseCommandPath = (stdout) => {
+  const lines = String(stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (path.isAbsolute(lines[index])) return lines[index];
   }
+  return null;
 };
+
+const resolveCommandPath = (command) => {
+  const cached = commandPathCache.get(command);
+  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.path);
+  if (cached) commandPathCache.delete(command);
+
+  const existing = commandPathPromises.get(command);
+  if (existing) return existing;
+
+  const lookup = shellPathSyncPromise
+    .then(() => runShellCommand(`command -v ${shellQuote(command)}`, 4000))
+    .then(({ stdout }) => parseCommandPath(stdout))
+    .catch(() => null);
+  const sharedLookup = lookup
+    .then((path) => {
+      commandPathCache.set(command, {
+        path,
+        expiresAt:
+          Date.now() +
+          (path ? COMMAND_PATH_CACHE_TTL_MS : COMMAND_PATH_MISS_CACHE_TTL_MS),
+      });
+      return path;
+    })
+    .finally(() => {
+      if (commandPathPromises.get(command) === sharedLookup) {
+        commandPathPromises.delete(command);
+      }
+    });
+  commandPathPromises.set(command, sharedLookup);
+  return sharedLookup;
+};
+
+const checkCommandAvailable = async (command) => Boolean(await resolveCommandPath(command));
 
 const providerUpdaterConfigs = [
   {
@@ -6877,7 +7058,7 @@ const checkProviderUpdate = async (config, enabledProviderIds = null) => {
   return withCurrentVersion;
 };
 
-const checkProviderUpdates = async (input = {}) => {
+const runProviderUpdateCheck = async (input = {}) => {
   const enabledProviderIds = normalizeEnabledProviderIds(input);
   const providers = await Promise.all(
     providerUpdaterConfigs.map((config) => checkProviderUpdate(config, enabledProviderIds))
@@ -6887,6 +7068,23 @@ const checkProviderUpdates = async (input = {}) => {
     updatesAvailable: providers.filter((provider) => provider.updateAvailable).length,
     providers,
   };
+};
+
+const providerUpdateCheckPromises = new Map();
+const checkProviderUpdates = (input = {}) => {
+  const enabledProviderIds = normalizeEnabledProviderIds(input);
+  const key = enabledProviderIds ? [...enabledProviderIds].sort().join(',') : '*';
+  const existing = providerUpdateCheckPromises.get(key);
+  if (existing) return existing;
+
+  const check = runProviderUpdateCheck(input);
+  const sharedCheck = check.finally(() => {
+    if (providerUpdateCheckPromises.get(key) === sharedCheck) {
+      providerUpdateCheckPromises.delete(key);
+    }
+  });
+  providerUpdateCheckPromises.set(key, sharedCheck);
+  return sharedCheck;
 };
 
 const getProviderStatuses = async () => checkProviderUpdates();
@@ -7010,10 +7208,20 @@ const updateProviderTool = async (config, expectedLatestVersion = null) => {
 
 const authenticateProviderTool = async (providerId) => {
   const config = providerUpdaterConfigs.find((provider) => provider.id === providerId);
-  if (!config) return { ok: false, error: `Unknown provider: ${providerId}` };
+  if (!config) {
+    return {
+      result: { ok: false, error: `Unknown provider: ${providerId}` },
+      completion: null,
+    };
+  }
 
   const commandPath = await resolveCommandPath(config.command);
-  if (!commandPath) return { ok: false, error: `${config.command} is not installed.` };
+  if (!commandPath) {
+    return {
+      result: { ok: false, error: `${config.command} is not installed.` },
+      completion: null,
+    };
+  }
 
   for (const args of config.authCommands ?? []) {
     try {
@@ -7027,14 +7235,66 @@ const authenticateProviderTool = async (providerId) => {
           NO_COLOR: '1',
         },
       });
+      const completion = new Promise((resolve) => {
+        child.once('error', (error) => {
+          resolve({ ok: false, error: getProcessErrorMessage(error) });
+        });
+        child.once('exit', (code, signal) => {
+          resolve({
+            ok: code === 0,
+            code,
+            signal,
+            ...(code === 0 ? {} : { error: `Authentication exited with code ${code ?? signal}.` }),
+          });
+        });
+      });
       child.unref();
-      return { ok: true };
+      return { result: { ok: true }, completion };
     } catch (error) {
-      return { ok: false, error: getProcessErrorMessage(error) };
+      return {
+        result: { ok: false, error: getProcessErrorMessage(error) },
+        completion: null,
+      };
     }
   }
 
-  return { ok: false, error: `No authentication command is configured for ${config.command}.` };
+  return {
+    result: {
+      ok: false,
+      error: `No authentication command is configured for ${config.command}.`,
+    },
+    completion: null,
+  };
+};
+
+const PROVIDER_AUTH_POLL_MS = 5000;
+const PROVIDER_AUTH_POLL_ATTEMPTS = 24;
+const providerAuthenticationGenerations = new Map();
+
+const waitForProviderAuthentication = async (providerId, completion) => {
+  const config = providerUpdaterConfigs.find((provider) => provider.id === providerId);
+  if (!config || !completion) return false;
+
+  // The provider may already be authenticated while the user is switching
+  // accounts. Waiting for this specific login process prevents the old
+  // session from being mistaken for completion of the new authentication.
+  const processResult = await completion;
+  if (!processResult.ok) return false;
+
+  // Providers without a machine-readable status command still get a refresh
+  // once their successful login process exits.
+  if (!config.statusCommand) return true;
+
+  // Most CLIs publish credentials before exiting. Retry status briefly for
+  // providers whose credential store settles just after the process does.
+  for (let attempt = 0; attempt < PROVIDER_AUTH_POLL_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, PROVIDER_AUTH_POLL_MS));
+    }
+    const auth = await getProviderAuthStatus(config);
+    if (auth.authenticated === true) return true;
+  }
+  return false;
 };
 
 const emitAgentEvent = (webContents, event) => {
@@ -7544,9 +7804,8 @@ const publishAppUpdateState = (patch) => {
   return appUpdateState;
 };
 
-const initializeAppUpdater = async () => {
-  if (appUpdateInitialized) return;
-  appUpdateInitialized = true;
+const initializeAppUpdaterOnce = async () => {
+  const { autoUpdater } = await import('electron-updater');
 
   // electron-forge does not generate the app-update.yml that electron-builder
   // ships in Resources, and electron-updater insists on reading one when
@@ -7663,9 +7922,25 @@ const initializeAppUpdater = async () => {
       error: error?.message ?? 'Update failed',
     });
   });
+
+  return autoUpdater;
 };
 
-const checkForAppUpdate = async () => {
+const initializeAppUpdater = () => {
+  if (!appUpdaterInitializationPromise) {
+    const initialization = initializeAppUpdaterOnce();
+    const sharedInitialization = initialization.catch((error) => {
+      if (appUpdaterInitializationPromise === sharedInitialization) {
+        appUpdaterInitializationPromise = null;
+      }
+      throw error;
+    });
+    appUpdaterInitializationPromise = sharedInitialization;
+  }
+  return appUpdaterInitializationPromise;
+};
+
+const runAppUpdateCheck = async () => {
   if (!app.isPackaged) {
     return publishAppUpdateState({
       status: 'not-available',
@@ -7674,29 +7949,63 @@ const checkForAppUpdate = async () => {
     });
   }
 
-  await initializeAppUpdater();
+  const autoUpdater = await initializeAppUpdater();
   await autoUpdater.checkForUpdates();
   return appUpdateState;
+};
+
+const checkForAppUpdate = ({ force = false } = {}) => {
+  if (appUpdateCheckPromise) return appUpdateCheckPromise;
+  if (!force && Date.now() - lastAppUpdateCheckAt < APP_UPDATE_CHECK_DEDUP_MS) {
+    return Promise.resolve(appUpdateState);
+  }
+
+  const check = runAppUpdateCheck().then((state) => {
+    lastAppUpdateCheckAt = Date.now();
+    if (appUpdateRetryTimer) {
+      clearTimeout(appUpdateRetryTimer);
+      appUpdateRetryTimer = null;
+    }
+    return state;
+  });
+  const sharedCheck = check.finally(() => {
+    if (appUpdateCheckPromise === sharedCheck) {
+      appUpdateCheckPromise = null;
+    }
+  });
+  appUpdateCheckPromise = sharedCheck;
+  return sharedCheck;
+};
+
+const publishAppUpdateCheckError = (error) => {
+  publishAppUpdateState({
+    status: 'error',
+    checkedAt: new Date().toISOString(),
+    error: error?.message ?? 'Could not check for updates',
+  });
+};
+
+const runScheduledAppUpdateCheck = () => {
+  void checkForAppUpdate().catch((error) => {
+    publishAppUpdateCheckError(error);
+    if (appUpdateRetryTimer) return;
+    appUpdateRetryTimer = setTimeout(() => {
+      appUpdateRetryTimer = null;
+      // One forced retry: it cannot rejoin or be suppressed by the failed
+      // primary check. A second failure falls back to the normal interval.
+      void checkForAppUpdate({ force: true }).catch(publishAppUpdateCheckError);
+    }, APP_UPDATE_RETRY_MS);
+  });
 };
 
 const scheduleAppUpdateChecks = () => {
   if (!app.isPackaged) return;
 
-  setTimeout(() => {
-    void checkForAppUpdate().catch((error) => {
-      publishAppUpdateState({
-        status: 'error',
-        checkedAt: new Date().toISOString(),
-        error: error?.message ?? 'Could not check for updates',
-      });
-    });
-  }, 10000);
+  setTimeout(runScheduledAppUpdateCheck, 10000);
 
   if (appUpdateCheckTimer) clearInterval(appUpdateCheckTimer);
-  appUpdateCheckTimer = setInterval(() => {
-    void checkForAppUpdate().catch(() => {});
-  }, 2 * 60 * 60 * 1000);
-}
+  appUpdateCheckTimer = setInterval(runScheduledAppUpdateCheck, 2 * 60 * 60 * 1000);
+};
 
 const createWindow = () => {
   const macWindowChrome =
@@ -7742,8 +8051,13 @@ app.whenReady().then(async () => {
   // Reinforce the app name (helps in some dev launch scenarios)
   app.setName('Orion');
 
-  await syncPathFromUserShell();
-  await cleanupLegacyMcpBridgeConfigs();
+  // Start maintenance immediately, but never hold the first window behind
+  // shell startup or filesystem cleanup. Provider and MCP operations await
+  // only the prerequisite they actually need.
+  shellPathSyncPromise = syncPathFromUserShell();
+  legacyMcpCleanupPromise = cleanupLegacyMcpBridgeConfigs().catch((error) => {
+    console.error('Could not finish legacy MCP bridge cleanup:', error);
+  });
 
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({
@@ -8325,33 +8639,23 @@ ipcMain.handle('fs:readDirectory', async (_event, dirPath) => {
   try {
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     const { directStatuses, aggregateStatuses } = await getGitStatusMap(dirPath);
-    const items = await Promise.all(
-      entries
-        .filter((e) => !(e.isDirectory() && hiddenSystemDirectories.has(e.name)))
-        .map(async (entry) => {
-          const fullPath = path.join(dirPath, entry.name);
-          let size = 0;
-          try {
-            if (!entry.isDirectory()) {
-              const stat = await fs.stat(fullPath);
-              size = stat.size;
-            }
-          } catch {}
-          const directStatus = directStatuses.get(fullPath);
-          const aggregateStatus = aggregateStatuses.get(fullPath);
-          const status = directStatus ?? aggregateStatus ?? null;
+    const items = entries
+      .filter((entry) => !(entry.isDirectory() && hiddenSystemDirectories.has(entry.name)))
+      .map((entry) => {
+        const fullPath = path.join(dirPath, entry.name);
+        const directStatus = directStatuses.get(fullPath);
+        const aggregateStatus = aggregateStatuses.get(fullPath);
+        const status = directStatus ?? aggregateStatus ?? null;
 
-          return {
-            name: entry.name,
-            path: fullPath,
-            isDirectory: entry.isDirectory(),
-            size,
-            gitStatus: status?.kind ?? null,
-            gitStatusLabel: status?.label ?? null,
-            hasChildGitStatus: !directStatus && Boolean(aggregateStatus),
-          };
-        })
-    );
+        return {
+          name: entry.name,
+          path: fullPath,
+          isDirectory: entry.isDirectory(),
+          gitStatus: status?.kind ?? null,
+          gitStatusLabel: status?.label ?? null,
+          hasChildGitStatus: !directStatus && Boolean(aggregateStatus),
+        };
+      });
     // Sort: folders first then files, alpha
     items.sort((a, b) => {
       if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
@@ -8804,6 +9108,54 @@ const boardTasksRequest = async (token, apiPath, options = {}) => {
   return data;
 };
 
+const downloadBoardTaskAttachments = async (token, task) => {
+  const attachments = Array.isArray(task?.attachments) ? task.attachments : [];
+  if (attachments.length === 0) return { ...task, attachments: [] };
+
+  const attachmentDir = getAttachmentDirectoryPath();
+  await fs.mkdir(attachmentDir, { recursive: true });
+  const downloaded = await Promise.all(
+    attachments.map(async (attachment) => {
+      const attachmentId = String(attachment?.id ?? '');
+      const taskId = String(task?.id ?? '');
+      if (!attachmentId || !taskId) {
+        return { ...attachment, downloadError: 'Invalid attachment metadata.' };
+      }
+
+      const originalName = sanitizeAttachmentName(attachment?.fileName || 'attachment');
+      const filePath = path.join(
+        attachmentDir,
+        `board-${sanitizeAttachmentName(taskId)}-${sanitizeAttachmentName(attachmentId)}-${originalName}`
+      );
+      try {
+        const expectedSize = Number(attachment?.size);
+        const existing = await fs.stat(filePath).catch(() => null);
+        if (!existing?.isFile() || (Number.isFinite(expectedSize) && existing.size !== expectedSize)) {
+          const response = await fetch(
+            new URL(
+              `/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(attachmentId)}`,
+              getOrionWebUrl()
+            ),
+            { headers: { authorization: `Bearer ${token}` } }
+          );
+          if (!response.ok) {
+            throw new Error(`Attachment download failed (${response.status}).`);
+          }
+          const buffer = Buffer.from(await response.arrayBuffer());
+          if (Number.isFinite(expectedSize) && expectedSize >= 0 && buffer.byteLength !== expectedSize) {
+            throw new Error('Attachment download was incomplete.');
+          }
+          await fs.writeFile(filePath, buffer);
+        }
+        return { ...attachment, localPath: filePath };
+      } catch (error) {
+        return { ...attachment, downloadError: cloudErrorMessage(error) };
+      }
+    })
+  );
+  return { ...task, attachments: downloaded };
+};
+
 const requireAccountToken = async () => {
   const session = await readAccountSession();
   return session?.token ?? null;
@@ -8818,6 +9170,24 @@ ipcMain.handle('tasks:list', async () => {
     const board = await boardTasksRequest(token, '/api/tasks');
     return { ok: true, columns: board.columns ?? [], tasks: board.tasks ?? [] };
   } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('tasks:get', async (_event, rawTaskId) => {
+  try {
+    const taskId = String(rawTaskId ?? '');
+    if (!taskId) return { ok: false, error: 'Missing task id.' };
+    const token = await requireAccountToken();
+    if (!token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`);
+    return { ok: true, task: await downloadBoardTaskAttachments(token, result.task) };
+  } catch (error) {
+    if (error?.status === 404) {
+      return { ok: false, stale: true, error: cloudErrorMessage(error) };
+    }
     return { ok: false, error: cloudErrorMessage(error) };
   }
 });
@@ -8840,7 +9210,7 @@ ipcMain.handle('tasks:link', async (_event, input) => {
         projectName: input?.projectName,
       }),
     });
-    return { ok: true, task: result.task };
+    return { ok: true, task: await downloadBoardTaskAttachments(token, result.task) };
   } catch (error) {
     return { ok: false, error: cloudErrorMessage(error) };
   }
@@ -9152,7 +9522,8 @@ ipcMain.handle('attachment:saveImage', async (_event, input) => {
   }
 });
 
-ipcMain.handle('agent:listModels', async () => {
+ipcMain.handle('agent:listModels', async (_event, input) => {
+  if (input?.force === true) invalidateAgentModelsCache();
   const models = await getAgentModels();
   const uniqueCommands = [...new Set(models.map((model) => model.command).filter(Boolean))];
   const availability = new Map(
@@ -9210,6 +9581,7 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
     results.push(await updateProviderTool(config, state.latestVersion));
   }
 
+  invalidateAgentModelsCache();
   const state = await checkProviderUpdates(input);
   const failed = results.filter((result) => !result.ok);
 
@@ -9221,7 +9593,25 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
   };
 });
 
-ipcMain.handle('providers:authenticate', async (_event, providerId) => authenticateProviderTool(providerId));
+ipcMain.handle('providers:authenticate', async (event, providerId) => {
+  const { result, completion } = await authenticateProviderTool(providerId);
+  if (result?.ok) {
+    invalidateAgentModelsCache();
+    const sender = event.sender;
+    const generation = (providerAuthenticationGenerations.get(providerId) ?? 0) + 1;
+    providerAuthenticationGenerations.set(providerId, generation);
+    void waitForProviderAuthentication(providerId, completion).then((authenticated) => {
+      if (providerAuthenticationGenerations.get(providerId) !== generation) return;
+      providerAuthenticationGenerations.delete(providerId);
+      if (!authenticated) return;
+      invalidateAgentModelsCache();
+      if (!sender.isDestroyed()) {
+        sender.send('providers:authenticated', { providerId });
+      }
+    });
+  }
+  return result;
+});
 
 ipcMain.handle('account:getSession', async () => verifyAccountSession());
 
@@ -9240,11 +9630,13 @@ ipcMain.handle('account:signOut', async () => {
 
 ipcMain.handle('appUpdate:getState', async () => appUpdateState);
 
-ipcMain.handle('appUpdate:check', async () => checkForAppUpdate());
+ipcMain.handle('appUpdate:check', async (_event, input) =>
+  checkForAppUpdate({ force: input?.force === true })
+);
 
 ipcMain.handle('appUpdate:download', async () => {
   if (!app.isPackaged) return appUpdateState;
-  await initializeAppUpdater();
+  const autoUpdater = await initializeAppUpdater();
   // downloadUpdate() fetches whatever the last check found, and that check
   // can be hours old — newer releases may have shipped since, and the feed's
   // signed download URLs expire minutes after each check. Re-check first so
@@ -9264,6 +9656,7 @@ ipcMain.handle('appUpdate:download', async () => {
 
 ipcMain.handle('appUpdate:restart', async () => {
   if (appUpdateState.status !== 'downloaded') return false;
+  const autoUpdater = await initializeAppUpdater();
   autoUpdater.quitAndInstall(false, true);
   return true;
 });
@@ -9305,6 +9698,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
       return { ok: false, error: 'Missing threadId, projectPath, prompt, or modelId.' };
     }
+
+    // A newly opened window can submit a turn while startup cleanup is still
+    // running. Do not let a provider load the stale persistent MCP entries
+    // that cleanup is removing.
+    await legacyMcpCleanupPromise;
 
     const models = await getAgentModels();
     const model = models.find((candidate) => candidate.id === input.modelId);
@@ -9399,6 +9797,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // the goal runtime auto-continues turns only inside a live app-server.
     const useCodexGoal =
       model.providerId === 'codex' && Boolean(input.codexGoal) && typeof input.codexGoal === 'object';
+    const useCodexReview =
+      model.providerId === 'codex' &&
+      Boolean(input.codexReview) &&
+      typeof input.codexReview === 'object';
     // spawn_subagent for non-Claude drivers: hand the CLI the bridge shim as
     // an `orion` MCP server. One token per runTurn call — a resume-fallback
     // reattempt reuses it; the last attempt's finalizeRun releases it.
@@ -9440,7 +9842,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       },
       // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
       // take no input.
-      stdio: [useAcp || useCodexGoal ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      stdio: [useAcp || useCodexGoal || useCodexReview ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
 
     let stderr = '';
@@ -9568,9 +9970,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     let reasoningText = '';
     let reasoningEmitTimer = null;
     let lastReasoningEmitAt = 0;
-    // Review runs use an ephemeral throwaway session — reporting its id would
-    // overwrite the thread's real resumable codex session.
-    let sessionIdReported = Boolean(input.codexReview);
+    let sessionIdReported = false;
     let finalized = false;
     let exitFallbackTimer = null;
     let terminalEventTimer = null;
@@ -9855,6 +10255,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             cwd: input.projectPath,
             model,
             promptText: input.prompt,
+            attachments: input.attachments,
             resumeSessionId,
             accessMode: input.accessMode || 'full-access',
             mcpServers: orionAcpMcpServers(orionMcp),
@@ -9933,13 +10334,14 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             },
           },
         })
-      : useCodexGoal
+      : useCodexGoal || useCodexReview
         ? createCodexAppServerDriver({
             child,
             cwd: input.projectPath,
             model,
             input: { ...input, orionMcp },
             goal: input.codexGoal,
+            review: input.codexReview,
             resumeSessionId,
             accessMode: input.accessMode || 'full-access',
             callbacks: {
@@ -9955,7 +10357,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
                   goal,
                 });
               },
-              onGoalRunEnd: finishDriverRun,
+              onRunEnd: finishDriverRun,
             },
           })
         : null;
@@ -9965,11 +10367,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       runId,
       threadId: input.threadId,
       type: 'started',
-      // Goal runs and flag-only review runs have no trailing prompt to strip.
+      // App-server runs have no trailing prompt to strip.
       command: `${model.command} ${(
-        useCodexGoal || (input.codexReview && !input.codexReview.instructions)
-          ? args.slice(1)
-          : args.slice(1, -1)
+        useCodexGoal || useCodexReview ? args.slice(1) : args.slice(1, -1)
       ).join(' ')}`,
     });
 

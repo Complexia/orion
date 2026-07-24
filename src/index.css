@@ -38,7 +38,7 @@
 }
 
 body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  font-family: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
   margin: 0;
   padding: 0;
   background: var(--bg-base);
@@ -4030,7 +4030,7 @@ body {
 
 .model-trigger:disabled,
 .codex-settings-trigger:disabled,
-.access-select:has(select:disabled),
+.access-select:disabled,
 .send-button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -4508,22 +4508,37 @@ body {
   background: var(--border-default);
 }
 
-.access-select {
-  margin-left: auto;
-  padding: 0 8px 0 10px;
+.access-mode-anchor {
   position: relative;
+  margin-left: auto;
+  flex-shrink: 0;
 }
 
-.access-select select {
-  appearance: none;
-  border: 0;
-  outline: none;
-  background: transparent;
-  color: inherit;
-  font: inherit;
+.access-select {
+  padding: 0 8px 0 10px;
   font-size: 13px;
+  font-weight: 650;
   cursor: pointer;
-  padding-right: 2px;
+}
+
+.access-select span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.access-mode-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  min-width: 180px;
+  padding: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-lg);
+  z-index: 110;
+  animation: popover-in 220ms var(--ease-out) both;
 }
 
 .send-button {
