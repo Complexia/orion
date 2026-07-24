@@ -17,6 +17,8 @@ import {
   X,
   Folder,
   FileText,
+  Pin,
+  PinOff,
   Play,
   Pause,
   Target,
@@ -228,6 +230,8 @@ const threadShellSignature = (thread: Thread): string => {
     thread.grokReasoningEffort,
     thread.createdAt,
     thread.hiddenFromRecent ? '1' : '0',
+    thread.pinnedAt,
+    thread.unpinnedAt,
     thread.parentThreadId,
     thread.branchedFromThreadId,
     thread.spawnId,
@@ -430,6 +434,8 @@ const App: React.FC = () => {
   // Recent agents list and the project lists.
   const [recentAgentsOpen, setRecentAgentsOpen] = useState(true);
   const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
+  const [pinnedAgentsOpen, setPinnedAgentsOpen] = useState(true);
+  const [pinnedAgentsShowAll, setPinnedAgentsShowAll] = useState(false);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
@@ -869,25 +875,60 @@ const App: React.FC = () => {
     return ids;
   }, [threads]);
 
+  const pinnedThreads = useMemo(
+    () =>
+      threads
+        .filter((t) => t.pinnedAt && !childThreadIds.has(t.id))
+        .sort(
+          (a, b) => new Date(b.pinnedAt ?? 0).getTime() - new Date(a.pinnedAt ?? 0).getTime()
+        ),
+    [childThreadIds, threads]
+  );
+
   const recentThreads = useMemo(
     () =>
       threads
         // Children never appear top-level; they nest under their parent's row.
-        .filter((t) => !t.hiddenFromRecent && !childThreadIds.has(t.id))
+        // Pinned threads live in the Pinned section instead.
+        .filter((t) => !t.hiddenFromRecent && !t.pinnedAt && !childThreadIds.has(t.id))
         .sort((a, b) => {
           // Running agents are active "now", so they always rank above
           // finished ones. Among running agents, keep start order so the list
           // doesn't reshuffle as they stream; finished agents sort by their
-          // last activity (i.e. when they finished).
+          // last activity (i.e. when they finished) — or by when they were
+          // unpinned, so a just-unpinned thread surfaces at the top instead
+          // of sinking back to its old chronological spot.
           const aRunning = a.status === 'running';
           const bRunning = b.status === 'running';
           if (aRunning !== bRunning) return aRunning ? -1 : 1;
           if (aRunning) {
             return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
           }
-          return getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime();
+          const recentRank = (t: Thread) =>
+            Math.max(
+              getThreadActivityTime(t).getTime(),
+              t.unpinnedAt ? new Date(t.unpinnedAt).getTime() : Number.NEGATIVE_INFINITY
+            );
+          return recentRank(b) - recentRank(a);
         }),
     [childThreadIds, threads]
+  );
+
+  const pinThread = useCallback(
+    (threadId: string) => updateThread(threadId, { pinnedAt: new Date().toISOString() }),
+    [updateThread]
+  );
+  // Unpinning surfaces the thread at the top of Recent agents (see the
+  // recentThreads sort) so an accidental unpin of an old thread is easy to
+  // recover instead of sinking back to its chronological spot.
+  const unpinThread = useCallback(
+    (threadId: string) =>
+      updateThread(threadId, {
+        pinnedAt: undefined,
+        unpinnedAt: new Date().toISOString(),
+        hiddenFromRecent: false,
+      }),
+    [updateThread]
   );
 
   const runningAgentCount = useMemo(
@@ -5979,6 +6020,154 @@ const App: React.FC = () => {
                   </div>
                 )}
 
+                {pinnedThreads.length > 0 && (
+                  <div className="recent-agents-section">
+                    <button
+                      type="button"
+                      className="sidebar-section-toggle"
+                      onClick={() =>
+                        setPinnedAgentsOpen((open) => {
+                          // Collapsing resets the list back to the default 5 on next expand.
+                          if (open) setPinnedAgentsShowAll(false);
+                          return !open;
+                        })
+                      }
+                      aria-expanded={pinnedAgentsOpen}
+                    >
+                      <ChevronRight
+                        size={12}
+                        className={`sidebar-section-chevron ${pinnedAgentsOpen ? 'open' : ''}`}
+                      />
+                      <span>Pinned</span>
+                    </button>
+                    {pinnedAgentsOpen && (
+                      <>
+                      <div className="threads-list recent-agents-list">
+                        {(pinnedAgentsShowAll
+                          ? pinnedThreads
+                          : pinnedThreads.slice(0, THREADS_VISIBLE_LIMIT)
+                        ).map((thread) => (
+                          <div
+                            key={thread.id}
+                            className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                            onClick={() => {
+                              if (threadRenameKey !== `pinned:${thread.id}`) selectThread(thread.id);
+                            }}
+                          >
+                            {threadRenameKey === `pinned:${thread.id}` ? (
+                              <InlineRenameInput
+                                className="thread-rename-input"
+                                initialValue={thread.title}
+                                onSubmit={(title) => {
+                                  updateThread(thread.id, { title });
+                                  setThreadRenameKey(null);
+                                }}
+                                onCancel={() => setThreadRenameKey(null)}
+                              />
+                            ) : (
+                              <span className="thread-title">
+                                {renderThreadCliBadge(thread)}
+                                <span className="thread-title-text">{thread.title}</span>
+                              </span>
+                            )}
+                            <span className="thread-project-tag thread-meta">
+                              {projects.find((p) => p.id === thread.projectId)?.name}
+                            </span>
+                            <span className="thread-time thread-meta">
+                              {thread.status === 'running' ? (
+                                <span className="thread-working-dot" title="Working" />
+                              ) : (
+                                formatShortTime(getThreadActivityTime(thread))
+                              )}
+                            </span>
+                            <div
+                              className="thread-menu-wrap"
+                              ref={threadItemMenuKey === `pinned:${thread.id}` ? threadItemMenuRef : undefined}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <button
+                                type="button"
+                                className="thread-options-trigger"
+                                title="Thread options"
+                                aria-label={`Options for ${thread.title}`}
+                                aria-haspopup="menu"
+                                aria-expanded={threadItemMenuKey === `pinned:${thread.id}`}
+                                onClick={() =>
+                                  setThreadItemMenuKey((open) =>
+                                    open === `pinned:${thread.id}` ? null : `pinned:${thread.id}`
+                                  )
+                                }
+                              >
+                                <Ellipsis size={13} />
+                              </button>
+                              {threadItemMenuKey === `pinned:${thread.id}` && (
+                                <div className="thread-menu thread-item-menu" role="menu">
+                                  <button
+                                    type="button"
+                                    className="project-menu-item"
+                                    role="menuitem"
+                                    onClick={() => {
+                                      setThreadItemMenuKey(null);
+                                      setThreadRenameKey(`pinned:${thread.id}`);
+                                    }}
+                                  >
+                                    <SquarePen size={13} /> Rename
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="project-menu-item"
+                                    role="menuitem"
+                                    onClick={() => {
+                                      setThreadItemMenuKey(null);
+                                      branchThread(thread.id);
+                                    }}
+                                  >
+                                    <GitBranch size={13} /> Branch
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="project-menu-item"
+                                    role="menuitem"
+                                    onClick={() => {
+                                      setThreadItemMenuKey(null);
+                                      unpinThread(thread.id);
+                                    }}
+                                  >
+                                    <PinOff size={13} /> Unpin
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="project-menu-item danger"
+                                    role="menuitem"
+                                    onClick={() => {
+                                      setThreadItemMenuKey(null);
+                                      if (confirm('Delete this thread?')) {
+                                        void deleteThreadWithRuntime(thread.id);
+                                      }
+                                    }}
+                                  >
+                                    <Trash2 size={13} /> Delete
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      {pinnedThreads.length > THREADS_VISIBLE_LIMIT && (
+                        <button
+                          type="button"
+                          className="threads-show-more"
+                          onClick={() => setPinnedAgentsShowAll((showAll) => !showAll)}
+                        >
+                          {pinnedAgentsShowAll ? 'Show less' : 'Show more'}
+                        </button>
+                      )}
+                      </>
+                    )}
+                  </div>
+                )}
+
                 {projects.length > 0 && (
                   <div className="recent-agents-section">
                     <button
@@ -6088,6 +6277,17 @@ const App: React.FC = () => {
                                       }}
                                     >
                                       <GitBranch size={13} /> Branch
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="project-menu-item"
+                                      role="menuitem"
+                                      onClick={() => {
+                                        setThreadItemMenuKey(null);
+                                        pinThread(thread.id);
+                                      }}
+                                    >
+                                      <Pin size={13} /> Pin
                                     </button>
                                     <button
                                       type="button"
@@ -6365,6 +6565,26 @@ const App: React.FC = () => {
                                         }}
                                       >
                                         <GitBranch size={13} /> Branch
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="project-menu-item"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setThreadItemMenuKey(null);
+                                          if (thread.pinnedAt) unpinThread(thread.id);
+                                          else pinThread(thread.id);
+                                        }}
+                                      >
+                                        {thread.pinnedAt ? (
+                                          <>
+                                            <PinOff size={13} /> Unpin
+                                          </>
+                                        ) : (
+                                          <>
+                                            <Pin size={13} /> Pin
+                                          </>
+                                        )}
                                       </button>
                                       <button
                                         type="button"
@@ -7106,9 +7326,13 @@ const App: React.FC = () => {
                                 ? `Linked task: ${selectedThread.linkedTask.title}`
                                 : 'Link a task from your Orion board'
                             }
+                            aria-label={
+                              selectedThread.linkedTask
+                                ? `Linked task: ${selectedThread.linkedTask.title}`
+                                : 'Link a task from your Orion board'
+                            }
                           >
                             <SquareKanban size={15} />
-                            {!selectedThread.linkedTask && <span>Link task</span>}
                           </button>
                           {taskPickerOpen && (
                             <TaskPickerPopover

@@ -199,6 +199,10 @@ export type Thread = {
   createdAt: string;
   /** Removed from the sidebar Recent agents list (still listed under its project). */
   hiddenFromRecent?: boolean;
+  /** Shown in the sidebar Pinned section (and excluded from Recent agents) while set. */
+  pinnedAt?: string;
+  /** Set on unpin so the thread surfaces at the top of Recent agents. */
+  unpinnedAt?: string;
   messages: Message[];
   // Per-provider harness session ids so follow-up turns resume the same
   // conversation (claude --resume, codex exec resume, etc.).

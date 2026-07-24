@@ -5014,7 +5014,10 @@ body {
 }
 
 .task-link-trigger {
-  padding: 0 10px;
+  width: 34px;
+  padding: 0;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .task-link-trigger.linked {
