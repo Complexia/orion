@@ -1463,14 +1463,15 @@ const resolveRemoteDefaultBranch = async (gitRoot) => {
   // Ask the remote first: origin/HEAD is only locally recorded metadata and
   // can remain stale after the repository changes its default branch.
   try {
-    const { stdout } = await execFileAsync('git', [
-      '-C',
-      gitRoot,
-      'ls-remote',
-      '--symref',
-      'origin',
-      'HEAD',
-    ]);
+    // Cap the network round trip and refuse credential prompts: an
+    // unreachable or auth-gated remote would otherwise never settle and pin
+    // the epic action in its disabled-UI busy state. The fallbacks below are
+    // local, so failing fast here degrades gracefully.
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', gitRoot, 'ls-remote', '--symref', 'origin', 'HEAD'],
+      { timeout: 15_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
+    );
     const branch = stdout.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD$/m)?.[1]?.trim();
     if (branch) return branch;
   } catch {
@@ -1638,7 +1639,7 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
         return {
           ok: false,
           error:
-            'No staged changes to commit. Stage only the files that belong to this epic, then try again.',
+            'No staged changes to commit. Stage only the changes that belong to this epic, then try again.',
         };
       }
       return {
@@ -1651,9 +1652,9 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
       };
     }
 
-    // The user-curated index is the epic boundary. Never stage the whole
-    // repository here: unrelated unstaged or untracked work must remain local.
-    // Freeze its tree before the message-generation turn so a concurrent git
+    // The user-curated index is the epic boundary. Never stage from historical
+    // filenames: a file can contain unrelated hunks before or after an agent
+    // turn. Freeze the index before message generation so a concurrent git
     // action cannot silently expand the commit.
     const indexTree = await readGitIndexTree(gitRoot);
     const entries = await readStagedGitEntries(gitRoot);
@@ -1740,6 +1741,14 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     if (!branch) {
       return { ok: false, error: 'Cannot open a PR from a detached HEAD.' };
     }
+    // Resolve and validate the target before any push. In particular, never
+    // publish local default-branch commits while preparing a PR.
+    target = await validateEpicGitTarget(gitRoot, branch, input);
+    if (!target.ok) return target;
+    const baseBranch = target.baseBranch;
+
+    // A staged snapshot is the only attributable Epic boundary. Require it to
+    // be committed before opening a PR; unstaged local work remains untouched.
     const stagedHasChanges = !(
       await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet'])
     );
@@ -1750,19 +1759,27 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
       };
     }
 
-    // Resolve and validate the target before any push. In particular, never
-    // publish local default-branch commits while preparing a PR.
-    target = await validateEpicGitTarget(gitRoot, branch, input);
-    if (!target.ok) return target;
-    const baseBranch = target.baseBranch;
-
     // Reuse an already-open PR for this branch instead of failing on create.
     // Check before pushing: a stale or diverged local branch can still have a
-    // valid open PR even though its non-fast-forward push would fail.
+    // valid open PR even though its non-fast-forward push would fail. With no
+    // selector, gh resolves the checked-out branch and its head repository;
+    // filtering only by branch name could select a same-named fork PR.
+    const currentBranch = await getCurrentGitBranch(gitRoot);
+    if (currentBranch !== branch) {
+      return {
+        ok: false,
+        gitRoot: target.gitRoot,
+        branch,
+        error:
+          currentBranch === null
+            ? 'The repository entered a detached HEAD while Orion was looking for an existing PR. Switch back to the epic branch and try again.'
+            : `The repository switched from ${branch} to ${currentBranch} while Orion was looking for an existing PR. Switch back to the epic branch and try again.`,
+      };
+    }
     try {
       const { stdout } = await execFileAsync(
         'gh',
-        ['pr', 'view', branch, '--json', 'url,state'],
+        ['pr', 'view', '--json', 'url,state'],
         { cwd: gitRoot }
       );
       const existing = JSON.parse(stdout);
@@ -1788,52 +1805,60 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     if (input?.modelId) {
       // Ensure the range used for message generation exists locally even when
       // the clone did not previously have an origin/HEAD tracking reference.
-      // Only the generated message needs it — gh targets the remote directly.
-      await execFileAsync('git', [
-        '-C',
-        gitRoot,
-        'fetch',
-        '--no-tags',
-        'origin',
-        `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
-      ]);
+      // Only the generated message needs it — gh targets the remote directly,
+      // and the push above already succeeded, so a failed fetch must not abort
+      // the PR: fall through to the static title/body.
+      let fetchedCurrentBase = false;
+      try {
+        await execFileAsync('git', [
+          '-C',
+          gitRoot,
+          'fetch',
+          '--no-tags',
+          'origin',
+          `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
+        ]);
+        fetchedCurrentBase = true;
+      } catch {}
 
-      const baseRef = `refs/remotes/origin/${baseBranch}`;
-      const branchRef = `refs/heads/${branch}`;
-      let commits = '';
-      let diffstat = '';
-      try {
-        ({ stdout: commits } = await execFileAsync('git', [
-          '-C',
-          gitRoot,
-          'log',
-          `${baseRef}..${branchRef}`,
-          '--pretty=- %s',
-        ]));
-      } catch {}
-      try {
-        ({ stdout: diffstat } = await execFileAsync('git', [
-          '-C',
-          gitRoot,
-          'diff',
-          `${baseRef}...${branchRef}`,
-          '--stat',
-        ]));
-      } catch {}
-      const prompt =
-        'Write a GitHub pull request title and description for the branch changes below' +
-        (input?.epicName ? `, which deliver the epic "${input.epicName}"` : '') +
-        '. First line: the PR title (specific, under 72 characters). Then a blank line, then the ' +
-        'PR description in markdown: a short summary paragraph followed by a "## Changes" bullet ' +
-        'list. Reply with ONLY the title and description — no quotes, no code fences, no commentary.\n\n' +
-        `Commits:\n${truncateForPrompt(commits, 3000)}\n\nDiffstat:\n${truncateForPrompt(diffstat, 3000)}`;
-      const text = cleanGeneratedGitMessage(
-        await runOneShotForModelId(input.modelId, prompt, gitRoot)
-      );
-      if (text) {
-        const newline = text.indexOf('\n');
-        title = (newline === -1 ? text : text.slice(0, newline)).trim();
-        body = newline === -1 ? '' : text.slice(newline + 1).trim();
+      if (fetchedCurrentBase) {
+        const baseRef = `refs/remotes/origin/${baseBranch}`;
+        const branchRef = `refs/heads/${branch}`;
+        let commits = '';
+        let diffstat = '';
+        try {
+          ({ stdout: commits } = await execFileAsync('git', [
+            '-C',
+            gitRoot,
+            'log',
+            `${baseRef}..${branchRef}`,
+            '--pretty=- %s',
+          ]));
+        } catch {}
+        try {
+          ({ stdout: diffstat } = await execFileAsync('git', [
+            '-C',
+            gitRoot,
+            'diff',
+            `${baseRef}...${branchRef}`,
+            '--stat',
+          ]));
+        } catch {}
+        const prompt =
+          'Write a GitHub pull request title and description for the branch changes below' +
+          (input?.epicName ? `, which deliver the epic "${input.epicName}"` : '') +
+          '. First line: the PR title (specific, under 72 characters). Then a blank line, then the ' +
+          'PR description in markdown: a short summary paragraph followed by a "## Changes" bullet ' +
+          'list. Reply with ONLY the title and description — no quotes, no code fences, no commentary.\n\n' +
+          `Commits:\n${truncateForPrompt(commits, 3000)}\n\nDiffstat:\n${truncateForPrompt(diffstat, 3000)}`;
+        const text = cleanGeneratedGitMessage(
+          await runOneShotForModelId(input.modelId, prompt, gitRoot)
+        );
+        if (text) {
+          const newline = text.indexOf('\n');
+          title = (newline === -1 ? text : text.slice(0, newline)).trim();
+          body = newline === -1 ? '' : text.slice(newline + 1).trim();
+        }
       }
     }
     if (!title) title = input?.epicName || `Changes from ${branch}`;

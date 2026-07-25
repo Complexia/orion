@@ -115,6 +115,7 @@ import orionIconUrl from '../assets/icon.png';
 import { CodeEditorPane } from './app/CodeEditorPane';
 import { ProjectIcon } from './app/ProjectIcon';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
+import { ComposerPopover } from './app/ComposerPopover';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import { AttachmentThumb, buildPromptWithAttachments, formatAttachmentSize, getDroppedFilePath, isMediaFile, isVideoAttachment, isVideoFile } from './app/attachments';
 import { AgentFamilySwitcher, ChatTranscript, isProviderAuthErrorText } from './app/chat';
@@ -284,7 +285,6 @@ const EpicDescriptionEditor: React.FC<{
 }> = ({ epicId, initialValue, onCommit }) => {
   const [draft, setDraft] = useState(initialValue);
   const latestRef = useRef({ epicId, draft, initialValue, onCommit });
-  latestRef.current = { epicId, draft, initialValue, onCommit };
   const commitTimerRef = useRef<number | null>(null);
 
   const flush = useCallback(() => {
@@ -295,6 +295,12 @@ const EpicDescriptionEditor: React.FC<{
     const latest = latestRef.current;
     if (latest.draft !== latest.initialValue) latest.onCommit(latest.epicId, latest.draft);
   }, []);
+
+  // Sync on every commit rather than during render: a discarded concurrent
+  // render must not leave its draft behind for the flush to write.
+  useEffect(() => {
+    latestRef.current = { epicId, draft, initialValue, onCommit };
+  });
 
   useEffect(() => flush, [flush]);
 
@@ -692,13 +698,6 @@ const App: React.FC = () => {
     projects.find((project) => project.id === latestThreadProjectId) ??
     projects[0] ??
     null;
-  // The store retargets selectedProjectId to an epic's repository. Do not
-  // apply the generic new-thread fallback while an epic is selected: an
-  // unbound epic must leave repository controls hidden instead of exposing a
-  // stale project.
-  const activeThreadProject =
-    selectedThreadProject ?? (selectedEpicId ? selectedProject : defaultNewThreadProject);
-
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
   // empty composer.
@@ -881,6 +880,12 @@ const App: React.FC = () => {
   useEffect(() => {
     setChatMentionIndex(0);
   }, [chatMentionListKey]);
+  // The dropdown's height is clamped to the space around the composer, so
+  // keyboard navigation has to keep the highlighted row scrolled into view.
+  const chatMentionSelectedRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    chatMentionSelectedRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [chatMentionIndex, chatMentionListKey]);
   // Role-model options for Settings → Orchestration: every real model grouped
   // by provider. The Orion pseudo-model can't delegate to itself.
   const orchestrationModelGroups = useMemo(
@@ -1103,33 +1108,40 @@ const App: React.FC = () => {
   }, [childThreadIds, epicsEnabled, threads]);
 
   const projectForGitRoot = useCallback(
-    (gitRoot: string | undefined) => {
+    (gitRoot: string | undefined, preferredProjectId?: string) => {
       if (!gitRoot) return null;
       const normalizedRoot = normalizeRepositoryPath(gitRoot);
-      return (
-        projects.find((project) => {
-          const normalizedProjectPath = normalizeRepositoryPath(project.path);
-          return (
-            normalizedProjectPath === normalizedRoot ||
-            normalizedProjectPath.startsWith(`${normalizedRoot}/`)
-          );
-        }) ?? null
-      );
+      const belongsToRoot = (project: Project) => {
+        const normalizedProjectPath = normalizeRepositoryPath(project.path);
+        return (
+          normalizedProjectPath === normalizedRoot ||
+          normalizedProjectPath.startsWith(`${normalizedRoot}/`)
+        );
+      };
+      const preferredProject = preferredProjectId
+        ? projects.find((project) => project.id === preferredProjectId)
+        : null;
+      if (preferredProject && belongsToRoot(preferredProject)) return preferredProject;
+      return projects.find(belongsToRoot) ?? null;
     },
     [projects]
   );
 
-  // A claimed epic must stay bound to its claimed repository. If that
+  // A claimed epic must stay bound to its claimed repository, so the claimed
+  // gitRoot outranks the picked repository everywhere (see
+  // projectForEpicRepository in the store and the epic git handlers). If that
   // repository was removed from Orion, return null instead of silently
   // redirecting new work into another project.
   const projectForEpic = useCallback(
     (epic: Epic) => {
+      if (epic.gitRoot) {
+        return projectForGitRoot(epic.gitRoot, epic.repositoryProjectId);
+      }
+
       const selectedRepository = epic.repositoryProjectId
         ? projects.find((project) => project.id === epic.repositoryProjectId)
         : null;
       if (selectedRepository) return selectedRepository;
-
-      if (epic.gitRoot) return projectForGitRoot(epic.gitRoot);
 
       const lastThread = threadsByEpic.get(epic.id)?.[0];
       const lastProject = lastThread
@@ -1143,12 +1155,21 @@ const App: React.FC = () => {
   const selectedEpic = epicsEnabled
     ? epics.find((epic) => epic.id === selectedEpicId) ?? null
     : null;
+
+  // The store retargets selectedProjectId to an epic's repository. Do not
+  // apply the generic new-thread fallback while an epic is selected: an
+  // unbound epic must leave repository controls hidden instead of exposing a
+  // stale project. Gate on the resolved epic, not the persisted id, so a
+  // leftover id cannot hide the controls once Epics is turned off.
+  const activeThreadProject =
+    selectedThreadProject ?? (selectedEpic ? selectedProject : defaultNewThreadProject);
+
   const selectedEpicThreads = selectedEpic ? threadsByEpic.get(selectedEpic.id) ?? [] : [];
   const selectedEpicRepositoryProject = selectedEpic?.repositoryProjectId
     ? projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null
     : null;
   const selectedEpicClaimedProject = selectedEpic
-    ? projectForGitRoot(selectedEpic.gitRoot)
+    ? projectForGitRoot(selectedEpic.gitRoot, selectedEpic.repositoryProjectId)
     : null;
 
   // The model that writes epic commit/PR messages: the Settings pick when it's
@@ -2954,12 +2975,30 @@ const App: React.FC = () => {
     return id;
   };
 
-  const handleEpicCommitAndPush = async (epic: Epic) => {
-    if (repositoryOperationBusy || !window.orion?.epicCommitAndPush) return;
+  // Shared setup for the epic git handlers: the repository to act on (the
+  // claimed gitRoot wins over the picked project) plus the branches other
+  // epics already claimed, which the main process uses to refuse collisions.
+  // projectPath stays optional so each caller can word its own toast.
+  const resolveEpicGitTarget = (epic: Epic) => {
     const project = epic.repositoryProjectId
       ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
       : null;
-    const projectPath = epic.gitRoot ?? project?.path;
+    return {
+      project,
+      projectPath: epic.gitRoot ?? project?.path,
+      claimedBranches: epics
+        .filter((candidate) => candidate.id !== epic.id && candidate.gitRoot && candidate.gitBranch)
+        .map((candidate) => ({
+          gitRoot: candidate.gitRoot!,
+          branch: candidate.gitBranch!,
+          epicName: candidate.name,
+        })),
+    };
+  };
+
+  const handleEpicCommitAndPush = async (epic: Epic) => {
+    if (repositoryOperationBusy || !window.orion?.epicCommitAndPush) return;
+    const { project, projectPath, claimedBranches } = resolveEpicGitTarget(epic);
     if (!projectPath) {
       toast.error('Select a repository for this epic before committing');
       return;
@@ -2973,13 +3012,7 @@ const App: React.FC = () => {
         epicName: epic.name,
         expectedGitRoot: epic.gitRoot,
         expectedBranch: epic.gitBranch,
-        claimedBranches: epics
-          .filter((candidate) => candidate.id !== epic.id && candidate.gitRoot && candidate.gitBranch)
-          .map((candidate) => ({
-            gitRoot: candidate.gitRoot!,
-            branch: candidate.gitBranch!,
-            epicName: candidate.name,
-          })),
+        claimedBranches,
       });
       if (result.gitRoot && result.branch) {
         // Claim the validated target even if a later commit hook or push fails,
@@ -2994,6 +3027,8 @@ const App: React.FC = () => {
       } else {
         toast.error(result.error ?? 'Commit and push failed');
       }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Commit and push failed');
     } finally {
       setEpicGitBusy(null);
     }
@@ -3001,10 +3036,7 @@ const App: React.FC = () => {
 
   const handleEpicCreatePr = async (epic: Epic) => {
     if (repositoryOperationBusy || !window.orion?.epicCreatePr) return;
-    const project = epic.repositoryProjectId
-      ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
-      : null;
-    const projectPath = epic.gitRoot ?? project?.path;
+    const { projectPath, claimedBranches } = resolveEpicGitTarget(epic);
     if (!projectPath) {
       toast.error('Select a repository for this epic before opening a PR');
       return;
@@ -3018,22 +3050,14 @@ const App: React.FC = () => {
         epicName: epic.name,
         expectedGitRoot: epic.gitRoot,
         expectedBranch: epic.gitBranch,
-        claimedBranches: epics
-          .filter((candidate) => candidate.id !== epic.id && candidate.gitRoot && candidate.gitBranch)
-          .map((candidate) => ({
-            gitRoot: candidate.gitRoot!,
-            branch: candidate.gitBranch!,
-            epicName: candidate.name,
-          })),
+        claimedBranches,
       });
       if (result.gitRoot && result.branch) {
         updateEpic(epic.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
       }
       if (result.ok) {
         const url = result.url;
-        updateEpic(epic.id, {
-          ...(url ? { prUrl: url } : {}),
-        });
+        if (url) updateEpic(epic.id, { prUrl: url });
         toast.success(
           result.alreadyExists
             ? 'A pull request for this branch is already open'
@@ -3050,6 +3074,8 @@ const App: React.FC = () => {
       } else {
         toast.error(result.error ?? 'Could not open a pull request');
       }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not open a pull request');
     } finally {
       setEpicGitBusy(null);
     }
@@ -7978,7 +8004,7 @@ const App: React.FC = () => {
                         )}
                         {selectedAgentModel?.providerId === 'codex' &&
                           /^\/review\s*$/i.test(chatInput.trimStart()) && (
-                            <div className="mention-popover review-popover" role="listbox">
+                            <ComposerPopover className="review-popover">
                               <button
                                 type="button"
                                 role="option"
@@ -7999,11 +8025,11 @@ const App: React.FC = () => {
                                 <GitBranch size={14} />
                                 <span className="mention-row-label">Review against a base branch</span>
                               </button>
-                            </div>
+                            </ComposerPopover>
                           )}
                         {selectedAgentModel?.providerId === 'codex' &&
                           /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
-                            <div className="mention-popover review-popover" role="listbox">
+                            <ComposerPopover className="review-popover">
                               {(gitState?.branches ?? [])
                                 .filter((branch) => !branch.current)
                                 .slice(0, 12)
@@ -8033,10 +8059,10 @@ const App: React.FC = () => {
                                   </span>
                                 </div>
                               )}
-                            </div>
+                            </ComposerPopover>
                           )}
                         {chatMentionOpen && (
-                          <div className="mention-popover" role="listbox">
+                          <ComposerPopover>
                             {chatMentionCandidates.map((model, index) => {
                               const ProviderIcon =
                                 agentProviders.find((provider) => provider.id === model.providerId)
@@ -8044,6 +8070,7 @@ const App: React.FC = () => {
                               return (
                                 <button
                                   key={model.id}
+                                  ref={index === chatMentionIndex ? chatMentionSelectedRef : null}
                                   type="button"
                                   role="option"
                                   aria-selected={index === chatMentionIndex}
@@ -8062,7 +8089,7 @@ const App: React.FC = () => {
                                 </button>
                               );
                             })}
-                          </div>
+                          </ComposerPopover>
                         )}
                         <textarea
                           ref={chatInputRef}

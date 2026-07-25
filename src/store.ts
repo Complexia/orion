@@ -52,17 +52,20 @@ const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/
  */
 const projectForEpicRepository = (projects: Project[], epic: Epic | undefined) => {
   if (!epic) return undefined;
-  if (epic.gitRoot) {
-    const epicRoot = normalizeRepoPath(epic.gitRoot);
-    const byRoot = projects.find((project) => {
-      const projectPath = normalizeRepoPath(project.path);
-      return projectPath === epicRoot || projectPath.startsWith(`${epicRoot}/`);
-    });
-    if (byRoot) return byRoot;
-  }
-  return epic.repositoryProjectId
+  const selectedRepository = epic.repositoryProjectId
     ? projects.find((project) => project.id === epic.repositoryProjectId)
     : undefined;
+  if (epic.gitRoot) {
+    const epicRoot = normalizeRepoPath(epic.gitRoot);
+    const belongsToRoot = (project: Project) => {
+      const projectPath = normalizeRepoPath(project.path);
+      return projectPath === epicRoot || projectPath.startsWith(`${epicRoot}/`);
+    };
+    if (selectedRepository && belongsToRoot(selectedRepository)) return selectedRepository;
+    const byRoot = projects.find(belongsToRoot);
+    if (byRoot) return byRoot;
+  }
+  return selectedRepository;
 };
 
 export type AgentToolSource = { url: string; title?: string };

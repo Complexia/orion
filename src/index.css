@@ -4374,10 +4374,11 @@ body {
 /* Composer @-mention dropdown — same surface tokens as the model picker. */
 .mention-popover {
   position: absolute;
+  box-sizing: border-box;
   left: 10px;
   right: 10px;
   bottom: calc(100% + 8px);
-  max-height: 320px;
+  max-height: 320px; /* ComposerPopover overrides this with the space that fits */
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 6px;
@@ -4387,6 +4388,25 @@ body {
   box-shadow: var(--shadow-lg);
   z-index: 100;
   animation: popover-in 220ms var(--ease-out) both;
+}
+
+/* Flipped below the composer when there isn't room above it. */
+.mention-popover.below {
+  top: calc(100% + 8px);
+  bottom: auto;
+  animation-name: popover-in-below;
+}
+
+@keyframes popover-in-below {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 .mention-row {
