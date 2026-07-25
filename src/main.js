@@ -66,6 +66,20 @@ const pendingRiftEpicIds = new Set();
 // binding reached durable store storage. This bridges invoke completion,
 // renderer reloads, and process crashes without exposing the source checkout.
 const unacknowledgedRifts = new Map(); // epicId -> ownership
+const codexGoalOpsByThread = new Map(); // threadId -> Set<{ controller, promise }>
+const disposeCodexGoalOpsForThread = async (threadId) => {
+  const operations = [...(codexGoalOpsByThread.get(threadId) ?? [])];
+  if (operations.length === 0) return false;
+  for (const operation of operations) operation.controller.abort();
+  await Promise.allSettled(operations.map((operation) => operation.promise));
+  return true;
+};
+const disposeAllCodexGoalOps = () => {
+  const shutdowns = [...codexGoalOpsByThread.keys()].map((threadId) =>
+    disposeCodexGoalOpsForThread(threadId)
+  );
+  if (shutdowns.length > 0) trackAgentShutdown(Promise.all(shutdowns));
+};
 const titleGenerationsByThread = new Map(); // threadId -> Set<{ controller, promise }>
 const disposeTitleGenerationsForThread = async (threadId) => {
   const generations = [...(titleGenerationsByThread.get(threadId) ?? [])];
@@ -893,6 +907,7 @@ app.on('window-all-closed', () => {
   // webContents and background agents cannot keep working invisibly.
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
+  disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
   reapActiveAgentRuns();
   if (process.platform !== 'darwin') {
@@ -910,6 +925,7 @@ app.on('will-quit', (event) => {
   cancelPendingRiftCreations();
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
+  disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
   reapActiveAgentRuns();
   if (quitBarrierSatisfied) return;
@@ -1784,6 +1800,7 @@ const hasLocalCommitsToPush = async (gitRoot, branch, baseBranch) => {
 ipcMain.handle('epic:commitAndPush', async (_event, input) => {
   let gitRoot = '';
   let branch = '';
+  let committed = false;
   try {
     if (typeof input?.epicId !== 'string' || !input.epicId) {
       return { ok: false, error: 'Missing epic id.' };
@@ -1888,6 +1905,7 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     }
 
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
+    committed = true;
     await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
 
     return { ok: true, gitRoot, branch, message };
@@ -1895,6 +1913,7 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     return {
       ok: false,
       ...(gitRoot ? { gitRoot, branch } : {}),
+      ...(committed ? { committed: true } : {}),
       error: error?.stderr?.toString().trim() || error?.message || String(error),
     };
   }
@@ -2388,10 +2407,17 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     // is in flight. If its frame is gone there is nobody left to persist the
     // returned path, so remove the completed workspace instead of orphaning
     // it. Explicit app quit sets the same condition and waits for this cleanup.
+    let senderFrameDestroyed = false;
+    try {
+      senderFrameDestroyed = event.senderFrame?.isDestroyed?.() === true;
+    } catch {
+      // Electron can throw while resolving senderFrame after its frame is disposed.
+      senderFrameDestroyed = true;
+    }
     if (
       riftShutdownRequested ||
       event.sender.isDestroyed() ||
-      event.senderFrame?.isDestroyed?.()
+      senderFrameDestroyed
     ) {
       const abandonedRiftPath = createdRiftPath;
       await riftRemove(abandonedRiftPath);
@@ -4126,20 +4152,43 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
 ipcMain.handle('agent:isRunFinalizing', (_event, runId) => finalizingAgentRuns.has(runId));
 
 ipcMain.handle('agent:codexGoal', async (_event, input) => {
+  const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
   try {
-    if (!input?.sessionId || !input?.projectPath || !input?.action) {
-      return { ok: false, error: 'Missing sessionId, projectPath, or action.' };
+    if (!input?.sessionId || !threadId || !input?.projectPath || !input?.action) {
+      return { ok: false, error: 'Missing sessionId, threadId, projectPath, or action.' };
     }
     if (!['pause', 'clear', 'get'].includes(input.action)) {
       return { ok: false, error: `Unsupported goal action: ${input.action}` };
     }
-    const available = await checkCommandAvailable('codex');
-    if (!available) return { ok: false, error: 'codex is not installed or not on PATH.' };
-    return await runCodexGoalOp({
-      sessionId: input.sessionId,
-      cwd: input.projectPath,
-      action: input.action,
-    });
+    const controller = new AbortController();
+    const operationEntry = { controller, promise: null };
+    let threadOperations = codexGoalOpsByThread.get(threadId);
+    if (!threadOperations) {
+      threadOperations = new Set();
+      codexGoalOpsByThread.set(threadId, threadOperations);
+    }
+    threadOperations.add(operationEntry);
+    const operation = (async () => {
+      const available = await checkCommandAvailable('codex');
+      if (controller.signal.aborted) {
+        return { ok: false, error: 'Codex goal operation was cancelled.' };
+      }
+      if (!available) return { ok: false, error: 'codex is not installed or not on PATH.' };
+      return await runCodexGoalOp({
+        sessionId: input.sessionId,
+        threadId,
+        cwd: input.projectPath,
+        action: input.action,
+        signal: controller.signal,
+      });
+    })();
+    operationEntry.promise = operation;
+    try {
+      return await operation;
+    } finally {
+      threadOperations.delete(operationEntry);
+      if (threadOperations.size === 0) codexGoalOpsByThread.delete(threadId);
+    }
   } catch (error) {
     console.error('agent:codexGoal error', error);
     return { ok: false, error: error?.message ?? String(error) };
@@ -4160,6 +4209,7 @@ ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
   }
   invalidateTerminalSession(threadId);
   const terminalShutdown = disposeTerminalSessionAndWait(threadId);
+  const goalShutdown = disposeCodexGoalOpsForThread(threadId);
   const titleShutdown = disposeTitleGenerationsForThread(threadId);
   // Also reap any live run process for the thread (e.g. a wedged ACP server
   // whose run the renderer no longer tracks): thread teardown must not leave
@@ -4173,13 +4223,15 @@ ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
     runShutdowns.push(killAgentChild(run.child, threadId));
     activeAgentRuns.delete(runId);
   }
-  const [disposedTerminal, disposedClaude, disposedTitles, disposedAgent] = await Promise.all([
-    terminalShutdown,
-    disposeClaudeSdkSessionAndWait(threadId),
-    titleShutdown,
-    waitForAgentThreadShutdowns(threadId),
-    ...runShutdowns,
-  ]);
+  const [disposedTerminal, disposedClaude, disposedGoals, disposedTitles, disposedAgent] =
+    await Promise.all([
+      terminalShutdown,
+      disposeClaudeSdkSessionAndWait(threadId),
+      goalShutdown,
+      titleShutdown,
+      waitForAgentThreadShutdowns(threadId),
+      ...runShutdowns,
+    ]);
   if (cancelledStartup) {
     const deadline = Date.now() + 3000;
     while (
@@ -4200,6 +4252,7 @@ ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
     disposedClaude ||
     disposedLateClaude ||
     disposedTerminal ||
+    disposedGoals ||
     disposedTitles ||
     disposedAgent ||
     runShutdowns.length > 0 ||
@@ -4804,7 +4857,12 @@ const titleFromResponseText = (responseText) => {
 // Run a single non-streaming prompt through a provider CLI in read-only mode
 // and return the model's plain-text reply ('' on any failure). Backs the
 // hidden utility turns: thread titles and epic commit/PR messages.
-const runOneShotAgentText = async (model, prompt, projectPath, { signal } = {}) => {
+const runOneShotAgentText = async (
+  model,
+  prompt,
+  projectPath,
+  { signal, threadId } = {}
+) => {
   const cwd = projectPath || process.cwd();
   if (signal?.aborted) return '';
 
@@ -4820,7 +4878,7 @@ const runOneShotAgentText = async (model, prompt, projectPath, { signal } = {}) 
   // access. Drive the turn over ACP plan mode instead, which disables tool
   // execution.
   if (model.providerId === 'kimi') {
-    return (await kimiPlanModeOneShot(model, prompt, cwd, { signal })) || '';
+    return (await kimiPlanModeOneShot(model, prompt, cwd, { signal, threadId })) || '';
   }
 
   // Reuse the command builder but force read-only access for the hidden turn
@@ -4861,7 +4919,7 @@ const runOneShotAgentText = async (model, prompt, projectPath, { signal } = {}) 
       if (settled) return;
       settled = true;
       cleanup();
-      void killAgentChild(child).then(() => resolve(''));
+      void killAgentChild(child, threadId).then(() => resolve(''));
     };
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) {
@@ -4991,6 +5049,7 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
     return titleFromResponseText(
       await runOneShotAgentText(model, titleInstruction, input.projectPath, {
         signal: controller.signal,
+        threadId,
       })
     );
   })();

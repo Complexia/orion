@@ -3187,6 +3187,7 @@ const App: React.FC = () => {
     let recoveryRetryCount = 0;
     const recoveringEpicIds = new Set<string>();
     const refresh = async () => {
+      let shouldRetryReadyRift = false;
       try {
         const status = await getRiftStatus();
         if (disposed) return;
@@ -3205,10 +3206,11 @@ const App: React.FC = () => {
         for (const ownership of status.readyRifts ?? []) {
           if (recoveringEpicIds.has(ownership.epicId)) continue;
           recoveringEpicIds.add(ownership.epicId);
+          let acknowledged = false;
           try {
             const acknowledgement = await persistAndAcknowledgeRift(ownership);
+            acknowledged = acknowledgement.ok;
             if (acknowledgement.ok) {
-              recoveryRetryCount = 0;
               if (locallyStartedRiftEpicIdsRef.current.delete(ownership.epicId)) {
                 const recoveredPending = Object.fromEntries(
                   [
@@ -3219,15 +3221,23 @@ const App: React.FC = () => {
                 riftSetupEpicIdsRef.current = recoveredPending;
                 setRiftSetupEpicIds(recoveredPending);
               }
-            } else if (locallyStartedRiftEpicIdsRef.current.has(ownership.epicId)) {
-              recoveryRetryCount += 1;
             }
           } finally {
+            if (!acknowledged) shouldRetryReadyRift = true;
             recoveringEpicIds.delete(ownership.epicId);
           }
         }
+        if (shouldRetryReadyRift) {
+          recoveryRetryCount += 1;
+        } else if ((status.readyRifts?.length ?? 0) > 0) {
+          recoveryRetryCount = 0;
+        }
         const hasMainPendingSetup = (status.pendingEpicIds?.length ?? 0) > 0;
-        if (hasMainPendingSetup || locallyStartedRiftEpicIdsRef.current.size > 0) {
+        if (
+          hasMainPendingSetup ||
+          locallyStartedRiftEpicIdsRef.current.size > 0 ||
+          shouldRetryReadyRift
+        ) {
           // Main-owned setup remains on the existing fast cadence. A ready
           // Rift whose save/acknowledgement failed backs off so a persistent
           // storage failure cannot create a hot IPC/save loop.
@@ -3237,7 +3247,10 @@ const App: React.FC = () => {
           refreshTimer = window.setTimeout(() => void refresh(), retryDelay);
         }
       } catch {
-        if (!disposed && locallyStartedRiftEpicIdsRef.current.size > 0) {
+        if (
+          !disposed &&
+          (locallyStartedRiftEpicIdsRef.current.size > 0 || shouldRetryReadyRift)
+        ) {
           recoveryRetryCount += 1;
           const retryDelay = Math.min(
             500 * 2 ** Math.min(recoveryRetryCount, 4),
@@ -3641,7 +3654,9 @@ const App: React.FC = () => {
         epicName: epic.name,
         ...claim,
       });
-      claimEpicGitTarget(epic, result);
+      if (result.ok || result.committed) {
+        claimEpicGitTarget(epic, result);
+      }
       if (result.ok) {
         toast.success(`Committed and pushed ${result.branch ?? 'branch'}`, {
           description: result.message?.split('\n')[0],
@@ -3688,8 +3703,8 @@ const App: React.FC = () => {
         epicName: epic.name,
         ...claim,
       });
-      claimEpicGitTarget(epic, result);
       if (result.ok) {
+        claimEpicGitTarget(epic, result);
         const url = result.url;
         if (url) {
           updateEpic(epic.id, { prUrl: url });
@@ -5303,7 +5318,12 @@ const App: React.FC = () => {
       }
       if (sessionId && project && window.orion?.codexGoalCommand) {
         void window.orion
-          .codexGoalCommand({ sessionId, projectPath: threadWorkingDir(state.epics, selectedThread, project), action: 'get' })
+          .codexGoalCommand({
+            sessionId,
+            threadId: selectedThreadId,
+            projectPath: threadWorkingDir(state.epics, selectedThread, project),
+            action: 'get',
+          })
           .then((result) => {
             if (result.ok) updateThread(selectedThreadId, { goal: result.goal ?? null });
             const latest = result.ok ? result.goal : goal;
@@ -5345,7 +5365,12 @@ const App: React.FC = () => {
         });
       } else if (sessionId && project && window.orion?.codexGoalCommand) {
         void window.orion
-          .codexGoalCommand({ sessionId, projectPath: threadWorkingDir(state.epics, selectedThread, project), action: 'pause' })
+          .codexGoalCommand({
+            sessionId,
+            threadId: selectedThreadId,
+            projectPath: threadWorkingDir(state.epics, selectedThread, project),
+            action: 'pause',
+          })
           .then((result) => {
             if (result.ok) {
               updateThread(selectedThreadId, { goal: result.goal ?? { ...goal, status: 'paused' } });
@@ -5367,7 +5392,12 @@ const App: React.FC = () => {
       const clearGoal = () => {
         if (sessionId && project && window.orion?.codexGoalCommand) {
           void window.orion
-            .codexGoalCommand({ sessionId, projectPath: threadWorkingDir(state.epics, selectedThread, project), action: 'clear' })
+            .codexGoalCommand({
+              sessionId,
+              threadId: selectedThreadId,
+              projectPath: threadWorkingDir(state.epics, selectedThread, project),
+              action: 'clear',
+            })
             .then((result) => {
               if (result.ok) {
                 updateThread(selectedThreadId, { goal: null });

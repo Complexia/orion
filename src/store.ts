@@ -543,19 +543,46 @@ const memoryStorage = new Map<string, string>();
 const STORE_SAVE_DEBOUNCE_MS = 400;
 let pendingStoreValue: string | null = null;
 let storeSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let storeSaveFlush: Promise<boolean> | null = null;
 
 export const flushOrionStoreSave = async (): Promise<boolean> => {
   if (storeSaveTimer !== null) {
     clearTimeout(storeSaveTimer);
     storeSaveTimer = null;
   }
-  if (pendingStoreValue === null) return true;
-  const value = pendingStoreValue;
-  pendingStoreValue = null;
-  if (typeof window === 'undefined' || !window.orion?.saveStore) return false;
-  const saved = await window.orion.saveStore(value);
-  if (!saved) console.warn('Failed to persist orion-storage');
-  return saved;
+  if (storeSaveFlush !== null) return storeSaveFlush;
+
+  const flush = (async () => {
+    while (pendingStoreValue !== null) {
+      if (typeof window === 'undefined' || !window.orion?.saveStore) return false;
+
+      const value = pendingStoreValue;
+      let saved = false;
+      try {
+        saved = await window.orion.saveStore(value);
+      } catch (error) {
+        console.warn('Failed to persist orion-storage', error);
+        return false;
+      }
+      if (!saved) {
+        console.warn('Failed to persist orion-storage');
+        return false;
+      }
+
+      // A newer snapshot may have arrived while this one was being written.
+      // Only clear the value that was actually persisted; the loop will drain
+      // a replacement before reporting success.
+      if (pendingStoreValue === value) pendingStoreValue = null;
+    }
+    return true;
+  })();
+
+  storeSaveFlush = flush;
+  try {
+    return await flush;
+  } finally {
+    if (storeSaveFlush === flush) storeSaveFlush = null;
+  }
 };
 
 if (typeof window !== 'undefined') {
@@ -657,12 +684,12 @@ const orionStorage: StateStorage = {
   },
   setItem: async (name, value) => {
     memoryStorage.set(name, value);
+    pendingStoreValue = value;
 
     if (typeof window === 'undefined' || !window.orion?.saveStore) {
       return;
     }
 
-    pendingStoreValue = value;
     if (storeSaveTimer === null) {
       storeSaveTimer = setTimeout(() => {
         storeSaveTimer = null;
