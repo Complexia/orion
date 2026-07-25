@@ -66,7 +66,7 @@ import {
   defaultProviderSettings,
   defaultOrchestrationSettings,
   defaultNotificationSettings,
-  defaultItemsSettings,
+  defaultEpicsSettings,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -80,7 +80,7 @@ import {
   type Thread,
   type ThreadGoal,
   type TurnTokenStats,
-  type WorkItem,
+  type Epic,
 } from './store';
 import { Toaster, toast } from 'sonner';
 import {
@@ -213,10 +213,10 @@ type SettingsTab =
 
 const THREADS_VISIBLE_LIMIT = 5;
 
-// Cheap models preferred for the hidden item commit/PR-message turns when the
+// Cheap models preferred for the hidden epic commit/PR-message turns when the
 // user hasn't picked one in Settings, best value first. Falls through to any
 // available model.
-const ITEM_MESSAGE_MODEL_PREFERENCE = [
+const EPIC_MESSAGE_MODEL_PREFERENCE = [
   'claude:claude-haiku-4-5',
   'codex:gpt-5.4-mini',
   'codex:gpt-5.3-codex-spark',
@@ -253,7 +253,7 @@ const threadShellSignature = (thread: Thread): string => {
     thread.unpinnedAt,
     thread.parentThreadId,
     thread.branchedFromThreadId,
-    thread.itemId,
+    thread.epicId,
     thread.spawnId,
     thread.terminalActivityAt,
     thread.messages.length,
@@ -272,19 +272,19 @@ const threadShellSignature = (thread: Thread): string => {
   return signature;
 };
 
-// The item-view description draft stays local while typing: every store write
-// rebuilds `items`, re-renders the whole shell, and re-serializes the persisted
+// The epic-view description draft stays local while typing: every store write
+// rebuilds `epics`, re-renders the whole shell, and re-serializes the persisted
 // state, so committing per keystroke would tax typing latency for no benefit.
 // Commits happen on blur, on a short idle debounce, and on unmount (which
-// covers switching items — the caller keys this component by item id).
-const ItemDescriptionEditor: React.FC<{
-  itemId: string;
+// covers switching epics — the caller keys this component by epic id).
+const EpicDescriptionEditor: React.FC<{
+  epicId: string;
   initialValue: string;
-  onCommit: (itemId: string, description: string) => void;
-}> = ({ itemId, initialValue, onCommit }) => {
+  onCommit: (epicId: string, description: string) => void;
+}> = ({ epicId, initialValue, onCommit }) => {
   const [draft, setDraft] = useState(initialValue);
-  const latestRef = useRef({ itemId, draft, initialValue, onCommit });
-  latestRef.current = { itemId, draft, initialValue, onCommit };
+  const latestRef = useRef({ epicId, draft, initialValue, onCommit });
+  latestRef.current = { epicId, draft, initialValue, onCommit };
   const commitTimerRef = useRef<number | null>(null);
 
   const flush = useCallback(() => {
@@ -293,15 +293,15 @@ const ItemDescriptionEditor: React.FC<{
       commitTimerRef.current = null;
     }
     const latest = latestRef.current;
-    if (latest.draft !== latest.initialValue) latest.onCommit(latest.itemId, latest.draft);
+    if (latest.draft !== latest.initialValue) latest.onCommit(latest.epicId, latest.draft);
   }, []);
 
   useEffect(() => flush, [flush]);
 
   return (
     <textarea
-      id="item-description"
-      className="item-view-description"
+      id="epic-description"
+      className="epic-view-description"
       value={draft}
       onChange={(e) => {
         setDraft(e.target.value);
@@ -309,7 +309,7 @@ const ItemDescriptionEditor: React.FC<{
         commitTimerRef.current = window.setTimeout(flush, 400);
       }}
       onBlur={flush}
-      placeholder="Add notes for this item…"
+      placeholder="Add notes for this epic…"
       rows={4}
     />
   );
@@ -322,20 +322,20 @@ const App: React.FC = () => {
     projects,
     selectedProjectId,
     selectedThreadId,
-    items,
-    selectedItemId,
-    itemsSettings,
+    epics,
+    selectedEpicId,
+    epicsSettings,
     addProject,
     removeProject,
     renameProject,
-    addItem,
-    renameItem,
-    updateItem,
-    deleteItem,
-    settleItem,
-    unsettleItem,
-    selectItem,
-    setItemsSettings,
+    addEpic,
+    renameEpic,
+    updateEpic,
+    deleteEpic,
+    settleEpic,
+    unsettleEpic,
+    selectEpic,
+    setEpicsSettings,
     createThread,
     branchThread,
     selectProject,
@@ -375,20 +375,20 @@ const App: React.FC = () => {
       projects: state.projects,
       selectedProjectId: state.selectedProjectId,
       selectedThreadId: state.selectedThreadId,
-      items: state.items,
-      selectedItemId: state.selectedItemId,
-      itemsSettings: state.itemsSettings,
+      epics: state.epics,
+      selectedEpicId: state.selectedEpicId,
+      epicsSettings: state.epicsSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
-      addItem: state.addItem,
-      renameItem: state.renameItem,
-      updateItem: state.updateItem,
-      deleteItem: state.deleteItem,
-      settleItem: state.settleItem,
-      unsettleItem: state.unsettleItem,
-      selectItem: state.selectItem,
-      setItemsSettings: state.setItemsSettings,
+      addEpic: state.addEpic,
+      renameEpic: state.renameEpic,
+      updateEpic: state.updateEpic,
+      deleteEpic: state.deleteEpic,
+      settleEpic: state.settleEpic,
+      unsettleEpic: state.unsettleEpic,
+      selectEpic: state.selectEpic,
+      setEpicsSettings: state.setEpicsSettings,
       createThread: state.createThread,
       branchThread: state.branchThread,
       selectProject: state.selectProject,
@@ -521,23 +521,25 @@ const App: React.FC = () => {
   const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
   const [pinnedAgentsOpen, setPinnedAgentsOpen] = useState(true);
   const [pinnedAgentsShowAll, setPinnedAgentsShowAll] = useState(false);
-  const [itemsSectionOpen, setItemsSectionOpen] = useState(true);
-  const [collapsedItems, setCollapsedItems] = useState<Record<string, boolean>>({});
+  const [epicsSectionOpen, setEpicsSectionOpen] = useState(true);
+  const [collapsedEpics, setCollapsedEpics] = useState<Record<string, boolean>>({});
   // Create-item modal (title + optional description).
-  const [createItemOpen, setCreateItemOpen] = useState(false);
-  const [newItemName, setNewItemName] = useState('');
-  const [newItemDescription, setNewItemDescription] = useState('');
-  const createItemTitleRef = useRef<HTMLInputElement>(null);
-  const [itemMenuOpenId, setItemMenuOpenId] = useState<string | null>(null);
-  const [itemRenameId, setItemRenameId] = useState<string | null>(null);
-  // One item git action (commit/PR) at a time; the item view's buttons disable
+  const [createEpicOpen, setCreateEpicOpen] = useState(false);
+  const [newEpicName, setNewEpicName] = useState('');
+  const [newEpicDescription, setNewEpicDescription] = useState('');
+  const createEpicTitleRef = useRef<HTMLInputElement>(null);
+  const [epicMenuOpenId, setEpicMenuOpenId] = useState<string | null>(null);
+  const [epicRenameId, setEpicRenameId] = useState<string | null>(null);
+  const [epicRepoPickerOpen, setEpicRepoPickerOpen] = useState(false);
+  // One epic git action (commit/PR) at a time; the epic view's buttons disable
   // while it runs.
-  const [itemGitBusy, setItemGitBusy] = useState<'commit' | 'pr' | null>(null);
-  const repositoryOperationBusy = gitBusy || cloudBusy || itemGitBusy !== null;
+  const [epicGitBusy, setEpicGitBusy] = useState<'commit' | 'pr' | null>(null);
+  const repositoryOperationBusy = gitBusy || cloudBusy || epicGitBusy !== null;
   useEffect(() => {
     if (!repositoryOperationBusy) return;
     setProjectPickerOpen(false);
     setBranchPickerOpen(false);
+    setEpicRepoPickerOpen(false);
   }, [repositoryOperationBusy]);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
@@ -565,7 +567,8 @@ const App: React.FC = () => {
   const goalMenuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const threadItemMenuRef = useRef<HTMLDivElement>(null);
-  const itemMenuRef = useRef<HTMLDivElement>(null);
+  const epicMenuRef = useRef<HTMLDivElement>(null);
+  const epicRepoPickerRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
   // Startup IPC resolves long before a normal turn ends. Retain its result for
   // a short grace window so a steer whose stop lands just after startup failed
@@ -689,12 +692,12 @@ const App: React.FC = () => {
     projects.find((project) => project.id === latestThreadProjectId) ??
     projects[0] ??
     null;
-  // The store retargets selectedProjectId to an item's repository. Do not
-  // apply the generic new-thread fallback while an item is selected: an
-  // unbound item must leave repository controls hidden instead of exposing a
+  // The store retargets selectedProjectId to an epic's repository. Do not
+  // apply the generic new-thread fallback while an epic is selected: an
+  // unbound epic must leave repository controls hidden instead of exposing a
   // stale project.
   const activeThreadProject =
-    selectedThreadProject ?? (selectedItemId ? selectedProject : defaultNewThreadProject);
+    selectedThreadProject ?? (selectedEpicId ? selectedProject : defaultNewThreadProject);
 
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
@@ -1066,38 +1069,38 @@ const App: React.FC = () => {
     [childThreadIds, threads]
   );
 
-  const itemsEnabled = itemsSettings?.enabled ?? defaultItemsSettings.enabled;
+  const epicsEnabled = epicsSettings?.enabled ?? defaultEpicsSettings.enabled;
 
-  const activeItems = useMemo(() => items.filter((item) => !item.settledAt), [items]);
+  const activeEpics = useMemo(() => epics.filter((epic) => !epic.settledAt), [epics]);
 
-  const archivedItems = useMemo(
+  const archivedEpics = useMemo(
     () =>
-      items
-        .filter((item) => item.settledAt)
+      epics
+        .filter((epic) => epic.settledAt)
         .sort(
           (a, b) => new Date(b.settledAt ?? 0).getTime() - new Date(a.settledAt ?? 0).getTime()
         ),
-    [items]
+    [epics]
   );
 
-  const threadsByItem = useMemo(() => {
+  const threadsByEpic = useMemo(() => {
     const grouped = new Map<string, Thread[]>();
-    // No Items UI renders while the feature is off, so skip the grouping work.
-    if (!itemsEnabled) return grouped;
+    // No Epics UI renders while the feature is off, so skip the grouping work.
+    if (!epicsEnabled) return grouped;
     for (const thread of threads) {
       // Top-level rows only; children render nested under their parent.
-      if (!thread.itemId || childThreadIds.has(thread.id)) continue;
-      const itemThreads = grouped.get(thread.itemId);
-      if (itemThreads) itemThreads.push(thread);
-      else grouped.set(thread.itemId, [thread]);
+      if (!thread.epicId || childThreadIds.has(thread.id)) continue;
+      const epicThreads = grouped.get(thread.epicId);
+      if (epicThreads) epicThreads.push(thread);
+      else grouped.set(thread.epicId, [thread]);
     }
-    for (const itemThreads of grouped.values()) {
-      itemThreads.sort(
+    for (const epicThreads of grouped.values()) {
+      epicThreads.sort(
         (a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
       );
     }
     return grouped;
-  }, [childThreadIds, itemsEnabled, threads]);
+  }, [childThreadIds, epicsEnabled, threads]);
 
   const projectForGitRoot = useCallback(
     (gitRoot: string | undefined) => {
@@ -1116,41 +1119,41 @@ const App: React.FC = () => {
     [projects]
   );
 
-  // A claimed item must stay bound to its claimed repository. If that
+  // A claimed epic must stay bound to its claimed repository. If that
   // repository was removed from Orion, return null instead of silently
   // redirecting new work into another project.
-  const projectForItem = useCallback(
-    (item: WorkItem) => {
-      const selectedRepository = item.repositoryProjectId
-        ? projects.find((project) => project.id === item.repositoryProjectId)
+  const projectForEpic = useCallback(
+    (epic: Epic) => {
+      const selectedRepository = epic.repositoryProjectId
+        ? projects.find((project) => project.id === epic.repositoryProjectId)
         : null;
       if (selectedRepository) return selectedRepository;
 
-      if (item.gitRoot) return projectForGitRoot(item.gitRoot);
+      if (epic.gitRoot) return projectForGitRoot(epic.gitRoot);
 
-      const lastThread = threadsByItem.get(item.id)?.[0];
+      const lastThread = threadsByEpic.get(epic.id)?.[0];
       const lastProject = lastThread
         ? projects.find((p) => p.id === lastThread.projectId)
         : undefined;
       return lastProject ?? defaultNewThreadProject ?? projects[0] ?? null;
     },
-    [defaultNewThreadProject, projectForGitRoot, projects, threadsByItem]
+    [defaultNewThreadProject, projectForGitRoot, projects, threadsByEpic]
   );
 
-  const selectedItem = itemsEnabled
-    ? items.find((item) => item.id === selectedItemId) ?? null
+  const selectedEpic = epicsEnabled
+    ? epics.find((epic) => epic.id === selectedEpicId) ?? null
     : null;
-  const selectedItemThreads = selectedItem ? threadsByItem.get(selectedItem.id) ?? [] : [];
-  const selectedItemRepositoryProject = selectedItem?.repositoryProjectId
-    ? projects.find((project) => project.id === selectedItem.repositoryProjectId) ?? null
+  const selectedEpicThreads = selectedEpic ? threadsByEpic.get(selectedEpic.id) ?? [] : [];
+  const selectedEpicRepositoryProject = selectedEpic?.repositoryProjectId
+    ? projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null
     : null;
-  const selectedItemClaimedProject = selectedItem
-    ? projectForGitRoot(selectedItem.gitRoot)
+  const selectedEpicClaimedProject = selectedEpic
+    ? projectForGitRoot(selectedEpic.gitRoot)
     : null;
 
-  // The model that writes item commit/PR messages: the Settings pick when it's
+  // The model that writes epic commit/PR messages: the Settings pick when it's
   // installed and its provider is enabled, else the cheapest enabled model.
-  const resolveItemMessageModelId = useCallback(() => {
+  const resolveEpicMessageModelId = useCallback(() => {
     const isUsable = (id: string | null | undefined): id is string => {
       if (!id || isOrionModelId(id) || id === claudeCodeCliModelId) return false;
       const model = agentModels.find((candidate) => candidate.id === id);
@@ -1161,9 +1164,9 @@ const App: React.FC = () => {
         enabledProviderIdSet.has(model.providerId)
       );
     };
-    const preferred = itemsSettings?.commitModelId ?? null;
+    const preferred = epicsSettings?.commitModelId ?? null;
     if (isUsable(preferred)) return preferred;
-    for (const id of ITEM_MESSAGE_MODEL_PREFERENCE) {
+    for (const id of EPIC_MESSAGE_MODEL_PREFERENCE) {
       if (isUsable(id)) return id;
     }
     return (
@@ -1176,7 +1179,7 @@ const App: React.FC = () => {
           model.id !== claudeCodeCliModelId
       )?.id ?? null
     );
-  }, [agentModels, enabledProviderIdSet, itemsSettings?.commitModelId]);
+  }, [agentModels, enabledProviderIdSet, epicsSettings?.commitModelId]);
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
     try {
@@ -1666,9 +1669,10 @@ const App: React.FC = () => {
       !threadMenuOpen &&
       !goalMenuOpen &&
       !openWithOpen &&
+      !epicRepoPickerOpen &&
       projectMenuOpenId === null &&
       threadItemMenuKey === null &&
-      itemMenuOpenId === null
+      epicMenuOpenId === null
     ) return undefined;
 
     const handlePointerDown = (event: MouseEvent) => {
@@ -1697,8 +1701,11 @@ const App: React.FC = () => {
       if (threadItemMenuKey !== null && !threadItemMenuRef.current?.contains(target)) {
         setThreadItemMenuKey(null);
       }
-      if (itemMenuOpenId !== null && !itemMenuRef.current?.contains(target)) {
-        setItemMenuOpenId(null);
+      if (epicMenuOpenId !== null && !epicMenuRef.current?.contains(target)) {
+        setEpicMenuOpenId(null);
+      }
+      if (epicRepoPickerOpen && !epicRepoPickerRef.current?.contains(target)) {
+        setEpicRepoPickerOpen(false);
       }
     };
 
@@ -1712,7 +1719,8 @@ const App: React.FC = () => {
         setOpenWithOpen(false);
         setProjectMenuOpenId(null);
         setThreadItemMenuKey(null);
-        setItemMenuOpenId(null);
+        setEpicMenuOpenId(null);
+        setEpicRepoPickerOpen(false);
       }
     };
 
@@ -1722,11 +1730,15 @@ const App: React.FC = () => {
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, goalMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey, itemMenuOpenId]);
+  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, goalMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey, epicMenuOpenId, epicRepoPickerOpen]);
 
   useEffect(() => {
     setThreadMenuOpen(false);
   }, [selectedThreadId]);
+
+  useEffect(() => {
+    setEpicRepoPickerOpen(false);
+  }, [selectedEpicId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2869,35 +2881,35 @@ const App: React.FC = () => {
     return id;
   };
 
-  const openCreateItemModal = useCallback(() => {
-    setNewItemName('');
-    setNewItemDescription('');
-    setItemsSectionOpen(true);
-    setCreateItemOpen(true);
+  const openCreateEpicModal = useCallback(() => {
+    setNewEpicName('');
+    setNewEpicDescription('');
+    setEpicsSectionOpen(true);
+    setCreateEpicOpen(true);
   }, []);
 
-  const closeCreateItemModal = useCallback(() => {
-    setCreateItemOpen(false);
-    setNewItemName('');
-    setNewItemDescription('');
+  const closeCreateEpicModal = useCallback(() => {
+    setCreateEpicOpen(false);
+    setNewEpicName('');
+    setNewEpicDescription('');
   }, []);
 
-  const handleCreateItem = useCallback(() => {
-    const trimmed = newItemName.trim();
+  const handleCreateEpic = useCallback(() => {
+    const trimmed = newEpicName.trim();
     if (!trimmed) return;
-    const description = newItemDescription.trim();
-    addItem(trimmed, description ? { description } : undefined);
-    closeCreateItemModal();
+    const description = newEpicDescription.trim();
+    addEpic(trimmed, description ? { description } : undefined);
+    closeCreateEpicModal();
     setActiveTab('agents');
-  }, [addItem, closeCreateItemModal, newItemDescription, newItemName, setActiveTab]);
+  }, [addEpic, closeCreateEpicModal, newEpicDescription, newEpicName, setActiveTab]);
 
   useEffect(() => {
-    if (!createItemOpen) return;
-    const id = window.setTimeout(() => createItemTitleRef.current?.focus(), 0);
+    if (!createEpicOpen) return;
+    const id = window.setTimeout(() => createEpicTitleRef.current?.focus(), 0);
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
-        closeCreateItemModal();
+        closeCreateEpicModal();
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -2905,29 +2917,29 @@ const App: React.FC = () => {
       window.clearTimeout(id);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [closeCreateItemModal, createItemOpen]);
+  }, [closeCreateEpicModal, createEpicOpen]);
 
-  const handleCreateThreadForItem = async (item: WorkItem) => {
-    const project = projectForItem(item);
+  const handleCreateThreadForEpic = async (epic: Epic) => {
+    const project = projectForEpic(epic);
     let projectId = project?.id;
     if (!project) {
-      if (item.gitRoot) {
+      if (epic.gitRoot) {
         toast.info('Select the claimed repository to re-add it to Orion', {
-          description: item.gitRoot,
+          description: epic.gitRoot,
         });
       }
       projectId = await handleAddProject({
         createInitialThread: false,
-        expectedGitRoot: item.gitRoot,
+        expectedGitRoot: epic.gitRoot,
       });
       if (!projectId) return;
     }
-    setCollapsedItems((prev) => (prev[item.id] ? { ...prev, [item.id]: false } : prev));
+    setCollapsedEpics((prev) => (prev[epic.id] ? { ...prev, [epic.id]: false } : prev));
     // Same anti-spam rule as handleCreateThread: reuse an untouched draft
-    // thread already under this item.
+    // thread already under this epic.
     if (
       selectedThread &&
-      selectedThread.itemId === item.id &&
+      selectedThread.epicId === epic.id &&
       selectedThread.projectId === projectId &&
       selectedThread.modelId !== claudeCodeCliModelId &&
       selectedThread.messages.length === 0 &&
@@ -2937,42 +2949,42 @@ const App: React.FC = () => {
       setActiveTab('agents');
       return selectedThread.id;
     }
-    const id = createThread(projectId, undefined, { itemId: item.id });
+    const id = createThread(projectId, undefined, { epicId: epic.id });
     setActiveTab('agents');
     return id;
   };
 
-  const handleItemCommitAndPush = async (item: WorkItem) => {
-    if (repositoryOperationBusy || !window.orion?.itemCommitAndPush) return;
-    const project = item.repositoryProjectId
-      ? projects.find((candidate) => candidate.id === item.repositoryProjectId) ?? null
+  const handleEpicCommitAndPush = async (epic: Epic) => {
+    if (repositoryOperationBusy || !window.orion?.epicCommitAndPush) return;
+    const project = epic.repositoryProjectId
+      ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
       : null;
-    const projectPath = item.gitRoot ?? project?.path;
+    const projectPath = epic.gitRoot ?? project?.path;
     if (!projectPath) {
-      toast.error('Select a repository for this item before committing');
+      toast.error('Select a repository for this epic before committing');
       return;
     }
 
-    setItemGitBusy('commit');
+    setEpicGitBusy('commit');
     try {
-      const result = await window.orion.itemCommitAndPush({
+      const result = await window.orion.epicCommitAndPush({
         projectPath,
-        modelId: resolveItemMessageModelId(),
-        itemName: item.name,
-        expectedGitRoot: item.gitRoot,
-        expectedBranch: item.gitBranch,
-        claimedBranches: items
-          .filter((candidate) => candidate.id !== item.id && candidate.gitRoot && candidate.gitBranch)
+        modelId: resolveEpicMessageModelId(),
+        epicName: epic.name,
+        expectedGitRoot: epic.gitRoot,
+        expectedBranch: epic.gitBranch,
+        claimedBranches: epics
+          .filter((candidate) => candidate.id !== epic.id && candidate.gitRoot && candidate.gitBranch)
           .map((candidate) => ({
             gitRoot: candidate.gitRoot!,
             branch: candidate.gitBranch!,
-            itemName: candidate.name,
+            epicName: candidate.name,
           })),
       });
       if (result.gitRoot && result.branch) {
         // Claim the validated target even if a later commit hook or push fails,
-        // so another item cannot reuse the branch on the next attempt.
-        updateItem(item.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
+        // so another epic cannot reuse the branch on the next attempt.
+        updateEpic(epic.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
       }
       if (result.ok) {
         toast.success(`Committed and pushed ${result.branch ?? 'branch'}`, {
@@ -2983,43 +2995,43 @@ const App: React.FC = () => {
         toast.error(result.error ?? 'Commit and push failed');
       }
     } finally {
-      setItemGitBusy(null);
+      setEpicGitBusy(null);
     }
   };
 
-  const handleItemCreatePr = async (item: WorkItem) => {
-    if (repositoryOperationBusy || !window.orion?.itemCreatePr) return;
-    const project = item.repositoryProjectId
-      ? projects.find((candidate) => candidate.id === item.repositoryProjectId) ?? null
+  const handleEpicCreatePr = async (epic: Epic) => {
+    if (repositoryOperationBusy || !window.orion?.epicCreatePr) return;
+    const project = epic.repositoryProjectId
+      ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
       : null;
-    const projectPath = item.gitRoot ?? project?.path;
+    const projectPath = epic.gitRoot ?? project?.path;
     if (!projectPath) {
-      toast.error('Select a repository for this item before opening a PR');
+      toast.error('Select a repository for this epic before opening a PR');
       return;
     }
 
-    setItemGitBusy('pr');
+    setEpicGitBusy('pr');
     try {
-      const result = await window.orion.itemCreatePr({
+      const result = await window.orion.epicCreatePr({
         projectPath,
-        modelId: resolveItemMessageModelId(),
-        itemName: item.name,
-        expectedGitRoot: item.gitRoot,
-        expectedBranch: item.gitBranch,
-        claimedBranches: items
-          .filter((candidate) => candidate.id !== item.id && candidate.gitRoot && candidate.gitBranch)
+        modelId: resolveEpicMessageModelId(),
+        epicName: epic.name,
+        expectedGitRoot: epic.gitRoot,
+        expectedBranch: epic.gitBranch,
+        claimedBranches: epics
+          .filter((candidate) => candidate.id !== epic.id && candidate.gitRoot && candidate.gitBranch)
           .map((candidate) => ({
             gitRoot: candidate.gitRoot!,
             branch: candidate.gitBranch!,
-            itemName: candidate.name,
+            epicName: candidate.name,
           })),
       });
       if (result.gitRoot && result.branch) {
-        updateItem(item.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
+        updateEpic(epic.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
       }
       if (result.ok) {
         const url = result.url;
-        updateItem(item.id, {
+        updateEpic(epic.id, {
           ...(url ? { prUrl: url } : {}),
         });
         toast.success(
@@ -3039,20 +3051,20 @@ const App: React.FC = () => {
         toast.error(result.error ?? 'Could not open a pull request');
       }
     } finally {
-      setItemGitBusy(null);
+      setEpicGitBusy(null);
     }
   };
 
-  const handleSettleItem = (item: WorkItem) => {
+  const handleSettleEpic = (epic: Epic) => {
     if (
       !confirm(
-        `Settle "${item.name}"? It moves to the archive (Settings → General); its threads stay in Recent agents and their projects.`
+        `Settle "${epic.name}"? It moves to the archive (Settings → General); its threads stay in Recent agents and their projects.`
       )
     ) {
       return;
     }
-    settleItem(item.id);
-    toast.success(`Settled ${item.name}`);
+    settleEpic(epic.id);
+    toast.success(`Settled ${epic.name}`);
   };
 
   const attachMediaFiles = useCallback(
@@ -3521,7 +3533,7 @@ const App: React.FC = () => {
         (roleMeta ? `${roleMeta.label}: ${promptSlice}` : `${model.label}: ${promptSlice}`);
 
       // Background spawn: never touch the user's selection (thread, project,
-      // or item view) — restoring it after the fact loses the item overview,
+      // or epic view) — restoring it after the fact loses the epic overview,
       // which no selection field of a thread spawn round-trips.
       const childThreadId = state.createThread(projectId, title, {
         parentThreadId: request.threadId,
@@ -5946,40 +5958,40 @@ const App: React.FC = () => {
                     </div>
                   </div>
 
-                  <div className="settings-group-label">Items</div>
+                  <div className="settings-group-label">Epics</div>
                   <div className="settings-group">
                     <div className="setting-row">
                       <div className="setting-label">
-                        <div className="setting-label-title">Items section</div>
+                        <div className="setting-label-title">Epics section</div>
                         <div className="setting-label-desc">
-                          Show Items in the sidebar — big-ticket tasks that group threads and can
+                          Show Epics in the sidebar — big-ticket tasks that group threads and can
                           commit, push, and open PRs for the work as a whole.
                         </div>
                       </div>
-                      <label className="provider-toggle" title="Items section">
+                      <label className="provider-toggle" title="Epics section">
                         <input
                           type="checkbox"
-                          checked={itemsEnabled}
-                          onChange={(e) => setItemsSettings({ enabled: e.target.checked })}
+                          checked={epicsEnabled}
+                          onChange={(e) => setEpicsSettings({ enabled: e.target.checked })}
                         />
                         <span />
                       </label>
                     </div>
 
-                    {itemsEnabled && (
+                    {epicsEnabled && (
                       <div className="setting-row">
                         <div className="setting-label">
                           <div className="setting-label-title">Commit & PR message model</div>
                           <div className="setting-label-desc">
-                            Writes an item's commit messages from staged changes and its PR
+                            Writes an epic's commit messages from staged changes and its PR
                             descriptions from branch changes. Auto picks the cheapest enabled model.
                           </div>
                         </div>
                         <select
                           className="setting-select"
-                          value={itemsSettings?.commitModelId ?? ''}
+                          value={epicsSettings?.commitModelId ?? ''}
                           onChange={(e) =>
-                            setItemsSettings({ commitModelId: e.target.value || null })
+                            setEpicsSettings({ commitModelId: e.target.value || null })
                           }
                         >
                           <option value="">Auto (cheapest available)</option>
@@ -5998,32 +6010,32 @@ const App: React.FC = () => {
                       </div>
                     )}
 
-                    {itemsEnabled && archivedItems.length > 0 && (
+                    {epicsEnabled && archivedEpics.length > 0 && (
                       <div className="setting-row setting-row-stacked">
                         <div className="setting-label">
-                          <div className="setting-label-title">Archived items</div>
+                          <div className="setting-label-title">Archived epics</div>
                           <div className="setting-label-desc">
-                            Settled items land here. Restore one to bring it back to the sidebar.
+                            Settled epics land here. Restore one to bring it back to the sidebar.
                           </div>
                         </div>
-                        <div className="archived-items-list">
-                          {archivedItems.map((item) => (
-                            <div key={item.id} className="archived-item-row">
-                              <SquareKanban size={13} className="item-icon" />
-                              <span className="archived-item-name truncate" title={item.name}>
-                                {item.name}
+                        <div className="archived-epics-list">
+                          {archivedEpics.map((epic) => (
+                            <div key={epic.id} className="archived-epic-row">
+                              <SquareKanban size={13} className="epic-icon" />
+                              <span className="archived-epic-name truncate" title={epic.name}>
+                                {epic.name}
                               </span>
-                              <span className="archived-item-date">
+                              <span className="archived-epic-date">
                                 Settled{' '}
-                                {formatShortTime(new Date(item.settledAt ?? item.createdAt))}
+                                {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
                               </span>
-                              {item.prUrl && (
+                              {epic.prUrl && (
                                 <button
                                   type="button"
-                                  className="archived-item-action"
+                                  className="archived-epic-action"
                                   title="Open the pull request"
                                   onClick={() =>
-                                    void window.orion?.openExternalUrl?.(item.prUrl as string)
+                                    void window.orion?.openExternalUrl?.(epic.prUrl as string)
                                   }
                                 >
                                   <GitPullRequest size={13} />
@@ -6031,21 +6043,21 @@ const App: React.FC = () => {
                               )}
                               <button
                                 type="button"
-                                className="archived-item-action"
+                                className="archived-epic-action"
                                 title="Restore to the sidebar"
-                                onClick={() => unsettleItem(item.id)}
+                                onClick={() => unsettleEpic(epic.id)}
                               >
                                 <RefreshCw size={13} />
                               </button>
                               <button
                                 type="button"
-                                className="archived-item-action danger"
-                                title="Delete item"
+                                className="archived-epic-action danger"
+                                title="Delete epic"
                                 onClick={() => {
                                   if (
-                                    confirm(`Delete item "${item.name}"? Its threads are kept.`)
+                                    confirm(`Delete epic "${epic.name}"? Its threads are kept.`)
                                   ) {
-                                    deleteItem(item.id);
+                                    deleteEpic(epic.id);
                                   }
                                 }}
                               >
@@ -6788,118 +6800,118 @@ const App: React.FC = () => {
                   </div>
                 )}
 
-                {itemsEnabled && projects.length > 0 && (
-                  <div className="recent-agents-section items-section">
-                    <div className="items-section-header">
+                {epicsEnabled && projects.length > 0 && (
+                  <div className="recent-agents-section epics-section">
+                    <div className="epics-section-header">
                       <button
                         type="button"
                         className="sidebar-section-toggle"
-                        onClick={() => setItemsSectionOpen((open) => !open)}
-                        aria-expanded={itemsSectionOpen}
+                        onClick={() => setEpicsSectionOpen((open) => !open)}
+                        aria-expanded={epicsSectionOpen}
                       >
                         <ChevronRight
-                          size={12}
-                          className={`sidebar-section-chevron ${itemsSectionOpen ? 'open' : ''}`}
+                          size={15}
+                          className={`sidebar-section-chevron ${epicsSectionOpen ? 'open' : ''}`}
                         />
-                        <span>Items</span>
+                        <span>Epics</span>
                       </button>
                       <button
                         type="button"
                         className="sidebar-section-action"
-                        title="New item"
-                        onClick={openCreateItemModal}
+                        title="New epic"
+                        onClick={openCreateEpicModal}
                       >
-                        <Plus size={14} />
+                        <Plus size={15} />
                       </button>
                     </div>
-                    {itemsSectionOpen && (
+                    {epicsSectionOpen && (
                       <>
-                        {activeItems.map((item) => {
-                          const itemThreads = threadsByItem.get(item.id) ?? [];
-                          const isItemCollapsed = collapsedItems[item.id] ?? false;
-                          const isItemSelected =
-                            selectedItemId === item.id && !selectedThreadId;
+                        {activeEpics.map((epic) => {
+                          const epicThreads = threadsByEpic.get(epic.id) ?? [];
+                          const isEpicCollapsed = collapsedEpics[epic.id] ?? false;
+                          const isEpicSelected =
+                            selectedEpicId === epic.id && !selectedThreadId;
 
                           return (
-                            <div key={item.id} className="project-section item-section">
+                            <div key={epic.id} className="project-section epic-section">
                               <div className="project-section-header-row">
                                 <button
                                   type="button"
                                   className="project-collapse-toggle"
-                                  title={isItemCollapsed ? 'Expand threads' : 'Collapse threads'}
-                                  aria-expanded={!isItemCollapsed}
+                                  title={isEpicCollapsed ? 'Expand threads' : 'Collapse threads'}
+                                  aria-expanded={!isEpicCollapsed}
                                   onClick={() =>
-                                    setCollapsedItems((prev) => ({
+                                    setCollapsedEpics((prev) => ({
                                       ...prev,
-                                      [item.id]: !isItemCollapsed,
+                                      [epic.id]: !isEpicCollapsed,
                                     }))
                                   }
                                 >
                                   <ChevronRight
                                     size={12}
-                                    className={`sidebar-section-chevron ${isItemCollapsed ? '' : 'open'}`}
+                                    className={`sidebar-section-chevron ${isEpicCollapsed ? '' : 'open'}`}
                                   />
                                 </button>
-                                {itemRenameId === item.id ? (
+                                {epicRenameId === epic.id ? (
                                   <div className="project-section-header project-section-header-renaming">
-                                    <SquareKanban size={13} className="item-icon" />
+                                    <SquareKanban size={13} className="epic-icon" />
                                     <InlineRenameInput
                                       className="thread-rename-input"
-                                      initialValue={item.name}
+                                      initialValue={epic.name}
                                       onSubmit={(name) => {
-                                        renameItem(item.id, name);
-                                        setItemRenameId(null);
+                                        renameEpic(epic.id, name);
+                                        setEpicRenameId(null);
                                       }}
-                                      onCancel={() => setItemRenameId(null)}
+                                      onCancel={() => setEpicRenameId(null)}
                                     />
                                   </div>
                                 ) : (
                                   <button
                                     type="button"
-                                    className={`project-section-header item-section-header ${isItemSelected ? 'item-section-header-selected' : ''}`}
+                                    className={`project-section-header epic-section-header ${isEpicSelected ? 'epic-section-header-selected' : ''}`}
                                     onClick={() => {
-                                      selectItem(item.id);
+                                      selectEpic(epic.id);
                                       setActiveTab('agents');
                                     }}
-                                    title={item.name}
+                                    title={epic.name}
                                   >
-                                    <SquareKanban size={13} className="item-icon" />
-                                    <span className="truncate">{item.name}</span>
-                                    {isItemCollapsed && itemThreads.length > 0 && (
+                                    <SquareKanban size={13} className="epic-icon" />
+                                    <span className="truncate">{epic.name}</span>
+                                    {isEpicCollapsed && epicThreads.length > 0 && (
                                       <span className="sidebar-section-count">
-                                        {itemThreads.length}
+                                        {epicThreads.length}
                                       </span>
                                     )}
                                   </button>
                                 )}
                                 <div
                                   className="project-menu-wrap"
-                                  ref={itemMenuOpenId === item.id ? itemMenuRef : undefined}
+                                  ref={epicMenuOpenId === epic.id ? epicMenuRef : undefined}
                                 >
                                   <button
                                     type="button"
                                     className="project-options-trigger"
-                                    title="Item options"
-                                    aria-label={`Options for ${item.name}`}
+                                    title="Epic options"
+                                    aria-label={`Options for ${epic.name}`}
                                     aria-haspopup="menu"
-                                    aria-expanded={itemMenuOpenId === item.id}
+                                    aria-expanded={epicMenuOpenId === epic.id}
                                     onClick={() =>
-                                      setItemMenuOpenId((open) =>
-                                        open === item.id ? null : item.id
+                                      setEpicMenuOpenId((open) =>
+                                        open === epic.id ? null : epic.id
                                       )
                                     }
                                   >
                                     <Ellipsis size={13} />
                                   </button>
-                                  {itemMenuOpenId === item.id && (
+                                  {epicMenuOpenId === epic.id && (
                                     <div className="thread-menu project-menu" role="menu">
                                       <button
                                         type="button"
                                         className="project-menu-item"
                                         role="menuitem"
                                         onClick={() => {
-                                          setItemMenuOpenId(null);
-                                          setItemRenameId(item.id);
+                                          setEpicMenuOpenId(null);
+                                          setEpicRenameId(epic.id);
                                         }}
                                       >
                                         <SquarePen size={13} /> Rename
@@ -6909,8 +6921,8 @@ const App: React.FC = () => {
                                         className="project-menu-item"
                                         role="menuitem"
                                         onClick={() => {
-                                          setItemMenuOpenId(null);
-                                          handleSettleItem(item);
+                                          setEpicMenuOpenId(null);
+                                          handleSettleEpic(epic);
                                         }}
                                       >
                                         <Archive size={13} /> Settle
@@ -6920,13 +6932,13 @@ const App: React.FC = () => {
                                         className="project-menu-item danger"
                                         role="menuitem"
                                         onClick={() => {
-                                          setItemMenuOpenId(null);
+                                          setEpicMenuOpenId(null);
                                           if (
                                             confirm(
-                                              `Delete item "${item.name}"? Its threads are kept — they just leave this group.`
+                                              `Delete epic "${epic.name}"? Its threads are kept — they just leave this group.`
                                             )
                                           ) {
-                                            deleteItem(item.id);
+                                            deleteEpic(epic.id);
                                           }
                                         }}
                                       >
@@ -6938,35 +6950,35 @@ const App: React.FC = () => {
                                 <button
                                   type="button"
                                   className="project-new-thread"
-                                  title={`New thread in ${item.name}`}
-                                  onClick={() => handleCreateThreadForItem(item)}
+                                  title={`New thread in ${epic.name}`}
+                                  onClick={() => handleCreateThreadForEpic(epic)}
                                 >
                                   <SquarePen size={13} />
                                 </button>
                               </div>
 
-                              {!isItemCollapsed && (
+                              {!isEpicCollapsed && (
                                 <div className="threads-list">
-                                  {itemThreads.length === 0 ? (
+                                  {epicThreads.length === 0 ? (
                                     <button
                                       type="button"
                                       className="thread-item thread-item-empty"
-                                      onClick={() => handleCreateThreadForItem(item)}
+                                      onClick={() => handleCreateThreadForEpic(epic)}
                                     >
                                       <span className="thread-title">New thread</span>
                                     </button>
                                   ) : (
-                                    itemThreads.map((thread) => (
+                                    epicThreads.map((thread) => (
                                       <div
                                         key={thread.id}
                                         className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
                                         onClick={() => {
-                                          if (threadRenameKey !== `item:${thread.id}`) {
+                                          if (threadRenameKey !== `epic:${thread.id}`) {
                                             selectThread(thread.id);
                                           }
                                         }}
                                       >
-                                        {threadRenameKey === `item:${thread.id}` ? (
+                                        {threadRenameKey === `epic:${thread.id}` ? (
                                           <InlineRenameInput
                                             className="thread-rename-input"
                                             initialValue={thread.title}
@@ -6994,7 +7006,7 @@ const App: React.FC = () => {
                                         </span>
                                         <div
                                           className="thread-menu-wrap"
-                                          ref={threadItemMenuKey === `item:${thread.id}` ? threadItemMenuRef : undefined}
+                                          ref={threadItemMenuKey === `epic:${thread.id}` ? threadItemMenuRef : undefined}
                                           onClick={(e) => e.stopPropagation()}
                                         >
                                           <button
@@ -7003,16 +7015,16 @@ const App: React.FC = () => {
                                             title="Thread options"
                                             aria-label={`Options for ${thread.title}`}
                                             aria-haspopup="menu"
-                                            aria-expanded={threadItemMenuKey === `item:${thread.id}`}
+                                            aria-expanded={threadItemMenuKey === `epic:${thread.id}`}
                                             onClick={() =>
                                               setThreadItemMenuKey((open) =>
-                                                open === `item:${thread.id}` ? null : `item:${thread.id}`
+                                                open === `epic:${thread.id}` ? null : `epic:${thread.id}`
                                               )
                                             }
                                           >
                                             <Ellipsis size={13} />
                                           </button>
-                                          {threadItemMenuKey === `item:${thread.id}` && (
+                                          {threadItemMenuKey === `epic:${thread.id}` && (
                                             <div className="thread-menu thread-item-menu" role="menu">
                                               <button
                                                 type="button"
@@ -7020,7 +7032,7 @@ const App: React.FC = () => {
                                                 role="menuitem"
                                                 onClick={() => {
                                                   setThreadItemMenuKey(null);
-                                                  setThreadRenameKey(`item:${thread.id}`);
+                                                  setThreadRenameKey(`epic:${thread.id}`);
                                                 }}
                                               >
                                                 <SquarePen size={13} /> Rename
@@ -7042,10 +7054,10 @@ const App: React.FC = () => {
                                                 role="menuitem"
                                                 onClick={() => {
                                                   setThreadItemMenuKey(null);
-                                                  updateThread(thread.id, { itemId: undefined });
+                                                  updateThread(thread.id, { epicId: undefined });
                                                 }}
                                               >
-                                                <EyeOff size={13} /> Remove from item
+                                                <EyeOff size={13} /> Remove from epic
                                               </button>
                                               <button
                                                 type="button"
@@ -7544,184 +7556,241 @@ const App: React.FC = () => {
 
             {/* Main Panel: Thread view */}
             <div className="panel agents-panel">
-              {!selectedThread && selectedItem ? (
-                <div className="item-view">
-                  <div className="item-view-header">
-                    <div className="item-view-icon">
+              {!selectedThread && selectedEpic ? (
+                <div className="epic-view">
+                  <div className="epic-view-header">
+                    <div className="epic-view-icon">
                       <SquareKanban size={24} />
                     </div>
-                    <div className="item-view-heading">
-                      <h2 className="item-view-title">{selectedItem.name}</h2>
-                      <div className="item-view-meta">
-                        {(selectedItemRepositoryProject || selectedItemClaimedProject) && (
+                    <div className="epic-view-heading">
+                      <h2 className="epic-view-title">{selectedEpic.name}</h2>
+                      <div className="epic-view-meta">
+                        {(selectedEpicRepositoryProject || selectedEpicClaimedProject) && (
                           <span
-                            className="item-view-project"
+                            className="epic-view-project"
                             title={
-                              selectedItem.gitRoot ??
-                              selectedItemRepositoryProject?.path ??
-                              selectedItemClaimedProject?.path
+                              selectedEpic.gitRoot ??
+                              selectedEpicRepositoryProject?.path ??
+                              selectedEpicClaimedProject?.path
                             }
                           >
                             <ProjectIcon
                               projectPath={
-                                selectedItem.gitRoot ??
-                                selectedItemRepositoryProject?.path ??
-                                selectedItemClaimedProject!.path
+                                selectedEpic.gitRoot ??
+                                selectedEpicRepositoryProject?.path ??
+                                selectedEpicClaimedProject!.path
                               }
                               size={13}
                             />
-                            {selectedItemRepositoryProject?.name ??
-                              selectedItemClaimedProject?.name}
+                            {selectedEpicRepositoryProject?.name ??
+                              selectedEpicClaimedProject?.name}
                           </span>
                         )}
                         <span>
-                          {selectedItemThreads.length === 1
+                          {selectedEpicThreads.length === 1
                             ? '1 thread'
-                            : `${selectedItemThreads.length} threads`}
+                            : `${selectedEpicThreads.length} threads`}
                         </span>
-                        <span>Created {formatShortTime(new Date(selectedItem.createdAt))}</span>
+                        <span>Created {formatShortTime(new Date(selectedEpic.createdAt))}</span>
                       </div>
                     </div>
                   </div>
 
-                  <div className="item-view-description-block">
-                    <label className="item-view-description-label" htmlFor="item-description">
+                  <div className="epic-view-description-block">
+                    <label className="epic-view-description-label" htmlFor="epic-description">
                       Description
                     </label>
-                    <ItemDescriptionEditor
-                      key={selectedItem.id}
-                      itemId={selectedItem.id}
-                      initialValue={selectedItem.description ?? ''}
-                      onCommit={(itemId, description) => updateItem(itemId, { description })}
+                    <EpicDescriptionEditor
+                      key={selectedEpic.id}
+                      epicId={selectedEpic.id}
+                      initialValue={selectedEpic.description ?? ''}
+                      onCommit={(epicId, description) => updateEpic(epicId, { description })}
                     />
                   </div>
 
-                  <div className="item-view-repository-block">
-                    <label className="item-view-description-label" htmlFor="item-repository">
+                  <div className="epic-view-repository-block">
+                    <label className="epic-view-description-label" id="epic-repository-label">
                       Repository
                     </label>
-                    {selectedItem.gitRoot ? (
-                      <div className="item-view-repository-claimed" title={selectedItem.gitRoot}>
+                    {selectedEpic.gitRoot ? (
+                      <div className="epic-view-repository-claimed" title={selectedEpic.gitRoot}>
                         <GitBranch size={14} />
                         <span>
-                          {selectedItemClaimedProject?.name ?? selectedItem.gitRoot}
-                          {selectedItem.gitBranch ? ` · ${selectedItem.gitBranch}` : ''}
+                          {selectedEpicClaimedProject?.name ?? selectedEpic.gitRoot}
+                          {selectedEpic.gitBranch ? ` · ${selectedEpic.gitBranch}` : ''}
                         </span>
                       </div>
                     ) : (
-                      <select
-                        id="item-repository"
-                        className="item-view-repository-select"
-                        value={selectedItem.repositoryProjectId ?? ''}
-                        disabled={repositoryOperationBusy}
-                        onChange={(event) =>
-                          updateItem(selectedItem.id, {
-                            repositoryProjectId: event.target.value || undefined,
-                          })
-                        }
-                      >
-                        <option value="">Select repository…</option>
-                        {projects.map((project) => (
-                          <option key={project.id} value={project.id}>
-                            {project.name} — {project.path}
-                          </option>
-                        ))}
-                      </select>
+                      <div className="epic-view-repository-picker" ref={epicRepoPickerRef}>
+                        <button
+                          type="button"
+                          id="epic-repository"
+                          className="epic-view-repository-trigger"
+                          disabled={repositoryOperationBusy || projects.length === 0}
+                          onClick={() => {
+                            if (repositoryOperationBusy) return;
+                            setEpicRepoPickerOpen((open) => !open);
+                          }}
+                          aria-haspopup="menu"
+                          aria-expanded={epicRepoPickerOpen && !repositoryOperationBusy}
+                          aria-labelledby="epic-repository-label"
+                          title={
+                            selectedEpicRepositoryProject?.path ??
+                            (projects.length === 0
+                              ? 'Add a project first'
+                              : 'Choose the repository for this epic')
+                          }
+                        >
+                          {selectedEpicRepositoryProject ? (
+                            <>
+                              <ProjectIcon
+                                projectPath={selectedEpicRepositoryProject.path}
+                                size={14}
+                              />
+                              <span className="truncate">
+                                {selectedEpicRepositoryProject.name}
+                              </span>
+                            </>
+                          ) : (
+                            <span className="epic-view-repository-placeholder truncate">
+                              {projects.length === 0
+                                ? 'No projects available'
+                                : 'Select repository…'}
+                            </span>
+                          )}
+                          <ChevronDown
+                            size={14}
+                            className={`project-pill-chevron ${epicRepoPickerOpen ? 'open' : ''}`}
+                          />
+                        </button>
+                        {epicRepoPickerOpen && !repositoryOperationBusy && projects.length > 0 && (
+                          <div
+                            className="shell-project-picker epic-view-repository-menu"
+                            role="menu"
+                            aria-labelledby="epic-repository-label"
+                          >
+                            {projects.map((option) => {
+                              const selected =
+                                option.id === selectedEpic.repositoryProjectId;
+                              return (
+                                <button
+                                  key={option.id}
+                                  type="button"
+                                  role="menuitemradio"
+                                  aria-checked={selected}
+                                  className={`project-picker-item ${selected ? 'selected' : ''}`}
+                                  onClick={() => {
+                                    setEpicRepoPickerOpen(false);
+                                    updateEpic(selectedEpic.id, {
+                                      repositoryProjectId: option.id,
+                                    });
+                                  }}
+                                  title={option.path}
+                                >
+                                  <ProjectIcon projectPath={option.path} size={13} />
+                                  <span className="truncate">{option.name}</span>
+                                  {selected && <Check size={13} />}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
                     )}
-                    <span className="item-view-repository-hint">
-                      {selectedItem.gitRoot
-                        ? 'This item is locked to its claimed repository and feature branch.'
+                    <span className="epic-view-repository-hint">
+                      {selectedEpic.gitRoot
+                        ? 'This epic is locked to its claimed repository and feature branch.'
                         : 'Choose the repository explicitly before using git actions.'}
                     </span>
                   </div>
 
-                  <div className="item-view-actions">
+                  <div className="epic-view-actions">
                     <button
                       type="button"
                       className="btn"
                       disabled={
                         repositoryOperationBusy ||
-                        (!selectedItemRepositoryProject && !selectedItem.gitRoot)
+                        (!selectedEpicRepositoryProject && !selectedEpic.gitRoot)
                       }
-                      onClick={() => void handleItemCommitAndPush(selectedItem)}
+                      onClick={() => void handleEpicCommitAndPush(selectedEpic)}
                       title="Generate a commit message from staged changes, then commit and push"
                     >
                       <GitCommit size={14} />
-                      {itemGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
+                      {epicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
                     </button>
                     <button
                       type="button"
                       className="btn"
                       disabled={
                         repositoryOperationBusy ||
-                        (!selectedItemRepositoryProject && !selectedItem.gitRoot)
+                        (!selectedEpicRepositoryProject && !selectedEpic.gitRoot)
                       }
-                      onClick={() => void handleItemCreatePr(selectedItem)}
+                      onClick={() => void handleEpicCreatePr(selectedEpic)}
                       title="Open a pull request with a generated title and description"
                     >
                       <GitPullRequest size={14} />
-                      {itemGitBusy === 'pr' ? 'Opening PR…' : 'Create PR'}
+                      {epicGitBusy === 'pr' ? 'Opening PR…' : 'Create PR'}
                     </button>
                     <button
                       type="button"
-                      className="btn item-view-settle"
-                      disabled={!!itemGitBusy}
-                      onClick={() => handleSettleItem(selectedItem)}
-                      title="Settle the item once its PR is merged — it moves to the archive"
+                      className="btn epic-view-settle"
+                      disabled={!!epicGitBusy}
+                      onClick={() => handleSettleEpic(selectedEpic)}
+                      title="Settle the epic once its PR is merged — it moves to the archive"
                     >
                       <Archive size={14} />
                       Settle
                     </button>
                   </div>
 
-                  {itemGitBusy && (
-                    <div className="item-view-status">
+                  {epicGitBusy && (
+                    <div className="epic-view-status">
                       <span className="working-dots" aria-hidden="true">
                         <span />
                         <span />
                         <span />
                       </span>
-                      {itemGitBusy === 'commit'
+                      {epicGitBusy === 'commit'
                         ? 'Writing a commit message from staged changes, then pushing…'
                         : 'Writing the PR message and opening the pull request…'}
                     </div>
                   )}
 
-                  {selectedItem.prUrl && (
+                  {selectedEpic.prUrl && (
                     <button
                       type="button"
-                      className="item-view-pr-link"
+                      className="epic-view-pr-link"
                       onClick={() =>
-                        void window.orion?.openExternalUrl?.(selectedItem.prUrl as string)
+                        void window.orion?.openExternalUrl?.(selectedEpic.prUrl as string)
                       }
                       title="Open the pull request in your browser"
                     >
                       <GitPullRequest size={13} />
-                      <span className="truncate">{selectedItem.prUrl}</span>
+                      <span className="truncate">{selectedEpic.prUrl}</span>
                       <SquareArrowOutUpRight size={12} />
                     </button>
                   )}
 
-                  <div className="item-view-threads">
-                    <div className="item-view-threads-header">
+                  <div className="epic-view-threads">
+                    <div className="epic-view-threads-header">
                       <span>Threads</span>
                       <button
                         type="button"
                         className="sidebar-section-action"
                         title="New thread"
                         aria-label="New thread"
-                        onClick={() => handleCreateThreadForItem(selectedItem)}
+                        onClick={() => handleCreateThreadForEpic(selectedEpic)}
                       >
                         <Plus size={14} />
                       </button>
                     </div>
-                    {selectedItemThreads.length === 0 ? (
-                      <div className="item-view-empty">
-                        No threads yet — spawn one to start working this item.
+                    {selectedEpicThreads.length === 0 ? (
+                      <div className="epic-view-empty">
+                        No threads yet — spawn one to start working this epic.
                       </div>
                     ) : (
-                      <div className="threads-list item-view-threads-list">
-                        {selectedItemThreads.map((thread) => (
+                      <div className="threads-list epic-view-threads-list">
+                        {selectedEpicThreads.map((thread) => (
                           <div
                             key={thread.id}
                             className="thread-item"
@@ -8635,21 +8704,21 @@ const App: React.FC = () => {
       </div>
       )}
 
-      {createItemOpen && (
+      {createEpicOpen && (
         <div
           className="modal-backdrop"
           role="presentation"
-          onClick={closeCreateItemModal}
+          onClick={closeCreateEpicModal}
         >
           <div
-            className="modal create-item-modal"
+            className="modal create-epic-modal"
             role="dialog"
             aria-modal="true"
-            aria-labelledby="create-item-title"
+            aria-labelledby="create-epic-title"
             onClick={(e) => e.stopPropagation()}
           >
-            <h2 id="create-item-title" className="modal-title">
-              New item
+            <h2 id="create-epic-title" className="modal-title">
+              New epic
             </h2>
             <p className="modal-subtitle">
               Group threads around a big-ticket task.
@@ -8658,7 +8727,7 @@ const App: React.FC = () => {
               className="modal-form"
               onSubmit={(e) => {
                 e.preventDefault();
-                handleCreateItem();
+                handleCreateEpic();
               }}
             >
               <label className="modal-field">
@@ -8666,11 +8735,11 @@ const App: React.FC = () => {
                   Title <span className="modal-required">*</span>
                 </span>
                 <input
-                  ref={createItemTitleRef}
+                  ref={createEpicTitleRef}
                   type="text"
                   className="modal-input"
-                  value={newItemName}
-                  onChange={(e) => setNewItemName(e.target.value)}
+                  value={newEpicName}
+                  onChange={(e) => setNewEpicName(e.target.value)}
                   placeholder="e.g. Optimize memory usage"
                   autoComplete="off"
                 />
@@ -8681,9 +8750,9 @@ const App: React.FC = () => {
                 </span>
                 <textarea
                   className="modal-textarea"
-                  value={newItemDescription}
-                  onChange={(e) => setNewItemDescription(e.target.value)}
-                  placeholder="What does this item cover?"
+                  value={newEpicDescription}
+                  onChange={(e) => setNewEpicDescription(e.target.value)}
+                  placeholder="What does this epic cover?"
                   rows={4}
                 />
               </label>
@@ -8691,16 +8760,16 @@ const App: React.FC = () => {
                 <button
                   type="button"
                   className="btn secondary"
-                  onClick={closeCreateItemModal}
+                  onClick={closeCreateEpicModal}
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   className="btn"
-                  disabled={!newItemName.trim()}
+                  disabled={!newEpicName.trim()}
                 >
-                  Create item
+                  Create epic
                 </button>
               </div>
             </form>

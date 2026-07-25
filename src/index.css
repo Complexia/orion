@@ -5316,37 +5316,50 @@ body {
 
 /* ===== Items (sidebar work items + item view) ===== */
 
-.items-section-header {
+.epics-section-header {
   display: flex;
   align-items: center;
   gap: 4px;
+  margin: 0 2px 6px;
 }
 
-.items-section-header .sidebar-section-toggle {
+.epics-section-header .sidebar-section-toggle {
   flex: 1;
   width: auto;
-  margin-bottom: 0;
+  height: 34px;
+  margin: 0;
+  padding: 0 6px;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
 }
 
-.items-section-header .sidebar-section-action {
+.epics-section-header .sidebar-section-toggle:hover {
+  color: var(--text-primary);
+}
+
+.epics-section-header .sidebar-section-action {
+  width: 28px;
+  height: 28px;
   margin-right: 2px;
 }
 
-.items-section .project-section:first-of-type {
+.epics-section .project-section:first-of-type {
   margin-top: 6px;
 }
 
-.item-icon {
+.epic-icon {
   flex-shrink: 0;
   color: var(--accent);
   opacity: 0.85;
 }
 
-.item-section-header {
+.epic-section-header {
   font-size: 13px;
 }
 
-.item-section-header-selected {
+.epic-section-header-selected {
   background: rgb(255 255 255 / 7%);
   color: var(--text-primary);
 }
@@ -5488,7 +5501,7 @@ body {
 }
 
 /* Item view (main panel) */
-.item-view {
+.epic-view {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -5498,14 +5511,14 @@ body {
   animation: welcome-in 400ms var(--ease-out) both;
 }
 
-.item-view-description-block {
+.epic-view-description-block {
   display: flex;
   flex-direction: column;
   gap: 6px;
   max-width: 720px;
 }
 
-.item-view-description-label {
+.epic-view-description-label {
   font-size: 11.5px;
   font-weight: 600;
   color: var(--text-muted);
@@ -5513,7 +5526,7 @@ body {
   letter-spacing: 0.04em;
 }
 
-.item-view-description {
+.epic-view-description {
   width: 100%;
   min-height: 96px;
   padding: 10px 12px;
@@ -5529,27 +5542,27 @@ body {
   transition: border-color var(--transition-fast), background var(--transition-fast);
 }
 
-.item-view-description::placeholder {
+.epic-view-description::placeholder {
   color: var(--text-muted);
 }
 
-.item-view-description:hover {
+.epic-view-description:hover {
   background: rgb(255 255 255 / 4%);
 }
 
-.item-view-description:focus {
+.epic-view-description:focus {
   border-color: rgb(77 141 255 / 45%);
   background: rgb(255 255 255 / 4%);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-.item-view-header {
+.epic-view-header {
   display: flex;
   align-items: center;
   gap: 16px;
 }
 
-.item-view-icon {
+.epic-view-icon {
   flex-shrink: 0;
   width: 52px;
   height: 52px;
@@ -5562,11 +5575,11 @@ body {
   color: var(--accent);
 }
 
-.item-view-heading {
+.epic-view-heading {
   min-width: 0;
 }
 
-.item-view-title {
+.epic-view-title {
   margin: 0 0 4px;
   font-size: 20px;
   font-weight: 700;
@@ -5575,7 +5588,7 @@ body {
   overflow-wrap: anywhere;
 }
 
-.item-view-meta {
+.epic-view-meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -5584,37 +5597,78 @@ body {
   font-size: 12px;
 }
 
-.item-view-project {
+.epic-view-project {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   color: var(--text-secondary);
 }
 
-.item-view-repository-block {
+.epic-view-repository-block {
   display: flex;
   flex-direction: column;
   gap: 7px;
 }
 
-.item-view-repository-select {
-  width: min(100%, 560px);
+.epic-view-repository-picker {
+  position: relative;
+  width: min(100%, 360px);
+}
+
+.epic-view-repository-trigger {
+  width: 100%;
   height: 34px;
-  padding: 0 30px 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
   border: 1px solid var(--border-default);
   border-radius: 7px;
   background: var(--bg-secondary);
   color: var(--text-primary);
   font: inherit;
   font-size: 13px;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
-.item-view-repository-select:focus {
-  outline: none;
+.epic-view-repository-trigger:hover:not(:disabled) {
+  background: rgb(255 255 255 / 5%);
+  border-color: var(--border-strong, var(--border-default));
+}
+
+.epic-view-repository-trigger[aria-expanded="true"] {
   border-color: var(--accent);
 }
 
-.item-view-repository-claimed {
+.epic-view-repository-trigger:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.epic-view-repository-trigger:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+}
+
+.epic-view-repository-trigger .project-pill-chevron {
+  margin-left: auto;
+}
+
+.epic-view-repository-placeholder {
+  color: var(--text-muted);
+}
+
+.epic-view-repository-menu {
+  width: 100%;
+  max-width: none;
+}
+
+.epic-view-repository-claimed {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -5624,29 +5678,29 @@ body {
   font-size: 13px;
 }
 
-.item-view-repository-claimed span {
+.epic-view-repository-claimed span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.item-view-repository-hint {
+.epic-view-repository-hint {
   color: var(--text-muted);
   font-size: 11.5px;
 }
 
-.item-view-actions {
+.epic-view-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
 
-.item-view-actions .btn:disabled {
+.epic-view-actions .btn:disabled {
   opacity: 0.55;
   cursor: default;
 }
 
-.item-view-status {
+.epic-view-status {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -5654,7 +5708,7 @@ body {
   font-size: 12.5px;
 }
 
-.item-view-pr-link {
+.epic-view-pr-link {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -5671,19 +5725,19 @@ body {
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.item-view-pr-link:hover {
+.epic-view-pr-link:hover {
   background: rgb(255 255 255 / 6%);
   color: var(--text-primary);
 }
 
-.item-view-threads {
+.epic-view-threads {
   display: flex;
   flex-direction: column;
   gap: 8px;
   min-height: 0;
 }
 
-.item-view-threads-header {
+.epic-view-threads-header {
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -5695,11 +5749,11 @@ body {
   letter-spacing: 0.04em;
 }
 
-.item-view-threads-list {
+.epic-view-threads-list {
   max-width: 720px;
 }
 
-.item-view-empty {
+.epic-view-empty {
   color: var(--text-muted);
   font-size: 12.5px;
 }
@@ -5753,14 +5807,14 @@ body {
 }
 
 /* Archived items (Settings → General) */
-.archived-items-list {
+.archived-epics-list {
   display: flex;
   flex-direction: column;
   gap: 4px;
   width: 100%;
 }
 
-.archived-item-row {
+.archived-epic-row {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -5770,20 +5824,20 @@ body {
   background: rgb(255 255 255 / 3%);
 }
 
-.archived-item-name {
+.archived-epic-name {
   flex: 1;
   min-width: 0;
   color: var(--text-primary);
   font-size: 12.5px;
 }
 
-.archived-item-date {
+.archived-epic-date {
   flex-shrink: 0;
   color: var(--text-muted);
   font-size: 11.5px;
 }
 
-.archived-item-action {
+.archived-epic-action {
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
@@ -5799,12 +5853,12 @@ body {
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.archived-item-action:hover {
+.archived-epic-action:hover {
   background: rgb(255 255 255 / 8%);
   color: var(--text-primary);
 }
 
-.archived-item-action.danger:hover {
+.archived-epic-action.danger:hover {
   background: rgb(248 113 113 / 12%);
   color: var(--danger);
 }

@@ -275,16 +275,16 @@ type OrionComputerUsePermissions = {
           error?: string;
         };
       }>;
-      itemCommitAndPush: (input: {
+      epicCommitAndPush: (input: {
         projectPath: string;
         modelId?: string | null;
-        itemName?: string;
+        epicName?: string;
         expectedGitRoot?: string;
         expectedBranch?: string;
         claimedBranches?: Array<{
           gitRoot: string;
           branch: string;
-          itemName?: string;
+          epicName?: string;
         }>;
       }) => Promise<{
         ok: boolean;
@@ -293,16 +293,16 @@ type OrionComputerUsePermissions = {
         message?: string;
         error?: string;
       }>;
-      itemCreatePr: (input: {
+      epicCreatePr: (input: {
         projectPath: string;
         modelId?: string | null;
-        itemName?: string;
+        epicName?: string;
         expectedGitRoot?: string;
         expectedBranch?: string;
         claimedBranches?: Array<{
           gitRoot: string;
           branch: string;
-          itemName?: string;
+          epicName?: string;
         }>;
       }) => Promise<{
         ok: boolean;

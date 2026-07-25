@@ -1375,7 +1375,7 @@ ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
   }
 });
 
-// --- Work items: git actions with LLM-written messages ------------------------
+// --- Epics: git actions with LLM-written messages ------------------------
 
 const truncateForPrompt = (text, limit) =>
   text.length > limit ? `${text.slice(0, limit)}\n… (truncated)` : text;
@@ -1512,10 +1512,10 @@ const canonicalGitPath = async (value) => {
   }
 };
 
-// Item git actions are intentionally confined to one non-default branch in
-// one repository. This prevents two items (or a later project switch) from
+// Epic git actions are intentionally confined to one non-default branch in
+// one repository. This prevents two epics (or a later project switch) from
 // silently sharing a push target.
-const validateItemGitTarget = async (gitRoot, branch, input) => {
+const validateEpicGitTarget = async (gitRoot, branch, input) => {
   const canonicalRoot = await canonicalGitPath(gitRoot);
   const expectedBranch = String(input?.expectedBranch ?? '').trim();
   const expectedRoot = String(input?.expectedGitRoot ?? '').trim();
@@ -1523,25 +1523,25 @@ const validateItemGitTarget = async (gitRoot, branch, input) => {
   if (expectedBranch && expectedBranch !== branch) {
     return {
       ok: false,
-      error: `This item is linked to ${expectedBranch}. Switch back to that branch before using its git actions.`,
+      error: `This epic is linked to ${expectedBranch}. Switch back to that branch before using its git actions.`,
     };
   }
   if (expectedRoot && (await canonicalGitPath(expectedRoot)) !== canonicalRoot) {
     return {
       ok: false,
-      error: 'This item is linked to a different repository. Use its original project for git actions.',
+      error: 'This epic is linked to a different repository. Use its original project for git actions.',
     };
   }
 
   for (const claim of Array.isArray(input?.claimedBranches) ? input.claimedBranches : []) {
     if (!claim?.gitRoot || !claim?.branch || claim.branch !== branch) continue;
     if ((await canonicalGitPath(claim.gitRoot)) !== canonicalRoot) continue;
-    const owner = String(claim.itemName ?? '').trim();
+    const owner = String(claim.epicName ?? '').trim();
     return {
       ok: false,
       error:
-        `${branch} is already linked to another item${owner ? ` (${owner})` : ''}. ` +
-        'Switch to a dedicated feature branch for this item.',
+        `${branch} is already linked to another epic${owner ? ` (${owner})` : ''}. ` +
+        'Switch to a dedicated feature branch for this epic.',
     };
   }
 
@@ -1593,7 +1593,7 @@ const hasLocalCommitsToPush = async (gitRoot, branch, baseBranch) => {
   return false;
 };
 
-ipcMain.handle('item:commitAndPush', async (_event, input) => {
+ipcMain.handle('epic:commitAndPush', async (_event, input) => {
   let target = null;
   let branch = '';
   try {
@@ -1608,7 +1608,7 @@ ipcMain.handle('item:commitAndPush', async (_event, input) => {
       return { ok: false, error: 'Cannot push from a detached HEAD.' };
     }
 
-    target = await validateItemGitTarget(gitRoot, branch, input);
+    target = await validateEpicGitTarget(gitRoot, branch, input);
     if (!target.ok) return target;
 
     const stagedHasChanges = !(
@@ -1616,14 +1616,14 @@ ipcMain.handle('item:commitAndPush', async (_event, input) => {
     );
     if (!stagedHasChanges) {
       // Pushing pre-existing local commits is only a retry for a branch this
-      // item already claimed (its commit landed but the push failed). An
-      // unclaimed item must not adopt unrelated local commits as its own —
-      // validateItemGitTarget has already proven the expected root/branch
+      // epic already claimed (its commit landed but the push failed). An
+      // unclaimed epic must not adopt unrelated local commits as its own —
+      // validateEpicGitTarget has already proven the expected root/branch
       // match the current target when they are set.
-      const itemOwnsBranch = Boolean(
+      const epicOwnsBranch = Boolean(
         String(input?.expectedGitRoot ?? '').trim() && String(input?.expectedBranch ?? '').trim()
       );
-      if (itemOwnsBranch && (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch))) {
+      if (epicOwnsBranch && (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch))) {
         await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
         return {
           ok: true,
@@ -1638,20 +1638,20 @@ ipcMain.handle('item:commitAndPush', async (_event, input) => {
         return {
           ok: false,
           error:
-            'No staged changes to commit. Stage only the files that belong to this item, then try again.',
+            'No staged changes to commit. Stage only the files that belong to this epic, then try again.',
         };
       }
       return {
         ok: false,
         error:
-          !itemOwnsBranch &&
+          !epicOwnsBranch &&
           (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch))
-            ? `${branch} has local commits, but this item has not claimed it. Stage this item's changes to make its first commit here.`
+            ? `${branch} has local commits, but this epic has not claimed it. Stage this epic's changes to make its first commit here.`
             : 'No local changes to commit.',
       };
     }
 
-    // The user-curated index is the item boundary. Never stage the whole
+    // The user-curated index is the epic boundary. Never stage the whole
     // repository here: unrelated unstaged or untracked work must remain local.
     // Freeze its tree before the message-generation turn so a concurrent git
     // action cannot silently expand the commit.
@@ -1672,7 +1672,7 @@ ipcMain.handle('item:commitAndPush', async (_event, input) => {
       }
       const prompt =
         'Write a git commit message for the changes below' +
-        (input?.itemName ? `, which are part of the work item "${input.itemName}"` : '') +
+        (input?.epicName ? `, which are part of the epic "${input.epicName}"` : '') +
         '. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
         'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
         'message — no quotes, no code fences, no commentary.\n\n' +
@@ -1698,8 +1698,8 @@ ipcMain.handle('item:commitAndPush', async (_event, input) => {
         branch,
         error:
           currentBranch === null
-            ? 'The repository entered a detached HEAD while Orion was preparing the commit. Switch back to the item branch and try again.'
-            : `The repository switched from ${branch} to ${currentBranch} while Orion was preparing the commit. Switch back to the item branch and try again.`,
+            ? 'The repository entered a detached HEAD while Orion was preparing the commit. Switch back to the epic branch and try again.'
+            : `The repository switched from ${branch} to ${currentBranch} while Orion was preparing the commit. Switch back to the epic branch and try again.`,
       };
     }
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
@@ -1720,7 +1720,7 @@ ipcMain.handle('item:commitAndPush', async (_event, input) => {
   }
 });
 
-ipcMain.handle('item:createPr', async (_event, input) => {
+ipcMain.handle('epic:createPr', async (_event, input) => {
   let target = null;
   let branch = '';
   try {
@@ -1746,13 +1746,13 @@ ipcMain.handle('item:createPr', async (_event, input) => {
     if (stagedHasChanges) {
       return {
         ok: false,
-        error: 'Commit & push the staged item changes before opening a PR.',
+        error: 'Commit & push the staged epic changes before opening a PR.',
       };
     }
 
     // Resolve and validate the target before any push. In particular, never
     // publish local default-branch commits while preparing a PR.
-    target = await validateItemGitTarget(gitRoot, branch, input);
+    target = await validateEpicGitTarget(gitRoot, branch, input);
     if (!target.ok) return target;
     const baseBranch = target.baseBranch;
 
@@ -1822,7 +1822,7 @@ ipcMain.handle('item:createPr', async (_event, input) => {
       } catch {}
       const prompt =
         'Write a GitHub pull request title and description for the branch changes below' +
-        (input?.itemName ? `, which deliver the work item "${input.itemName}"` : '') +
+        (input?.epicName ? `, which deliver the epic "${input.epicName}"` : '') +
         '. First line: the PR title (specific, under 72 characters). Then a blank line, then the ' +
         'PR description in markdown: a short summary paragraph followed by a "## Changes" bullet ' +
         'list. Reply with ONLY the title and description — no quotes, no code fences, no commentary.\n\n' +
@@ -1836,8 +1836,8 @@ ipcMain.handle('item:createPr', async (_event, input) => {
         body = newline === -1 ? '' : text.slice(newline + 1).trim();
       }
     }
-    if (!title) title = input?.itemName || `Changes from ${branch}`;
-    if (!body) body = `Changes from the Orion item "${input?.itemName ?? branch}".`;
+    if (!title) title = input?.epicName || `Changes from ${branch}`;
+    if (!body) body = `Changes from the Orion epic "${input?.epicName ?? branch}".`;
 
     const { stdout } = await execFileAsync(
       'gh',
@@ -4031,7 +4031,7 @@ const titleFromResponseText = (responseText) => {
 
 // Run a single non-streaming prompt through a provider CLI in read-only mode
 // and return the model's plain-text reply ('' on any failure). Backs the
-// hidden utility turns: thread titles and item commit/PR messages.
+// hidden utility turns: thread titles and epic commit/PR messages.
 const runOneShotAgentText = async (model, prompt, projectPath) => {
   const cwd = projectPath || process.cwd();
 
@@ -4077,7 +4077,7 @@ const runOneShotAgentText = async (model, prompt, projectPath) => {
       resolve(value);
     };
     // A provider CLI stalled on auth or network input would otherwise pin the
-    // awaiting caller forever — the item git actions hold their disabled-UI
+    // awaiting caller forever — the epic git actions hold their disabled-UI
     // busy state on this promise. Cap the turn and reap the child; callers
     // fall back to their non-LLM message.
     const deadline = setTimeout(() => {

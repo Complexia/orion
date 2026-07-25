@@ -35,9 +35,9 @@ contextBridge.exposeInMainWorld('orion', {
   checkoutGitBranch: (input) => ipcRenderer.invoke('git:checkoutBranch', input),
   commitAndPush: (projectPath) => ipcRenderer.invoke('git:commitAndPush', projectPath),
 
-  // Work items (sidebar Items section)
-  itemCommitAndPush: (input) => ipcRenderer.invoke('item:commitAndPush', input),
-  itemCreatePr: (input) => ipcRenderer.invoke('item:createPr', input),
+  // Epics (sidebar Epics section)
+  epicCommitAndPush: (input) => ipcRenderer.invoke('epic:commitAndPush', input),
+  epicCreatePr: (input) => ipcRenderer.invoke('epic:createPr', input),
 
   // Agent runtime
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),
