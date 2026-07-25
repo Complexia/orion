@@ -219,7 +219,8 @@ type OrionComputerUsePermissions = {
       getGitState: (projectPath: string) => Promise<{
         ok: boolean;
         root?: string;
-        currentBranch?: string;
+        currentBranch?: string | null;
+        detachedHead?: string | null;
         branches: Array<{
           name: string;
           current: boolean;
@@ -240,7 +241,8 @@ type OrionComputerUsePermissions = {
         state?: {
           ok: boolean;
           root?: string;
-          currentBranch?: string;
+          currentBranch?: string | null;
+          detachedHead?: string | null;
           branches: Array<{
             name: string;
             current: boolean;
@@ -260,7 +262,8 @@ type OrionComputerUsePermissions = {
         state?: {
           ok: boolean;
           root?: string;
-          currentBranch?: string;
+          currentBranch?: string | null;
+          detachedHead?: string | null;
           branches: Array<{
             name: string;
             current: boolean;
@@ -271,6 +274,45 @@ type OrionComputerUsePermissions = {
           behind?: number;
           error?: string;
         };
+      }>;
+      epicCommitAndPush: (input: {
+        projectPath: string;
+        modelId?: string | null;
+        epicName?: string;
+        expectedGitRoot?: string;
+        expectedBranch?: string;
+        claimedBranches?: Array<{
+          gitRoot: string;
+          branch: string;
+          epicName?: string;
+        }>;
+      }) => Promise<{
+        ok: boolean;
+        gitRoot?: string;
+        branch?: string;
+        message?: string;
+        error?: string;
+      }>;
+      epicCreatePr: (input: {
+        projectPath: string;
+        modelId?: string | null;
+        epicName?: string;
+        expectedGitRoot?: string;
+        expectedBranch?: string;
+        claimedBranches?: Array<{
+          gitRoot: string;
+          branch: string;
+          epicName?: string;
+        }>;
+      }) => Promise<{
+        ok: boolean;
+        url?: string;
+        title?: string;
+        gitRoot?: string;
+        branch?: string;
+        baseBranch?: string;
+        alreadyExists?: boolean;
+        error?: string;
       }>;
       getPathForFile?: (file: File) => string;
       saveImageAttachment: (input: {

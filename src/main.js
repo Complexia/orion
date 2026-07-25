@@ -32,7 +32,7 @@ import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIc
 import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
-import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
+import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, registerMcpBridgeForRun, startLegacyMcpCleanup } from './main/mcp-bridge.js';
 import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
@@ -1372,6 +1372,511 @@ ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
     };
   } catch (error) {
     return { ok: false, error: error?.stderr?.toString().trim() || error?.message || String(error) };
+  }
+});
+
+// --- Epics: git actions with LLM-written messages ------------------------
+
+const truncateForPrompt = (text, limit) =>
+  text.length > limit ? `${text.slice(0, limit)}\n… (truncated)` : text;
+
+// Models answer with fences/labels no matter how firmly the prompt forbids
+// them; strip the common wrappers so the raw message survives.
+const cleanGeneratedGitMessage = (text) => {
+  let candidate = (text || '').trim();
+  candidate = candidate.replace(/^```[a-z]*\s*\n?/i, '').replace(/\n?```\s*$/, '');
+  candidate = candidate.replace(/^(commit message|pr description|title)\s*[:：]\s*/i, '');
+  return candidate.trim();
+};
+
+// Describe only the index snapshot that will be committed. Edits made while
+// the model writes the message remain in the worktree for a later commit.
+// The prompt only ever sees the first ~14k chars, so the diff read is bounded
+// well below the full index and an oversized diff degrades to the diffstat
+// (and then to the file list alone) instead of failing the commit.
+const readStagedGitChangesContext = async (gitRoot, entries) => {
+  const fileList = entries
+    .map((entry) => `${entry.kind}\t${entry.relativePath}`)
+    .join('\n');
+
+  let diff = '';
+  try {
+    ({ stdout: diff } = await execFileAsync('git', ['-C', gitRoot, 'diff', '--cached'], {
+      maxBuffer: 1024 * 1024 * 4,
+    }));
+  } catch {
+    try {
+      ({ stdout: diff } = await execFileAsync(
+        'git',
+        ['-C', gitRoot, 'diff', '--cached', '--stat'],
+        { maxBuffer: 1024 * 1024 }
+      ));
+    } catch {
+      diff = '';
+    }
+  }
+
+  return `Staged files:\n${fileList}\nDiff:\n${truncateForPrompt(diff, 14000)}`;
+};
+
+const readStagedGitEntries = async (gitRoot) => {
+  const { stdout } = await execFileAsync('git', [
+    '-C',
+    gitRoot,
+    'diff',
+    '--cached',
+    '--name-status',
+    '-z',
+  ]);
+  const fields = stdout.split('\0');
+  const entries = [];
+  let index = 0;
+
+  while (index < fields.length) {
+    const rawStatus = fields[index++];
+    if (!rawStatus) break;
+    const status = rawStatus[0];
+    const sourcePath = fields[index++];
+    const relativePath =
+      status === 'R' || status === 'C' ? fields[index++] : sourcePath;
+    if (!relativePath) continue;
+    const kind = {
+      A: 'added',
+      C: 'copied',
+      D: 'deleted',
+      M: 'modified',
+      R: 'renamed',
+      U: 'conflicted',
+    }[status] ?? 'modified';
+    entries.push({ kind, relativePath });
+  }
+
+  return entries;
+};
+
+const readGitIndexTree = async (gitRoot) => {
+  const { stdout } = await execFileAsync('git', ['-C', gitRoot, 'write-tree']);
+  return stdout.trim();
+};
+
+const resolveRemoteDefaultBranch = async (gitRoot) => {
+  // Ask the remote first: origin/HEAD is only locally recorded metadata and
+  // can remain stale after the repository changes its default branch.
+  try {
+    // Cap the network round trip and refuse credential prompts: an
+    // unreachable or auth-gated remote would otherwise never settle and pin
+    // the epic action in its disabled-UI busy state. The fallbacks below are
+    // local, so failing fast here degrades gracefully.
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', gitRoot, 'ls-remote', '--symref', 'origin', 'HEAD'],
+      { timeout: 15_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
+    );
+    const branch = stdout.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD$/m)?.[1]?.trim();
+    if (branch) return branch;
+  } catch {
+    // An offline or inaccessible remote may still have usable local metadata.
+  }
+
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '-C',
+      gitRoot,
+      'symbolic-ref',
+      '--short',
+      'refs/remotes/origin/HEAD',
+    ]);
+    const branch = stdout.trim().replace(/^origin\//, '');
+    if (branch) return branch;
+  } catch {
+    // No origin/HEAD tracking reference; fall through to GitHub metadata.
+  }
+
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['repo', 'view', '--json', 'defaultBranchRef'],
+      { cwd: gitRoot }
+    );
+    const branch = JSON.parse(stdout)?.defaultBranchRef?.name;
+    return typeof branch === 'string' ? branch.trim() : '';
+  } catch {
+    return '';
+  }
+};
+
+const canonicalGitPath = async (value) => {
+  try {
+    return await fs.realpath(value);
+  } catch {
+    return path.resolve(value);
+  }
+};
+
+// Epic git actions are intentionally confined to one non-default branch in
+// one repository. This prevents two epics (or a later project switch) from
+// silently sharing a push target.
+const validateEpicGitTarget = async (gitRoot, branch, input) => {
+  const canonicalRoot = await canonicalGitPath(gitRoot);
+  const expectedBranch = String(input?.expectedBranch ?? '').trim();
+  const expectedRoot = String(input?.expectedGitRoot ?? '').trim();
+
+  if (expectedBranch && expectedBranch !== branch) {
+    return {
+      ok: false,
+      error: `This epic is linked to ${expectedBranch}. Switch back to that branch before using its git actions.`,
+    };
+  }
+  if (expectedRoot && (await canonicalGitPath(expectedRoot)) !== canonicalRoot) {
+    return {
+      ok: false,
+      error: 'This epic is linked to a different repository. Use its original project for git actions.',
+    };
+  }
+
+  for (const claim of Array.isArray(input?.claimedBranches) ? input.claimedBranches : []) {
+    if (!claim?.gitRoot || !claim?.branch || claim.branch !== branch) continue;
+    if ((await canonicalGitPath(claim.gitRoot)) !== canonicalRoot) continue;
+    const owner = String(claim.epicName ?? '').trim();
+    return {
+      ok: false,
+      error:
+        `${branch} is already linked to another epic${owner ? ` (${owner})` : ''}. ` +
+        'Switch to a dedicated feature branch for this epic.',
+    };
+  }
+
+  const baseBranch = await resolveRemoteDefaultBranch(canonicalRoot);
+  if (!baseBranch) {
+    return {
+      ok: false,
+      error:
+        'Could not determine the remote default branch. Check the origin remote and GitHub authentication.',
+    };
+  }
+  if (baseBranch === branch) {
+    return {
+      ok: false,
+      error: `You are on ${branch}, the repository default branch — switch to a dedicated feature branch first.`,
+    };
+  }
+
+  return { ok: true, gitRoot: canonicalRoot, baseBranch };
+};
+
+const hasLocalCommitsToPush = async (gitRoot, branch, baseBranch) => {
+  const branchRef = `refs/heads/${branch}`;
+  const countAheadOf = async (revision) => {
+    try {
+      const { stdout } = await execFileAsync('git', [
+        '-C',
+        gitRoot,
+        'rev-list',
+        '--count',
+        `${revision}..${branchRef}`,
+      ]);
+      return Number.parseInt(stdout.trim(), 10) > 0;
+    } catch {
+      return null;
+    }
+  };
+
+  const aheadOfRemoteBranch = await countAheadOf(`refs/remotes/origin/${branch}`);
+  if (aheadOfRemoteBranch !== null) return aheadOfRemoteBranch;
+
+  // A first push can fail before -u records an upstream. In that case, a
+  // feature commit ahead of the default branch is still retryable without
+  // requiring the user to stage and commit an unrelated change.
+  for (const revision of [`refs/remotes/origin/${baseBranch}`, `refs/heads/${baseBranch}`]) {
+    const ahead = await countAheadOf(revision);
+    if (ahead !== null) return ahead;
+  }
+  return false;
+};
+
+ipcMain.handle('epic:commitAndPush', async (_event, input) => {
+  let target = null;
+  let branch = '';
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+
+    const gitRoot = await getGitRoot(projectPath);
+    branch = (await getCurrentGitBranch(gitRoot)) ?? '';
+    if (!branch) {
+      return { ok: false, error: 'Cannot push from a detached HEAD.' };
+    }
+
+    target = await validateEpicGitTarget(gitRoot, branch, input);
+    if (!target.ok) return target;
+
+    const stagedHasChanges = !(
+      await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet'])
+    );
+    if (!stagedHasChanges) {
+      // Pushing pre-existing local commits is only a retry for a branch this
+      // epic already claimed (its commit landed but the push failed). An
+      // unclaimed epic must not adopt unrelated local commits as its own —
+      // validateEpicGitTarget has already proven the expected root/branch
+      // match the current target when they are set.
+      const epicOwnsBranch = Boolean(
+        String(input?.expectedGitRoot ?? '').trim() && String(input?.expectedBranch ?? '').trim()
+      );
+      if (epicOwnsBranch && (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch))) {
+        await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
+        return {
+          ok: true,
+          gitRoot: target.gitRoot,
+          branch,
+          message: 'Pushed existing local commits',
+        };
+      }
+
+      const entries = await readGitStatusEntries(gitRoot);
+      if (entries.length > 0) {
+        return {
+          ok: false,
+          error:
+            'No staged changes to commit. Stage only the changes that belong to this epic, then try again.',
+        };
+      }
+      return {
+        ok: false,
+        error:
+          !epicOwnsBranch &&
+          (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch))
+            ? `${branch} has local commits, but this epic has not claimed it. Stage this epic's changes to make its first commit here.`
+            : 'No local changes to commit.',
+      };
+    }
+
+    // The user-curated index is the epic boundary. Never stage from historical
+    // filenames: a file can contain unrelated hunks before or after an agent
+    // turn. Freeze the index before message generation so a concurrent git
+    // action cannot silently expand the commit.
+    const indexTree = await readGitIndexTree(gitRoot);
+    const entries = await readStagedGitEntries(gitRoot);
+
+    let message = '';
+    if (input?.modelId) {
+      const context = await readStagedGitChangesContext(gitRoot, entries);
+      if ((await readGitIndexTree(gitRoot)) !== indexTree) {
+        return {
+          ok: false,
+          gitRoot: target.gitRoot,
+          branch,
+          error:
+            'Staged changes changed while Orion was preparing the commit. Review the index and try again.',
+        };
+      }
+      const prompt =
+        'Write a git commit message for the changes below' +
+        (input?.epicName ? `, which are part of the epic "${input.epicName}"` : '') +
+        '. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
+        'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
+        'message — no quotes, no code fences, no commentary.\n\n' +
+        context;
+      message = cleanGeneratedGitMessage(await runOneShotForModelId(input.modelId, prompt, gitRoot));
+    }
+    if (!message) message = commitMessageForEntries(entries);
+
+    if ((await readGitIndexTree(gitRoot)) !== indexTree) {
+      return {
+        ok: false,
+        gitRoot: target.gitRoot,
+        branch,
+        error:
+          'Staged changes changed while Orion was preparing the commit. Review the index and try again.',
+      };
+    }
+    const currentBranch = await getCurrentGitBranch(gitRoot);
+    if (currentBranch !== branch) {
+      return {
+        ok: false,
+        gitRoot: target.gitRoot,
+        branch,
+        error:
+          currentBranch === null
+            ? 'The repository entered a detached HEAD while Orion was preparing the commit. Switch back to the epic branch and try again.'
+            : `The repository switched from ${branch} to ${currentBranch} while Orion was preparing the commit. Switch back to the epic branch and try again.`,
+      };
+    }
+    await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
+    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
+
+    return {
+      ok: true,
+      gitRoot: target.gitRoot,
+      branch,
+      message,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      ...(target?.ok ? { gitRoot: target.gitRoot, branch } : {}),
+      error: error?.stderr?.toString().trim() || error?.message || String(error),
+    };
+  }
+});
+
+ipcMain.handle('epic:createPr', async (_event, input) => {
+  let target = null;
+  let branch = '';
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+    if (!(await checkCommandAvailable('gh'))) {
+      return {
+        ok: false,
+        error: 'The GitHub CLI (gh) is required to open PRs. Install it and run `gh auth login`.',
+      };
+    }
+
+    const gitRoot = await getGitRoot(projectPath);
+    branch = (await getCurrentGitBranch(gitRoot)) ?? '';
+    if (!branch) {
+      return { ok: false, error: 'Cannot open a PR from a detached HEAD.' };
+    }
+    // Resolve and validate the target before any push. In particular, never
+    // publish local default-branch commits while preparing a PR.
+    target = await validateEpicGitTarget(gitRoot, branch, input);
+    if (!target.ok) return target;
+    const baseBranch = target.baseBranch;
+
+    // A staged snapshot is the only attributable Epic boundary. Require it to
+    // be committed before opening a PR; unstaged local work remains untouched.
+    const stagedHasChanges = !(
+      await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet'])
+    );
+    if (stagedHasChanges) {
+      return {
+        ok: false,
+        error: 'Commit & push the staged epic changes before opening a PR.',
+      };
+    }
+
+    // Reuse an already-open PR for this branch instead of failing on create.
+    // Check before pushing: a stale or diverged local branch can still have a
+    // valid open PR even though its non-fast-forward push would fail. With no
+    // selector, gh resolves the checked-out branch and its head repository;
+    // filtering only by branch name could select a same-named fork PR.
+    const currentBranch = await getCurrentGitBranch(gitRoot);
+    if (currentBranch !== branch) {
+      return {
+        ok: false,
+        gitRoot: target.gitRoot,
+        branch,
+        error:
+          currentBranch === null
+            ? 'The repository entered a detached HEAD while Orion was looking for an existing PR. Switch back to the epic branch and try again.'
+            : `The repository switched from ${branch} to ${currentBranch} while Orion was looking for an existing PR. Switch back to the epic branch and try again.`,
+      };
+    }
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['pr', 'view', '--json', 'url,state'],
+        { cwd: gitRoot }
+      );
+      const existing = JSON.parse(stdout);
+      if (existing?.url && existing?.state === 'OPEN') {
+        return {
+          ok: true,
+          url: existing.url,
+          alreadyExists: true,
+          gitRoot: target.gitRoot,
+          branch,
+          baseBranch,
+        };
+      }
+    } catch {
+      // No PR yet.
+    }
+
+    // The branch must exist on the remote before gh can target a new PR.
+    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
+
+    let title = '';
+    let body = '';
+    if (input?.modelId) {
+      // Ensure the range used for message generation exists locally even when
+      // the clone did not previously have an origin/HEAD tracking reference.
+      // Only the generated message needs it — gh targets the remote directly,
+      // and the push above already succeeded, so a failed fetch must not abort
+      // the PR: fall through to the static title/body.
+      let fetchedCurrentBase = false;
+      try {
+        await execFileAsync('git', [
+          '-C',
+          gitRoot,
+          'fetch',
+          '--no-tags',
+          'origin',
+          `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
+        ]);
+        fetchedCurrentBase = true;
+      } catch {}
+
+      if (fetchedCurrentBase) {
+        const baseRef = `refs/remotes/origin/${baseBranch}`;
+        const branchRef = `refs/heads/${branch}`;
+        let commits = '';
+        let diffstat = '';
+        try {
+          ({ stdout: commits } = await execFileAsync('git', [
+            '-C',
+            gitRoot,
+            'log',
+            `${baseRef}..${branchRef}`,
+            '--pretty=- %s',
+          ]));
+        } catch {}
+        try {
+          ({ stdout: diffstat } = await execFileAsync('git', [
+            '-C',
+            gitRoot,
+            'diff',
+            `${baseRef}...${branchRef}`,
+            '--stat',
+          ]));
+        } catch {}
+        const prompt =
+          'Write a GitHub pull request title and description for the branch changes below' +
+          (input?.epicName ? `, which deliver the epic "${input.epicName}"` : '') +
+          '. First line: the PR title (specific, under 72 characters). Then a blank line, then the ' +
+          'PR description in markdown: a short summary paragraph followed by a "## Changes" bullet ' +
+          'list. Reply with ONLY the title and description — no quotes, no code fences, no commentary.\n\n' +
+          `Commits:\n${truncateForPrompt(commits, 3000)}\n\nDiffstat:\n${truncateForPrompt(diffstat, 3000)}`;
+        const text = cleanGeneratedGitMessage(
+          await runOneShotForModelId(input.modelId, prompt, gitRoot)
+        );
+        if (text) {
+          const newline = text.indexOf('\n');
+          title = (newline === -1 ? text : text.slice(0, newline)).trim();
+          body = newline === -1 ? '' : text.slice(newline + 1).trim();
+        }
+      }
+    }
+    if (!title) title = input?.epicName || `Changes from ${branch}`;
+    if (!body) body = `Changes from the Orion epic "${input?.epicName ?? branch}".`;
+
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['pr', 'create', '--head', branch, '--base', baseBranch, '--title', title, '--body', body],
+      { cwd: gitRoot }
+    );
+    const url = stdout.match(/https?:\/\/\S+/)?.[0] ?? '';
+    return { ok: true, url, title, gitRoot: target.gitRoot, branch, baseBranch };
+  } catch (error) {
+    return {
+      ok: false,
+      ...(target?.ok ? { gitRoot: target.gitRoot, branch } : {}),
+      error: error?.stderr?.toString().trim() || error?.message || String(error),
+    };
   }
 });
 
@@ -3549,6 +4054,144 @@ const titleFromResponseText = (responseText) => {
   return candidate;
 };
 
+// Run a single non-streaming prompt through a provider CLI in read-only mode
+// and return the model's plain-text reply ('' on any failure). Backs the
+// hidden utility turns: thread titles and epic commit/PR messages.
+const runOneShotAgentText = async (model, prompt, projectPath) => {
+  const cwd = projectPath || process.cwd();
+
+  // OpenCode's non-interactive command does not currently expose a mode that
+  // Orion can enforce as read-only. Hidden utility turns must fail closed
+  // instead of inheriting the user's normal repository permissions.
+  if (model.providerId === 'opencode') {
+    return '';
+  }
+
+  // kimi's prompt mode auto-approves every tool and rejects --plan, so a
+  // one-shot `kimi -p` would silently run this hidden turn with full write
+  // access. Drive the turn over ACP plan mode instead, which disables tool
+  // execution.
+  if (model.providerId === 'kimi') {
+    return (await kimiPlanModeOneShot(model, prompt, cwd)) || '';
+  }
+
+  // Reuse the command builder but force read-only access for the hidden turn
+  const args = commandForModel(model, {
+    prompt,
+    projectPath: cwd,
+    accessMode: 'read-only',
+  });
+
+  const commandString = args.map(shellQuote).join(' ');
+  return await new Promise((resolve) => {
+    const child = spawn(loginShell, ['-lc', commandString], {
+      cwd,
+      env: {
+        ...process.env,
+        FORCE_COLOR: '0',
+        NO_COLOR: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(value);
+    };
+    // A provider CLI stalled on auth or network input would otherwise pin the
+    // awaiting caller forever — the epic git actions hold their disabled-UI
+    // busy state on this promise. Cap the turn and reap the child; callers
+    // fall back to their non-LLM message.
+    const deadline = setTimeout(() => {
+      void killAgentChild(child);
+      finish('');
+    }, 120_000);
+
+    let stdout = '';
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+    // Drain diagnostics so a chatty failed CLI cannot block on a full pipe.
+    // They are never valid generated text.
+    child.stderr.resume();
+
+    child.on('error', () => finish(''));
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish('');
+        return;
+      }
+
+      const jsonMode = sendsJsonEvents(model.providerId);
+      let responseText = '';
+
+      if (jsonMode) {
+        // Parse NDJSON / streaming-json output and extract only real text (ignore thoughts etc.)
+        const adapter = jsonAdapterForProvider(model.providerId);
+        const textContext = { textSeen: false };
+        const lines = stdout.split(/\r?\n/);
+        let partial = '';
+        for (const rawLine of lines) {
+          const line = partial ? partial + rawLine : rawLine;
+          const trimmed = line.trim();
+          if (!trimmed) {
+            partial = '';
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(trimmed);
+            const t = adapter.text(parsed, textContext);
+            if (t) {
+              responseText += t;
+              textContext.textSeen = true;
+              partial = '';
+            } else {
+              // parsed but no text content (e.g. thought) — discard this line
+              partial = '';
+            }
+          } catch {
+            // Not (yet) valid JSON. If it doesn't look like start of JSON, treat as plain text.
+            if (!/^\s*[\{\[]/.test(trimmed)) {
+              responseText += rawLine + '\n';
+              partial = '';
+            } else {
+              partial = line; // keep for potential multi-line object (rare)
+            }
+          }
+        }
+        // flush last partial if it parses
+        if (partial.trim()) {
+          try {
+            const p = JSON.parse(partial.trim());
+            const t = adapter.text(p, textContext);
+            if (t) responseText += t;
+          } catch {
+            if (!/^\s*[\{\[]/.test(partial)) responseText += partial;
+          }
+        }
+      } else {
+        responseText = stdout;
+      }
+
+      finish(responseText);
+    });
+  });
+};
+
+// Look up a model id, verify its CLI is on PATH, and run a one-shot prompt.
+const runOneShotForModelId = async (modelId, prompt, projectPath) => {
+  if (!modelId) return '';
+  const models = await getAgentModels();
+  const model = models.find((candidate) => candidate.id === modelId);
+  if (!model) return '';
+  if (!(await checkCommandAvailable(model.command))) return '';
+  return runOneShotAgentText(model, prompt, projectPath);
+};
+
 // Generate a short, relevant title for a thread based on the first user prompt.
 // This runs a lightweight non-streaming call and returns just the title string.
 ipcMain.handle('agent:generateTitle', async (_event, input) => {
@@ -3569,109 +4212,9 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
       'Request:\n' +
       input.prompt;
 
-    // kimi's prompt mode auto-approves every tool and rejects --plan, so a
-    // one-shot `kimi -p` would silently run this hidden turn with full write
-    // access. Drive the title turn over ACP plan mode instead, which
-    // disables tool execution.
-    if (model.providerId === 'kimi') {
-      const text = await kimiPlanModeOneShot(
-        model,
-        titleInstruction,
-        input.projectPath || process.cwd()
-      );
-      return titleFromResponseText(text);
-    }
-
-    // Reuse command builder but force a read-only-ish access where possible for title gen
-    const args = commandForModel(model, {
-      prompt: titleInstruction,
-      projectPath: input.projectPath || process.cwd(),
-      accessMode: 'read-only',
-    });
-
-    const commandString = args.map(shellQuote).join(' ');
-    return await new Promise((resolve) => {
-      const child = spawn(loginShell, ['-lc', commandString], {
-        cwd: input.projectPath || process.cwd(),
-        env: {
-          ...process.env,
-          FORCE_COLOR: '0',
-          NO_COLOR: '1',
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let stdout = '';
-      let stderr = '';
-
-      child.stdout.on('data', (data) => {
-        stdout += data.toString();
-      });
-      child.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      child.on('error', () => resolve(''));
-
-      child.on('close', () => {
-        const jsonMode = sendsJsonEvents(model.providerId);
-        let responseText = '';
-
-        if (jsonMode) {
-          // Parse NDJSON / streaming-json output and extract only real text (ignore thoughts etc.)
-          const adapter = jsonAdapterForProvider(model.providerId);
-          const titleContext = { textSeen: false };
-          const lines = stdout.split(/\r?\n/);
-          let partial = '';
-          for (const rawLine of lines) {
-            const line = partial ? partial + rawLine : rawLine;
-            const trimmed = line.trim();
-            if (!trimmed) {
-              partial = '';
-              continue;
-            }
-            try {
-              const parsed = JSON.parse(trimmed);
-              const t = adapter.text(parsed, titleContext);
-              if (t) {
-                responseText += t;
-                titleContext.textSeen = true;
-                partial = '';
-              } else {
-                // parsed but no text content (e.g. thought) — discard this line
-                partial = '';
-              }
-            } catch {
-              // Not (yet) valid JSON. If it doesn't look like start of JSON, treat as plain text.
-              if (!/^\s*[\{\[]/.test(trimmed)) {
-                responseText += rawLine + '\n';
-                partial = '';
-              } else {
-                partial = line; // keep for potential multi-line object (rare)
-              }
-            }
-          }
-          // flush last partial if it parses
-          if (partial.trim()) {
-            try {
-              const p = JSON.parse(partial.trim());
-              const t = adapter.text(p, titleContext);
-              if (t) responseText += t;
-            } catch {
-              if (!/^\s*[\{\[]/.test(partial)) responseText += partial;
-            }
-          }
-        } else {
-          responseText = stdout;
-        }
-
-        if (!responseText.trim() && stderr.trim()) {
-          responseText = stderr;
-        }
-
-        resolve(titleFromResponseText(responseText));
-      });
-    });
+    return titleFromResponseText(
+      await runOneShotAgentText(model, titleInstruction, input.projectPath)
+    );
   } catch (e) {
     console.error('agent:generateTitle error', e);
     return '';

@@ -892,12 +892,12 @@ export const kimiPlanModeOneShot = (model, promptText, cwd) =>
     });
     let text = '';
     let settled = false;
-    const finish = () => {
+    const finish = (success = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
       killAgentChild(child);
-      resolve(text);
+      resolve(success ? text : '');
     };
     // The ACP server idles after the prompt resolves and never exits on its
     // own; cap the whole turn so a wedged server can't leak a process.
@@ -917,8 +917,8 @@ export const kimiPlanModeOneShot = (model, promptText, cwd) =>
         onText: (delta) => {
           text += delta;
         },
-        onTurnEnd: finish,
-        onFatal: finish,
+        onTurnEnd: () => finish(true),
+        onFatal: () => finish(false),
       },
     });
     let buffer = '';
@@ -935,7 +935,7 @@ export const kimiPlanModeOneShot = (model, promptText, cwd) =>
       }
     });
     child.stderr.resume();
-    child.on('error', finish);
-    child.on('close', finish);
+    child.on('error', () => finish(false));
+    child.on('close', () => finish(false));
     driver.start();
   });

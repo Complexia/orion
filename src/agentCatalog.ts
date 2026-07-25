@@ -369,12 +369,20 @@ export const fallbackAgentModels: AgentModel[] = [
     shortcut: '⌘1',
   },
   {
+    id: 'claude:claude-opus-5',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Opus 5',
+    slug: 'claude-opus-5',
+    shortcut: '⌘2',
+  },
+  {
     id: 'claude:claude-opus-4-8',
     providerId: 'claude',
     providerLabel: 'Claude',
     label: 'Claude Opus 4.8',
     slug: 'claude-opus-4-8',
-    shortcut: '⌘2',
+    shortcut: '⌘3',
   },
   {
     id: 'claude:claude-sonnet-5',
@@ -382,7 +390,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Sonnet 5',
     slug: 'claude-sonnet-5',
-    shortcut: '⌘3',
+    shortcut: '⌘4',
   },
   {
     id: 'claude:claude-opus-4-7',
@@ -390,7 +398,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 4.7',
     slug: 'claude-opus-4-7',
-    shortcut: '⌘4',
+    shortcut: '⌘5',
   },
   {
     id: 'claude:claude-opus-4-6',
@@ -398,7 +406,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 4.6',
     slug: 'claude-opus-4-6',
-    shortcut: '⌘5',
+    shortcut: '⌘6',
   },
   {
     id: 'claude:claude-opus-4-5',
@@ -406,7 +414,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 4.5',
     slug: 'claude-opus-4-5',
-    shortcut: '⌘6',
+    shortcut: '⌘7',
   },
   {
     id: 'claude:claude-sonnet-4-6',
@@ -414,7 +422,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Sonnet 4.6',
     slug: 'claude-sonnet-4-6',
-    shortcut: '⌘7',
+    shortcut: '⌘8',
   },
   {
     id: 'claude:claude-haiku-4-5',
@@ -422,7 +430,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Haiku 4.5',
     slug: 'claude-haiku-4-5',
-    shortcut: '⌘8',
+    shortcut: '⌘9',
   },
   {
     id: 'claude:claude-code-cli',

@@ -7,6 +7,67 @@ export type Project = {
   path: string;
 };
 
+/**
+ * A big-ticket epic ("Optimize memory usage") that groups threads in the
+ * sidebar Epics section. Threads keep living in Recent agents and under their
+ * project as usual; an epic is an extra lens over them plus git actions
+ * (commit & push, PR) for the work as a whole. Settling archives the epic.
+ */
+export type Epic = {
+  id: string;
+  name: string;
+  /** Optional longer notes for the epic (editable in the epic view). */
+  description?: string;
+  createdAt: string;
+  /** Set when the epic is settled (PR merged); settled epics are archived. */
+  settledAt?: string;
+  /** URL of the PR opened from this epic, if any. */
+  prUrl?: string;
+  /** Project explicitly selected as the repository for this epic's git actions. */
+  repositoryProjectId?: string;
+  /** Canonical repository root claimed by this epic's git actions. */
+  gitRoot?: string;
+  /** Dedicated feature branch claimed by this epic's git actions. */
+  gitBranch?: string;
+};
+
+export type EpicsSettings = {
+  /** Show the Epics sidebar section and epic views. */
+  enabled: boolean;
+  /** AgentModel id used to write commit/PR messages; null = cheapest available. */
+  commitModelId: string | null;
+};
+
+export const defaultEpicsSettings: EpicsSettings = {
+  enabled: true,
+  commitModelId: null,
+};
+
+const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
+
+/**
+ * The project acting as the repository for an epic's git actions, if it can be
+ * resolved: the claimed git root wins (that is what the git actions operate
+ * on), then the explicitly selected repository project.
+ */
+const projectForEpicRepository = (projects: Project[], epic: Epic | undefined) => {
+  if (!epic) return undefined;
+  const selectedRepository = epic.repositoryProjectId
+    ? projects.find((project) => project.id === epic.repositoryProjectId)
+    : undefined;
+  if (epic.gitRoot) {
+    const epicRoot = normalizeRepoPath(epic.gitRoot);
+    const belongsToRoot = (project: Project) => {
+      const projectPath = normalizeRepoPath(project.path);
+      return projectPath === epicRoot || projectPath.startsWith(`${epicRoot}/`);
+    };
+    if (selectedRepository && belongsToRoot(selectedRepository)) return selectedRepository;
+    const byRoot = projects.find(belongsToRoot);
+    if (byRoot) return byRoot;
+  }
+  return selectedRepository;
+};
+
 export type AgentToolSource = { url: string; title?: string };
 
 export type AgentPlanEntry = {
@@ -236,6 +297,8 @@ export type Thread = {
   linkedTask?: LinkedBoardTask;
   /** Codex goal (/goal) this thread is pursuing, if any. Null after /goal clear. */
   goal?: ThreadGoal | null;
+  /** Sidebar epic this thread belongs to, if any. */
+  epicId?: string;
 };
 
 export type OpenFile = {
@@ -329,6 +392,12 @@ interface OrionState {
   selectedProjectId: string | null;
   selectedThreadId: string | null;
 
+  // Epics
+  epics: Epic[];
+  /** Selected epic (epic view in the main panel). Cleared when a thread is selected. */
+  selectedEpicId: string | null;
+  epicsSettings: EpicsSettings;
+
   // Code tab workspace
   workspacePath: string | null;
   openFiles: OpenFile[];
@@ -353,6 +422,16 @@ interface OrionState {
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
+  addEpic: (name: string, options?: { description?: string }) => string; // returns new epic id
+  renameEpic: (id: string, name: string) => void;
+  updateEpic: (id: string, updates: Partial<Epic>) => void;
+  /** Deletes the epic; its threads survive and just lose the grouping. */
+  deleteEpic: (id: string) => void;
+  settleEpic: (id: string) => void;
+  unsettleEpic: (id: string) => void;
+  selectEpic: (id: string | null) => void;
+  setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
+
   createThread: (
     projectId: string,
     title?: string,
@@ -363,6 +442,8 @@ interface OrionState {
       spawnId?: string;
       accessMode?: Thread['accessMode'];
       subagent?: NativeSubagentInfo;
+      /** Epic the new thread is grouped under. */
+      epicId?: string;
       /** false = don't switch the UI to the new thread (background spawns). */
       select?: boolean;
     }
@@ -579,6 +660,9 @@ export const useOrionStore = create<OrionState>()(
       threads: [],
       selectedProjectId: null,
       selectedThreadId: null,
+      epics: [],
+      selectedEpicId: null,
+      epicsSettings: defaultEpicsSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -684,9 +768,17 @@ export const useOrionStore = create<OrionState>()(
           const remainingProjects = state.projects.filter((p) => p.id !== id);
           const fallbackProject = remainingProjects[0] ?? null;
           const wasWorkspaceProject = removedProject?.path === state.workspacePath;
+          const selectedEpic = state.epics.find((epic) => epic.id === state.selectedEpicId);
+          const selectedEpicRepository = projectForEpicRepository(state.projects, selectedEpic);
+          const removedSelectedEpicRepository = selectedEpicRepository?.id === id;
 
           return {
             projects: remainingProjects,
+            epics: state.epics.map((epic) =>
+              epic.repositoryProjectId === id
+                ? { ...epic, repositoryProjectId: undefined }
+                : epic
+            ),
             threads: state.threads.filter((t) => t.projectId !== id),
             selectedProjectId:
               state.selectedProjectId === id ? fallbackProject?.id ?? null : state.selectedProjectId,
@@ -694,6 +786,10 @@ export const useOrionStore = create<OrionState>()(
               state.threads.find((t) => t.id === state.selectedThreadId)?.projectId === id
                 ? null
                 : state.selectedThreadId,
+            // Dismiss an epic whose repository was removed before moving the
+            // shell to a fallback project. Its durable gitRoot/branch claim is
+            // retained for safety if that repository is added again.
+            selectedEpicId: removedSelectedEpicRepository ? null : state.selectedEpicId,
             expandedProjects: state.expandedProjects.filter((pid) => pid !== id),
             workspacePath: wasWorkspaceProject ? fallbackProject?.path ?? null : state.workspacePath,
             openFiles: wasWorkspaceProject ? [] : state.openFiles,
@@ -705,6 +801,107 @@ export const useOrionStore = create<OrionState>()(
       renameProject: (id, name) =>
         set((state) => ({
           projects: state.projects.map((p) => (p.id === id ? { ...p, name } : p)),
+        })),
+
+      addEpic: (name, options) => {
+        const description = options?.description?.trim();
+        const newEpic: Epic = {
+          id: crypto.randomUUID(),
+          name,
+          ...(description ? { description } : {}),
+          createdAt: new Date().toISOString(),
+        };
+        set((state) => ({
+          epics: [newEpic, ...state.epics],
+          selectedEpicId: newEpic.id,
+          selectedThreadId: null,
+          // A new epic is intentionally unbound. Clear the shell repository so
+          // header git controls cannot keep targeting the previously selected
+          // project while the epic view asks the user to choose one.
+          selectedProjectId: null,
+        }));
+        return newEpic.id;
+      },
+
+      renameEpic: (id, name) =>
+        set((state) => ({
+          epics: state.epics.map((epic) => (epic.id === id ? { ...epic, name } : epic)),
+        })),
+
+      updateEpic: (id, updates) =>
+        set((state) => {
+          const repositoryChanged = Object.prototype.hasOwnProperty.call(
+            updates,
+            'repositoryProjectId'
+          );
+          const repositoryProject = repositoryChanged
+            ? state.projects.find((project) => project.id === updates.repositoryProjectId)
+            : undefined;
+
+          return {
+            epics: state.epics.map((epic) => (epic.id === id ? { ...epic, ...updates } : epic)),
+            // Repository selection in the active epic view also defines the
+            // shell context used by the header branch picker and generic git
+            // controls. Keep the epic selected while retargeting atomically.
+            ...(state.selectedEpicId === id && repositoryChanged
+              ? { selectedProjectId: repositoryProject?.id ?? null }
+              : {}),
+          };
+        }),
+
+      deleteEpic: (id) =>
+        set((state) => ({
+          epics: state.epics.filter((epic) => epic.id !== id),
+          // Threads survive their epic — they stay in Recent agents and their
+          // project list; only the grouping is gone.
+          threads: state.threads.map((t) =>
+            t.epicId === id ? { ...t, epicId: undefined } : t
+          ),
+          selectedEpicId: state.selectedEpicId === id ? null : state.selectedEpicId,
+        })),
+
+      settleEpic: (id) =>
+        set((state) => ({
+          epics: state.epics.map((epic) =>
+            epic.id === id ? { ...epic, settledAt: new Date().toISOString() } : epic
+          ),
+          selectedEpicId: state.selectedEpicId === id ? null : state.selectedEpicId,
+        })),
+
+      unsettleEpic: (id) =>
+        set((state) => ({
+          epics: state.epics.map((epic) =>
+            epic.id === id ? { ...epic, settledAt: undefined } : epic
+          ),
+        })),
+
+      selectEpic: (id) =>
+        set((state) => {
+          if (!id) return { selectedEpicId: null };
+          // Retarget the shell's project context (header branch picker and
+          // generic git controls) to the epic's repository — otherwise they
+          // keep operating on whatever project was selected before, letting a
+          // commit land in the wrong repository while the epic view shows
+          // another one.
+          const epic = state.epics.find((candidate) => candidate.id === id);
+          const repositoryProject = projectForEpicRepository(state.projects, epic);
+          return {
+            selectedEpicId: id,
+            // The epic view replaces the thread view; a selected thread would
+            // shadow it.
+            selectedThreadId: null,
+            // An unbound epic must not inherit the previous shell repository.
+            selectedProjectId: repositoryProject?.id ?? null,
+          };
+        }),
+
+      setEpicsSettings: (updates) =>
+        set((state) => ({
+          epicsSettings: {
+            ...defaultEpicsSettings,
+            ...state.epicsSettings,
+            ...updates,
+          },
         })),
 
       createThread: (projectId, title, options) => {
@@ -748,13 +945,18 @@ export const useOrionStore = create<OrionState>()(
           spawnId: options?.spawnId,
           hiddenFromRecent: options?.hiddenFromRecent,
           subagent: options?.subagent,
+          epicId: options?.epicId,
           messages: [],
         };
         set((state) => ({
           threads: [newThread, ...state.threads],
           ...(options?.select === false
             ? {}
-            : { selectedProjectId: projectId, selectedThreadId: newThread.id }),
+            : {
+                selectedProjectId: projectId,
+                selectedThreadId: newThread.id,
+                selectedEpicId: options?.epicId ?? null,
+              }),
         }));
         return newThread.id;
       },
@@ -790,11 +992,13 @@ export const useOrionStore = create<OrionState>()(
           agentSessionIds: inheritedProviders.length ? sessionIds : undefined,
           pendingForkProviders: inheritedProviders.length ? inheritedProviders : undefined,
           branchedFromThreadId: source.id,
+          epicId: source.epicId,
         };
         set((state) => ({
           threads: [newThread, ...state.threads],
           selectedProjectId: source.projectId,
           selectedThreadId: newThread.id,
+          selectedEpicId: source.epicId ?? null,
         }));
         return newThread.id;
       },
@@ -807,6 +1011,8 @@ export const useOrionStore = create<OrionState>()(
             selectedProjectId: id,
             selectedThreadId:
               selectedThread && selectedThread.projectId !== id ? null : state.selectedThreadId,
+            // Picking a project moves focus off the epic view.
+            selectedEpicId: null,
           };
         }),
 
@@ -817,6 +1023,10 @@ export const useOrionStore = create<OrionState>()(
           return {
             selectedThreadId: id,
             selectedProjectId: thread?.projectId ?? state.selectedProjectId,
+            // Preserve epic context only for a thread that actually belongs to
+            // that epic. Selecting an unrelated (or missing) thread must not
+            // leave a stale epic view waiting behind it.
+            selectedEpicId: thread?.epicId ?? null,
           };
         }),
 
@@ -1108,6 +1318,12 @@ export const useOrionStore = create<OrionState>()(
         projects: state.projects,
         selectedProjectId: state.selectedProjectId,
         selectedThreadId: state.selectedThreadId,
+        epics: state.epics,
+        selectedEpicId: state.selectedEpicId,
+        epicsSettings: {
+          ...defaultEpicsSettings,
+          ...state.epicsSettings,
+        },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
         providerSettings: {
