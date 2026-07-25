@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, Sparkles, SquareKanban, X, Zap } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, Plus, Sparkles, SquareKanban, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Thread, useOrionStore } from '../store';
+import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type Thread, useOrionStore } from '../store';
 import { agentProviders } from '../agentCatalog';
+import { ProjectIcon } from './ProjectIcon';
 import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, formatTurnStats, PinnedRunStatus, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
 import { MarkdownBaseDirContext, MarkdownContent } from './markdown';
@@ -488,20 +489,118 @@ export const ChatMessage = React.memo(function ChatMessage({
 
 export const AgentsWelcome: React.FC<{
   projectName?: string | null;
-}> = ({ projectName }) => (
-  <div className="agents-welcome">
-    <div className="agents-welcome-icon">
-      <Sparkles size={26} />
+  /** When provided (and changing is allowed), the project name becomes a dropdown. */
+  projects?: Project[];
+  selectedProjectId?: string | null;
+  canChangeProject?: boolean;
+  onSelectProject?: (projectId: string) => void;
+  onAddProject?: () => void;
+}> = ({
+  projectName,
+  projects,
+  selectedProjectId,
+  canChangeProject,
+  onSelectProject,
+  onAddProject,
+}) => {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setPickerOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPickerOpen(false);
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [pickerOpen]);
+
+  const interactive =
+    !!canChangeProject && !!onSelectProject && (projects?.length ?? 0) > 0;
+
+  return (
+    <div className="agents-welcome">
+      <div className="agents-welcome-icon">
+        <Sparkles size={26} />
+      </div>
+      <h2>
+        What should we build in{' '}
+        {interactive ? (
+          <span className="agents-welcome-project" ref={pickerRef}>
+            <button
+              type="button"
+              className="agents-welcome-project-trigger"
+              onClick={() => setPickerOpen((open) => !open)}
+              aria-haspopup="menu"
+              aria-expanded={pickerOpen}
+              title="Change project"
+            >
+              <strong>{projectName ?? 'this project'}</strong>
+              <ChevronDown
+                size={18}
+                className={`agents-welcome-project-chevron ${pickerOpen ? 'open' : ''}`}
+              />
+            </button>
+            {pickerOpen && (
+              <div className="shell-project-picker agents-welcome-project-picker" role="menu">
+                {projects!.map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={`project-picker-item ${option.id === selectedProjectId ? 'selected' : ''}`}
+                    onClick={() => {
+                      setPickerOpen(false);
+                      onSelectProject!(option.id);
+                    }}
+                    title={option.path}
+                  >
+                    <ProjectIcon projectPath={option.path} size={13} />
+                    <span className="truncate">{option.name}</span>
+                    {option.id === selectedProjectId && <Check size={13} />}
+                  </button>
+                ))}
+                {onAddProject && (
+                  <>
+                    <div className="project-picker-divider" />
+                    <button
+                      type="button"
+                      className="project-picker-item"
+                      onClick={() => {
+                        setPickerOpen(false);
+                        onAddProject();
+                      }}
+                    >
+                      <Plus size={13} /> Add project
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </span>
+        ) : (
+          <strong>{projectName ?? 'this project'}</strong>
+        )}
+        ?
+      </h2>
     </div>
-    <h2>
-      What should we build in <strong>{projectName ?? 'this project'}</strong>?
-    </h2>
-  </div>
-);
+  );
+};
 
 export type ChatTranscriptProps = {
   threadId: string;
   projectName?: string | null;
+  /** Welcome-screen project dropdown (only used while the thread is empty). */
+  projects?: Project[];
+  canChangeProject?: boolean;
+  onSelectProject?: (projectId: string) => void;
+  onAddProject?: () => void;
   mediaBaseDirs: string[];
   isSending: boolean;
   steerSupported: boolean;
@@ -532,6 +631,10 @@ export type ChatTranscriptProps = {
 export const ChatTranscript = React.memo(function ChatTranscript({
   threadId,
   projectName,
+  projects,
+  canChangeProject,
+  onSelectProject,
+  onAddProject,
   mediaBaseDirs,
   isSending,
   steerSupported,
@@ -736,7 +839,16 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       <div className="chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll}>
         <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
           <div className="chat-container">
-            {thread.messages.length === 0 && <AgentsWelcome projectName={projectName} />}
+            {thread.messages.length === 0 && (
+              <AgentsWelcome
+                projectName={projectName}
+                projects={projects}
+                selectedProjectId={thread.projectId}
+                canChangeProject={canChangeProject}
+                onSelectProject={onSelectProject}
+                onAddProject={onAddProject}
+              />
+            )}
 
             {leadingBtwAsides.map(renderBtwAside)}
 

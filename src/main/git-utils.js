@@ -302,10 +302,16 @@ export const commandSucceeds = async (command, args) => {
 export const getCurrentGitBranch = async (gitRoot) => {
   const { stdout } = await execFileAsync('git', ['-C', gitRoot, 'branch', '--show-current']);
   const branch = stdout.trim();
-  if (branch) return branch;
+  return branch || null;
+};
 
-  const rev = await execFileAsync('git', ['-C', gitRoot, 'rev-parse', '--short', 'HEAD']);
-  return rev.stdout.trim();
+const getDetachedGitHead = async (gitRoot) => {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', gitRoot, 'rev-parse', '--short', 'HEAD']);
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
 };
 
 export const readGitBranches = async (gitRoot, currentBranch) => {
@@ -359,11 +365,13 @@ export const getGitStateForPath = async (projectPath) => {
     readGitAheadBehind(gitRoot),
   ]);
   const branches = await readGitBranches(gitRoot, currentBranch);
+  const detachedHead = currentBranch === null ? await getDetachedGitHead(gitRoot) : null;
 
   return {
     ok: true,
     root: gitRoot,
     currentBranch,
+    detachedHead,
     branches,
     hasUncommittedChanges: entries.length > 0,
     ...aheadBehind,

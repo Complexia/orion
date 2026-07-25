@@ -8,6 +8,7 @@ import {
   Code2,
   GitBranch,
   GitCommit,
+  GitPullRequest,
   ChevronDown,
   ChevronRight,
   Ellipsis,
@@ -65,6 +66,7 @@ import {
   defaultProviderSettings,
   defaultOrchestrationSettings,
   defaultNotificationSettings,
+  defaultItemsSettings,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -78,6 +80,7 @@ import {
   type Thread,
   type ThreadGoal,
   type TurnTokenStats,
+  type WorkItem,
 } from './store';
 import { Toaster, toast } from 'sonner';
 import {
@@ -137,13 +140,17 @@ type GitBranchInfo = {
 type GitRepoState = {
   ok: boolean;
   root?: string;
-  currentBranch?: string;
+  currentBranch?: string | null;
+  detachedHead?: string | null;
   branches: GitBranchInfo[];
   hasUncommittedChanges: boolean;
   ahead?: number;
   behind?: number;
   error?: string;
 };
+
+const normalizeRepositoryPath = (value: string) =>
+  value.replace(/\\/g, '/').replace(/\/+$/, '');
 
 type ProviderUpdateItem = {
   id: string;
@@ -206,6 +213,18 @@ type SettingsTab =
 
 const THREADS_VISIBLE_LIMIT = 5;
 
+// Cheap models preferred for the hidden item commit/PR-message turns when the
+// user hasn't picked one in Settings, best value first. Falls through to any
+// available model.
+const ITEM_MESSAGE_MODEL_PREFERENCE = [
+  'claude:claude-haiku-4-5',
+  'codex:gpt-5.4-mini',
+  'codex:gpt-5.3-codex-spark',
+  'grok:grok-composer-2.5-fast',
+  'cursor:composer-2.5-fast',
+  'kimi:kimi-code/kimi-for-coding-highspeed',
+];
+
 // Keep the shell/sidebar subscription independent from transcript payloads.
 // A token chunk replaces a Thread object, but none of these metadata fields,
 // so useShallow keeps App asleep while ChatTranscript handles the update.
@@ -234,6 +253,7 @@ const threadShellSignature = (thread: Thread): string => {
     thread.unpinnedAt,
     thread.parentThreadId,
     thread.branchedFromThreadId,
+    thread.itemId,
     thread.spawnId,
     thread.terminalActivityAt,
     thread.messages.length,
@@ -252,6 +272,49 @@ const threadShellSignature = (thread: Thread): string => {
   return signature;
 };
 
+// The item-view description draft stays local while typing: every store write
+// rebuilds `items`, re-renders the whole shell, and re-serializes the persisted
+// state, so committing per keystroke would tax typing latency for no benefit.
+// Commits happen on blur, on a short idle debounce, and on unmount (which
+// covers switching items — the caller keys this component by item id).
+const ItemDescriptionEditor: React.FC<{
+  itemId: string;
+  initialValue: string;
+  onCommit: (itemId: string, description: string) => void;
+}> = ({ itemId, initialValue, onCommit }) => {
+  const [draft, setDraft] = useState(initialValue);
+  const latestRef = useRef({ itemId, draft, initialValue, onCommit });
+  latestRef.current = { itemId, draft, initialValue, onCommit };
+  const commitTimerRef = useRef<number | null>(null);
+
+  const flush = useCallback(() => {
+    if (commitTimerRef.current !== null) {
+      window.clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
+    const latest = latestRef.current;
+    if (latest.draft !== latest.initialValue) latest.onCommit(latest.itemId, latest.draft);
+  }, []);
+
+  useEffect(() => flush, [flush]);
+
+  return (
+    <textarea
+      id="item-description"
+      className="item-view-description"
+      value={draft}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+        commitTimerRef.current = window.setTimeout(flush, 400);
+      }}
+      onBlur={flush}
+      placeholder="Add notes for this item…"
+      rows={4}
+    />
+  );
+};
+
 const App: React.FC = () => {
   const {
     activeTab,
@@ -259,9 +322,20 @@ const App: React.FC = () => {
     projects,
     selectedProjectId,
     selectedThreadId,
+    items,
+    selectedItemId,
+    itemsSettings,
     addProject,
     removeProject,
     renameProject,
+    addItem,
+    renameItem,
+    updateItem,
+    deleteItem,
+    settleItem,
+    unsettleItem,
+    selectItem,
+    setItemsSettings,
     createThread,
     branchThread,
     selectProject,
@@ -301,9 +375,20 @@ const App: React.FC = () => {
       projects: state.projects,
       selectedProjectId: state.selectedProjectId,
       selectedThreadId: state.selectedThreadId,
+      items: state.items,
+      selectedItemId: state.selectedItemId,
+      itemsSettings: state.itemsSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
+      addItem: state.addItem,
+      renameItem: state.renameItem,
+      updateItem: state.updateItem,
+      deleteItem: state.deleteItem,
+      settleItem: state.settleItem,
+      unsettleItem: state.unsettleItem,
+      selectItem: state.selectItem,
+      setItemsSettings: state.setItemsSettings,
       createThread: state.createThread,
       branchThread: state.branchThread,
       selectProject: state.selectProject,
@@ -436,6 +521,24 @@ const App: React.FC = () => {
   const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
   const [pinnedAgentsOpen, setPinnedAgentsOpen] = useState(true);
   const [pinnedAgentsShowAll, setPinnedAgentsShowAll] = useState(false);
+  const [itemsSectionOpen, setItemsSectionOpen] = useState(true);
+  const [collapsedItems, setCollapsedItems] = useState<Record<string, boolean>>({});
+  // Create-item modal (title + optional description).
+  const [createItemOpen, setCreateItemOpen] = useState(false);
+  const [newItemName, setNewItemName] = useState('');
+  const [newItemDescription, setNewItemDescription] = useState('');
+  const createItemTitleRef = useRef<HTMLInputElement>(null);
+  const [itemMenuOpenId, setItemMenuOpenId] = useState<string | null>(null);
+  const [itemRenameId, setItemRenameId] = useState<string | null>(null);
+  // One item git action (commit/PR) at a time; the item view's buttons disable
+  // while it runs.
+  const [itemGitBusy, setItemGitBusy] = useState<'commit' | 'pr' | null>(null);
+  const repositoryOperationBusy = gitBusy || cloudBusy || itemGitBusy !== null;
+  useEffect(() => {
+    if (!repositoryOperationBusy) return;
+    setProjectPickerOpen(false);
+    setBranchPickerOpen(false);
+  }, [repositoryOperationBusy]);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
@@ -462,6 +565,7 @@ const App: React.FC = () => {
   const goalMenuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const threadItemMenuRef = useRef<HTMLDivElement>(null);
+  const itemMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
   // Startup IPC resolves long before a normal turn ends. Retain its result for
   // a short grace window so a steer whose stop lands just after startup failed
@@ -585,7 +689,12 @@ const App: React.FC = () => {
     projects.find((project) => project.id === latestThreadProjectId) ??
     projects[0] ??
     null;
-  const activeThreadProject = selectedThreadProject ?? defaultNewThreadProject;
+  // The store retargets selectedProjectId to an item's repository. Do not
+  // apply the generic new-thread fallback while an item is selected: an
+  // unbound item must leave repository controls hidden instead of exposing a
+  // stale project.
+  const activeThreadProject =
+    selectedThreadProject ?? (selectedItemId ? selectedProject : defaultNewThreadProject);
 
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
@@ -956,6 +1065,118 @@ const App: React.FC = () => {
     },
     [childThreadIds, threads]
   );
+
+  const itemsEnabled = itemsSettings?.enabled ?? defaultItemsSettings.enabled;
+
+  const activeItems = useMemo(() => items.filter((item) => !item.settledAt), [items]);
+
+  const archivedItems = useMemo(
+    () =>
+      items
+        .filter((item) => item.settledAt)
+        .sort(
+          (a, b) => new Date(b.settledAt ?? 0).getTime() - new Date(a.settledAt ?? 0).getTime()
+        ),
+    [items]
+  );
+
+  const threadsByItem = useMemo(() => {
+    const grouped = new Map<string, Thread[]>();
+    // No Items UI renders while the feature is off, so skip the grouping work.
+    if (!itemsEnabled) return grouped;
+    for (const thread of threads) {
+      // Top-level rows only; children render nested under their parent.
+      if (!thread.itemId || childThreadIds.has(thread.id)) continue;
+      const itemThreads = grouped.get(thread.itemId);
+      if (itemThreads) itemThreads.push(thread);
+      else grouped.set(thread.itemId, [thread]);
+    }
+    for (const itemThreads of grouped.values()) {
+      itemThreads.sort(
+        (a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
+      );
+    }
+    return grouped;
+  }, [childThreadIds, itemsEnabled, threads]);
+
+  const projectForGitRoot = useCallback(
+    (gitRoot: string | undefined) => {
+      if (!gitRoot) return null;
+      const normalizedRoot = normalizeRepositoryPath(gitRoot);
+      return (
+        projects.find((project) => {
+          const normalizedProjectPath = normalizeRepositoryPath(project.path);
+          return (
+            normalizedProjectPath === normalizedRoot ||
+            normalizedProjectPath.startsWith(`${normalizedRoot}/`)
+          );
+        }) ?? null
+      );
+    },
+    [projects]
+  );
+
+  // A claimed item must stay bound to its claimed repository. If that
+  // repository was removed from Orion, return null instead of silently
+  // redirecting new work into another project.
+  const projectForItem = useCallback(
+    (item: WorkItem) => {
+      const selectedRepository = item.repositoryProjectId
+        ? projects.find((project) => project.id === item.repositoryProjectId)
+        : null;
+      if (selectedRepository) return selectedRepository;
+
+      if (item.gitRoot) return projectForGitRoot(item.gitRoot);
+
+      const lastThread = threadsByItem.get(item.id)?.[0];
+      const lastProject = lastThread
+        ? projects.find((p) => p.id === lastThread.projectId)
+        : undefined;
+      return lastProject ?? defaultNewThreadProject ?? projects[0] ?? null;
+    },
+    [defaultNewThreadProject, projectForGitRoot, projects, threadsByItem]
+  );
+
+  const selectedItem = itemsEnabled
+    ? items.find((item) => item.id === selectedItemId) ?? null
+    : null;
+  const selectedItemThreads = selectedItem ? threadsByItem.get(selectedItem.id) ?? [] : [];
+  const selectedItemRepositoryProject = selectedItem?.repositoryProjectId
+    ? projects.find((project) => project.id === selectedItem.repositoryProjectId) ?? null
+    : null;
+  const selectedItemClaimedProject = selectedItem
+    ? projectForGitRoot(selectedItem.gitRoot)
+    : null;
+
+  // The model that writes item commit/PR messages: the Settings pick when it's
+  // installed and its provider is enabled, else the cheapest enabled model.
+  const resolveItemMessageModelId = useCallback(() => {
+    const isUsable = (id: string | null | undefined): id is string => {
+      if (!id || isOrionModelId(id) || id === claudeCodeCliModelId) return false;
+      const model = agentModels.find((candidate) => candidate.id === id);
+      return (
+        !!model &&
+        model.providerId !== 'opencode' &&
+        model.available !== false &&
+        enabledProviderIdSet.has(model.providerId)
+      );
+    };
+    const preferred = itemsSettings?.commitModelId ?? null;
+    if (isUsable(preferred)) return preferred;
+    for (const id of ITEM_MESSAGE_MODEL_PREFERENCE) {
+      if (isUsable(id)) return id;
+    }
+    return (
+      agentModels.find(
+        (model) =>
+          model.available !== false &&
+          model.providerId !== 'opencode' &&
+          enabledProviderIdSet.has(model.providerId) &&
+          !isOrionModelId(model.id) &&
+          model.id !== claudeCodeCliModelId
+      )?.id ?? null
+    );
+  }, [agentModels, enabledProviderIdSet, itemsSettings?.commitModelId]);
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
     try {
@@ -1446,7 +1667,8 @@ const App: React.FC = () => {
       !goalMenuOpen &&
       !openWithOpen &&
       projectMenuOpenId === null &&
-      threadItemMenuKey === null
+      threadItemMenuKey === null &&
+      itemMenuOpenId === null
     ) return undefined;
 
     const handlePointerDown = (event: MouseEvent) => {
@@ -1475,6 +1697,9 @@ const App: React.FC = () => {
       if (threadItemMenuKey !== null && !threadItemMenuRef.current?.contains(target)) {
         setThreadItemMenuKey(null);
       }
+      if (itemMenuOpenId !== null && !itemMenuRef.current?.contains(target)) {
+        setItemMenuOpenId(null);
+      }
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1487,6 +1712,7 @@ const App: React.FC = () => {
         setOpenWithOpen(false);
         setProjectMenuOpenId(null);
         setThreadItemMenuKey(null);
+        setItemMenuOpenId(null);
       }
     };
 
@@ -1496,7 +1722,7 @@ const App: React.FC = () => {
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, goalMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey]);
+  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, goalMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey, itemMenuOpenId]);
 
   useEffect(() => {
     setThreadMenuOpen(false);
@@ -2329,22 +2555,44 @@ const App: React.FC = () => {
     refreshTree();
   };
 
-  // Add a project
-  const handleAddProject = async () => {
-    if (!window.orion) return;
-    const dir = await window.orion.openDirectory();
-    if (!dir) return;
+  // Add a project. Keep this stable because it crosses the memoized transcript
+  // boundary and App also renders on every composer edit.
+  const handleAddProject = useCallback(
+    async (options?: { createInitialThread?: boolean; expectedGitRoot?: string }) => {
+      if (!window.orion || repositoryOperationBusy) return;
+      const dir = await window.orion.openDirectory();
+      if (!dir) return;
 
-    const name = await window.orion.basename(dir);
-    const projectId = addProject({ name, path: dir });
+      if (options?.expectedGitRoot) {
+        const selectedRepository = await window.orion.getGitState(dir);
+        const selectedRoot = selectedRepository.ok ? selectedRepository.root : undefined;
+        if (
+          !selectedRoot ||
+          normalizeRepositoryPath(selectedRoot) !==
+            normalizeRepositoryPath(options.expectedGitRoot)
+        ) {
+          toast.error('That folder belongs to a different repository', {
+            description: `Select ${options.expectedGitRoot}`,
+          });
+          return;
+        }
+      }
 
-    // Also set workspace to this project
-    setWorkspacePath(dir);
+      const name = await window.orion.basename(dir);
+      const projectId = addProject({ name, path: dir });
 
-    // Adding a project means the user wants to work in it now — drop them
-    // straight into a fresh thread for it.
-    handleCreateThread(projectId);
-  };
+      // Also set workspace to this project
+      setWorkspacePath(dir);
+
+      // Adding a project means the user wants to work in it now — drop them
+      // straight into a fresh thread for it unless a caller needs to attach its
+      // own thread metadata first.
+      if (options?.createInitialThread !== false) createThread(projectId);
+      setActiveTab('agents');
+      return projectId;
+    },
+    [addProject, createThread, repositoryOperationBusy, setActiveTab, setWorkspacePath]
+  );
 
   // Open folder directly for code tab
   const handleOpenFolderForCode = async () => {
@@ -2376,29 +2624,50 @@ const App: React.FC = () => {
     handleCreateThread(projectId);
   };
 
-  const handleChangeSelectedThreadProject = (projectId: string) => {
-    const project = projects.find((candidate) => candidate.id === projectId);
-    if (!project) return;
+  const handleChangeSelectedThreadProject = useCallback(
+    (projectId: string) => {
+      if (repositoryOperationBusy) return;
+      const project = projects.find((candidate) => candidate.id === projectId);
+      if (!project) return;
 
-    if (!selectedThread) {
+      // Read the thread at call time instead of depending on the Thread
+      // object: its identity churns with every shell-signature change, and a
+      // churning callback would break ChatTranscript's memo boundary.
+      const thread = useOrionStore
+        .getState()
+        .threads.find((candidate) => candidate.id === selectedThreadId);
+      if (!thread) {
+        selectProject(projectId);
+        setProjectPickerOpen(false);
+        return;
+      }
+
+      if (!canChangeSelectedThreadProject) {
+        toast.error('Project can only be changed before the agent runs in this thread');
+        setProjectPickerOpen(false);
+        return;
+      }
+
+      updateThread(thread.id, { projectId });
       selectProject(projectId);
       setProjectPickerOpen(false);
-      return;
-    }
-
-    if (!canChangeSelectedThreadProject) {
-      toast.error('Project can only be changed before the agent runs in this thread');
-      setProjectPickerOpen(false);
-      return;
-    }
-
-    updateThread(selectedThread.id, { projectId });
-    selectProject(projectId);
-    setProjectPickerOpen(false);
-  };
+    },
+    [
+      canChangeSelectedThreadProject,
+      projects,
+      repositoryOperationBusy,
+      selectProject,
+      selectedThreadId,
+      updateThread,
+    ]
+  );
 
   const handleCheckoutBranch = async (branchName: string) => {
-    if (!activeThreadProject?.path || !window.orion?.checkoutGitBranch || gitBusy) return;
+    if (
+      !activeThreadProject?.path ||
+      !window.orion?.checkoutGitBranch ||
+      repositoryOperationBusy
+    ) return;
     if (gitState?.hasUncommittedChanges) {
       toast.error('Commit or discard local changes before checking out another branch');
       return;
@@ -2423,7 +2692,11 @@ const App: React.FC = () => {
   };
 
   const handleCreateBranch = async (branchName: string) => {
-    if (!activeThreadProject?.path || !window.orion?.checkoutGitBranch || gitBusy) return;
+    if (
+      !activeThreadProject?.path ||
+      !window.orion?.checkoutGitBranch ||
+      repositoryOperationBusy
+    ) return;
 
     const normalized = branchName.trim();
     if (!normalized) return;
@@ -2448,7 +2721,11 @@ const App: React.FC = () => {
   };
 
   const handleCommitAndPush = async () => {
-    if (!activeThreadProject?.path || !window.orion?.commitAndPush || gitBusy) return;
+    if (
+      !activeThreadProject?.path ||
+      !window.orion?.commitAndPush ||
+      repositoryOperationBusy
+    ) return;
 
     setGitBusy(true);
     try {
@@ -2465,7 +2742,11 @@ const App: React.FC = () => {
   };
 
   const handleCloudPublish = async () => {
-    if (!activeThreadProject?.path || !window.orion?.publishToCloud || cloudBusy) return;
+    if (
+      !activeThreadProject?.path ||
+      !window.orion?.publishToCloud ||
+      repositoryOperationBusy
+    ) return;
 
     setCloudBusy(true);
     try {
@@ -2495,7 +2776,11 @@ const App: React.FC = () => {
   };
 
   const handleCloudPush = async () => {
-    if (!activeThreadProject?.path || !window.orion?.pushToCloud || cloudBusy) return;
+    if (
+      !activeThreadProject?.path ||
+      !window.orion?.pushToCloud ||
+      repositoryOperationBusy
+    ) return;
 
     setCloudBusy(true);
     try {
@@ -2528,7 +2813,11 @@ const App: React.FC = () => {
   };
 
   const handleCloudPull = async () => {
-    if (!activeThreadProject?.path || !window.orion?.pullFromCloud || cloudBusy) return;
+    if (
+      !activeThreadProject?.path ||
+      !window.orion?.pullFromCloud ||
+      repositoryOperationBusy
+    ) return;
 
     setCloudBusy(true);
     try {
@@ -2578,6 +2867,192 @@ const App: React.FC = () => {
     const id = createThread(projectId);
     setActiveTab('agents');
     return id;
+  };
+
+  const openCreateItemModal = useCallback(() => {
+    setNewItemName('');
+    setNewItemDescription('');
+    setItemsSectionOpen(true);
+    setCreateItemOpen(true);
+  }, []);
+
+  const closeCreateItemModal = useCallback(() => {
+    setCreateItemOpen(false);
+    setNewItemName('');
+    setNewItemDescription('');
+  }, []);
+
+  const handleCreateItem = useCallback(() => {
+    const trimmed = newItemName.trim();
+    if (!trimmed) return;
+    const description = newItemDescription.trim();
+    addItem(trimmed, description ? { description } : undefined);
+    closeCreateItemModal();
+    setActiveTab('agents');
+  }, [addItem, closeCreateItemModal, newItemDescription, newItemName, setActiveTab]);
+
+  useEffect(() => {
+    if (!createItemOpen) return;
+    const id = window.setTimeout(() => createItemTitleRef.current?.focus(), 0);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeCreateItemModal();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.clearTimeout(id);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [closeCreateItemModal, createItemOpen]);
+
+  const handleCreateThreadForItem = async (item: WorkItem) => {
+    const project = projectForItem(item);
+    let projectId = project?.id;
+    if (!project) {
+      if (item.gitRoot) {
+        toast.info('Select the claimed repository to re-add it to Orion', {
+          description: item.gitRoot,
+        });
+      }
+      projectId = await handleAddProject({
+        createInitialThread: false,
+        expectedGitRoot: item.gitRoot,
+      });
+      if (!projectId) return;
+    }
+    setCollapsedItems((prev) => (prev[item.id] ? { ...prev, [item.id]: false } : prev));
+    // Same anti-spam rule as handleCreateThread: reuse an untouched draft
+    // thread already under this item.
+    if (
+      selectedThread &&
+      selectedThread.itemId === item.id &&
+      selectedThread.projectId === projectId &&
+      selectedThread.modelId !== claudeCodeCliModelId &&
+      selectedThread.messages.length === 0 &&
+      !chatInput.trim() &&
+      chatAttachments.length === 0
+    ) {
+      setActiveTab('agents');
+      return selectedThread.id;
+    }
+    const id = createThread(projectId, undefined, { itemId: item.id });
+    setActiveTab('agents');
+    return id;
+  };
+
+  const handleItemCommitAndPush = async (item: WorkItem) => {
+    if (repositoryOperationBusy || !window.orion?.itemCommitAndPush) return;
+    const project = item.repositoryProjectId
+      ? projects.find((candidate) => candidate.id === item.repositoryProjectId) ?? null
+      : null;
+    const projectPath = item.gitRoot ?? project?.path;
+    if (!projectPath) {
+      toast.error('Select a repository for this item before committing');
+      return;
+    }
+
+    setItemGitBusy('commit');
+    try {
+      const result = await window.orion.itemCommitAndPush({
+        projectPath,
+        modelId: resolveItemMessageModelId(),
+        itemName: item.name,
+        expectedGitRoot: item.gitRoot,
+        expectedBranch: item.gitBranch,
+        claimedBranches: items
+          .filter((candidate) => candidate.id !== item.id && candidate.gitRoot && candidate.gitBranch)
+          .map((candidate) => ({
+            gitRoot: candidate.gitRoot!,
+            branch: candidate.gitBranch!,
+            itemName: candidate.name,
+          })),
+      });
+      if (result.gitRoot && result.branch) {
+        // Claim the validated target even if a later commit hook or push fails,
+        // so another item cannot reuse the branch on the next attempt.
+        updateItem(item.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
+      }
+      if (result.ok) {
+        toast.success(`Committed and pushed ${result.branch ?? 'branch'}`, {
+          description: result.message?.split('\n')[0],
+        });
+        if (project && activeThreadProject?.id === project.id) await refreshGitState();
+      } else {
+        toast.error(result.error ?? 'Commit and push failed');
+      }
+    } finally {
+      setItemGitBusy(null);
+    }
+  };
+
+  const handleItemCreatePr = async (item: WorkItem) => {
+    if (repositoryOperationBusy || !window.orion?.itemCreatePr) return;
+    const project = item.repositoryProjectId
+      ? projects.find((candidate) => candidate.id === item.repositoryProjectId) ?? null
+      : null;
+    const projectPath = item.gitRoot ?? project?.path;
+    if (!projectPath) {
+      toast.error('Select a repository for this item before opening a PR');
+      return;
+    }
+
+    setItemGitBusy('pr');
+    try {
+      const result = await window.orion.itemCreatePr({
+        projectPath,
+        modelId: resolveItemMessageModelId(),
+        itemName: item.name,
+        expectedGitRoot: item.gitRoot,
+        expectedBranch: item.gitBranch,
+        claimedBranches: items
+          .filter((candidate) => candidate.id !== item.id && candidate.gitRoot && candidate.gitBranch)
+          .map((candidate) => ({
+            gitRoot: candidate.gitRoot!,
+            branch: candidate.gitBranch!,
+            itemName: candidate.name,
+          })),
+      });
+      if (result.gitRoot && result.branch) {
+        updateItem(item.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
+      }
+      if (result.ok) {
+        const url = result.url;
+        updateItem(item.id, {
+          ...(url ? { prUrl: url } : {}),
+        });
+        toast.success(
+          result.alreadyExists
+            ? 'A pull request for this branch is already open'
+            : 'Pull request opened',
+          url
+            ? {
+                action: {
+                  label: 'Open',
+                  onClick: () => void window.orion?.openExternalUrl?.(url),
+                },
+              }
+            : undefined
+        );
+      } else {
+        toast.error(result.error ?? 'Could not open a pull request');
+      }
+    } finally {
+      setItemGitBusy(null);
+    }
+  };
+
+  const handleSettleItem = (item: WorkItem) => {
+    if (
+      !confirm(
+        `Settle "${item.name}"? It moves to the archive (Settings → General); its threads stay in Recent agents and their projects.`
+      )
+    ) {
+      return;
+    }
+    settleItem(item.id);
+    toast.success(`Settled ${item.name}`);
   };
 
   const attachMediaFiles = useCallback(
@@ -3045,14 +3520,14 @@ const App: React.FC = () => {
         request.title ||
         (roleMeta ? `${roleMeta.label}: ${promptSlice}` : `${model.label}: ${promptSlice}`);
 
-      // createThread selects the new thread; put the user's selection back so
-      // a background spawn never yanks the UI away from their current thread.
-      const prevThreadId = state.selectedThreadId;
-      const prevProjectId = state.selectedProjectId;
+      // Background spawn: never touch the user's selection (thread, project,
+      // or item view) — restoring it after the fact loses the item overview,
+      // which no selection field of a thread spawn round-trips.
       const childThreadId = state.createThread(projectId, title, {
         parentThreadId: request.threadId,
         modelId: model.id,
         hiddenFromRecent: true,
+        select: false,
         // Persisted on the thread so stop/delete/reload can still resolve the
         // driver's blocked spawn_subagent call.
         spawnId: request.spawnId,
@@ -3060,12 +3535,6 @@ const App: React.FC = () => {
         // whatever an unrelated project thread last used.
         accessMode: request.accessMode ?? driverThread.accessMode,
       });
-      if (prevThreadId) {
-        state.selectThread(prevThreadId);
-      } else {
-        state.selectThread(null);
-        state.selectProject(prevProjectId);
-      }
 
       // The spawnId was persisted at creation so the completion watcher can't
       // miss a fast run. Async start failures set the thread status to
@@ -4851,17 +5320,23 @@ const App: React.FC = () => {
                     type="button"
                     className="shell-project-trigger"
                     onClick={() => {
+                      if (repositoryOperationBusy) return;
                       if (selectedThread && !canChangeSelectedThreadProject) return;
                       setProjectPickerOpen((open) => !open);
                     }}
-                    disabled={!!selectedThread && !canChangeSelectedThreadProject}
+                    disabled={
+                      repositoryOperationBusy ||
+                      (!!selectedThread && !canChangeSelectedThreadProject)
+                    }
                     title={
-                      selectedThread && !canChangeSelectedThreadProject
-                        ? 'Project is locked after an agent runs'
-                        : activeThreadProject.path
+                      repositoryOperationBusy
+                        ? 'Repository operation in progress'
+                        : selectedThread && !canChangeSelectedThreadProject
+                          ? 'Project is locked after an agent runs'
+                          : activeThreadProject.path
                     }
                     aria-haspopup="menu"
-                    aria-expanded={projectPickerOpen}
+                    aria-expanded={projectPickerOpen && !repositoryOperationBusy}
                   >
                     <ProjectIcon projectPath={activeThreadProject.path} size={14} />
                     <span className="truncate">{activeThreadProject.name}</span>
@@ -4872,48 +5347,50 @@ const App: React.FC = () => {
                       />
                     )}
                   </button>
-                  {projectPickerOpen && (!selectedThread || canChangeSelectedThreadProject) && (
-                    <div className="shell-project-picker" role="menu">
-                      {projects.map((option) => (
-                        <button
-                          key={option.id}
-                          type="button"
-                          className={`project-picker-item ${option.id === activeThreadProject.id ? 'selected' : ''}`}
-                          onClick={() => handleChangeSelectedThreadProject(option.id)}
-                          title={option.path}
-                        >
-                          <ProjectIcon projectPath={option.path} size={13} />
-                          <span className="truncate">{option.name}</span>
-                          {option.id === activeThreadProject.id && <Check size={13} />}
-                        </button>
-                      ))}
-                      <div className="project-picker-divider" />
-                      <button
-                        type="button"
-                        className="project-picker-item"
-                        onClick={() => {
-                          setProjectPickerOpen(false);
-                          void handleAddProject();
-                        }}
-                      >
-                        <Plus size={13} /> Add project
-                      </button>
-                      {activeThreadProject && projects.length > 1 && (
+                  {projectPickerOpen &&
+                    !repositoryOperationBusy &&
+                    (!selectedThread || canChangeSelectedThreadProject) && (
+                      <div className="shell-project-picker" role="menu">
+                        {projects.map((option) => (
+                          <button
+                            key={option.id}
+                            type="button"
+                            className={`project-picker-item ${option.id === activeThreadProject.id ? 'selected' : ''}`}
+                            onClick={() => handleChangeSelectedThreadProject(option.id)}
+                            title={option.path}
+                          >
+                            <ProjectIcon projectPath={option.path} size={13} />
+                            <span className="truncate">{option.name}</span>
+                            {option.id === activeThreadProject.id && <Check size={13} />}
+                          </button>
+                        ))}
+                        <div className="project-picker-divider" />
                         <button
                           type="button"
-                          className="project-picker-item danger"
+                          className="project-picker-item"
                           onClick={() => {
                             setProjectPickerOpen(false);
-                            if (confirm(`Remove project "${activeThreadProject.name}"?`)) {
-                              void removeProjectWithRuntimes(activeThreadProject.id);
-                            }
+                            void handleAddProject();
                           }}
                         >
-                          <Trash2 size={13} /> Remove project
+                          <Plus size={13} /> Add project
                         </button>
-                      )}
-                    </div>
-                  )}
+                        {activeThreadProject && projects.length > 1 && (
+                          <button
+                            type="button"
+                            className="project-picker-item danger"
+                            onClick={() => {
+                              setProjectPickerOpen(false);
+                              if (confirm(`Remove project "${activeThreadProject.name}"?`)) {
+                                void removeProjectWithRuntimes(activeThreadProject.id);
+                              }
+                            }}
+                          >
+                            <Trash2 size={13} /> Remove project
+                          </button>
+                        )}
+                      </div>
+                    )}
                 </div>
 
                 <div className="shell-branch-control" ref={branchPickerRef}>
@@ -4921,21 +5398,26 @@ const App: React.FC = () => {
                     type="button"
                     className="shell-branch-trigger"
                     onClick={() => setBranchPickerOpen((open) => !open)}
-                    disabled={gitLoading || gitBusy || !gitState?.ok}
+                    disabled={gitLoading || repositoryOperationBusy || !gitState?.ok}
                     title={gitState?.error ?? gitState?.root ?? 'Git state'}
                     aria-haspopup="menu"
-                    aria-expanded={branchPickerOpen}
+                    aria-expanded={branchPickerOpen && !repositoryOperationBusy}
                   >
                     <GitBranch size={14} />
                     <span className="truncate">
-                      {gitLoading ? 'Git...' : gitState?.currentBranch ?? 'No Git'}
+                      {gitLoading
+                        ? 'Git...'
+                        : gitState?.currentBranch ??
+                          (gitState?.detachedHead
+                            ? `Detached @ ${gitState.detachedHead}`
+                            : 'No Git')}
                     </span>
                     <ChevronDown
                       size={13}
                       className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`}
                     />
                   </button>
-                  {branchPickerOpen && (
+                  {branchPickerOpen && !repositoryOperationBusy && (
                     <div className="shell-branch-picker" role="menu">
                       {gitState?.hasUncommittedChanges && (
                         <div className="branch-picker-note">Commit local changes before switching branches.</div>
@@ -4946,7 +5428,11 @@ const App: React.FC = () => {
                           type="button"
                           className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
                           onClick={() => handleCheckoutBranch(branch.name)}
-                          disabled={branch.current || gitState.hasUncommittedChanges || gitBusy}
+                          disabled={
+                            branch.current ||
+                            gitState.hasUncommittedChanges ||
+                            repositoryOperationBusy
+                          }
                           title={
                             gitState.hasUncommittedChanges && !branch.current
                               ? 'Unavailable with uncommitted changes'
@@ -4980,7 +5466,7 @@ const App: React.FC = () => {
                           type="button"
                           className="branch-picker-item"
                           onClick={() => setCreatingBranch(true)}
-                          disabled={gitBusy || !gitState?.ok}
+                          disabled={repositoryOperationBusy || !gitState?.ok}
                         >
                           <Plus size={13} /> New branch
                         </button>
@@ -4992,7 +5478,9 @@ const App: React.FC = () => {
                           setBranchPickerOpen(false);
                           void handleCommitAndPush();
                         }}
-                        disabled={gitBusy || !gitState?.ok || !gitState.currentBranch}
+                        disabled={
+                          repositoryOperationBusy || !gitState?.ok || !gitState.currentBranch
+                        }
                         title="git add . && git commit && git push"
                       >
                         <GitCommit size={13} /> Commit and Push
@@ -5022,7 +5510,7 @@ const App: React.FC = () => {
                         void handleCloudPublish();
                       }
                     }}
-                    disabled={cloudBusy || gitBusy}
+                    disabled={repositoryOperationBusy}
                     title={
                       !cloudState.linked
                         ? 'Publish this repository to Orion Cloud'
@@ -5052,7 +5540,7 @@ const App: React.FC = () => {
                         cloudState.sync === 'behind' || cloudState.sync === 'diverged' ? 'attention' : ''
                       }`}
                       onClick={() => void handleCloudPull()}
-                      disabled={cloudBusy || gitBusy}
+                      disabled={repositoryOperationBusy}
                       title={
                         cloudState.sync === 'behind'
                           ? 'Orion Cloud has new changes — pull them'
@@ -5232,7 +5720,9 @@ const App: React.FC = () => {
               {settingsTab === 'cosmetics' && 'COSMETICS'}
             </div>
 
-            <div className="settings-panel">
+            <div
+              className={`settings-panel${settingsTab === 'general' ? ' settings-panel-grouped' : ''}`}
+            >
               {settingsTab === 'account' && (
                 <>
                   <div className="account-row">
@@ -5309,146 +5799,276 @@ const App: React.FC = () => {
 
               {settingsTab === 'general' && (
                 <>
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Theme</div>
-                      <div className="setting-label-desc">Choose how Orion looks across the app.</div>
+                  <div className="settings-group-label">Appearance</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Theme</div>
+                        <div className="setting-label-desc">Choose how Orion looks across the app.</div>
+                      </div>
+                      <select className="setting-select" defaultValue="system">
+                        <option value="system">System</option>
+                        <option value="dark">Dark</option>
+                        <option value="light">Light</option>
+                      </select>
                     </div>
-                    <select className="setting-select" defaultValue="system">
-                      <option value="system">System</option>
-                      <option value="dark">Dark</option>
-                      <option value="light">Light</option>
-                    </select>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Time format</div>
+                        <div className="setting-label-desc">System default follows your browser or OS clock preference.</div>
+                      </div>
+                      <select className="setting-select" defaultValue="system">
+                        <option value="system">System default</option>
+                        <option value="12h">12-hour</option>
+                        <option value="24h">24-hour</option>
+                      </select>
+                    </div>
                   </div>
 
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Time format</div>
-                      <div className="setting-label-desc">System default follows your browser or OS clock preference.</div>
+                  <div className="settings-group-label">Content</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Word wrap</div>
+                        <div className="setting-label-desc">Wrap long lines in code blocks, tables, diffs, and file previews by default.</div>
+                      </div>
+                      <label className="provider-toggle" title="Word wrap">
+                        <input type="checkbox" defaultChecked />
+                        <span />
+                      </label>
                     </div>
-                    <select className="setting-select" defaultValue="system">
-                      <option value="system">System default</option>
-                      <option value="12h">12-hour</option>
-                      <option value="24h">24-hour</option>
-                    </select>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Hide whitespace changes</div>
+                        <div className="setting-label-desc">Set whether the diff panel ignores whitespace-only edits by default.</div>
+                      </div>
+                      <label className="provider-toggle" title="Hide whitespace">
+                        <input type="checkbox" defaultChecked />
+                        <span />
+                      </label>
+                    </div>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Assistant output</div>
+                        <div className="setting-label-desc">Show token-by-token output while a response is in progress.</div>
+                      </div>
+                      <label className="provider-toggle" title="Assistant output">
+                        <input type="checkbox" />
+                        <span />
+                      </label>
+                    </div>
                   </div>
 
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Word wrap</div>
-                      <div className="setting-label-desc">Wrap long lines in code blocks, tables, diffs, and file previews by default.</div>
+                  <div className="settings-group-label">Notifications</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Thread notifications</div>
+                        <div className="setting-label-desc">Show a desktop notification when an agent thread finishes while you're looking elsewhere.</div>
+                      </div>
+                      <label className="provider-toggle" title="Thread notifications">
+                        <input
+                          type="checkbox"
+                          checked={notificationSettings?.enabled ?? true}
+                          onChange={(e) => setNotificationSettings({ enabled: e.target.checked })}
+                        />
+                        <span />
+                      </label>
                     </div>
-                    <label className="provider-toggle" title="Word wrap">
-                      <input type="checkbox" defaultChecked />
-                      <span />
-                    </label>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Notification sound</div>
+                        <div className="setting-label-desc">Play the system sound with thread-finished notifications.</div>
+                      </div>
+                      <label className="provider-toggle" title="Notification sound">
+                        <input
+                          type="checkbox"
+                          checked={notificationSettings?.sound ?? true}
+                          disabled={!(notificationSettings?.enabled ?? true)}
+                          onChange={(e) => setNotificationSettings({ sound: e.target.checked })}
+                        />
+                        <span />
+                      </label>
+                    </div>
                   </div>
 
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Hide whitespace changes</div>
-                      <div className="setting-label-desc">Set whether the diff panel ignores whitespace-only edits by default.</div>
+                  <div className="settings-group-label">Threads</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">New threads</div>
+                        <div className="setting-label-desc">Pick the default workspace mode for newly created draft threads.</div>
+                      </div>
+                      <select className="setting-select" defaultValue="local">
+                        <option value="local">Local</option>
+                        <option value="remote">Remote</option>
+                      </select>
                     </div>
-                    <label className="provider-toggle" title="Hide whitespace">
-                      <input type="checkbox" defaultChecked />
-                      <span />
-                    </label>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Archive confirmation</div>
+                        <div className="setting-label-desc">Require a second click on the inline archive action before a thread is archived.</div>
+                      </div>
+                      <label className="provider-toggle" title="Archive confirmation">
+                        <input type="checkbox" />
+                        <span />
+                      </label>
+                    </div>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Delete confirmation</div>
+                        <div className="setting-label-desc">Ask before deleting a thread and its chat history.</div>
+                      </div>
+                      <label className="provider-toggle" title="Delete confirmation">
+                        <input type="checkbox" defaultChecked />
+                        <span />
+                      </label>
+                    </div>
                   </div>
 
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Assistant output</div>
-                      <div className="setting-label-desc">Show token-by-token output while a response is in progress.</div>
+                  <div className="settings-group-label">Providers</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Provider update checks</div>
+                        <div className="setting-label-desc">Check installed provider CLIs for newer available versions.</div>
+                      </div>
+                      <label className="provider-toggle" title="Provider update checks">
+                        <input type="checkbox" defaultChecked />
+                        <span />
+                      </label>
                     </div>
-                    <label className="provider-toggle" title="Assistant output">
-                      <input type="checkbox" />
-                      <span />
-                    </label>
                   </div>
 
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Thread notifications</div>
-                      <div className="setting-label-desc">Show a desktop notification when an agent thread finishes while you're looking elsewhere.</div>
+                  <div className="settings-group-label">Items</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Items section</div>
+                        <div className="setting-label-desc">
+                          Show Items in the sidebar — big-ticket tasks that group threads and can
+                          commit, push, and open PRs for the work as a whole.
+                        </div>
+                      </div>
+                      <label className="provider-toggle" title="Items section">
+                        <input
+                          type="checkbox"
+                          checked={itemsEnabled}
+                          onChange={(e) => setItemsSettings({ enabled: e.target.checked })}
+                        />
+                        <span />
+                      </label>
                     </div>
-                    <label className="provider-toggle" title="Thread notifications">
-                      <input
-                        type="checkbox"
-                        checked={notificationSettings?.enabled ?? true}
-                        onChange={(e) => setNotificationSettings({ enabled: e.target.checked })}
-                      />
-                      <span />
-                    </label>
+
+                    {itemsEnabled && (
+                      <div className="setting-row">
+                        <div className="setting-label">
+                          <div className="setting-label-title">Commit & PR message model</div>
+                          <div className="setting-label-desc">
+                            Writes an item's commit messages from staged changes and its PR
+                            descriptions from branch changes. Auto picks the cheapest enabled model.
+                          </div>
+                        </div>
+                        <select
+                          className="setting-select"
+                          value={itemsSettings?.commitModelId ?? ''}
+                          onChange={(e) =>
+                            setItemsSettings({ commitModelId: e.target.value || null })
+                          }
+                        >
+                          <option value="">Auto (cheapest available)</option>
+                          {orchestrationModelGroups
+                            .filter((group) => group.provider.id !== 'opencode')
+                            .map((group) => (
+                              <optgroup key={group.provider.id} label={group.provider.label}>
+                                {group.models.map((model) => (
+                                  <option key={model.id} value={model.id}>
+                                    {model.label}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {itemsEnabled && archivedItems.length > 0 && (
+                      <div className="setting-row setting-row-stacked">
+                        <div className="setting-label">
+                          <div className="setting-label-title">Archived items</div>
+                          <div className="setting-label-desc">
+                            Settled items land here. Restore one to bring it back to the sidebar.
+                          </div>
+                        </div>
+                        <div className="archived-items-list">
+                          {archivedItems.map((item) => (
+                            <div key={item.id} className="archived-item-row">
+                              <SquareKanban size={13} className="item-icon" />
+                              <span className="archived-item-name truncate" title={item.name}>
+                                {item.name}
+                              </span>
+                              <span className="archived-item-date">
+                                Settled{' '}
+                                {formatShortTime(new Date(item.settledAt ?? item.createdAt))}
+                              </span>
+                              {item.prUrl && (
+                                <button
+                                  type="button"
+                                  className="archived-item-action"
+                                  title="Open the pull request"
+                                  onClick={() =>
+                                    void window.orion?.openExternalUrl?.(item.prUrl as string)
+                                  }
+                                >
+                                  <GitPullRequest size={13} />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="archived-item-action"
+                                title="Restore to the sidebar"
+                                onClick={() => unsettleItem(item.id)}
+                              >
+                                <RefreshCw size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                className="archived-item-action danger"
+                                title="Delete item"
+                                onClick={() => {
+                                  if (
+                                    confirm(`Delete item "${item.name}"? Its threads are kept.`)
+                                  ) {
+                                    deleteItem(item.id);
+                                  }
+                                }}
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Notification sound</div>
-                      <div className="setting-label-desc">Play the system sound with thread-finished notifications.</div>
+                  <div className="settings-group-label">About</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">About</div>
+                        <div className="setting-label-desc">The Orion version currently installed.</div>
+                      </div>
+                      <span className="setting-version">
+                        {appUpdateState?.currentVersion ? `v${appUpdateState.currentVersion}` : '—'}
+                      </span>
                     </div>
-                    <label className="provider-toggle" title="Notification sound">
-                      <input
-                        type="checkbox"
-                        checked={notificationSettings?.sound ?? true}
-                        disabled={!(notificationSettings?.enabled ?? true)}
-                        onChange={(e) => setNotificationSettings({ sound: e.target.checked })}
-                      />
-                      <span />
-                    </label>
-                  </div>
-
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Provider update checks</div>
-                      <div className="setting-label-desc">Check installed provider CLIs for newer available versions.</div>
-                    </div>
-                    <label className="provider-toggle" title="Provider update checks">
-                      <input type="checkbox" defaultChecked />
-                      <span />
-                    </label>
-                  </div>
-
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">New threads</div>
-                      <div className="setting-label-desc">Pick the default workspace mode for newly created draft threads.</div>
-                    </div>
-                    <select className="setting-select" defaultValue="local">
-                      <option value="local">Local</option>
-                      <option value="remote">Remote</option>
-                    </select>
-                  </div>
-
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Archive confirmation</div>
-                      <div className="setting-label-desc">Require a second click on the inline archive action before a thread is archived.</div>
-                    </div>
-                    <label className="provider-toggle" title="Archive confirmation">
-                      <input type="checkbox" />
-                      <span />
-                    </label>
-                  </div>
-
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Delete confirmation</div>
-                      <div className="setting-label-desc">Ask before deleting a thread and its chat history.</div>
-                    </div>
-                    <label className="provider-toggle" title="Delete confirmation">
-                      <input type="checkbox" defaultChecked />
-                      <span />
-                    </label>
-                  </div>
-
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">About</div>
-                      <div className="setting-label-desc">The Orion version currently installed.</div>
-                    </div>
-                    <span className="setting-version">
-                      {appUpdateState?.currentVersion ? `v${appUpdateState.currentVersion}` : '—'}
-                    </span>
                   </div>
                 </>
               )}
@@ -5970,7 +6590,7 @@ const App: React.FC = () => {
                     </div>
                     <div className="empty-state-title">No projects yet</div>
                     <div className="text-xs text-[#6b6b74]">Add a folder to start agent threads</div>
-                    <button onClick={handleAddProject} className="btn mt-3">
+                    <button onClick={() => void handleAddProject()} className="btn mt-3">
                       <Plus size={14} /> Add Project
                     </button>
                   </div>
@@ -6163,6 +6783,294 @@ const App: React.FC = () => {
                           {pinnedAgentsShowAll ? 'Show less' : 'Show more'}
                         </button>
                       )}
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {itemsEnabled && projects.length > 0 && (
+                  <div className="recent-agents-section items-section">
+                    <div className="items-section-header">
+                      <button
+                        type="button"
+                        className="sidebar-section-toggle"
+                        onClick={() => setItemsSectionOpen((open) => !open)}
+                        aria-expanded={itemsSectionOpen}
+                      >
+                        <ChevronRight
+                          size={12}
+                          className={`sidebar-section-chevron ${itemsSectionOpen ? 'open' : ''}`}
+                        />
+                        <span>Items</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="sidebar-section-action"
+                        title="New item"
+                        onClick={openCreateItemModal}
+                      >
+                        <Plus size={14} />
+                      </button>
+                    </div>
+                    {itemsSectionOpen && (
+                      <>
+                        {activeItems.map((item) => {
+                          const itemThreads = threadsByItem.get(item.id) ?? [];
+                          const isItemCollapsed = collapsedItems[item.id] ?? false;
+                          const isItemSelected =
+                            selectedItemId === item.id && !selectedThreadId;
+
+                          return (
+                            <div key={item.id} className="project-section item-section">
+                              <div className="project-section-header-row">
+                                <button
+                                  type="button"
+                                  className="project-collapse-toggle"
+                                  title={isItemCollapsed ? 'Expand threads' : 'Collapse threads'}
+                                  aria-expanded={!isItemCollapsed}
+                                  onClick={() =>
+                                    setCollapsedItems((prev) => ({
+                                      ...prev,
+                                      [item.id]: !isItemCollapsed,
+                                    }))
+                                  }
+                                >
+                                  <ChevronRight
+                                    size={12}
+                                    className={`sidebar-section-chevron ${isItemCollapsed ? '' : 'open'}`}
+                                  />
+                                </button>
+                                {itemRenameId === item.id ? (
+                                  <div className="project-section-header project-section-header-renaming">
+                                    <SquareKanban size={13} className="item-icon" />
+                                    <InlineRenameInput
+                                      className="thread-rename-input"
+                                      initialValue={item.name}
+                                      onSubmit={(name) => {
+                                        renameItem(item.id, name);
+                                        setItemRenameId(null);
+                                      }}
+                                      onCancel={() => setItemRenameId(null)}
+                                    />
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className={`project-section-header item-section-header ${isItemSelected ? 'item-section-header-selected' : ''}`}
+                                    onClick={() => {
+                                      selectItem(item.id);
+                                      setActiveTab('agents');
+                                    }}
+                                    title={item.name}
+                                  >
+                                    <SquareKanban size={13} className="item-icon" />
+                                    <span className="truncate">{item.name}</span>
+                                    {isItemCollapsed && itemThreads.length > 0 && (
+                                      <span className="sidebar-section-count">
+                                        {itemThreads.length}
+                                      </span>
+                                    )}
+                                  </button>
+                                )}
+                                <div
+                                  className="project-menu-wrap"
+                                  ref={itemMenuOpenId === item.id ? itemMenuRef : undefined}
+                                >
+                                  <button
+                                    type="button"
+                                    className="project-options-trigger"
+                                    title="Item options"
+                                    aria-label={`Options for ${item.name}`}
+                                    aria-haspopup="menu"
+                                    aria-expanded={itemMenuOpenId === item.id}
+                                    onClick={() =>
+                                      setItemMenuOpenId((open) =>
+                                        open === item.id ? null : item.id
+                                      )
+                                    }
+                                  >
+                                    <Ellipsis size={13} />
+                                  </button>
+                                  {itemMenuOpenId === item.id && (
+                                    <div className="thread-menu project-menu" role="menu">
+                                      <button
+                                        type="button"
+                                        className="project-menu-item"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setItemMenuOpenId(null);
+                                          setItemRenameId(item.id);
+                                        }}
+                                      >
+                                        <SquarePen size={13} /> Rename
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="project-menu-item"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setItemMenuOpenId(null);
+                                          handleSettleItem(item);
+                                        }}
+                                      >
+                                        <Archive size={13} /> Settle
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="project-menu-item danger"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setItemMenuOpenId(null);
+                                          if (
+                                            confirm(
+                                              `Delete item "${item.name}"? Its threads are kept — they just leave this group.`
+                                            )
+                                          ) {
+                                            deleteItem(item.id);
+                                          }
+                                        }}
+                                      >
+                                        <Trash2 size={13} /> Delete
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                                <button
+                                  type="button"
+                                  className="project-new-thread"
+                                  title={`New thread in ${item.name}`}
+                                  onClick={() => handleCreateThreadForItem(item)}
+                                >
+                                  <SquarePen size={13} />
+                                </button>
+                              </div>
+
+                              {!isItemCollapsed && (
+                                <div className="threads-list">
+                                  {itemThreads.length === 0 ? (
+                                    <button
+                                      type="button"
+                                      className="thread-item thread-item-empty"
+                                      onClick={() => handleCreateThreadForItem(item)}
+                                    >
+                                      <span className="thread-title">New thread</span>
+                                    </button>
+                                  ) : (
+                                    itemThreads.map((thread) => (
+                                      <div
+                                        key={thread.id}
+                                        className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                                        onClick={() => {
+                                          if (threadRenameKey !== `item:${thread.id}`) {
+                                            selectThread(thread.id);
+                                          }
+                                        }}
+                                      >
+                                        {threadRenameKey === `item:${thread.id}` ? (
+                                          <InlineRenameInput
+                                            className="thread-rename-input"
+                                            initialValue={thread.title}
+                                            onSubmit={(title) => {
+                                              updateThread(thread.id, { title });
+                                              setThreadRenameKey(null);
+                                            }}
+                                            onCancel={() => setThreadRenameKey(null)}
+                                          />
+                                        ) : (
+                                          <span className="thread-title">
+                                            {renderThreadCliBadge(thread)}
+                                            <span className="thread-title-text">{thread.title}</span>
+                                          </span>
+                                        )}
+                                        <span className="thread-project-tag thread-meta">
+                                          {projects.find((p) => p.id === thread.projectId)?.name}
+                                        </span>
+                                        <span className="thread-time thread-meta">
+                                          {thread.status === 'running' ? (
+                                            <span className="thread-working-dot" title="Working" />
+                                          ) : (
+                                            formatShortTime(getThreadActivityTime(thread))
+                                          )}
+                                        </span>
+                                        <div
+                                          className="thread-menu-wrap"
+                                          ref={threadItemMenuKey === `item:${thread.id}` ? threadItemMenuRef : undefined}
+                                          onClick={(e) => e.stopPropagation()}
+                                        >
+                                          <button
+                                            type="button"
+                                            className="thread-options-trigger"
+                                            title="Thread options"
+                                            aria-label={`Options for ${thread.title}`}
+                                            aria-haspopup="menu"
+                                            aria-expanded={threadItemMenuKey === `item:${thread.id}`}
+                                            onClick={() =>
+                                              setThreadItemMenuKey((open) =>
+                                                open === `item:${thread.id}` ? null : `item:${thread.id}`
+                                              )
+                                            }
+                                          >
+                                            <Ellipsis size={13} />
+                                          </button>
+                                          {threadItemMenuKey === `item:${thread.id}` && (
+                                            <div className="thread-menu thread-item-menu" role="menu">
+                                              <button
+                                                type="button"
+                                                className="project-menu-item"
+                                                role="menuitem"
+                                                onClick={() => {
+                                                  setThreadItemMenuKey(null);
+                                                  setThreadRenameKey(`item:${thread.id}`);
+                                                }}
+                                              >
+                                                <SquarePen size={13} /> Rename
+                                              </button>
+                                              <button
+                                                type="button"
+                                                className="project-menu-item"
+                                                role="menuitem"
+                                                onClick={() => {
+                                                  setThreadItemMenuKey(null);
+                                                  branchThread(thread.id);
+                                                }}
+                                              >
+                                                <GitBranch size={13} /> Branch
+                                              </button>
+                                              <button
+                                                type="button"
+                                                className="project-menu-item"
+                                                role="menuitem"
+                                                onClick={() => {
+                                                  setThreadItemMenuKey(null);
+                                                  updateThread(thread.id, { itemId: undefined });
+                                                }}
+                                              >
+                                                <EyeOff size={13} /> Remove from item
+                                              </button>
+                                              <button
+                                                type="button"
+                                                className="project-menu-item danger"
+                                                role="menuitem"
+                                                onClick={() => {
+                                                  setThreadItemMenuKey(null);
+                                                  if (confirm('Delete this thread?')) {
+                                                    void deleteThreadWithRuntime(thread.id);
+                                                  }
+                                                }}
+                                              >
+                                                <Trash2 size={13} /> Delete
+                                              </button>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </div>
+                                    ))
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </>
                     )}
                   </div>
@@ -6636,7 +7544,210 @@ const App: React.FC = () => {
 
             {/* Main Panel: Thread view */}
             <div className="panel agents-panel">
-              {!selectedThread ? (
+              {!selectedThread && selectedItem ? (
+                <div className="item-view">
+                  <div className="item-view-header">
+                    <div className="item-view-icon">
+                      <SquareKanban size={24} />
+                    </div>
+                    <div className="item-view-heading">
+                      <h2 className="item-view-title">{selectedItem.name}</h2>
+                      <div className="item-view-meta">
+                        {(selectedItemRepositoryProject || selectedItemClaimedProject) && (
+                          <span
+                            className="item-view-project"
+                            title={
+                              selectedItem.gitRoot ??
+                              selectedItemRepositoryProject?.path ??
+                              selectedItemClaimedProject?.path
+                            }
+                          >
+                            <ProjectIcon
+                              projectPath={
+                                selectedItem.gitRoot ??
+                                selectedItemRepositoryProject?.path ??
+                                selectedItemClaimedProject!.path
+                              }
+                              size={13}
+                            />
+                            {selectedItemRepositoryProject?.name ??
+                              selectedItemClaimedProject?.name}
+                          </span>
+                        )}
+                        <span>
+                          {selectedItemThreads.length === 1
+                            ? '1 thread'
+                            : `${selectedItemThreads.length} threads`}
+                        </span>
+                        <span>Created {formatShortTime(new Date(selectedItem.createdAt))}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="item-view-description-block">
+                    <label className="item-view-description-label" htmlFor="item-description">
+                      Description
+                    </label>
+                    <ItemDescriptionEditor
+                      key={selectedItem.id}
+                      itemId={selectedItem.id}
+                      initialValue={selectedItem.description ?? ''}
+                      onCommit={(itemId, description) => updateItem(itemId, { description })}
+                    />
+                  </div>
+
+                  <div className="item-view-repository-block">
+                    <label className="item-view-description-label" htmlFor="item-repository">
+                      Repository
+                    </label>
+                    {selectedItem.gitRoot ? (
+                      <div className="item-view-repository-claimed" title={selectedItem.gitRoot}>
+                        <GitBranch size={14} />
+                        <span>
+                          {selectedItemClaimedProject?.name ?? selectedItem.gitRoot}
+                          {selectedItem.gitBranch ? ` · ${selectedItem.gitBranch}` : ''}
+                        </span>
+                      </div>
+                    ) : (
+                      <select
+                        id="item-repository"
+                        className="item-view-repository-select"
+                        value={selectedItem.repositoryProjectId ?? ''}
+                        disabled={repositoryOperationBusy}
+                        onChange={(event) =>
+                          updateItem(selectedItem.id, {
+                            repositoryProjectId: event.target.value || undefined,
+                          })
+                        }
+                      >
+                        <option value="">Select repository…</option>
+                        {projects.map((project) => (
+                          <option key={project.id} value={project.id}>
+                            {project.name} — {project.path}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <span className="item-view-repository-hint">
+                      {selectedItem.gitRoot
+                        ? 'This item is locked to its claimed repository and feature branch.'
+                        : 'Choose the repository explicitly before using git actions.'}
+                    </span>
+                  </div>
+
+                  <div className="item-view-actions">
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={
+                        repositoryOperationBusy ||
+                        (!selectedItemRepositoryProject && !selectedItem.gitRoot)
+                      }
+                      onClick={() => void handleItemCommitAndPush(selectedItem)}
+                      title="Generate a commit message from staged changes, then commit and push"
+                    >
+                      <GitCommit size={14} />
+                      {itemGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={
+                        repositoryOperationBusy ||
+                        (!selectedItemRepositoryProject && !selectedItem.gitRoot)
+                      }
+                      onClick={() => void handleItemCreatePr(selectedItem)}
+                      title="Open a pull request with a generated title and description"
+                    >
+                      <GitPullRequest size={14} />
+                      {itemGitBusy === 'pr' ? 'Opening PR…' : 'Create PR'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn item-view-settle"
+                      disabled={!!itemGitBusy}
+                      onClick={() => handleSettleItem(selectedItem)}
+                      title="Settle the item once its PR is merged — it moves to the archive"
+                    >
+                      <Archive size={14} />
+                      Settle
+                    </button>
+                  </div>
+
+                  {itemGitBusy && (
+                    <div className="item-view-status">
+                      <span className="working-dots" aria-hidden="true">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                      {itemGitBusy === 'commit'
+                        ? 'Writing a commit message from staged changes, then pushing…'
+                        : 'Writing the PR message and opening the pull request…'}
+                    </div>
+                  )}
+
+                  {selectedItem.prUrl && (
+                    <button
+                      type="button"
+                      className="item-view-pr-link"
+                      onClick={() =>
+                        void window.orion?.openExternalUrl?.(selectedItem.prUrl as string)
+                      }
+                      title="Open the pull request in your browser"
+                    >
+                      <GitPullRequest size={13} />
+                      <span className="truncate">{selectedItem.prUrl}</span>
+                      <SquareArrowOutUpRight size={12} />
+                    </button>
+                  )}
+
+                  <div className="item-view-threads">
+                    <div className="item-view-threads-header">
+                      <span>Threads</span>
+                      <button
+                        type="button"
+                        className="sidebar-section-action"
+                        title="New thread"
+                        aria-label="New thread"
+                        onClick={() => handleCreateThreadForItem(selectedItem)}
+                      >
+                        <Plus size={14} />
+                      </button>
+                    </div>
+                    {selectedItemThreads.length === 0 ? (
+                      <div className="item-view-empty">
+                        No threads yet — spawn one to start working this item.
+                      </div>
+                    ) : (
+                      <div className="threads-list item-view-threads-list">
+                        {selectedItemThreads.map((thread) => (
+                          <div
+                            key={thread.id}
+                            className="thread-item"
+                            onClick={() => selectThread(thread.id)}
+                          >
+                            <span className="thread-title">
+                              {renderThreadCliBadge(thread)}
+                              <span className="thread-title-text">{thread.title}</span>
+                            </span>
+                            <span className="thread-project-tag thread-meta">
+                              {projects.find((p) => p.id === thread.projectId)?.name}
+                            </span>
+                            <span className="thread-time thread-meta">
+                              {thread.status === 'running' ? (
+                                <span className="thread-working-dot" title="Working" />
+                              ) : (
+                                formatShortTime(getThreadActivityTime(thread))
+                              )}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : !selectedThread ? (
                 <div className="empty-state">
                   <div className="empty-state-icon">
                     <Bot size={30} />
@@ -6671,6 +7782,10 @@ const App: React.FC = () => {
                         <ChatTranscript
                           threadId={selectedThread.id}
                           projectName={selectedThreadProject?.name}
+                          projects={projects}
+                          canChangeProject={canChangeSelectedThreadProject}
+                          onSelectProject={handleChangeSelectedThreadProject}
+                          onAddProject={handleAddProject}
                           mediaBaseDirs={mediaBaseDirs}
                           isSending={isSending}
                           steerSupported={steerSupported}
@@ -7518,6 +8633,79 @@ const App: React.FC = () => {
           </>
         )}
       </div>
+      )}
+
+      {createItemOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={closeCreateItemModal}
+        >
+          <div
+            className="modal create-item-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="create-item-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="create-item-title" className="modal-title">
+              New item
+            </h2>
+            <p className="modal-subtitle">
+              Group threads around a big-ticket task.
+            </p>
+            <form
+              className="modal-form"
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleCreateItem();
+              }}
+            >
+              <label className="modal-field">
+                <span className="modal-field-label">
+                  Title <span className="modal-required">*</span>
+                </span>
+                <input
+                  ref={createItemTitleRef}
+                  type="text"
+                  className="modal-input"
+                  value={newItemName}
+                  onChange={(e) => setNewItemName(e.target.value)}
+                  placeholder="e.g. Optimize memory usage"
+                  autoComplete="off"
+                />
+              </label>
+              <label className="modal-field">
+                <span className="modal-field-label">
+                  Description <span className="modal-optional">optional</span>
+                </span>
+                <textarea
+                  className="modal-textarea"
+                  value={newItemDescription}
+                  onChange={(e) => setNewItemDescription(e.target.value)}
+                  placeholder="What does this item cover?"
+                  rows={4}
+                />
+              </label>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn secondary"
+                  onClick={closeCreateItemModal}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="btn"
+                  disabled={!newItemName.trim()}
+                >
+                  Create item
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );

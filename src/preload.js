@@ -35,6 +35,10 @@ contextBridge.exposeInMainWorld('orion', {
   checkoutGitBranch: (input) => ipcRenderer.invoke('git:checkoutBranch', input),
   commitAndPush: (projectPath) => ipcRenderer.invoke('git:commitAndPush', projectPath),
 
+  // Work items (sidebar Items section)
+  itemCommitAndPush: (input) => ipcRenderer.invoke('item:commitAndPush', input),
+  itemCreatePr: (input) => ipcRenderer.invoke('item:createPr', input),
+
   // Agent runtime
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),

@@ -7,6 +7,64 @@ export type Project = {
   path: string;
 };
 
+/**
+ * A big-ticket work item ("Optimize memory usage") that groups threads in the
+ * sidebar Items section. Threads keep living in Recent agents and under their
+ * project as usual; an item is an extra lens over them plus git actions
+ * (commit & push, PR) for the work as a whole. Settling archives the item.
+ */
+export type WorkItem = {
+  id: string;
+  name: string;
+  /** Optional longer notes for the item (editable in the item view). */
+  description?: string;
+  createdAt: string;
+  /** Set when the item is settled (PR merged); settled items are archived. */
+  settledAt?: string;
+  /** URL of the PR opened from this item, if any. */
+  prUrl?: string;
+  /** Project explicitly selected as the repository for this item's git actions. */
+  repositoryProjectId?: string;
+  /** Canonical repository root claimed by this item's git actions. */
+  gitRoot?: string;
+  /** Dedicated feature branch claimed by this item's git actions. */
+  gitBranch?: string;
+};
+
+export type ItemsSettings = {
+  /** Show the Items sidebar section and item views. */
+  enabled: boolean;
+  /** AgentModel id used to write commit/PR messages; null = cheapest available. */
+  commitModelId: string | null;
+};
+
+export const defaultItemsSettings: ItemsSettings = {
+  enabled: true,
+  commitModelId: null,
+};
+
+const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
+
+/**
+ * The project acting as the repository for an item's git actions, if it can be
+ * resolved: the claimed git root wins (that is what the git actions operate
+ * on), then the explicitly selected repository project.
+ */
+const projectForItemRepository = (projects: Project[], item: WorkItem | undefined) => {
+  if (!item) return undefined;
+  if (item.gitRoot) {
+    const itemRoot = normalizeRepoPath(item.gitRoot);
+    const byRoot = projects.find((project) => {
+      const projectPath = normalizeRepoPath(project.path);
+      return projectPath === itemRoot || projectPath.startsWith(`${itemRoot}/`);
+    });
+    if (byRoot) return byRoot;
+  }
+  return item.repositoryProjectId
+    ? projects.find((project) => project.id === item.repositoryProjectId)
+    : undefined;
+};
+
 export type AgentToolSource = { url: string; title?: string };
 
 export type AgentPlanEntry = {
@@ -236,6 +294,8 @@ export type Thread = {
   linkedTask?: LinkedBoardTask;
   /** Codex goal (/goal) this thread is pursuing, if any. Null after /goal clear. */
   goal?: ThreadGoal | null;
+  /** Sidebar work item this thread belongs to, if any. */
+  itemId?: string;
 };
 
 export type OpenFile = {
@@ -329,6 +389,12 @@ interface OrionState {
   selectedProjectId: string | null;
   selectedThreadId: string | null;
 
+  // Work items
+  items: WorkItem[];
+  /** Selected item (item view in the main panel). Cleared when a thread is selected. */
+  selectedItemId: string | null;
+  itemsSettings: ItemsSettings;
+
   // Code tab workspace
   workspacePath: string | null;
   openFiles: OpenFile[];
@@ -353,6 +419,16 @@ interface OrionState {
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
+  addItem: (name: string, options?: { description?: string }) => string; // returns new item id
+  renameItem: (id: string, name: string) => void;
+  updateItem: (id: string, updates: Partial<WorkItem>) => void;
+  /** Deletes the item; its threads survive and just lose the grouping. */
+  deleteItem: (id: string) => void;
+  settleItem: (id: string) => void;
+  unsettleItem: (id: string) => void;
+  selectItem: (id: string | null) => void;
+  setItemsSettings: (updates: Partial<ItemsSettings>) => void;
+
   createThread: (
     projectId: string,
     title?: string,
@@ -363,6 +439,8 @@ interface OrionState {
       spawnId?: string;
       accessMode?: Thread['accessMode'];
       subagent?: NativeSubagentInfo;
+      /** Work item the new thread is grouped under. */
+      itemId?: string;
       /** false = don't switch the UI to the new thread (background spawns). */
       select?: boolean;
     }
@@ -579,6 +657,9 @@ export const useOrionStore = create<OrionState>()(
       threads: [],
       selectedProjectId: null,
       selectedThreadId: null,
+      items: [],
+      selectedItemId: null,
+      itemsSettings: defaultItemsSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -684,9 +765,17 @@ export const useOrionStore = create<OrionState>()(
           const remainingProjects = state.projects.filter((p) => p.id !== id);
           const fallbackProject = remainingProjects[0] ?? null;
           const wasWorkspaceProject = removedProject?.path === state.workspacePath;
+          const selectedItem = state.items.find((item) => item.id === state.selectedItemId);
+          const selectedItemRepository = projectForItemRepository(state.projects, selectedItem);
+          const removedSelectedItemRepository = selectedItemRepository?.id === id;
 
           return {
             projects: remainingProjects,
+            items: state.items.map((item) =>
+              item.repositoryProjectId === id
+                ? { ...item, repositoryProjectId: undefined }
+                : item
+            ),
             threads: state.threads.filter((t) => t.projectId !== id),
             selectedProjectId:
               state.selectedProjectId === id ? fallbackProject?.id ?? null : state.selectedProjectId,
@@ -694,6 +783,10 @@ export const useOrionStore = create<OrionState>()(
               state.threads.find((t) => t.id === state.selectedThreadId)?.projectId === id
                 ? null
                 : state.selectedThreadId,
+            // Dismiss an item whose repository was removed before moving the
+            // shell to a fallback project. Its durable gitRoot/branch claim is
+            // retained for safety if that repository is added again.
+            selectedItemId: removedSelectedItemRepository ? null : state.selectedItemId,
             expandedProjects: state.expandedProjects.filter((pid) => pid !== id),
             workspacePath: wasWorkspaceProject ? fallbackProject?.path ?? null : state.workspacePath,
             openFiles: wasWorkspaceProject ? [] : state.openFiles,
@@ -705,6 +798,107 @@ export const useOrionStore = create<OrionState>()(
       renameProject: (id, name) =>
         set((state) => ({
           projects: state.projects.map((p) => (p.id === id ? { ...p, name } : p)),
+        })),
+
+      addItem: (name, options) => {
+        const description = options?.description?.trim();
+        const newItem: WorkItem = {
+          id: crypto.randomUUID(),
+          name,
+          ...(description ? { description } : {}),
+          createdAt: new Date().toISOString(),
+        };
+        set((state) => ({
+          items: [newItem, ...state.items],
+          selectedItemId: newItem.id,
+          selectedThreadId: null,
+          // A new item is intentionally unbound. Clear the shell repository so
+          // header git controls cannot keep targeting the previously selected
+          // project while the item view asks the user to choose one.
+          selectedProjectId: null,
+        }));
+        return newItem.id;
+      },
+
+      renameItem: (id, name) =>
+        set((state) => ({
+          items: state.items.map((item) => (item.id === id ? { ...item, name } : item)),
+        })),
+
+      updateItem: (id, updates) =>
+        set((state) => {
+          const repositoryChanged = Object.prototype.hasOwnProperty.call(
+            updates,
+            'repositoryProjectId'
+          );
+          const repositoryProject = repositoryChanged
+            ? state.projects.find((project) => project.id === updates.repositoryProjectId)
+            : undefined;
+
+          return {
+            items: state.items.map((item) => (item.id === id ? { ...item, ...updates } : item)),
+            // Repository selection in the active item view also defines the
+            // shell context used by the header branch picker and generic git
+            // controls. Keep the item selected while retargeting atomically.
+            ...(state.selectedItemId === id && repositoryChanged
+              ? { selectedProjectId: repositoryProject?.id ?? null }
+              : {}),
+          };
+        }),
+
+      deleteItem: (id) =>
+        set((state) => ({
+          items: state.items.filter((item) => item.id !== id),
+          // Threads survive their item — they stay in Recent agents and their
+          // project list; only the grouping is gone.
+          threads: state.threads.map((t) =>
+            t.itemId === id ? { ...t, itemId: undefined } : t
+          ),
+          selectedItemId: state.selectedItemId === id ? null : state.selectedItemId,
+        })),
+
+      settleItem: (id) =>
+        set((state) => ({
+          items: state.items.map((item) =>
+            item.id === id ? { ...item, settledAt: new Date().toISOString() } : item
+          ),
+          selectedItemId: state.selectedItemId === id ? null : state.selectedItemId,
+        })),
+
+      unsettleItem: (id) =>
+        set((state) => ({
+          items: state.items.map((item) =>
+            item.id === id ? { ...item, settledAt: undefined } : item
+          ),
+        })),
+
+      selectItem: (id) =>
+        set((state) => {
+          if (!id) return { selectedItemId: null };
+          // Retarget the shell's project context (header branch picker and
+          // generic git controls) to the item's repository — otherwise they
+          // keep operating on whatever project was selected before, letting a
+          // commit land in the wrong repository while the item view shows
+          // another one.
+          const item = state.items.find((candidate) => candidate.id === id);
+          const repositoryProject = projectForItemRepository(state.projects, item);
+          return {
+            selectedItemId: id,
+            // The item view replaces the thread view; a selected thread would
+            // shadow it.
+            selectedThreadId: null,
+            // An unbound item must not inherit the previous shell repository.
+            selectedProjectId: repositoryProject?.id ?? null,
+          };
+        }),
+
+      setItemsSettings: (updates) =>
+        set((state) => ({
+          itemsSettings: {
+            ...defaultItemsSettings,
+            ...state.itemsSettings,
+            ...updates,
+          },
         })),
 
       createThread: (projectId, title, options) => {
@@ -748,13 +942,18 @@ export const useOrionStore = create<OrionState>()(
           spawnId: options?.spawnId,
           hiddenFromRecent: options?.hiddenFromRecent,
           subagent: options?.subagent,
+          itemId: options?.itemId,
           messages: [],
         };
         set((state) => ({
           threads: [newThread, ...state.threads],
           ...(options?.select === false
             ? {}
-            : { selectedProjectId: projectId, selectedThreadId: newThread.id }),
+            : {
+                selectedProjectId: projectId,
+                selectedThreadId: newThread.id,
+                selectedItemId: options?.itemId ?? null,
+              }),
         }));
         return newThread.id;
       },
@@ -790,11 +989,13 @@ export const useOrionStore = create<OrionState>()(
           agentSessionIds: inheritedProviders.length ? sessionIds : undefined,
           pendingForkProviders: inheritedProviders.length ? inheritedProviders : undefined,
           branchedFromThreadId: source.id,
+          itemId: source.itemId,
         };
         set((state) => ({
           threads: [newThread, ...state.threads],
           selectedProjectId: source.projectId,
           selectedThreadId: newThread.id,
+          selectedItemId: source.itemId ?? null,
         }));
         return newThread.id;
       },
@@ -807,6 +1008,8 @@ export const useOrionStore = create<OrionState>()(
             selectedProjectId: id,
             selectedThreadId:
               selectedThread && selectedThread.projectId !== id ? null : state.selectedThreadId,
+            // Picking a project moves focus off the item view.
+            selectedItemId: null,
           };
         }),
 
@@ -817,6 +1020,10 @@ export const useOrionStore = create<OrionState>()(
           return {
             selectedThreadId: id,
             selectedProjectId: thread?.projectId ?? state.selectedProjectId,
+            // Preserve item context only for a thread that actually belongs to
+            // that item. Selecting an unrelated (or missing) thread must not
+            // leave a stale item view waiting behind it.
+            selectedItemId: thread?.itemId ?? null,
           };
         }),
 
@@ -1108,6 +1315,12 @@ export const useOrionStore = create<OrionState>()(
         projects: state.projects,
         selectedProjectId: state.selectedProjectId,
         selectedThreadId: state.selectedThreadId,
+        items: state.items,
+        selectedItemId: state.selectedItemId,
+        itemsSettings: {
+          ...defaultItemsSettings,
+          ...state.itemsSettings,
+        },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
         providerSettings: {
