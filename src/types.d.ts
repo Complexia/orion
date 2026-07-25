@@ -294,6 +294,8 @@ type OrionComputerUsePermissions = {
         gitRoot?: string;
         branch?: string;
         message?: string;
+        /** The commit landed locally even though a later step (normally push) failed. */
+        committed?: boolean;
         error?: string;
       }>;
       epicCreatePr: (input: {
@@ -711,6 +713,7 @@ type OrionComputerUsePermissions = {
       /** Codex goal ops (pause/clear/status refresh) when no goal run is live. */
       codexGoalCommand: (input: {
         sessionId: string;
+        threadId: string;
         projectPath: string;
         action: 'pause' | 'clear' | 'get';
       }) => Promise<{ ok: boolean; goal?: import('./store').ThreadGoal | null; error?: string }>;

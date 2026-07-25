@@ -54,7 +54,8 @@ it.
   prebuilt CLI (`node_modules/rift-snapshot/prebuilds/<platform>-<arch>/rift`)
   is spawned by the main process (`src/main/rift.js`). The Bun/Node FFI
   bindings need runtimes Electron doesn't provide.
-- IPC: `rift:status`, `epic:createRift`, `epic:removeRift` (src/main.js).
+- IPC: `rift:status`, `epic:createRift`, `epic:acknowledgeRift`,
+  `epic:removeRift` (src/main.js).
 - Packaging mirrors node-pty: copied in `packageAfterCopy`, asar-unpacked, and
   the binary exec bit is restored there and in `postinstall`.
 

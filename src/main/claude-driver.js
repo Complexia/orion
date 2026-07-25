@@ -1298,6 +1298,18 @@ export const disposeClaudeSdkSessionAndWait = async (threadId, timeoutMs = 3000)
   ]);
   if (timeoutId) clearTimeout(timeoutId);
   if (!ended) {
+    // Abort is normally enough to unwind the SDK pump, but a wedged query
+    // must not remain in terminatingClaudeSdkSessions forever. Force-close
+    // only the sessions captured by this wait, then finalize their local
+    // state so a later teardown attempt can make progress. A replacement
+    // session added while this wait was pending remains tracked separately.
+    for (const session of sessions) {
+      if (session.ended) continue;
+      try {
+        session.query?.close?.();
+      } catch {}
+      endClaudeSession(session, null);
+    }
     throw new Error(`Claude runtime for thread ${threadId} did not stop in time.`);
   }
   return true;

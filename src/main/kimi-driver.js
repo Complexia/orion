@@ -884,7 +884,7 @@ export const createKimiAcpDriver = ({
 // entirely (the driver's read-only permission policy backstops it).
 // Resolves with the accumulated response text, or '' on failure. Cancellation
 // waits for the ACP child to exit so callers may safely tear down its cwd.
-export const kimiPlanModeOneShot = (model, promptText, cwd, { signal } = {}) => {
+export const kimiPlanModeOneShot = (model, promptText, cwd, { signal, threadId } = {}) => {
   if (signal?.aborted) return Promise.resolve('');
   return new Promise((resolve) => {
     const child = spawn(loginShell, ['-lc', 'kimi acp'], {
@@ -903,7 +903,7 @@ export const kimiPlanModeOneShot = (model, promptText, cwd, { signal } = {}) => 
       if (settled) return;
       settled = true;
       cleanup();
-      void killAgentChild(child).then(() => resolve(success ? text : ''));
+      void killAgentChild(child, threadId).then(() => resolve(success ? text : ''));
     };
     const abort = () => finish(false);
     signal?.addEventListener('abort', abort, { once: true });
