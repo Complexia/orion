@@ -276,9 +276,12 @@ type OrionComputerUsePermissions = {
         };
       }>;
       epicCommitAndPush: (input: {
+        epicId: string;
         projectPath: string;
         modelId?: string | null;
         epicName?: string;
+        /** projectPath is the epic's own rift workspace — claims don't apply. */
+        isRift?: boolean;
         expectedGitRoot?: string;
         expectedBranch?: string;
         claimedBranches?: Array<{
@@ -294,9 +297,12 @@ type OrionComputerUsePermissions = {
         error?: string;
       }>;
       epicCreatePr: (input: {
+        epicId: string;
         projectPath: string;
         modelId?: string | null;
         epicName?: string;
+        /** projectPath is the epic's own rift workspace — claims don't apply. */
+        isRift?: boolean;
         expectedGitRoot?: string;
         expectedBranch?: string;
         claimedBranches?: Array<{
@@ -312,6 +318,54 @@ type OrionComputerUsePermissions = {
         branch?: string;
         baseBranch?: string;
         alreadyExists?: boolean;
+        error?: string;
+      }>;
+      epicGitStatus: (input: { projectPath: string; prUrl?: string }) => Promise<{
+        ok: boolean;
+        gitRoot?: string;
+        branch?: string;
+        hasChangesToCommit?: boolean;
+        hasUnpushedCommits?: boolean;
+        pr?: { state: 'OPEN' | 'CLOSED' | 'MERGED'; url: string };
+        error?: string;
+      }>;
+      riftStatus: () => Promise<{
+        available: boolean;
+        version?: string | null;
+        pendingEpicIds?: string[];
+        readyRifts?: Array<{
+          epicId: string;
+          projectId?: string;
+          projectPath: string;
+          riftPath: string;
+          riftWorkingDir: string;
+          gitRoot: string;
+          branch: string;
+        }>;
+      }>;
+      epicCreateRift: (input: {
+        epicId: string;
+        projectId: string;
+        projectPath: string;
+        epicName?: string;
+        epicDescription?: string;
+        modelId?: string | null;
+      }) => Promise<{
+        ok: boolean;
+        riftPath?: string;
+        riftWorkingDir?: string;
+        gitRoot?: string;
+        branch?: string;
+        error?: string;
+      }>;
+      epicAcknowledgeRift: (input: { epicId: string; riftPath: string }) => Promise<{
+        ok: boolean;
+        skipped?: boolean;
+        error?: string;
+      }>;
+      epicRemoveRift: (input: { riftPath: string }) => Promise<{
+        ok: boolean;
+        skipped?: boolean;
         error?: string;
       }>;
       getPathForFile?: (file: File) => string;
@@ -475,6 +529,7 @@ type OrionComputerUsePermissions = {
       runAgentTurn: (input: {
         runId?: string;
         threadId: string;
+        epicId?: string;
         projectPath: string;
         prompt: string;
         modelId: string;
@@ -539,6 +594,7 @@ type OrionComputerUsePermissions = {
       /** Claude Code CLI embedded terminal (one PTY per thread, lives in main). */
       terminalEnsure: (input: {
         threadId: string;
+        epicId?: string;
         projectPath: string;
         accessMode: 'read-only' | 'workspace-write' | 'full-access';
         /** Resume this CLI session instead of starting fresh (--resume). */
@@ -579,9 +635,11 @@ type OrionComputerUsePermissions = {
       /** The thread's live claude CLI session id, discovered from claude's session store. */
       onTerminalSession: (cb: (event: { threadId: string; sessionId: string }) => void) => () => void;
       generateThreadTitle: (input: {
+        threadId: string;
         prompt: string;
         modelId: string;
         projectPath?: string;
+        epicId?: string;
       }) => Promise<string>;
       findProjectIcon: (projectPath: string) => Promise<string | null>;
       listOpenWithApps: () => Promise<Array<{ id: string; name: string; icon: string | null }>>;

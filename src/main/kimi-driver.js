@@ -882,9 +882,11 @@ export const createKimiAcpDriver = ({
 // ("Cannot combine --prompt with --plan" on 0.26), so hidden background
 // prompts must go through ACP plan mode, which disables tool execution
 // entirely (the driver's read-only permission policy backstops it).
-// Resolves with the accumulated response text, or '' on failure.
-export const kimiPlanModeOneShot = (model, promptText, cwd) =>
-  new Promise((resolve) => {
+// Resolves with the accumulated response text, or '' on failure. Cancellation
+// waits for the ACP child to exit so callers may safely tear down its cwd.
+export const kimiPlanModeOneShot = (model, promptText, cwd, { signal } = {}) => {
+  if (signal?.aborted) return Promise.resolve('');
+  return new Promise((resolve) => {
     const child = spawn(loginShell, ['-lc', 'kimi acp'], {
       cwd,
       env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
@@ -892,16 +894,26 @@ export const kimiPlanModeOneShot = (model, promptText, cwd) =>
     });
     let text = '';
     let settled = false;
+    let deadline = null;
+    const cleanup = () => {
+      if (deadline) clearTimeout(deadline);
+      signal?.removeEventListener('abort', abort);
+    };
     const finish = (success = false) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
-      killAgentChild(child);
-      resolve(success ? text : '');
+      cleanup();
+      void killAgentChild(child).then(() => resolve(success ? text : ''));
     };
+    const abort = () => finish(false);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
     // The ACP server idles after the prompt resolves and never exits on its
     // own; cap the whole turn so a wedged server can't leak a process.
-    const deadline = setTimeout(finish, 60_000);
+    deadline = setTimeout(finish, 60_000);
     const driver = createKimiAcpDriver({
       child,
       cwd,
@@ -939,3 +951,4 @@ export const kimiPlanModeOneShot = (model, promptText, cwd) =>
     child.on('close', () => finish(false));
     driver.start();
   });
+};

@@ -32,6 +32,11 @@ export const resolveClaudeBinary = () => {
 };
 
 export const claudeSdkSessions = new Map(); // threadId -> session
+// Sessions removed from claudeSdkSessions but whose SDK/CLI process has not
+// acknowledged AbortController.abort() yet. Destructive workspace teardown
+// waits for every entry for the thread instead of mistaking "removed from the
+// active map" for "process exited".
+export const terminatingClaudeSdkSessions = new Map(); // threadId -> Set<session>
 // A foreground turn can finish while Claude-owned background agents keep
 // running. Retain that completed run id as a cancellable handle until the
 // background work settles or a new turn takes over.
@@ -809,6 +814,12 @@ export const handleClaudeSessionMessage = async (session, message) => {
 export const endClaudeSession = (session, error) => {
   if (session.ended) return;
   session.ended = true;
+  session.resolveEnded?.();
+  const terminating = terminatingClaudeSdkSessions.get(session.threadId);
+  if (terminating) {
+    terminating.delete(session);
+    if (terminating.size === 0) terminatingClaudeSdkSessions.delete(session.threadId);
+  }
   clearClaudeBackgroundRun(session);
   session.subagentTracker?.dispose(
     session.disposed ? 'stopped' : error ? 'error' : 'done'
@@ -915,6 +926,10 @@ export const createClaudeSdkSession = ({
   const sdkOptions = claudeSdkOptionsForInput(model, input);
   const inputQueue = createClaudeInputQueue();
   const abortController = new AbortController();
+  let resolveEnded;
+  const endedPromise = new Promise((resolve) => {
+    resolveEnded = resolve;
+  });
   const session = {
     threadId,
     projectPath,
@@ -953,6 +968,8 @@ export const createClaudeSdkSession = ({
     stderrTail: '',
     disposed: false,
     ended: false,
+    endedPromise,
+    resolveEnded,
     // Feeds idle eviction: bumped on every user push and every CLI message,
     // so background-agent chatter counts as activity.
     lastActivityAt: Date.now(),
@@ -1071,8 +1088,10 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
   if (existing && !session) {
     // Model, effort, access mode, or project changed: replace the harness
     // process, resuming the same conversation. Background agents started by
-    // the old process do not survive this.
-    existing.dispose();
+    // the old process do not survive this. Route the old harness through the
+    // tracked disposal path so destructive workspace teardown also waits for
+    // it after the replacement takes over the thread's active map entry.
+    disposeClaudeSdkSession(threadId);
   }
 
   if (!session) {
@@ -1166,7 +1185,9 @@ export const interruptClaudeSdkRun = async (runId, { terminateBackground = false
         while (session.activeTurns.length > 0) {
           await finalizeClaudeTurn(session, null);
         }
-        if (terminateBackground) disposeClaudeSdkSession(session.threadId);
+        if (terminateBackground) {
+          await disposeClaudeSdkSessionAndWait(session.threadId);
+        }
         return true;
       }
       if (terminateBackground) {
@@ -1181,7 +1202,7 @@ export const interruptClaudeSdkRun = async (runId, { terminateBackground = false
             new Promise((resolve) => setTimeout(resolve, 1000)),
           ]);
         } catch {}
-        disposeClaudeSdkSession(session.threadId);
+        await disposeClaudeSdkSessionAndWait(session.threadId);
         return true;
       }
       // Steer: interrupt the turn in place; the session and any background
@@ -1226,7 +1247,9 @@ export const interruptClaudeSdkRun = async (runId, { terminateBackground = false
   const backgroundSession = claudeBackgroundRunSessions.get(runId);
   if (backgroundSession) {
     clearClaudeBackgroundRun(backgroundSession);
-    if (terminateBackground) disposeClaudeSdkSession(backgroundSession.threadId);
+    if (terminateBackground) {
+      await disposeClaudeSdkSessionAndWait(backgroundSession.threadId);
+    }
     // With no foreground turn there is nothing to interrupt. Returning true
     // still acknowledges the retained handle; a steer may now push a fresh
     // instruction, while Stop disposes the session above.
@@ -1242,13 +1265,52 @@ export const disposeClaudeSdkSession = (threadId) => {
   // session created for the same thread id.
   claudeSdkSessions.delete(threadId);
   clearClaudeBackgroundRun(session);
+  let terminating = terminatingClaudeSdkSessions.get(threadId);
+  if (!terminating) {
+    terminating = new Set();
+    terminatingClaudeSdkSessions.set(threadId, terminating);
+  }
+  terminating.add(session);
   session.dispose();
   return true;
 };
 
+// Rift removal must not move a workspace while its persistent Claude process
+// is still unwinding after AbortController.abort(). The ordinary disposal API
+// stays synchronous for UI/model-switch call sites; destructive workspace
+// lifecycle paths use this bounded acknowledgement.
+export const disposeClaudeSdkSessionAndWait = async (threadId, timeoutMs = 3000) => {
+  const sessions = new Set(terminatingClaudeSdkSessions.get(threadId) ?? []);
+  const activeSession = claudeSdkSessions.get(threadId);
+  if (activeSession) {
+    disposeClaudeSdkSession(threadId);
+    sessions.add(activeSession);
+  }
+  if (sessions.size === 0) return false;
+  if ([...sessions].every((session) => session.ended)) return true;
+
+  let timeoutId;
+  const ended = await Promise.race([
+    Promise.all([...sessions].map((session) => session.endedPromise)).then(() => true),
+    new Promise((resolve) => {
+      timeoutId = setTimeout(() => resolve(false), timeoutMs);
+    }),
+  ]);
+  if (timeoutId) clearTimeout(timeoutId);
+  if (!ended) {
+    throw new Error(`Claude runtime for thread ${threadId} did not stop in time.`);
+  }
+  return true;
+};
+
 export const disposeAllClaudeSdkSessions = () => {
-  for (const session of claudeSdkSessions.values()) session.dispose();
-  claudeSdkSessions.clear();
+  // Keep every disposed harness in the terminating map until its query
+  // acknowledges shutdown. On macOS a new window can open before those
+  // acknowledgements arrive, and a destructive rift removal must still see
+  // and wait for sessions owned by the previous window.
+  for (const threadId of [...claudeSdkSessions.keys()]) {
+    disposeClaudeSdkSession(threadId);
+  }
   claudeBackgroundRunSessions.clear();
 };
 

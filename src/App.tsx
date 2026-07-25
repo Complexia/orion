@@ -8,7 +8,9 @@ import {
   Code2,
   GitBranch,
   GitCommit,
+  GitMerge,
   GitPullRequest,
+  GitPullRequestClosed,
   ChevronDown,
   ChevronRight,
   Ellipsis,
@@ -59,10 +61,12 @@ import {
   FilePen,
   BookOpen,
   Workflow,
+  FlaskConical,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   useOrionStore,
+  flushOrionStoreSave,
   defaultProviderSettings,
   defaultOrchestrationSettings,
   defaultNotificationSettings,
@@ -210,7 +214,8 @@ type SettingsTab =
   | 'providers'
   | 'orchestration'
   | 'computer-use'
-  | 'cosmetics';
+  | 'cosmetics'
+  | 'experimental';
 
 const THREADS_VISIBLE_LIMIT = 5;
 
@@ -225,6 +230,20 @@ const EPIC_MESSAGE_MODEL_PREFERENCE = [
   'cursor:composer-2.5-fast',
   'kimi:kimi-code/kimi-for-coding-highspeed',
 ];
+
+// Threads grouped under an epic that has a rift workspace (experimental Rifts
+// feature) run their agent processes inside the rift instead of the project
+// directory.
+const threadWorkingDir = (
+  epics: Epic[],
+  thread: { epicId?: string } | undefined,
+  project: Project
+) => {
+  const epic = thread?.epicId ? epics.find((candidate) => candidate.id === thread.epicId) : undefined;
+  return epic?.riftPath && !epic.riftCleanupPending
+    ? epic.riftWorkingDir ?? epic.riftPath
+    : project.path;
+};
 
 // Keep the shell/sidebar subscription independent from transcript payloads.
 // A token chunk replaces a Thread object, but none of these metadata fields,
@@ -331,6 +350,8 @@ const App: React.FC = () => {
     epics,
     selectedEpicId,
     epicsSettings,
+    riftsSettings,
+    setRiftsSettings,
     addProject,
     removeProject,
     renameProject,
@@ -384,6 +405,8 @@ const App: React.FC = () => {
       epics: state.epics,
       selectedEpicId: state.selectedEpicId,
       epicsSettings: state.epicsSettings,
+      riftsSettings: state.riftsSettings,
+      setRiftsSettings: state.setRiftsSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
@@ -533,6 +556,59 @@ const App: React.FC = () => {
   const [createEpicOpen, setCreateEpicOpen] = useState(false);
   const [newEpicName, setNewEpicName] = useState('');
   const [newEpicDescription, setNewEpicDescription] = useState('');
+  // Project the new epic binds to; preset on open to the project the user
+  // last sent a message in.
+  const [newEpicProjectId, setNewEpicProjectId] = useState<string | null>(null);
+  // Per-epic opt-out for the modal's "Create a rift" checkbox; the default
+  // comes from the experimental Rifts settings when the modal opens.
+  const [newEpicCreateRift, setNewEpicCreateRift] = useState(false);
+  // Rift binary availability, fetched once (null while unknown).
+  const [riftStatus, setRiftStatus] = useState<{
+    available: boolean;
+    version?: string | null;
+    pendingEpicIds?: string[];
+    readyRifts?: Array<{
+      epicId: string;
+      projectId?: string;
+      projectPath: string;
+      riftPath: string;
+      riftWorkingDir: string;
+      gitRoot?: string;
+      branch?: string;
+    }>;
+  } | null>(null);
+  // Epics whose rift workspace is still being created (branch naming runs a
+  // hidden model turn, so this can take a few seconds). Mirrored in a ref so
+  // the turn dispatcher — which reads state at call time — can refuse to start
+  // an epic's threads in the source repository before its rift exists.
+  const [riftSetupEpicIds, setRiftSetupEpicIds] = useState<Record<string, boolean>>({});
+  const riftSetupEpicIdsRef = useRef<Record<string, boolean>>({});
+  const locallyStartedRiftEpicIdsRef = useRef<Set<string>>(new Set());
+  const [riftRecoveryRefreshNonce, setRiftRecoveryRefreshNonce] = useState(0);
+  // Prevent repeated delete clicks from racing two runtime teardown / rift
+  // removal sequences for the same epic. The state mirror also unmounts any
+  // selected Claude terminal while teardown is in flight.
+  const [riftRemovalEpicIds, setRiftRemovalEpicIds] = useState<Record<string, boolean>>({});
+  const riftRemovalEpicIdsRef = useRef<Set<string>>(new Set());
+  const markRiftRemoval = useCallback((epicId: string, pending: boolean) => {
+    if (pending) riftRemovalEpicIdsRef.current.add(epicId);
+    else riftRemovalEpicIdsRef.current.delete(epicId);
+    setRiftRemovalEpicIds((current) => {
+      const next = { ...current };
+      if (pending) next[epicId] = true;
+      else delete next[epicId];
+      return next;
+    });
+  }, []);
+  const markRiftSetup = useCallback((epicId: string, pending: boolean) => {
+    if (pending) locallyStartedRiftEpicIdsRef.current.add(epicId);
+    else locallyStartedRiftEpicIdsRef.current.delete(epicId);
+    const next = { ...riftSetupEpicIdsRef.current };
+    if (pending) next[epicId] = true;
+    else delete next[epicId];
+    riftSetupEpicIdsRef.current = next;
+    setRiftSetupEpicIds(next);
+  }, []);
   const createEpicTitleRef = useRef<HTMLInputElement>(null);
   const [epicMenuOpenId, setEpicMenuOpenId] = useState<string | null>(null);
   const [epicRenameId, setEpicRenameId] = useState<string | null>(null);
@@ -540,6 +616,19 @@ const App: React.FC = () => {
   // One epic git action (commit/PR) at a time; the epic view's buttons disable
   // while it runs.
   const [epicGitBusy, setEpicGitBusy] = useState<'commit' | 'pr' | null>(null);
+  // Live workspace status behind the epic git buttons: "Commit & push" greys
+  // out when the workspace is clean and fully pushed, and a created PR shows
+  // its lifecycle state (open/merged/closed) instead of the Create PR button.
+  const [epicGitStatuses, setEpicGitStatuses] = useState<
+    Record<
+      string,
+      {
+        hasChangesToCommit: boolean;
+        hasUnpushedCommits: boolean;
+        prState?: 'OPEN' | 'CLOSED' | 'MERGED';
+      }
+    >
+  >({});
   const repositoryOperationBusy = gitBusy || cloudBusy || epicGitBusy !== null;
   useEffect(() => {
     if (!repositoryOperationBusy) return;
@@ -655,7 +744,32 @@ const App: React.FC = () => {
   // thread's project dir, plus the grok CLI's per-session dir — Grok Imagine
   // saves generated images there (~/.grok/sessions/<encoded-cwd>/<session-id>/
   // images/N.jpg) and references them relative to it, not to the project.
-  const selectedThreadProjectPath = selectedThreadProject?.path;
+  const selectedThreadEpic = selectedThread?.epicId
+    ? epics.find((epic) => epic.id === selectedThread.epicId)
+    : undefined;
+  const selectedThreadRiftPending = Boolean(
+    selectedThread?.epicId && riftSetupEpicIds[selectedThread.epicId]
+  );
+  const selectedThreadRiftRemoving = Boolean(
+    selectedThread?.epicId && riftRemovalEpicIds[selectedThread.epicId]
+  );
+  const selectedThreadRiftUnavailable =
+    selectedThreadRiftPending ||
+    selectedThreadRiftRemoving ||
+    Boolean(selectedThreadEpic?.riftRequest) ||
+    Boolean(selectedThreadEpic?.riftCleanupPending) ||
+    Boolean(
+      selectedThreadEpic &&
+        !selectedThreadEpic.riftPath &&
+        riftsSettings.enabled &&
+        riftStatus === null
+    );
+  // Threads grouped under an epic with a rift work inside that rift workspace.
+  const selectedThreadProjectPath = selectedThreadRiftUnavailable
+    ? undefined
+    : selectedThreadEpic?.riftPath
+      ? selectedThreadEpic.riftWorkingDir ?? selectedThreadEpic.riftPath
+      : selectedThreadProject?.path;
   const selectedThreadGrokSessionId = selectedThread?.agentSessionIds?.grok;
   const mediaBaseDirs = useMemo(() => {
     if (!selectedThreadProjectPath) return [];
@@ -689,6 +803,25 @@ const App: React.FC = () => {
       if (createdAt > latestCreatedAt) {
         latestCreatedAt = createdAt;
         latestProjectId = thread.projectId;
+      }
+    }
+    return latestProjectId;
+  }, [threads]);
+  // The project the user last sent a message in (a thread's last user message
+  // is its latest, so only that one is checked per thread). Presets the
+  // create-epic modal's project picker.
+  const lastMessagedProjectId = useMemo(() => {
+    let latestProjectId: string | null = null;
+    let latestTs = -Infinity;
+    for (const thread of threads) {
+      for (let i = thread.messages.length - 1; i >= 0; i--) {
+        if (thread.messages[i].role !== 'user') continue;
+        const ts = new Date(thread.messages[i].ts).getTime();
+        if (ts > latestTs) {
+          latestTs = ts;
+          latestProjectId = thread.projectId;
+        }
+        break;
       }
     }
     return latestProjectId;
@@ -731,7 +864,13 @@ const App: React.FC = () => {
   }, [agentModels]);
 
   const canChangeSelectedThreadProject =
-    !!selectedThread && selectedThread.messages.length === 0 && selectedThread.status === 'idle' && !isSending;
+    !!selectedThread &&
+    !selectedThreadEpic?.riftPath &&
+    !selectedThreadEpic?.riftRequest &&
+    !selectedThreadRiftPending &&
+    selectedThread.messages.length === 0 &&
+    selectedThread.status === 'idle' &&
+    !isSending;
 
   const shellTitle =
     activeTab === 'agents'
@@ -1164,6 +1303,40 @@ const App: React.FC = () => {
   const activeThreadProject =
     selectedThreadProject ?? (selectedEpic ? selectedProject : defaultNewThreadProject);
 
+  // The directory the repository controls act on. A thread grouped under an
+  // epic with a rift has its agents working inside that rift, so the git
+  // state, branch actions, commit/push, cloud sync, Code tab and Open With
+  // have to follow it there — reading or committing the source repository
+  // instead would show and act on a tree nobody is editing.
+  const activeRift =
+    selectedThread ? selectedThreadEpic : selectedEpic;
+  const activeRiftPath =
+    activeRift?.riftPath && !activeRift.riftCleanupPending
+      ? activeRift.riftWorkingDir ?? activeRift.riftPath
+      : null;
+  const activeRiftUnavailable = Boolean(
+    activeRift &&
+      (riftSetupEpicIds[activeRift.id] ||
+        riftRemovalEpicIds[activeRift.id] ||
+        activeRift.riftRequest ||
+        activeRift.riftCleanupPending ||
+        (!activeRift.riftPath && riftsSettings.enabled && riftStatus === null))
+  );
+  const activeWorkingDir = activeRiftUnavailable
+    ? null
+    : activeRiftPath ?? activeThreadProject?.path ?? null;
+  const previousActiveWorkingDirRef = useRef(activeWorkingDir);
+  useLayoutEffect(() => {
+    const workingDirChanged = previousActiveWorkingDirRef.current !== activeWorkingDir;
+    previousActiveWorkingDirRef.current = activeWorkingDir;
+    // Keep the editor mounted only while it still belongs to the active
+    // thread/epic. Leaving Code preserves any open-file state; reopening it
+    // goes through handleSetActiveTab, which switches the workspace root.
+    if (activeTab === 'code' && (activeRiftUnavailable || workingDirChanged)) {
+      setActiveTab('agents');
+    }
+  }, [activeRiftUnavailable, activeWorkingDir, activeTab, setActiveTab]);
+
   const selectedEpicThreads = selectedEpic ? threadsByEpic.get(selectedEpic.id) ?? [] : [];
   const selectedEpicRepositoryProject = selectedEpic?.repositoryProjectId
     ? projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null
@@ -1171,6 +1344,21 @@ const App: React.FC = () => {
   const selectedEpicClaimedProject = selectedEpic
     ? projectForGitRoot(selectedEpic.gitRoot, selectedEpic.repositoryProjectId)
     : null;
+  const selectedEpicGitStatus = selectedEpic ? epicGitStatuses[selectedEpic.id] : undefined;
+  // Fail open: until the first status arrives, the commit button stays enabled.
+  const selectedEpicHasWorkToPush =
+    !selectedEpicGitStatus ||
+    selectedEpicGitStatus.hasChangesToCommit ||
+    selectedEpicGitStatus.hasUnpushedCommits;
+  const selectedEpicPrBadge = !selectedEpic?.prUrl
+    ? null
+    : selectedEpicGitStatus?.prState === 'MERGED'
+      ? { label: 'PR merged', modifier: 'merged' as const }
+      : selectedEpicGitStatus?.prState === 'CLOSED'
+        ? { label: 'PR closed', modifier: 'closed' as const }
+        : selectedEpicGitStatus?.prState === 'OPEN'
+          ? { label: 'PR open', modifier: 'open' as const }
+          : { label: 'PR created', modifier: 'open' as const };
 
   // The model that writes epic commit/PR messages: the Settings pick when it's
   // installed and its provider is enabled, else the cheapest enabled model.
@@ -1540,7 +1728,7 @@ const App: React.FC = () => {
   }, []);
 
   const refreshGitState = useCallback(async () => {
-    const projectPath = activeThreadProject?.path;
+    const projectPath = activeWorkingDir;
     if (!projectPath || !window.orion?.getGitState) {
       setGitState(null);
       return;
@@ -1559,14 +1747,14 @@ const App: React.FC = () => {
     } finally {
       setGitLoading(false);
     }
-  }, [activeThreadProject?.path]);
+  }, [activeWorkingDir]);
 
   useEffect(() => {
     void refreshGitState();
   }, [refreshGitState]);
 
   const refreshCloudState = useCallback(async () => {
-    const projectPath = activeThreadProject?.path;
+    const projectPath = activeWorkingDir;
     if (!projectPath || !window.orion?.getCloudState) {
       setCloudState(null);
       return;
@@ -1580,7 +1768,7 @@ const App: React.FC = () => {
         error: error instanceof Error ? error.message : 'Unable to read Orion Cloud state',
       });
     }
-  }, [activeThreadProject?.path]);
+  }, [activeWorkingDir]);
 
   // Cloud state depends on both the account session and local git state
   // (each git action can change what is ahead/behind the cloud copy).
@@ -2161,6 +2349,7 @@ const App: React.FC = () => {
               modelId: parent.modelId,
               hiddenFromRecent: true,
               accessMode: parent.accessMode,
+              epicId: parent.epicId,
               select: false,
               subagent: {
                 id: subagentId,
@@ -2639,8 +2828,15 @@ const App: React.FC = () => {
   };
 
   const handleSetActiveTab = (tab: 'agents' | 'code') => {
-    if (tab === 'code' && selectedProject && workspacePath !== selectedProject.path) {
-      setWorkspacePath(selectedProject.path);
+    // Open the directory the agents are actually editing: a rift workspace
+    // when the current thread's epic has one, else the project.
+    const codeRoot = activeWorkingDir;
+    if (tab === 'code' && activeRiftUnavailable) {
+      toast.error('Wait for the epic’s rift workspace to become available');
+      return;
+    }
+    if (tab === 'code' && codeRoot && workspacePath !== codeRoot) {
+      setWorkspacePath(codeRoot);
       closeAllFiles();
     }
 
@@ -2675,8 +2871,23 @@ const App: React.FC = () => {
         return;
       }
 
+      const threadEpic = thread.epicId
+        ? useOrionStore.getState().epics.find((epic) => epic.id === thread.epicId)
+        : undefined;
+      if (threadEpic?.riftPath || threadEpic?.riftRequest) {
+        toast.error('Threads in a rift stay bound to the epic’s source project');
+        setProjectPickerOpen(false);
+        return;
+      }
+      if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
+        toast.error('Wait for the epic’s rift setup to finish before changing projects');
+        setProjectPickerOpen(false);
+        return;
+      }
       if (!canChangeSelectedThreadProject) {
-        toast.error('Project can only be changed before the agent runs in this thread');
+        toast.error(
+          'Project can only be changed before the agent runs in this thread'
+        );
         setProjectPickerOpen(false);
         return;
       }
@@ -2697,7 +2908,7 @@ const App: React.FC = () => {
 
   const handleCheckoutBranch = async (branchName: string) => {
     if (
-      !activeThreadProject?.path ||
+      !activeWorkingDir ||
       !window.orion?.checkoutGitBranch ||
       repositoryOperationBusy
     ) return;
@@ -2709,7 +2920,7 @@ const App: React.FC = () => {
     setGitBusy(true);
     try {
       const result = await window.orion.checkoutGitBranch({
-        projectPath: activeThreadProject.path,
+        projectPath: activeWorkingDir,
         branchName,
       });
       if (result.ok) {
@@ -2726,7 +2937,7 @@ const App: React.FC = () => {
 
   const handleCreateBranch = async (branchName: string) => {
     if (
-      !activeThreadProject?.path ||
+      !activeWorkingDir ||
       !window.orion?.checkoutGitBranch ||
       repositoryOperationBusy
     ) return;
@@ -2737,7 +2948,7 @@ const App: React.FC = () => {
     setGitBusy(true);
     try {
       const result = await window.orion.checkoutGitBranch({
-        projectPath: activeThreadProject.path,
+        projectPath: activeWorkingDir,
         branchName: normalized,
         create: true,
       });
@@ -2755,14 +2966,14 @@ const App: React.FC = () => {
 
   const handleCommitAndPush = async () => {
     if (
-      !activeThreadProject?.path ||
+      !activeWorkingDir ||
       !window.orion?.commitAndPush ||
       repositoryOperationBusy
     ) return;
 
     setGitBusy(true);
     try {
-      const result = await window.orion.commitAndPush(activeThreadProject.path);
+      const result = await window.orion.commitAndPush(activeWorkingDir);
       if (result.ok) {
         toast.success(`Committed and pushed ${result.branch ?? gitState?.currentBranch ?? 'branch'}`);
         await refreshGitState();
@@ -2776,14 +2987,14 @@ const App: React.FC = () => {
 
   const handleCloudPublish = async () => {
     if (
-      !activeThreadProject?.path ||
+      !activeWorkingDir ||
       !window.orion?.publishToCloud ||
       repositoryOperationBusy
     ) return;
 
     setCloudBusy(true);
     try {
-      const result = await window.orion.publishToCloud({ projectPath: activeThreadProject.path });
+      const result = await window.orion.publishToCloud({ projectPath: activeWorkingDir });
       if (result.ok && result.alreadyLinked) {
         toast.success(result.upToDate ? 'Orion Cloud is already up to date' : 'Pushed to Orion Cloud');
         await refreshCloudState();
@@ -2792,7 +3003,7 @@ const App: React.FC = () => {
           description: 'Press Deploy on Orion Cloud to host it as an app.',
           action: {
             label: 'Open',
-            onClick: () => void window.orion?.openCloudRepoInBrowser?.(activeThreadProject.path),
+            onClick: () => void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir),
           },
         });
         await refreshCloudState();
@@ -2810,14 +3021,14 @@ const App: React.FC = () => {
 
   const handleCloudPush = async () => {
     if (
-      !activeThreadProject?.path ||
+      !activeWorkingDir ||
       !window.orion?.pushToCloud ||
       repositoryOperationBusy
     ) return;
 
     setCloudBusy(true);
     try {
-      const result = await window.orion.pushToCloud(activeThreadProject.path);
+      const result = await window.orion.pushToCloud(activeWorkingDir);
       if (result.ok && result.upToDate) {
         toast.info('Orion Cloud is already up to date');
       } else if (result.ok) {
@@ -2847,14 +3058,14 @@ const App: React.FC = () => {
 
   const handleCloudPull = async () => {
     if (
-      !activeThreadProject?.path ||
+      !activeWorkingDir ||
       !window.orion?.pullFromCloud ||
       repositoryOperationBusy
     ) return;
 
     setCloudBusy(true);
     try {
-      const result = await window.orion.pullFromCloud(activeThreadProject.path);
+      const result = await window.orion.pullFromCloud(activeWorkingDir);
       if (!result.ok) {
         toast.error(result.error ?? 'Pull from Orion Cloud failed');
       } else {
@@ -2902,27 +3113,341 @@ const App: React.FC = () => {
     return id;
   };
 
+  // Unknown availability (null, still fetching) stays optimistic; the create
+  // IPC reports a clear error if the binary is genuinely missing.
+  const riftsAvailable = riftStatus?.available !== false;
+  const riftsActive = riftsSettings.enabled && riftsAvailable;
+
+  const persistAndAcknowledgeRift = useCallback(
+    async (ownership: {
+      epicId: string;
+      projectId?: string;
+      projectPath: string;
+      riftPath: string;
+      riftWorkingDir: string;
+      gitRoot?: string;
+      branch?: string;
+    }) => {
+      const state = useOrionStore.getState();
+      const epic = state.epics.find((candidate) => candidate.id === ownership.epicId);
+      if (!epic) {
+        return { ok: false, error: 'The epic no longer exists.' };
+      }
+      // Bind the completed workspace to the project that requested it, not
+      // the epic's mutable repository selection. The id survives canonical
+      // path differences; the path fallback supports a removed/re-added
+      // project after renderer recovery.
+      const requestedProjectId = ownership.projectId ?? epic.riftRequest?.projectId;
+      const project =
+        state.projects.find((candidate) => candidate.id === requestedProjectId) ??
+        state.projects.find((candidate) => candidate.path === ownership.projectPath) ??
+        state.projects.find(
+          (candidate) => candidate.path === epic.riftRequest?.projectPath
+        );
+      if (!project) {
+        return {
+          ok: false,
+          error: 'The project that requested this Rift is no longer available in Orion.',
+        };
+      }
+      updateEpic(ownership.epicId, {
+        riftPath: ownership.riftPath,
+        riftWorkingDir: ownership.riftWorkingDir,
+        riftRequest: undefined,
+        ...(ownership.gitRoot ? { gitRoot: ownership.gitRoot } : {}),
+        ...(ownership.branch ? { gitBranch: ownership.branch } : {}),
+        repositoryProjectId: project.id,
+      });
+      for (const thread of useOrionStore.getState().threads) {
+        if (thread.epicId === ownership.epicId && thread.projectId !== project.id) {
+          updateThread(thread.id, { projectId: project.id });
+        }
+      }
+
+      // Main verifies the saved store itself before releasing its ownership
+      // journal and source-workspace lock.
+      if (!(await flushOrionStoreSave())) {
+        return { ok: false, error: 'Could not save Rift ownership.' };
+      }
+      return (
+        (await window.orion?.epicAcknowledgeRift?.({
+          epicId: ownership.epicId,
+          riftPath: ownership.riftPath,
+        })) ?? { ok: false, error: 'This Orion build cannot acknowledge Rift ownership.' }
+      );
+    },
+    [updateEpic, updateThread]
+  );
+
+  useEffect(() => {
+    const getRiftStatus = window.orion?.riftStatus;
+    if (!getRiftStatus) return;
+    let disposed = false;
+    let refreshTimer: number | null = null;
+    let recoveryRetryCount = 0;
+    const recoveringEpicIds = new Set<string>();
+    const refresh = async () => {
+      try {
+        const status = await getRiftStatus();
+        if (disposed) return;
+        setRiftStatus(status);
+        const pending = Object.fromEntries(
+          [
+            ...(status.pendingEpicIds ?? []),
+            ...locallyStartedRiftEpicIdsRef.current,
+          ].map((epicId) => [epicId, true])
+        );
+        // Main owns this lock across macOS window recreation. Mirror its
+        // current state so the reopened UI also disables controls immediately
+        // after hydration; launch IPCs enforce the same lock authoritatively.
+        riftSetupEpicIdsRef.current = pending;
+        setRiftSetupEpicIds(pending);
+        for (const ownership of status.readyRifts ?? []) {
+          if (recoveringEpicIds.has(ownership.epicId)) continue;
+          recoveringEpicIds.add(ownership.epicId);
+          try {
+            const acknowledgement = await persistAndAcknowledgeRift(ownership);
+            if (acknowledgement.ok) {
+              recoveryRetryCount = 0;
+              if (locallyStartedRiftEpicIdsRef.current.delete(ownership.epicId)) {
+                const recoveredPending = Object.fromEntries(
+                  [
+                    ...(status.pendingEpicIds ?? []),
+                    ...locallyStartedRiftEpicIdsRef.current,
+                  ].map((epicId) => [epicId, true])
+                );
+                riftSetupEpicIdsRef.current = recoveredPending;
+                setRiftSetupEpicIds(recoveredPending);
+              }
+            } else if (locallyStartedRiftEpicIdsRef.current.has(ownership.epicId)) {
+              recoveryRetryCount += 1;
+            }
+          } finally {
+            recoveringEpicIds.delete(ownership.epicId);
+          }
+        }
+        const hasMainPendingSetup = (status.pendingEpicIds?.length ?? 0) > 0;
+        if (hasMainPendingSetup || locallyStartedRiftEpicIdsRef.current.size > 0) {
+          // Main-owned setup remains on the existing fast cadence. A ready
+          // Rift whose save/acknowledgement failed backs off so a persistent
+          // storage failure cannot create a hot IPC/save loop.
+          const retryDelay = hasMainPendingSetup
+            ? 500
+            : Math.min(500 * 2 ** Math.min(recoveryRetryCount, 4), 5000);
+          refreshTimer = window.setTimeout(() => void refresh(), retryDelay);
+        }
+      } catch {
+        if (!disposed && locallyStartedRiftEpicIdsRef.current.size > 0) {
+          recoveryRetryCount += 1;
+          const retryDelay = Math.min(
+            500 * 2 ** Math.min(recoveryRetryCount, 4),
+            5000
+          );
+          refreshTimer = window.setTimeout(() => void refresh(), retryDelay);
+        }
+      }
+    };
+    void refresh();
+    return () => {
+      disposed = true;
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+    };
+  }, [persistAndAcknowledgeRift, riftRecoveryRefreshNonce]);
+
   const openCreateEpicModal = useCallback(() => {
     setNewEpicName('');
     setNewEpicDescription('');
+    setNewEpicProjectId(
+      (projects.find((project) => project.id === lastMessagedProjectId) ?? defaultNewThreadProject)
+        ?.id ?? null
+    );
+    setNewEpicCreateRift(riftsActive && riftsSettings.autoCreateForEpics);
     setEpicsSectionOpen(true);
     setCreateEpicOpen(true);
-  }, []);
+  }, [
+    defaultNewThreadProject,
+    lastMessagedProjectId,
+    projects,
+    riftsActive,
+    riftsSettings.autoCreateForEpics,
+  ]);
 
   const closeCreateEpicModal = useCallback(() => {
     setCreateEpicOpen(false);
     setNewEpicName('');
     setNewEpicDescription('');
+    setNewEpicProjectId(null);
   }, []);
 
-  const handleCreateEpic = useCallback(() => {
+  // Creates the epic's copy-on-write rift workspace and its feature branch
+  // (named by the epic message model), then binds them to the epic. Runs in
+  // the background after the create modal closes.
+  const setupRiftForEpic = async (epicId: string) => {
+    if (riftSetupEpicIdsRef.current[epicId]) return;
+    const state = useOrionStore.getState();
+    const epic = state.epics.find((candidate) => candidate.id === epicId);
+    const request = epic?.riftRequest;
+    if (!epic || !request || epic.riftPath) return;
+    const project =
+      state.projects.find(
+        (candidate) =>
+          candidate.id === request.projectId && candidate.path === request.projectPath
+      ) ??
+      state.projects.find((candidate) => candidate.path === request.projectPath);
+    if (!project) {
+      updateEpic(epicId, {
+        riftRequest: {
+          ...request,
+          error: 'The project selected for this Rift is no longer available in Orion.',
+        },
+      });
+      return;
+    }
+    if (!window.orion?.epicCreateRift) {
+      updateEpic(epicId, {
+        riftRequest: {
+          ...request,
+          error: 'This Orion build cannot create Rift workspaces.',
+        },
+      });
+      return;
+    }
+    updateEpic(epicId, {
+      repositoryProjectId: project.id,
+      riftRequest: { ...request, error: undefined },
+    });
+    markRiftSetup(epicId, true);
+    let keepSetupLocked = false;
+    try {
+      // The request must reach disk before main starts creating anything.
+      // That way a renderer/app restart after a recoverable setup failure
+      // still knows this epic must not fall back to the source checkout.
+      if (!(await flushOrionStoreSave())) {
+        updateEpic(epicId, {
+          riftRequest: {
+            ...request,
+            error: 'Could not save the Rift request. Retry after Orion storage is available.',
+          },
+        });
+        toast.error('Could not save the Rift request');
+        return;
+      }
+      const result = await window.orion.epicCreateRift({
+        epicId,
+        projectId: project.id,
+        projectPath: project.path,
+        epicName: epic.name,
+        epicDescription: epic.description,
+        modelId: resolveEpicMessageModelId(),
+      });
+      if (result.ok && result.riftPath) {
+        // Keep the local launch lock if persistence throws as well as when it
+        // returns { ok: false }; main retains the ready ownership journal for
+        // the recovery poll in either case.
+        keepSetupLocked = true;
+        const acknowledgement = await persistAndAcknowledgeRift({
+          epicId,
+          projectId: project.id,
+          projectPath: project.path,
+          riftPath: result.riftPath,
+          riftWorkingDir: result.riftWorkingDir ?? result.riftPath,
+          gitRoot: result.gitRoot,
+          branch: result.branch,
+        });
+        if (!acknowledgement.ok) {
+          // The status effect may have gone idle before this local creation
+          // began. Wake it only when recovery is needed, avoiding polling and
+          // duplicate store saves during the normal successful setup path.
+          setRiftRecoveryRefreshNonce((current) => current + 1);
+          toast.error('Rift created, but its ownership could not be persisted', {
+            description: acknowledgement.error,
+          });
+          return;
+        }
+        keepSetupLocked = false;
+        toast.success(`Rift ready — working on ${result.branch}`, {
+          description: result.riftPath,
+        });
+      } else {
+        // Main normally removes a rift when post-create branch setup fails.
+        // If even that cleanup failed, retain the incomplete path on the epic
+        // so deletion can retry it after reload; never run threads there.
+        if (result.riftPath) {
+          updateEpic(epicId, {
+            riftPath: result.riftPath,
+            riftCleanupPending: true,
+            repositoryProjectId: project.id,
+            riftRequest: {
+              ...request,
+              error: result.error ?? 'Rift setup failed and its incomplete workspace needs cleanup.',
+            },
+          });
+        } else {
+          updateEpic(epicId, {
+            riftRequest: {
+              ...request,
+              error: result.error ?? 'Rift setup failed. Try again after fixing the source repository.',
+            },
+          });
+        }
+        await flushOrionStoreSave();
+        toast.error('Could not create a rift for this epic', {
+          description: result.error ?? undefined,
+        });
+      }
+    } catch (error) {
+      if (keepSetupLocked) {
+        setRiftRecoveryRefreshNonce((current) => current + 1);
+      } else {
+        updateEpic(epicId, {
+          riftRequest: {
+            ...request,
+            error: error instanceof Error ? error.message : 'Rift setup failed.',
+          },
+        });
+        await flushOrionStoreSave();
+      }
+      toast.error(
+        keepSetupLocked
+          ? 'Rift created, but its ownership could not be persisted'
+          : 'Could not create a rift for this epic',
+        {
+          description: error instanceof Error ? error.message : undefined,
+        }
+      );
+    } finally {
+      if (!keepSetupLocked) markRiftSetup(epicId, false);
+    }
+  };
+
+  const handleCreateEpic = () => {
     const trimmed = newEpicName.trim();
     if (!trimmed) return;
     const description = newEpicDescription.trim();
-    addEpic(trimmed, description ? { description } : undefined);
+    const epicProject = projects.find((project) => project.id === newEpicProjectId) ?? null;
+    const riftProject = epicProject;
+    const riftRequest =
+      newEpicCreateRift && riftsActive && riftProject
+        ? {
+            projectId: riftProject.id,
+            projectPath: riftProject.path,
+          }
+        : undefined;
+    const epicId = addEpic(trimmed, {
+      ...(description ? { description } : {}),
+      ...(epicProject ? { repositoryProjectId: epicProject.id } : {}),
+      ...(riftRequest ? { riftRequest } : {}),
+    });
     closeCreateEpicModal();
     setActiveTab('agents');
-  }, [addEpic, closeCreateEpicModal, newEpicDescription, newEpicName, setActiveTab]);
+    if (newEpicCreateRift && riftsActive) {
+      if (riftProject) {
+        void setupRiftForEpic(epicId);
+      } else {
+        toast.info('Pick a project to create a rift for this epic');
+      }
+    }
+  };
 
   useEffect(() => {
     if (!createEpicOpen) return;
@@ -2975,30 +3500,133 @@ const App: React.FC = () => {
     return id;
   };
 
-  // Shared setup for the epic git handlers: the repository to act on (the
-  // claimed gitRoot wins over the picked project) plus the branches other
-  // epics already claimed, which the main process uses to refuse collisions.
-  // projectPath stays optional so each caller can word its own toast.
+  // Shared setup for the epic git handlers: the directory the epic's git
+  // actions act on. The rift workspace wins when one exists; otherwise the
+  // claimed gitRoot, then the picked project. projectPath stays optional so
+  // each caller can word its own toast.
+  //
+  // Without a rift, the epic shares its repository with everything else, so
+  // main must still refuse a drifted checkout or a branch another epic
+  // claimed. A rift is exclusively this epic's workspace, so those claims
+  // don't apply there.
   const resolveEpicGitTarget = (epic: Epic) => {
     const project = epic.repositoryProjectId
       ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
       : null;
+    const isRift = Boolean(epic.riftPath && !epic.riftCleanupPending);
     return {
       project,
-      projectPath: epic.gitRoot ?? project?.path,
-      claimedBranches: epics
-        .filter((candidate) => candidate.id !== epic.id && candidate.gitRoot && candidate.gitBranch)
-        .map((candidate) => ({
-          gitRoot: candidate.gitRoot!,
-          branch: candidate.gitBranch!,
-          epicName: candidate.name,
-        })),
+      projectPath: epic.riftCleanupPending
+        ? undefined
+        : epic.riftPath ?? epic.gitRoot ?? project?.path,
+      claim: isRift
+        ? {
+            isRift: true as const,
+            expectedGitRoot: epic.riftPath,
+            expectedBranch: epic.gitBranch,
+          }
+        : {
+            isRift: false as const,
+            expectedGitRoot: epic.gitRoot,
+            expectedBranch: epic.gitBranch,
+            claimedBranches: epics
+              .filter(
+                (candidate) =>
+                  candidate.id !== epic.id &&
+                  !candidate.riftPath &&
+                  candidate.gitRoot &&
+                  candidate.gitBranch
+              )
+              .map((candidate) => ({
+                gitRoot: candidate.gitRoot!,
+                branch: candidate.gitBranch!,
+                epicName: candidate.name,
+              })),
+          },
     };
   };
 
+  // A rift epic's gitRoot stays the source repository root (it associates the
+  // epic with its project); the main process reports the rift itself as the
+  // git root, which must not overwrite that binding.
+  const claimEpicGitTarget = (epic: Epic, result: { gitRoot?: string; branch?: string }) => {
+    if (!result.gitRoot || !result.branch) return;
+    updateEpic(epic.id, {
+      ...(epic.riftPath ? {} : { gitRoot: result.gitRoot }),
+      gitBranch: result.branch,
+    });
+  };
+
+  // Keeps the selected epic's git-button status fresh: fetched on selection
+  // and after every epic git action (epicGitBusy returning to null re-runs the
+  // effect), plus a light local-only poll while the view stays open so agent
+  // work re-enables "Commit & push". The PR state lookup hits GitHub, so it
+  // runs only on the initial fetch, not on every poll tick.
+  const refreshEpicGitStatus = async (epic: Epic, options?: { includePr?: boolean }) => {
+    if (!window.orion?.epicGitStatus) return;
+    const { projectPath } = resolveEpicGitTarget(epic);
+    if (!projectPath) return;
+    try {
+      const result = await window.orion.epicGitStatus({
+        projectPath,
+        ...(options?.includePr && epic.prUrl ? { prUrl: epic.prUrl } : {}),
+      });
+      return result.ok ? result : undefined;
+    } catch {
+      // Keep the last known status; the buttons fail open without one.
+      return undefined;
+    }
+  };
+
+  useEffect(() => {
+    if (
+      !selectedEpic ||
+      epicGitBusy ||
+      activeRiftUnavailable ||
+      riftRemovalEpicIds[selectedEpic.id]
+    ) {
+      return;
+    }
+    let cancelled = false;
+    let refreshTimer: number | undefined;
+    const run = async (includePr: boolean) => {
+      const result = await refreshEpicGitStatus(selectedEpic, { includePr });
+      if (cancelled) return;
+      if (result) {
+        setEpicGitStatuses((current) => ({
+          ...current,
+          [selectedEpic.id]: {
+            hasChangesToCommit: Boolean(result.hasChangesToCommit),
+            hasUnpushedCommits: Boolean(result.hasUnpushedCommits),
+            prState: result.pr?.state ?? current[selectedEpic.id]?.prState,
+          },
+        }));
+      }
+      refreshTimer = window.setTimeout(() => void run(false), 5000);
+    };
+    void run(true);
+    return () => {
+      cancelled = true;
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+    };
+    // refreshEpicGitStatus is recreated every render; depending on it would
+    // refire the effect every render and defeat the refresh loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedEpic, epicGitBusy, activeRiftUnavailable, riftRemovalEpicIds]);
+
   const handleEpicCommitAndPush = async (epic: Epic) => {
-    if (repositoryOperationBusy || !window.orion?.epicCommitAndPush) return;
-    const { project, projectPath, claimedBranches } = resolveEpicGitTarget(epic);
+    if (
+      repositoryOperationBusy ||
+      riftSetupEpicIdsRef.current[epic.id] ||
+      riftRemovalEpicIdsRef.current.has(epic.id) ||
+      epic.riftRequest ||
+      epic.riftCleanupPending ||
+      (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
+      !window.orion?.epicCommitAndPush
+    ) {
+      return;
+    }
+    const { project, projectPath, claim } = resolveEpicGitTarget(epic);
     if (!projectPath) {
       toast.error('Select a repository for this epic before committing');
       return;
@@ -3007,23 +3635,22 @@ const App: React.FC = () => {
     setEpicGitBusy('commit');
     try {
       const result = await window.orion.epicCommitAndPush({
+        epicId: epic.id,
         projectPath,
         modelId: resolveEpicMessageModelId(),
         epicName: epic.name,
-        expectedGitRoot: epic.gitRoot,
-        expectedBranch: epic.gitBranch,
-        claimedBranches,
+        ...claim,
       });
-      if (result.gitRoot && result.branch) {
-        // Claim the validated target even if a later commit hook or push fails,
-        // so another epic cannot reuse the branch on the next attempt.
-        updateEpic(epic.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
-      }
+      claimEpicGitTarget(epic, result);
       if (result.ok) {
         toast.success(`Committed and pushed ${result.branch ?? 'branch'}`, {
           description: result.message?.split('\n')[0],
         });
-        if (project && activeThreadProject?.id === project.id) await refreshGitState();
+        // Refresh only when the shell is showing the directory just committed
+        // (the epic's rift, or its repository when it has none).
+        if (projectPath === activeWorkingDir || (project && activeThreadProject?.id === project.id)) {
+          await refreshGitState();
+        }
       } else {
         toast.error(result.error ?? 'Commit and push failed');
       }
@@ -3035,8 +3662,18 @@ const App: React.FC = () => {
   };
 
   const handleEpicCreatePr = async (epic: Epic) => {
-    if (repositoryOperationBusy || !window.orion?.epicCreatePr) return;
-    const { projectPath, claimedBranches } = resolveEpicGitTarget(epic);
+    if (
+      repositoryOperationBusy ||
+      riftSetupEpicIdsRef.current[epic.id] ||
+      riftRemovalEpicIdsRef.current.has(epic.id) ||
+      epic.riftRequest ||
+      epic.riftCleanupPending ||
+      (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
+      !window.orion?.epicCreatePr
+    ) {
+      return;
+    }
+    const { projectPath, claim } = resolveEpicGitTarget(epic);
     if (!projectPath) {
       toast.error('Select a repository for this epic before opening a PR');
       return;
@@ -3045,19 +3682,30 @@ const App: React.FC = () => {
     setEpicGitBusy('pr');
     try {
       const result = await window.orion.epicCreatePr({
+        epicId: epic.id,
         projectPath,
         modelId: resolveEpicMessageModelId(),
         epicName: epic.name,
-        expectedGitRoot: epic.gitRoot,
-        expectedBranch: epic.gitBranch,
-        claimedBranches,
+        ...claim,
       });
-      if (result.gitRoot && result.branch) {
-        updateEpic(epic.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
-      }
+      claimEpicGitTarget(epic, result);
       if (result.ok) {
         const url = result.url;
-        if (url) updateEpic(epic.id, { prUrl: url });
+        if (url) {
+          updateEpic(epic.id, { prUrl: url });
+          setEpicGitStatuses((current) => {
+            const status = current[epic.id];
+            return status
+              ? {
+                  ...current,
+                  [epic.id]: {
+                    ...status,
+                    prState: 'OPEN',
+                  },
+                }
+              : current;
+          });
+        }
         toast.success(
           result.alreadyExists
             ? 'A pull request for this branch is already open'
@@ -3078,6 +3726,278 @@ const App: React.FC = () => {
       toast.error(error instanceof Error ? error.message : 'Could not open a pull request');
     } finally {
       setEpicGitBusy(null);
+    }
+  };
+
+  const handleRemoveThreadFromEpic = async (threadId: string) => {
+    const state = useOrionStore.getState();
+    const thread = state.threads.find((candidate) => candidate.id === threadId);
+    const epic = thread?.epicId
+      ? state.epics.find((candidate) => candidate.id === thread.epicId)
+      : undefined;
+    if (!thread || !epic) return;
+    if (!epic.riftPath) {
+      updateThread(thread.id, { epicId: undefined });
+      return;
+    }
+    if (riftRemovalEpicIdsRef.current.has(epic.id)) return;
+
+    const disposeAgentThread = window.orion?.disposeAgentThread;
+    if (!disposeAgentThread) {
+      toast.error('This Orion build cannot safely detach a thread from a live rift');
+      return;
+    }
+
+    markRiftRemoval(epic.id, true);
+    try {
+      // Capture both renderer tracking views before changing membership. A
+      // just-started run may only be present in runOutputMessages until React
+      // publishes activeRunsByThreadRef.
+      const runIds = new Set<string>();
+      const activeRunId = activeRunsByThreadRef.current[thread.id];
+      if (activeRunId) runIds.add(activeRunId);
+      for (const [runId, tracked] of runOutputMessages.current) {
+        if (tracked.threadId === thread.id) runIds.add(runId);
+      }
+
+      for (const runId of runIds) {
+        const tracked = runOutputMessages.current.get(runId);
+        runOutputMessages.current.delete(runId);
+        clearActiveRun(runId);
+        if (tracked) {
+          updateThreadMessage(tracked.threadId, tracked.messageId, {
+            status: 'stopped',
+            completedAt: new Date().toISOString(),
+            statusText: 'Stopped because the thread left its epic rift.',
+          });
+        }
+      }
+      flushChunkBuffers();
+
+      if (window.orion?.stopAgentTurn) {
+        await Promise.allSettled(
+          [...runIds].map((runId) =>
+            window.orion!.stopAgentTurn(runId, { terminateBackground: true })
+          )
+        );
+      }
+      await disposeAgentThread(thread.id);
+
+      if (thread.spawnId) {
+        void window.orion?.reportSubagentResult?.({
+          spawnId: thread.spawnId,
+          ok: false,
+          result: 'Subagent run was stopped because its thread left the epic rift.',
+        });
+      }
+      updateThread(thread.id, {
+        epicId: undefined,
+        status: thread.status === 'running' ? 'idle' : thread.status,
+        queuedMessages: [],
+        spawnId: undefined,
+        agentSessionIds: undefined,
+        pendingForkProviders: undefined,
+      });
+    } catch (error) {
+      toast.error('Could not safely detach this thread from its epic rift', {
+        description: error instanceof Error ? error.message : undefined,
+      });
+    } finally {
+      markRiftRemoval(epic.id, false);
+    }
+  };
+
+  // Confirms and deletes an epic. Its threads survive (deleteEpic only clears
+  // their epicId), so a rift-backed epic needs a fuller warning: the workspace
+  // those threads were editing goes away with it.
+  const handleDeleteEpic = async (epic: Epic) => {
+    if (repositoryOperationBusy) {
+      toast.error('Wait for the current repository operation to finish before deleting this epic');
+      return;
+    }
+    if (riftSetupEpicIdsRef.current[epic.id]) {
+      toast.error('Wait for this epic’s rift setup to finish before deleting it');
+      return;
+    }
+    if (riftRemovalEpicIdsRef.current.has(epic.id)) return;
+
+    // Re-read at click time so a rift that completed between render and the
+    // click cannot be mistaken for a non-rift epic and orphaned.
+    const state = useOrionStore.getState();
+    const currentEpic = state.epics.find((candidate) => candidate.id === epic.id);
+    if (!currentEpic) return;
+    const epicThreads = state.threads.filter((thread) => thread.epicId === currentEpic.id);
+    if (!currentEpic.riftPath) {
+      if (
+        !confirm(
+          `Delete epic "${currentEpic.name}"? Its threads are kept — they just leave this group.`
+        )
+      ) {
+        return;
+      }
+      deleteEpic(currentEpic.id);
+      return;
+    }
+
+    const fallbackProject =
+      state.projects.find((project) => project.id === currentEpic.repositoryProjectId)?.name ??
+      'their project';
+    if (
+      !confirm(
+        `Delete epic "${currentEpic.name}"?\n\n` +
+          `Its rift workspace moves to Rift trash — commit and push anything you still need ` +
+          `(recoverable with rift until \`rift gc\`).` +
+          (epicThreads.length > 0
+            ? `\n\n${epicThreads.length} thread${epicThreads.length === 1 ? '' : 's'} ` +
+              `${epicThreads.length === 1 ? 'is' : 'are'} kept, but ` +
+              `${epicThreads.length === 1 ? 'it goes' : 'they go'} back to ${fallbackProject} ` +
+              `and ${epicThreads.length === 1 ? 'starts' : 'start'} a fresh agent session.`
+            : '')
+      )
+    ) {
+      return;
+    }
+
+    const disposeAgentThread = window.orion?.disposeAgentThread;
+    const removeRift = window.orion?.epicRemoveRift;
+    if (!disposeAgentThread || !removeRift) {
+      toast.error('This Orion build cannot safely remove a live epic rift');
+      return;
+    }
+
+    markRiftRemoval(currentEpic.id, true);
+    try {
+      // Include descendants as well as directly grouped threads. This safely
+      // covers children created before epic inheritance was added.
+      const runtimeThreadIds = new Set(epicThreads.map((thread) => thread.id));
+      let foundChild = true;
+      while (foundChild) {
+        foundChild = false;
+        for (const thread of state.threads) {
+          if (
+            thread.parentThreadId &&
+            runtimeThreadIds.has(thread.parentThreadId) &&
+            !runtimeThreadIds.has(thread.id)
+          ) {
+            runtimeThreadIds.add(thread.id);
+            foundChild = true;
+          }
+        }
+      }
+      const runtimeThreads = state.threads.filter((thread) => runtimeThreadIds.has(thread.id));
+
+      // The ref can lag a just-started run until the next render, while the
+      // output map is updated synchronously. Merge both views so every tracked
+      // foreground or retained background run is stopped.
+      const runsByThread = new Map<string, string>(
+        Object.entries(activeRunsByThreadRef.current)
+      );
+      for (const [runId, tracked] of runOutputMessages.current) {
+        runsByThread.set(tracked.threadId, runId);
+      }
+      const runsToStop = runtimeThreads
+        .map((thread) => {
+          const runId = runsByThread.get(thread.id);
+          return runId ? { threadId: thread.id, runId } : null;
+        })
+        .filter(
+          (entry): entry is { threadId: string; runId: string } => entry !== null
+        );
+
+      // Untrack before IPC so terminal events racing with teardown cannot mark
+      // an intentionally stopped run as finished.
+      for (const { threadId, runId } of runsToStop) {
+        const tracked = runOutputMessages.current.get(runId);
+        runOutputMessages.current.delete(runId);
+        clearActiveRun(runId);
+        if (tracked) {
+          updateThreadMessage(tracked.threadId, tracked.messageId, {
+            status: 'stopped',
+            completedAt: new Date().toISOString(),
+            statusText: 'Stopped because the epic rift was removed.',
+          });
+        } else {
+          const thread = state.threads.find((candidate) => candidate.id === threadId);
+          const lastRun = thread
+            ? [...thread.messages].reverse().find((message) => message.kind === 'agent-run')
+            : undefined;
+          if (lastRun) {
+            updateThreadMessage(threadId, lastRun.id, {
+              completedAt: new Date().toISOString(),
+              statusText: 'Stopped because the epic rift was removed.',
+            });
+          }
+        }
+      }
+      flushChunkBuffers();
+
+      // stopAgentTurn handles tracked foreground/background run handles.
+      // disposeAgentThread is the authoritative teardown for every thread: it
+      // also kills untracked agents, persistent Claude background sessions,
+      // Claude terminal PTYs, and pending terminal starts.
+      if (window.orion?.stopAgentTurn) {
+        await Promise.allSettled(
+          runsToStop.map(({ runId }) =>
+            window.orion!.stopAgentTurn(runId, { terminateBackground: true })
+          )
+        );
+      }
+      try {
+        await Promise.all(runtimeThreads.map((thread) => disposeAgentThread(thread.id)));
+      } catch (error) {
+        toast.error('Could not safely stop every runtime in the epic rift', {
+          description: error instanceof Error ? error.message : undefined,
+        });
+        return;
+      }
+
+      const pendingSpawnIds: string[] = [];
+      for (const thread of runtimeThreads) {
+        const updates: Partial<Thread> = {};
+        if (thread.status === 'running') updates.status = 'idle';
+        if ((thread.queuedMessages?.length ?? 0) > 0) updates.queuedMessages = [];
+        if (thread.spawnId) {
+          updates.spawnId = undefined;
+          pendingSpawnIds.push(thread.spawnId);
+        }
+        if (Object.keys(updates).length > 0) updateThread(thread.id, updates);
+      }
+      for (const spawnId of pendingSpawnIds) {
+        void window.orion?.reportSubagentResult?.({
+          spawnId,
+          ok: false,
+          result: 'Subagent run was stopped because its epic rift was removed.',
+        });
+      }
+
+      let removalResult;
+      try {
+        removalResult = await removeRift({ riftPath: currentEpic.riftPath });
+      } catch (error) {
+        toast.error('Could not remove the epic rift', {
+          description: error instanceof Error ? error.message : undefined,
+        });
+        return;
+      }
+      if (!removalResult?.ok) {
+        toast.error('Could not remove the epic rift', {
+          description: removalResult?.error,
+        });
+        return;
+      }
+
+      // These sessions were recorded with the removed rift as their working
+      // directory. Clear them only after removal succeeds; on failure the epic
+      // and riftPath remain intact and deletion can be retried.
+      for (const thread of runtimeThreads) {
+        updateThread(thread.id, {
+          agentSessionIds: undefined,
+          pendingForkProviders: undefined,
+        });
+      }
+      deleteEpic(currentEpic.id);
+    } finally {
+      markRiftRemoval(currentEpic.id, false);
     }
   };
 
@@ -3238,6 +4158,38 @@ const App: React.FC = () => {
       }
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      // The epic's rift is still being created: starting now would run the
+      // turn in the source repository and record a session against it, which
+      // the next turn — by then inside the rift — could not resume.
+      if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is still being created — try again in a moment',
+        };
+      }
+      const threadEpic = thread.epicId
+        ? state.epics.find((epic) => epic.id === thread.epicId)
+        : undefined;
+      if (threadEpic?.riftRequest) {
+        return {
+          ok: false,
+          error: threadEpic.riftRequest.error
+            ? 'This epic’s rift setup needs to be retried before work can continue'
+            : 'This epic’s rift workspace is still being created — try again in a moment',
+        };
+      }
+      if (threadEpic?.riftCleanupPending) {
+        return {
+          ok: false,
+          error: 'This epic has an incomplete rift that must be removed before work can continue',
+        };
+      }
+      if (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId)) {
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is being removed',
+        };
+      }
       let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
 
@@ -3370,7 +4322,14 @@ const App: React.FC = () => {
           updateThread(threadId, { title: initialTitle });
         }
         // Kick off async LLM refinement for a nicer title
-        void tryGenerateBetterTitle(threadId, titleSeed, model.id, project.path, updateThread);
+        void tryGenerateBetterTitle(
+          threadId,
+          titleSeed,
+          model.id,
+          threadWorkingDir(state.epics, thread, project),
+          updateThread,
+          thread.epicId
+        );
       }
 
       if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
@@ -3409,7 +4368,8 @@ const App: React.FC = () => {
         window.orion.runAgentTurn({
           runId,
           threadId,
-          projectPath: project.path,
+          epicId: thread.epicId,
+          projectPath: threadWorkingDir(state.epics, thread, project),
           prompt: agentPrompt,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -3513,6 +4473,28 @@ const App: React.FC = () => {
         report(false, 'Driver thread not found');
         return;
       }
+      if (
+        driverThread.epicId &&
+        (riftSetupEpicIdsRef.current[driverThread.epicId] ||
+          riftRemovalEpicIdsRef.current.has(driverThread.epicId))
+      ) {
+        report(false, 'The driver epic’s rift workspace is not available');
+        return;
+      }
+      if (
+        driverThread.epicId &&
+        state.epics.find((epic) => epic.id === driverThread.epicId)?.riftRequest
+      ) {
+        report(false, 'The driver epic’s rift setup must finish before spawning subagents');
+        return;
+      }
+      if (
+        driverThread.epicId &&
+        state.epics.find((epic) => epic.id === driverThread.epicId)?.riftCleanupPending
+      ) {
+        report(false, 'The driver epic has an incomplete rift pending cleanup');
+        return;
+      }
       const projectId = driverThread.projectId;
       if (!state.projects.some((project) => project.id === projectId)) {
         report(false, 'Driver project not found');
@@ -3565,6 +4547,7 @@ const App: React.FC = () => {
         parentThreadId: request.threadId,
         modelId: model.id,
         hiddenFromRecent: true,
+        epicId: driverThread.epicId,
         select: false,
         // Persisted on the thread so stop/delete/reload can still resolve the
         // driver's blocked spawn_subagent call.
@@ -3842,6 +4825,17 @@ const App: React.FC = () => {
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      const threadEpic = thread.epicId
+        ? state.epics.find((epic) => epic.id === thread.epicId)
+        : undefined;
+      if (
+        (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) ||
+        threadEpic?.riftRequest ||
+        threadEpic?.riftCleanupPending ||
+        (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
+      ) {
+        return { ok: false, error: 'This epic’s rift workspace is not available' };
+      }
       let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       // Orion threads run on their configured main-driver model. Resolve the
       // pseudo-model here just as startTurnForThread does so a Claude-backed
@@ -3894,7 +4888,8 @@ const App: React.FC = () => {
         .runAgentTurn({
           runId,
           threadId,
-          projectPath: project.path,
+          epicId: thread.epicId,
+          projectPath: threadWorkingDir(state.epics, thread, project),
           prompt,
           modelId: model.id,
           // Plan mode: the aside can read the repo but never mutate it.
@@ -3948,6 +4943,34 @@ const App: React.FC = () => {
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      // Wait for the epic's rift: see startTurnForThread.
+      if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is still being created — try again in a moment',
+        };
+      }
+      if (
+        thread.epicId &&
+        state.epics.find((epic) => epic.id === thread.epicId)?.riftRequest
+      ) {
+        return {
+          ok: false,
+          error: 'This epic’s rift setup needs to finish before work can continue',
+        };
+      }
+      if (
+        thread.epicId &&
+        state.epics.find((epic) => epic.id === thread.epicId)?.riftCleanupPending
+      ) {
+        return {
+          ok: false,
+          error: 'This epic has an incomplete rift that must be removed before work can continue',
+        };
+      }
+      if (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId)) {
+        return { ok: false, error: 'This epic’s rift workspace is being removed' };
+      }
       const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
       if (model.providerId !== 'codex') {
@@ -3983,7 +5006,8 @@ const App: React.FC = () => {
         .runAgentTurn({
           runId,
           threadId,
-          projectPath: project.path,
+          epicId: thread.epicId,
+          projectPath: threadWorkingDir(state.epics, thread, project),
           prompt: goalAction.objective || 'Resume the goal.',
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -4048,6 +5072,34 @@ const App: React.FC = () => {
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      // Wait for the epic's rift: see startTurnForThread.
+      if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is still being created — try again in a moment',
+        };
+      }
+      if (
+        thread.epicId &&
+        state.epics.find((epic) => epic.id === thread.epicId)?.riftRequest
+      ) {
+        return {
+          ok: false,
+          error: 'This epic’s rift setup needs to finish before work can continue',
+        };
+      }
+      if (
+        thread.epicId &&
+        state.epics.find((epic) => epic.id === thread.epicId)?.riftCleanupPending
+      ) {
+        return {
+          ok: false,
+          error: 'This epic has an incomplete rift that must be removed before work can continue',
+        };
+      }
+      if (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId)) {
+        return { ok: false, error: 'This epic’s rift workspace is being removed' };
+      }
       const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
       if (model.providerId !== 'codex') {
@@ -4099,7 +5151,8 @@ const App: React.FC = () => {
         .runAgentTurn({
           runId,
           threadId,
-          projectPath: project.path,
+          epicId: thread.epicId,
+          projectPath: threadWorkingDir(state.epics, thread, project),
           prompt: review.instructions || reviewLabel,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -4250,7 +5303,7 @@ const App: React.FC = () => {
       }
       if (sessionId && project && window.orion?.codexGoalCommand) {
         void window.orion
-          .codexGoalCommand({ sessionId, projectPath: project.path, action: 'get' })
+          .codexGoalCommand({ sessionId, projectPath: threadWorkingDir(state.epics, selectedThread, project), action: 'get' })
           .then((result) => {
             if (result.ok) updateThread(selectedThreadId, { goal: result.goal ?? null });
             const latest = result.ok ? result.goal : goal;
@@ -4292,7 +5345,7 @@ const App: React.FC = () => {
         });
       } else if (sessionId && project && window.orion?.codexGoalCommand) {
         void window.orion
-          .codexGoalCommand({ sessionId, projectPath: project.path, action: 'pause' })
+          .codexGoalCommand({ sessionId, projectPath: threadWorkingDir(state.epics, selectedThread, project), action: 'pause' })
           .then((result) => {
             if (result.ok) {
               updateThread(selectedThreadId, { goal: result.goal ?? { ...goal, status: 'paused' } });
@@ -4314,7 +5367,7 @@ const App: React.FC = () => {
       const clearGoal = () => {
         if (sessionId && project && window.orion?.codexGoalCommand) {
           void window.orion
-            .codexGoalCommand({ sessionId, projectPath: project.path, action: 'clear' })
+            .codexGoalCommand({ sessionId, projectPath: threadWorkingDir(state.epics, selectedThread, project), action: 'clear' })
             .then((result) => {
               if (result.ok) {
                 updateThread(selectedThreadId, { goal: null });
@@ -4479,6 +5532,15 @@ const App: React.FC = () => {
       !isSending && Boolean(selectedThread.linkedTask && !selectedThread.linkedTask.injected);
     if (!promptText && chatAttachments.length === 0 && !canSendLinkedTaskAlone) return;
 
+    if (selectedThreadRiftUnavailable) {
+      toast.error(
+        selectedThreadRiftRemoving
+          ? 'This epic’s rift workspace is being removed'
+          : 'This epic’s rift workspace is still being created — try again in a moment'
+      );
+      return;
+    }
+
     // Claude Code CLI thread: the composer feeds the embedded terminal —
     // the draft is delivered to the TUI exactly as if typed there (so claude
     // slash commands like /compact work too). Nothing goes through runTurn.
@@ -4566,8 +5628,9 @@ const App: React.FC = () => {
           submittedThreadId,
           promptText,
           'claude:claude-haiku-4-5',
-          selectedThreadProject?.path ?? '',
-          updateThread
+          selectedThreadProjectPath ?? '',
+          updateThread,
+          currentThread.epicId
         );
       }
       return;
@@ -5358,19 +6421,24 @@ const App: React.FC = () => {
                     type="button"
                     className="shell-project-trigger"
                     onClick={() => {
-                      if (repositoryOperationBusy) return;
+                      if (repositoryOperationBusy || activeRiftUnavailable) return;
                       if (selectedThread && !canChangeSelectedThreadProject) return;
                       setProjectPickerOpen((open) => !open);
                     }}
                     disabled={
                       repositoryOperationBusy ||
+                      activeRiftUnavailable ||
                       (!!selectedThread && !canChangeSelectedThreadProject)
                     }
                     title={
                       repositoryOperationBusy
                         ? 'Repository operation in progress'
+                        : activeRiftUnavailable
+                          ? 'Wait for the epic’s rift workspace to become available'
                         : selectedThread && !canChangeSelectedThreadProject
-                          ? 'Project is locked after an agent runs'
+                          ? selectedThreadEpic?.riftPath || selectedThreadRiftPending
+                            ? 'Project is locked to the epic’s rift'
+                            : 'Project is locked after an agent runs'
                           : activeThreadProject.path
                     }
                     aria-haspopup="menu"
@@ -5387,6 +6455,7 @@ const App: React.FC = () => {
                   </button>
                   {projectPickerOpen &&
                     !repositoryOperationBusy &&
+                    !activeRiftUnavailable &&
                     (!selectedThread || canChangeSelectedThreadProject) && (
                       <div className="shell-project-picker" role="menu">
                         {projects.map((option) => (
@@ -5435,8 +6504,15 @@ const App: React.FC = () => {
                   <button
                     type="button"
                     className="shell-branch-trigger"
-                    onClick={() => setBranchPickerOpen((open) => !open)}
-                    disabled={gitLoading || repositoryOperationBusy || !gitState?.ok}
+                    onClick={() => {
+                      if (!activeRiftUnavailable) setBranchPickerOpen((open) => !open);
+                    }}
+                    disabled={
+                      activeRiftUnavailable ||
+                      gitLoading ||
+                      repositoryOperationBusy ||
+                      !gitState?.ok
+                    }
                     title={gitState?.error ?? gitState?.root ?? 'Git state'}
                     aria-haspopup="menu"
                     aria-expanded={branchPickerOpen && !repositoryOperationBusy}
@@ -5455,7 +6531,7 @@ const App: React.FC = () => {
                       className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`}
                     />
                   </button>
-                  {branchPickerOpen && !repositoryOperationBusy && (
+                  {branchPickerOpen && !repositoryOperationBusy && !activeRiftUnavailable && (
                     <div className="shell-branch-picker" role="menu">
                       {gitState?.hasUncommittedChanges && (
                         <div className="branch-picker-note">Commit local changes before switching branches.</div>
@@ -5591,8 +6667,8 @@ const App: React.FC = () => {
                       type="button"
                       className="shell-cloud-icon-button"
                       onClick={() =>
-                        activeThreadProject?.path &&
-                        void window.orion?.openCloudRepoInBrowser?.(activeThreadProject.path)
+                        activeWorkingDir &&
+                        void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir)
                       }
                       disabled={!cloudState.linked}
                       title="Open on Orion Cloud"
@@ -5609,13 +6685,13 @@ const App: React.FC = () => {
           </div>
 
           <div className="shell-right-group">
-            {openWithApps.length > 0 && activeThreadProject?.path && (
+            {openWithApps.length > 0 && activeWorkingDir && (
               <div className="shell-openwith-control" ref={openWithRef}>
                 <button
                   type="button"
                   className="shell-openwith-trigger"
                   onClick={() => setOpenWithOpen((open) => !open)}
-                  title={`Open ${activeThreadProject.name} in another app`}
+                  title={`Open ${activeWorkingDir.split(/[\\/]/).pop() || activeWorkingDir} in another app`}
                   aria-label="Open with"
                   aria-haspopup="menu"
                   aria-expanded={openWithOpen}
@@ -5639,7 +6715,7 @@ const App: React.FC = () => {
                           void window.orion
                             ?.openProjectWith?.({
                               appId: appOption.id,
-                              projectPath: activeThreadProject.path,
+                              projectPath: activeWorkingDir,
                             })
                             .then((result) => {
                               if (result && !result.ok && result.error) {
@@ -5725,6 +6801,7 @@ const App: React.FC = () => {
                 { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
                 { id: 'computer-use', label: 'Computer Use', Icon: MousePointerClick },
                 { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
+                { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
               ].map(({ id, label, Icon }) => (
                 <button
                   key={id}
@@ -5756,10 +6833,11 @@ const App: React.FC = () => {
               {settingsTab === 'orchestration' && 'ORCHESTRATION'}
               {settingsTab === 'computer-use' && 'COMPUTER USE'}
               {settingsTab === 'cosmetics' && 'COSMETICS'}
+              {settingsTab === 'experimental' && 'EXPERIMENTAL'}
             </div>
 
             <div
-              className={`settings-panel${settingsTab === 'general' ? ' settings-panel-grouped' : ''}`}
+              className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' ? ' settings-panel-grouped' : ''}`}
             >
               {settingsTab === 'account' && (
                 <>
@@ -6079,13 +7157,7 @@ const App: React.FC = () => {
                                 type="button"
                                 className="archived-epic-action danger"
                                 title="Delete epic"
-                                onClick={() => {
-                                  if (
-                                    confirm(`Delete epic "${epic.name}"? Its threads are kept.`)
-                                  ) {
-                                    deleteEpic(epic.id);
-                                  }
-                                }}
+                                onClick={() => handleDeleteEpic(epic)}
                               >
                                 <Trash2 size={13} />
                               </button>
@@ -6608,6 +7680,58 @@ const App: React.FC = () => {
                   <div className="settings-muted">Coming soon.</div>
                 </div>
               )}
+              {settingsTab === 'experimental' && (
+                <>
+                  <div className="settings-group-label">Rifts</div>
+                  <div className="settings-group">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Enable Rifts</div>
+                        <div className="setting-label-desc">
+                          Give each epic an instant copy-on-write clone of its repository
+                          (github.com/anomalyco/rift). Epic threads, commits, pushes, and PRs all
+                          happen inside the rift, so unrelated local changes never mix in.
+                          {riftStatus?.available === false
+                            ? ' Unavailable: the bundled rift binary does not support this platform.'
+                            : riftStatus?.version
+                              ? ` Bundled rift v${riftStatus.version} — update with "bun run update-rifts".`
+                              : ''}
+                        </div>
+                      </div>
+                      <label className="provider-toggle" title="Enable Rifts">
+                        <input
+                          type="checkbox"
+                          checked={riftsSettings.enabled}
+                          disabled={riftStatus?.available === false}
+                          onChange={(e) => setRiftsSettings({ enabled: e.target.checked })}
+                        />
+                        <span />
+                      </label>
+                    </div>
+
+                    {riftsSettings.enabled && (
+                      <div className="setting-row">
+                        <div className="setting-label">
+                          <div className="setting-label-title">Create a rift per epic</div>
+                          <div className="setting-label-desc">
+                            New epics get a rift and a dedicated branch (named by the epic
+                            message model) automatically. You can still opt out per epic in the
+                            create dialog.
+                          </div>
+                        </div>
+                        <label className="provider-toggle" title="Create a rift per epic">
+                          <input
+                            type="checkbox"
+                            checked={riftsSettings.autoCreateForEpics}
+                            onChange={(e) => setRiftsSettings({ autoCreateForEpics: e.target.checked })}
+                          />
+                          <span />
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -6959,13 +8083,7 @@ const App: React.FC = () => {
                                         role="menuitem"
                                         onClick={() => {
                                           setEpicMenuOpenId(null);
-                                          if (
-                                            confirm(
-                                              `Delete epic "${epic.name}"? Its threads are kept — they just leave this group.`
-                                            )
-                                          ) {
-                                            deleteEpic(epic.id);
-                                          }
+                                          handleDeleteEpic(epic);
                                         }}
                                       >
                                         <Trash2 size={13} /> Delete
@@ -7080,7 +8198,7 @@ const App: React.FC = () => {
                                                 role="menuitem"
                                                 onClick={() => {
                                                   setThreadItemMenuKey(null);
-                                                  updateThread(thread.id, { epicId: undefined });
+                                                  void handleRemoveThreadFromEpic(thread.id);
                                                 }}
                                               >
                                                 <EyeOff size={13} /> Remove from epic
@@ -7652,9 +8770,13 @@ const App: React.FC = () => {
                           type="button"
                           id="epic-repository"
                           className="epic-view-repository-trigger"
-                          disabled={repositoryOperationBusy || projects.length === 0}
+                          disabled={
+                            repositoryOperationBusy ||
+                            Boolean(selectedEpic.riftRequest) ||
+                            projects.length === 0
+                          }
                           onClick={() => {
-                            if (repositoryOperationBusy) return;
+                            if (repositoryOperationBusy || selectedEpic.riftRequest) return;
                             setEpicRepoPickerOpen((open) => !open);
                           }}
                           aria-haspopup="menu"
@@ -7689,7 +8811,10 @@ const App: React.FC = () => {
                             className={`project-pill-chevron ${epicRepoPickerOpen ? 'open' : ''}`}
                           />
                         </button>
-                        {epicRepoPickerOpen && !repositoryOperationBusy && projects.length > 0 && (
+                        {epicRepoPickerOpen &&
+                          !repositoryOperationBusy &&
+                          !selectedEpic.riftRequest &&
+                          projects.length > 0 && (
                           <div
                             className="shell-project-picker epic-view-repository-menu"
                             role="menu"
@@ -7723,10 +8848,23 @@ const App: React.FC = () => {
                         )}
                       </div>
                     )}
+                    {selectedEpic.riftPath && (
+                      <div
+                        className="epic-view-repository-claimed epic-view-rift"
+                        title={selectedEpic.riftPath}
+                      >
+                        <FlaskConical size={14} />
+                        <span className="truncate">Rift · {selectedEpic.riftPath}</span>
+                      </div>
+                    )}
                     <span className="epic-view-repository-hint">
-                      {selectedEpic.gitRoot
-                        ? 'This epic is locked to its claimed repository and feature branch.'
-                        : 'Choose the repository explicitly before using git actions.'}
+                      {selectedEpic.riftPath
+                        ? 'Threads and git actions run inside this epic’s rift workspace.'
+                        : selectedEpic.riftRequest
+                          ? 'This epic stays locked to its requested project until Rift setup succeeds.'
+                        : selectedEpic.gitRoot
+                          ? 'This epic is locked to its claimed repository and feature branch.'
+                          : 'Choose the repository explicitly before using git actions.'}
                     </span>
                   </div>
 
@@ -7736,31 +8874,73 @@ const App: React.FC = () => {
                       className="btn"
                       disabled={
                         repositoryOperationBusy ||
-                        (!selectedEpicRepositoryProject && !selectedEpic.gitRoot)
+                        activeRiftUnavailable ||
+                        riftRemovalEpicIds[selectedEpic.id] ||
+                        (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
+                        !selectedEpicHasWorkToPush
                       }
                       onClick={() => void handleEpicCommitAndPush(selectedEpic)}
-                      title="Generate a commit message from staged changes, then commit and push"
+                      title={
+                        selectedEpicHasWorkToPush
+                          ? 'Stage all changes, generate a commit message, then commit and push'
+                          : 'Nothing to commit — the workspace is clean and fully pushed'
+                      }
                     >
                       <GitCommit size={14} />
                       {epicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
                     </button>
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={
-                        repositoryOperationBusy ||
-                        (!selectedEpicRepositoryProject && !selectedEpic.gitRoot)
-                      }
-                      onClick={() => void handleEpicCreatePr(selectedEpic)}
-                      title="Open a pull request with a generated title and description"
-                    >
-                      <GitPullRequest size={14} />
-                      {epicGitBusy === 'pr' ? 'Opening PR…' : 'Create PR'}
-                    </button>
+                    {selectedEpicPrBadge && (
+                      <button
+                        type="button"
+                        className={`btn epic-view-pr-state epic-view-pr-state--${selectedEpicPrBadge.modifier}`}
+                        onClick={() =>
+                          void window.orion?.openExternalUrl?.(selectedEpic.prUrl as string)
+                        }
+                        title={
+                          selectedEpicPrBadge.modifier === 'merged'
+                            ? 'The pull request is merged — settle the epic to archive it'
+                            : 'This epic already has a pull request — click to view it on GitHub'
+                        }
+                      >
+                        {selectedEpicPrBadge.modifier === 'merged' ? (
+                          <GitMerge size={14} />
+                        ) : selectedEpicPrBadge.modifier === 'closed' ? (
+                          <GitPullRequestClosed size={14} />
+                        ) : (
+                          <GitPullRequest size={14} />
+                        )}
+                        {selectedEpicPrBadge.label}
+                      </button>
+                    )}
+                    {(!selectedEpicPrBadge || selectedEpicPrBadge.modifier === 'closed') && (
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={
+                          repositoryOperationBusy ||
+                          activeRiftUnavailable ||
+                          riftRemovalEpicIds[selectedEpic.id] ||
+                          (!selectedEpicRepositoryProject && !selectedEpic.gitRoot)
+                        }
+                        onClick={() => void handleEpicCreatePr(selectedEpic)}
+                        title={
+                          selectedEpicPrBadge?.modifier === 'closed'
+                            ? 'Open a replacement pull request for this branch'
+                            : 'Open a pull request with a generated title and description'
+                        }
+                      >
+                        <GitPullRequest size={14} />
+                        {epicGitBusy === 'pr'
+                          ? 'Opening PR…'
+                          : selectedEpicPrBadge?.modifier === 'closed'
+                            ? 'Create replacement PR'
+                            : 'Create PR'}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="btn epic-view-settle"
-                      disabled={!!epicGitBusy}
+                      disabled={!!epicGitBusy || activeRiftUnavailable}
                       onClick={() => handleSettleEpic(selectedEpic)}
                       title="Settle the epic once its PR is merged — it moves to the archive"
                     >
@@ -7769,18 +8949,40 @@ const App: React.FC = () => {
                     </button>
                   </div>
 
-                  {epicGitBusy && (
+                  {(epicGitBusy || riftSetupEpicIds[selectedEpic.id]) && (
                     <div className="epic-view-status">
                       <span className="working-dots" aria-hidden="true">
                         <span />
                         <span />
                         <span />
                       </span>
-                      {epicGitBusy === 'commit'
-                        ? 'Writing a commit message from staged changes, then pushing…'
-                        : 'Writing the PR message and opening the pull request…'}
+                      {riftSetupEpicIds[selectedEpic.id]
+                        ? 'Creating the epic’s rift workspace and branch…'
+                        : epicGitBusy === 'commit'
+                          ? 'Staging all changes and writing a commit message, then pushing…'
+                          : 'Writing the PR message and opening the pull request…'}
                     </div>
                   )}
+
+                  {selectedEpic.riftRequest &&
+                    !riftSetupEpicIds[selectedEpic.id] &&
+                    !selectedEpic.riftCleanupPending && (
+                      <div className="epic-view-rift-retry">
+                        <span>
+                          {selectedEpic.riftRequest.error ??
+                            'Rift setup still needs to finish before this epic can run.'}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn secondary"
+                          disabled={repositoryOperationBusy}
+                          onClick={() => void setupRiftForEpic(selectedEpic.id)}
+                        >
+                          <RefreshCw size={13} />
+                          Retry Rift setup
+                        </button>
+                      </div>
+                    )}
 
                   {selectedEpic.prUrl && (
                     <button
@@ -7862,16 +9064,24 @@ const App: React.FC = () => {
                 <>
                   <div className="panel-content">
                     {isTerminalThread ? (
+                      // Mounting spawns the CLI: hold off until the epic's
+                      // rift exists so the terminal never opens in the source
+                      // repository and then has to move.
+                      selectedThreadRiftUnavailable ? (
+                        <div className="terminal-view" />
+                      ) : (
                       <React.Suspense fallback={<div className="terminal-view" />}>
                         <TerminalView
                           key={selectedThread.id}
                           threadId={selectedThread.id}
+                          epicId={selectedThread.epicId}
                           projectPath={selectedThreadProjectPath ?? ''}
                           accessMode={selectedThread.accessMode ?? 'full-access'}
                           resumeSessionId={selectedThread.agentSessionIds?.claude}
                           forkSession={selectedThread.pendingForkProviders?.includes('claude')}
                         />
                       </React.Suspense>
+                      )
                     ) : (
                       <>
                         <ChatTranscript
@@ -8094,10 +9304,16 @@ const App: React.FC = () => {
                         <textarea
                           ref={chatInputRef}
                           className="chat-input min-h-[52px]"
-                          disabled={isNativeSubagentThread}
+                          disabled={isNativeSubagentThread || selectedThreadRiftUnavailable}
                           placeholder={
                             isNativeSubagentThread
                               ? 'Read-only subagent transcript — steer from the parent thread.'
+                              : selectedThreadRiftUnavailable
+                              ? selectedThreadRiftRemoving
+                                ? 'Removing this epic’s rift workspace…'
+                                : selectedThreadEpic?.riftRequest?.error
+                                  ? 'Rift setup needs attention — retry it from the epic view.'
+                                  : 'Creating this epic’s rift workspace — one moment…'
                               : isTerminalThread
                               ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
                               : isSending
@@ -8783,6 +9999,41 @@ const App: React.FC = () => {
                   rows={4}
                 />
               </label>
+              {projects.length > 0 && (
+                <label className="modal-field">
+                  <span className="modal-field-label">Project</span>
+                  <select
+                    className="modal-input"
+                    value={newEpicProjectId ?? ''}
+                    onChange={(e) => setNewEpicProjectId(e.target.value || null)}
+                  >
+                    <option value="">No project</option>
+                    {projects.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {riftsActive && (
+                <label className="modal-field modal-field-checkbox">
+                  <span className="modal-field-label">Rift</span>
+                  <span className="modal-checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={newEpicCreateRift}
+                      onChange={(e) => setNewEpicCreateRift(e.target.checked)}
+                    />
+                    <span className="modal-checkbox-text">
+                      Work in a rift — a copy-on-write clone of{' '}
+                      {projects.find((project) => project.id === newEpicProjectId)?.name ??
+                        'the selected project'}{' '}
+                      on its own branch
+                    </span>
+                  </span>
+                </label>
+              )}
               <div className="modal-actions">
                 <button
                   type="button"
@@ -8794,7 +10045,9 @@ const App: React.FC = () => {
                 <button
                   type="submit"
                   className="btn"
-                  disabled={!newEpicName.trim()}
+                  disabled={
+                    !newEpicName.trim() || (newEpicCreateRift && !newEpicProjectId)
+                  }
                 >
                   Create epic
                 </button>

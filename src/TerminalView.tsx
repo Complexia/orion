@@ -17,6 +17,7 @@ import '@xterm/xterm/css/xterm.css';
 // the thread (agentSessionIds.claude) for --resume after an app restart.
 type TerminalViewProps = {
   threadId: string;
+  epicId?: string;
   projectPath: string;
   accessMode: 'read-only' | 'workspace-write' | 'full-access';
   /** Existing claude CLI session id for this thread; resumed on spawn. */
@@ -35,6 +36,7 @@ const terminalTheme = {
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
   threadId,
+  epicId,
   projectPath,
   accessMode,
   resumeSessionId,
@@ -113,6 +115,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       if (options.fresh) term.reset();
       const result = await window.orion.terminalEnsure({
         threadId,
+        ...(epicId ? { epicId } : {}),
         projectPath,
         accessMode,
         cols: term.cols,
@@ -176,7 +179,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       offExit?.();
       term.dispose();
     };
-  }, [threadId, projectPath, accessMode, forkSession]);
+  }, [threadId, epicId, projectPath, accessMode, forkSession]);
 
   if (!projectPath) {
     return (
