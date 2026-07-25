@@ -38,6 +38,13 @@ contextBridge.exposeInMainWorld('orion', {
   // Epics (sidebar Epics section)
   epicCommitAndPush: (input) => ipcRenderer.invoke('epic:commitAndPush', input),
   epicCreatePr: (input) => ipcRenderer.invoke('epic:createPr', input),
+  epicGitStatus: (input) => ipcRenderer.invoke('epic:gitStatus', input),
+
+  // Rifts (experimental copy-on-write epic workspaces)
+  riftStatus: () => ipcRenderer.invoke('rift:status'),
+  epicCreateRift: (input) => ipcRenderer.invoke('epic:createRift', input),
+  epicAcknowledgeRift: (input) => ipcRenderer.invoke('epic:acknowledgeRift', input),
+  epicRemoveRift: (input) => ipcRenderer.invoke('epic:removeRift', input),
 
   // Agent runtime
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),

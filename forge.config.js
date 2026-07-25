@@ -9,10 +9,11 @@ const macNonCodeResourcePattern = /\.(?:pak|bin|dat|png|jpe?g|gif|icns|ico|ttf|w
 
 module.exports = {
   packagerConfig: {
-    // node-pty's spawn-helper is a plain executable (no .node extension), so
-    // the auto-unpack-natives plugin alone won't unpack it — unpack the whole
-    // module. The plugin merges its own '**/*.node' pattern into this.
-    asar: { unpack: '**/node_modules/node-pty/**' },
+    // node-pty's spawn-helper and rift-snapshot's prebuilt CLI are plain
+    // executables (no .node extension), so the auto-unpack-natives plugin
+    // alone won't unpack them — unpack the whole modules. The plugin merges
+    // its own '**/*.node' pattern into this.
+    asar: { unpack: '**/node_modules/{node-pty,rift-snapshot}/**' },
     icon: path.join(__dirname, 'assets', 'icon'),
     extraResource: [path.join(__dirname, 'assets', 'icon.png')],
     name: 'Orion',
@@ -45,6 +46,23 @@ module.exports = {
         for (const dir of fs.readdirSync(prebuilds)) {
           const helper = path.join(prebuilds, dir, 'spawn-helper');
           if (fs.existsSync(helper)) fs.chmodSync(helper, 0o755);
+        }
+      }
+
+      // rift-snapshot ships the prebuilt `rift` CLI the same way; the main
+      // process spawns it for epic rift workspaces.
+      const riftSrc = path.join(__dirname, 'node_modules', 'rift-snapshot');
+      const riftDest = path.join(buildPath, 'node_modules', 'rift-snapshot');
+      if (fs.existsSync(riftSrc)) {
+        fs.cpSync(riftSrc, riftDest, { recursive: true, dereference: true });
+        const riftPrebuilds = path.join(riftDest, 'prebuilds');
+        if (fs.existsSync(riftPrebuilds)) {
+          for (const dir of fs.readdirSync(riftPrebuilds)) {
+            for (const name of ['rift', 'rift.exe']) {
+              const binary = path.join(riftPrebuilds, dir, name);
+              if (fs.existsSync(binary)) fs.chmodSync(binary, 0o755);
+            }
+          }
         }
       }
     },

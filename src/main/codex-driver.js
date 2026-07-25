@@ -591,8 +591,11 @@ export const codexGoalRunDrivers = new Map();
 // Goal ops on a thread with no live goal run (pause after the run already
 // ended, clear, status refresh). Runs a short-lived app-server dialog:
 // initialize → thread/resume → goal op → kill.
-export const runCodexGoalOp = ({ sessionId, cwd, action }) =>
-  new Promise((resolve) => {
+export const runCodexGoalOp = ({ sessionId, threadId, cwd, action, signal }) => {
+  if (signal?.aborted) {
+    return Promise.resolve({ ok: false, error: 'Codex goal operation was cancelled.' });
+  }
+  return new Promise((resolve) => {
     const child = spawn(loginShell, ['-lc', 'codex app-server'], {
       cwd,
       env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
@@ -602,14 +605,27 @@ export const runCodexGoalOp = ({ sessionId, cwd, action }) =>
     let buffer = '';
     const pending = new Map();
     let settled = false;
+    let timeout = null;
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
+    };
     const settle = (value) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
-      killAgentChild(child);
-      resolve(value);
+      cleanup();
+      void killAgentChild(child, threadId).then(() => resolve(value));
     };
-    const timeout = setTimeout(() => settle({ ok: false, error: 'Codex app-server timed out.' }), 20000);
+    const abort = () => settle({ ok: false, error: 'Codex goal operation was cancelled.' });
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    timeout = setTimeout(
+      () => settle({ ok: false, error: 'Codex app-server timed out.' }),
+      20000
+    );
     const write = (message) => {
       try {
         child.stdin.write(`${JSON.stringify(message)}\n`);
@@ -668,3 +684,4 @@ export const runCodexGoalOp = ({ sessionId, cwd, action }) =>
       }
     })();
   });
+};

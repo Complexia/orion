@@ -7,6 +7,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   readlinkSync,
   readdirSync,
   realpathSync,
@@ -29,7 +30,7 @@ import {
   pushRepo,
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, publishAppUpdateState, scheduleAppUpdateChecks } from './main/app-updater.js';
-import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
+import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
@@ -39,7 +40,7 @@ import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtension
 import { getAgentModels, invalidateAgentModelsCache } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, getThreadsFilePath, storageFileName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdate, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
-import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForPendingAgentShutdowns } from './main/run-registry.js';
+import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
 import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents } from './main/stream-adapters.js';
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
@@ -47,6 +48,7 @@ import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-for
 import { emitAgentEvent, sendToAllWindows } from './main/events.js';
 import { createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
+import { riftBinaryPath, riftCreate, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
 
 // Set the application name as early as possible.
 // This helps the Dock, menu bar, and tooltips show "Orion" instead of "Electron"
@@ -57,6 +59,175 @@ app.setAppUserModelId('com.complexia.orion');
 const hiddenSystemDirectories = new Set(['.git']);
 let quitAfterPendingWork = false;
 let quitBarrierSatisfied = false;
+let riftShutdownRequested = false;
+const pendingRiftCreations = new Set();
+const pendingRiftEpicIds = new Set();
+// Successful workspaces remain main-owned until the renderer proves the epic
+// binding reached durable store storage. This bridges invoke completion,
+// renderer reloads, and process crashes without exposing the source checkout.
+const unacknowledgedRifts = new Map(); // epicId -> ownership
+const codexGoalOpsByThread = new Map(); // threadId -> Set<{ controller, promise }>
+const disposeCodexGoalOpsForThread = async (threadId) => {
+  const operations = [...(codexGoalOpsByThread.get(threadId) ?? [])];
+  if (operations.length === 0) return false;
+  for (const operation of operations) operation.controller.abort();
+  await Promise.allSettled(operations.map((operation) => operation.promise));
+  return true;
+};
+const disposeAllCodexGoalOps = () => {
+  const shutdowns = [...codexGoalOpsByThread.keys()].map((threadId) =>
+    disposeCodexGoalOpsForThread(threadId)
+  );
+  if (shutdowns.length > 0) trackAgentShutdown(Promise.all(shutdowns));
+};
+const titleGenerationsByThread = new Map(); // threadId -> Set<{ controller, promise }>
+const disposeTitleGenerationsForThread = async (threadId) => {
+  const generations = [...(titleGenerationsByThread.get(threadId) ?? [])];
+  if (generations.length === 0) return false;
+  for (const generation of generations) generation.controller.abort();
+  await Promise.allSettled(generations.map((generation) => generation.promise));
+  return true;
+};
+const disposeAllTitleGenerations = () => {
+  const shutdowns = [...titleGenerationsByThread.keys()].map((threadId) =>
+    disposeTitleGenerationsForThread(threadId)
+  );
+  if (shutdowns.length > 0) trackAgentShutdown(Promise.all(shutdowns));
+};
+const pendingRiftSetupError = (input) =>
+  typeof input?.epicId === 'string' && pendingRiftEpicIds.has(input.epicId)
+    ? 'This epic’s rift workspace is still being created — try again in a moment'
+    : null;
+const cancelPendingRiftCreations = () => {
+  for (const creation of pendingRiftCreations) creation.cancel();
+};
+const waitForPendingRiftCreations = async (timeoutMs = 8_000) => {
+  const deadline = new Promise((resolve) => {
+    setTimeout(() => resolve('timeout'), timeoutMs);
+  });
+  while (pendingRiftCreations.size > 0) {
+    const result = await Promise.race([
+      Promise.allSettled([...pendingRiftCreations].map((creation) => creation.promise)).then(
+        () => 'settled'
+      ),
+      deadline,
+    ]);
+    if (result === 'timeout') {
+      // A force-killed Rift child should normally settle well before this
+      // deadline. Journal any workspace path already reported so startup can
+      // retry cleanup without holding Cmd-Q open indefinitely.
+      rememberRiftCleanupForQuit(
+        [...pendingRiftCreations].map((creation) => creation.riftPath()).filter(Boolean)
+      );
+      return;
+    }
+  }
+};
+const riftQuitCleanupPaths = new Set();
+let riftCleanupJournalQueue = Promise.resolve();
+const riftCleanupJournalPath = () => path.join(app.getPath('userData'), 'orphaned-rifts.json');
+const updateRiftCleanupJournal = (update) => {
+  riftCleanupJournalQueue = riftCleanupJournalQueue
+    .catch(() => {})
+    .then(async () => {
+      const journalPath = riftCleanupJournalPath();
+      let paths = [];
+      try {
+        const parsed = JSON.parse(await fs.readFile(journalPath, 'utf-8'));
+        if (Array.isArray(parsed)) paths = parsed.filter((value) => typeof value === 'string');
+      } catch {}
+      const nextPaths = [...new Set([...(await update(paths)), ...riftQuitCleanupPaths])];
+      const tempPath = `${journalPath}.${process.pid}.tmp`;
+      await fs.mkdir(path.dirname(journalPath), { recursive: true });
+      await fs.writeFile(tempPath, JSON.stringify(nextPaths), 'utf-8');
+      await fs.rename(tempPath, journalPath);
+    });
+  return riftCleanupJournalQueue;
+};
+const rememberRiftCleanup = (riftPath) =>
+  updateRiftCleanupJournal((paths) => [...paths, riftPath]);
+const forgetRiftCleanup = (riftPath) =>
+  updateRiftCleanupJournal((paths) => paths.filter((candidate) => candidate !== riftPath));
+const hasRememberedRiftCleanup = async (riftPath) => {
+  let remembered = false;
+  await updateRiftCleanupJournal((paths) => {
+    remembered = paths.includes(riftPath);
+    return paths;
+  });
+  return remembered;
+};
+const isSafeMarkerlessRiftPath = (riftPath) => {
+  const resolvedPath = path.resolve(riftPath);
+  const riftsDirectory = path.dirname(path.dirname(resolvedPath));
+  if (
+    path.basename(riftsDirectory) !== '.rifts' ||
+    !/-[0-9a-f]{24}$/.test(path.basename(resolvedPath))
+  ) {
+    return false;
+  }
+  try {
+    const stat = lstatSync(resolvedPath);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
+const removeRememberedRiftCleanup = async (riftPath, { allowMarkerless = false } = {}) => {
+  if (existsSync(path.join(riftPath, '.rift'))) {
+    await riftRemove(riftPath);
+    return;
+  }
+  if (!allowMarkerless || !isSafeMarkerlessRiftPath(riftPath)) {
+    throw new Error(
+      'The rift path still exists but its .rift marker is missing; refusing unsafe removal.'
+    );
+  }
+  // A failed `rift create` can leave the deterministic destination behind
+  // before writing its marker. Only pre-journaled Orion destinations reach
+  // this path, and the OS trash keeps their removal recoverable.
+  await shell.trashItem(riftPath);
+};
+const rememberRiftCleanupForQuit = (riftPaths) => {
+  for (const riftPath of riftPaths) riftQuitCleanupPaths.add(riftPath);
+  if (riftQuitCleanupPaths.size === 0) return;
+  try {
+    const journalPath = riftCleanupJournalPath();
+    let paths = [];
+    try {
+      const parsed = JSON.parse(readFileSync(journalPath, 'utf-8'));
+      if (Array.isArray(parsed)) paths = parsed.filter((value) => typeof value === 'string');
+    } catch {}
+    const tempPath = `${journalPath}.${process.pid}.quit.tmp`;
+    mkdirSync(path.dirname(journalPath), { recursive: true });
+    writeFileSync(
+      tempPath,
+      JSON.stringify([...new Set([...paths, ...riftQuitCleanupPaths])]),
+      'utf-8'
+    );
+    renameSync(tempPath, journalPath);
+  } catch (error) {
+    console.error('Could not journal pending Rift cleanup before quit', error);
+  }
+};
+const retryOrphanedRiftCleanup = () =>
+  updateRiftCleanupJournal(async (paths) => {
+    const persistedOwners = await readPersistedRiftOwners();
+    const remaining = [];
+    for (const riftPath of paths) {
+      // The renderer can durably save active ownership immediately before a
+      // crash prevents its acknowledgement IPC. Active ownership wins over the
+      // stale journal; cleanup-pending ownership remains eligible for recovery.
+      const persistedOwner = persistedOwners.get(riftPath);
+      if (persistedOwner && !persistedOwner.cleanupPending) continue;
+      if (!existsSync(riftPath)) continue;
+      try {
+        await removeRememberedRiftCleanup(riftPath, { allowMarkerless: true });
+      } catch {
+        remaining.push(riftPath);
+      }
+    }
+    return remaining;
+  });
 
 let pendingDesktopAuth = null;
 let inMemoryAccountSession = null;
@@ -101,6 +272,26 @@ const sanitizeStoreValue = (value) => {
   }
 
   return null;
+};
+
+const readPersistedRiftOwners = async () => {
+  const owners = new Map();
+  try {
+    const value = sanitizeStoreValue(await fs.readFile(getStorageFilePath(), 'utf-8'));
+    if (!value) return owners;
+    const parsed = JSON.parse(value);
+    const epics = parsed?.state?.epics;
+    if (!Array.isArray(epics)) return owners;
+    for (const epic of epics) {
+      if (typeof epic?.id === 'string' && typeof epic?.riftPath === 'string') {
+        owners.set(epic.riftPath, {
+          epicId: epic.id,
+          cleanupPending: epic.riftCleanupPending === true,
+        });
+      }
+    }
+  } catch {}
+  return owners;
 };
 
 const base64Url = (value) =>
@@ -477,6 +668,7 @@ const createWindow = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  void retryOrphanedRiftCleanup();
   // Reinforce the app name (helps in some dev launch scenarios)
   app.setName('Orion');
 
@@ -715,6 +907,8 @@ app.on('window-all-closed', () => {
   // webContents and background agents cannot keep working invisibly.
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
+  disposeAllCodexGoalOps();
+  disposeAllTitleGenerations();
   reapActiveAgentRuns();
   if (process.platform !== 'darwin') {
     app.quit();
@@ -724,8 +918,15 @@ app.on('window-all-closed', () => {
 // Persistent claude sessions outlive individual turns; kill their CLI
 // processes (and any background subagents inside them) when Orion exits.
 app.on('will-quit', (event) => {
+  riftShutdownRequested = true;
+  rememberRiftCleanupForQuit(
+    [...pendingRiftCreations].map((creation) => creation.riftPath()).filter(Boolean)
+  );
+  cancelPendingRiftCreations();
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
+  disposeAllCodexGoalOps();
+  disposeAllTitleGenerations();
   reapActiveAgentRuns();
   if (quitBarrierSatisfied) return;
 
@@ -736,7 +937,7 @@ app.on('will-quit', (event) => {
   event.preventDefault();
   if (!quitAfterPendingWork) {
     quitAfterPendingWork = true;
-    void waitForPendingAgentShutdowns()
+    void Promise.all([waitForPendingAgentShutdowns(), waitForPendingRiftCreations()])
       .then(() => threadsSaveQueue.catch(() => {}))
       .finally(() => {
         quitAfterPendingWork = false;
@@ -1354,7 +1555,7 @@ ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
       return { ok: false, error: 'No local changes to commit.' };
     }
 
-    await execFileAsync('git', ['-C', gitRoot, 'add', '.']);
+    await execFileAsync('git', ['-C', gitRoot, 'add', '-A']);
     const stagedHasChanges = !(await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet']));
     if (!stagedHasChanges) {
       return { ok: false, error: 'No staged changes to commit.' };
@@ -1513,9 +1714,11 @@ const canonicalGitPath = async (value) => {
   }
 };
 
-// Epic git actions are intentionally confined to one non-default branch in
-// one repository. This prevents two epics (or a later project switch) from
-// silently sharing a push target.
+// Epic git actions are confined to one non-default branch in one repository.
+// This prevents two epics (or a later project switch) from silently sharing a
+// push target. A rift-backed epic owns its whole workspace, so the renderer
+// sends no expected root/branch or foreign claims for it — only the
+// default-branch guard, which still applies, runs.
 const validateEpicGitTarget = async (gitRoot, branch, input) => {
   const canonicalRoot = await canonicalGitPath(gitRoot);
   const expectedBranch = String(input?.expectedBranch ?? '').trim();
@@ -1595,82 +1798,77 @@ const hasLocalCommitsToPush = async (gitRoot, branch, baseBranch) => {
 };
 
 ipcMain.handle('epic:commitAndPush', async (_event, input) => {
-  let target = null;
+  let gitRoot = '';
   let branch = '';
+  let committed = false;
   try {
+    if (typeof input?.epicId !== 'string' || !input.epicId) {
+      return { ok: false, error: 'Missing epic id.' };
+    }
+    const riftSetupError = pendingRiftSetupError(input);
+    if (riftSetupError) {
+      return { ok: false, error: riftSetupError };
+    }
     const projectPath = input?.projectPath;
     if (!projectPath) {
       return { ok: false, error: 'Missing project path.' };
     }
 
-    const gitRoot = await getGitRoot(projectPath);
+    gitRoot = await getGitRoot(projectPath);
     branch = (await getCurrentGitBranch(gitRoot)) ?? '';
     if (!branch) {
       return { ok: false, error: 'Cannot push from a detached HEAD.' };
     }
 
-    target = await validateEpicGitTarget(gitRoot, branch, input);
+    // Refuse a drifted or shared target before touching the index.
+    const target = await validateEpicGitTarget(gitRoot, branch, input);
     if (!target.ok) return target;
+    gitRoot = target.gitRoot;
+    const setupErrorAfterValidation = pendingRiftSetupError(input);
+    if (setupErrorAfterValidation) {
+      return { ok: false, gitRoot, branch, error: setupErrorAfterValidation };
+    }
 
+    // Stage everything. When the epic works inside a rift, the workspace only
+    // ever contains this epic's changes; outside a rift, staging all local
+    // changes is the accepted trade-off.
+    await execFileAsync('git', ['-C', gitRoot, 'add', '-A']);
     const stagedHasChanges = !(
       await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet'])
     );
     if (!stagedHasChanges) {
-      // Pushing pre-existing local commits is only a retry for a branch this
-      // epic already claimed (its commit landed but the push failed). An
-      // unclaimed epic must not adopt unrelated local commits as its own —
-      // validateEpicGitTarget has already proven the expected root/branch
-      // match the current target when they are set.
+      // Nothing new to commit — retry the push if a previous commit landed but
+      // its push failed. Only for a branch this epic already owns: an
+      // unclaimed epic must not adopt unrelated local commits as its own.
       const epicOwnsBranch = Boolean(
-        String(input?.expectedGitRoot ?? '').trim() && String(input?.expectedBranch ?? '').trim()
+        input?.isRift ||
+          (String(input?.expectedGitRoot ?? '').trim() && String(input?.expectedBranch ?? '').trim())
       );
-      if (epicOwnsBranch && (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch))) {
+      if (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch)) {
+        if (!epicOwnsBranch) {
+          return {
+            ok: false,
+            error: `${branch} has local commits, but this epic has not claimed it. Make this epic's first commit here to claim the branch.`,
+          };
+        }
+        const setupErrorBeforePush = pendingRiftSetupError(input);
+        if (setupErrorBeforePush) {
+          return { ok: false, gitRoot, branch, error: setupErrorBeforePush };
+        }
         await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
-        return {
-          ok: true,
-          gitRoot: target.gitRoot,
-          branch,
-          message: 'Pushed existing local commits',
-        };
+        return { ok: true, gitRoot, branch, message: 'Pushed existing local commits' };
       }
-
-      const entries = await readGitStatusEntries(gitRoot);
-      if (entries.length > 0) {
-        return {
-          ok: false,
-          error:
-            'No staged changes to commit. Stage only the changes that belong to this epic, then try again.',
-        };
-      }
-      return {
-        ok: false,
-        error:
-          !epicOwnsBranch &&
-          (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch))
-            ? `${branch} has local commits, but this epic has not claimed it. Stage this epic's changes to make its first commit here.`
-            : 'No local changes to commit.',
-      };
+      return { ok: false, error: 'No local changes to commit.' };
     }
 
-    // The user-curated index is the epic boundary. Never stage from historical
-    // filenames: a file can contain unrelated hunks before or after an agent
-    // turn. Freeze the index before message generation so a concurrent git
-    // action cannot silently expand the commit.
+    // Freeze the index: the message model turn below takes seconds, during
+    // which a running agent or the user can stage more work. Committing then
+    // would ship changes the generated message never described.
     const indexTree = await readGitIndexTree(gitRoot);
     const entries = await readStagedGitEntries(gitRoot);
-
     let message = '';
     if (input?.modelId) {
       const context = await readStagedGitChangesContext(gitRoot, entries);
-      if ((await readGitIndexTree(gitRoot)) !== indexTree) {
-        return {
-          ok: false,
-          gitRoot: target.gitRoot,
-          branch,
-          error:
-            'Staged changes changed while Orion was preparing the commit. Review the index and try again.',
-        };
-      }
       const prompt =
         'Write a git commit message for the changes below' +
         (input?.epicName ? `, which are part of the epic "${input.epicName}"` : '') +
@@ -1682,49 +1880,67 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     }
     if (!message) message = commitMessageForEntries(entries);
 
+    // Re-verify what the commit will actually land, and where: `git commit`
+    // uses the index and the current checkout, but the push below targets the
+    // branch captured above.
     if ((await readGitIndexTree(gitRoot)) !== indexTree) {
       return {
         ok: false,
-        gitRoot: target.gitRoot,
+        gitRoot,
         branch,
-        error:
-          'Staged changes changed while Orion was preparing the commit. Review the index and try again.',
+        error: 'Staged changes changed while Orion was preparing the commit. Try again.',
       };
     }
-    const currentBranch = await getCurrentGitBranch(gitRoot);
-    if (currentBranch !== branch) {
+    if ((await getCurrentGitBranch(gitRoot)) !== branch) {
       return {
         ok: false,
-        gitRoot: target.gitRoot,
+        gitRoot,
         branch,
-        error:
-          currentBranch === null
-            ? 'The repository entered a detached HEAD while Orion was preparing the commit. Switch back to the epic branch and try again.'
-            : `The repository switched from ${branch} to ${currentBranch} while Orion was preparing the commit. Switch back to the epic branch and try again.`,
+        error: `The repository moved off ${branch} while Orion was preparing the commit. Switch back and try again.`,
       };
     }
+    const setupErrorBeforeCommit = pendingRiftSetupError(input);
+    if (setupErrorBeforeCommit) {
+      return { ok: false, gitRoot, branch, error: setupErrorBeforeCommit };
+    }
+
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
+    committed = true;
     await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
 
-    return {
-      ok: true,
-      gitRoot: target.gitRoot,
-      branch,
-      message,
-    };
+    return { ok: true, gitRoot, branch, message };
   } catch (error) {
     return {
       ok: false,
-      ...(target?.ok ? { gitRoot: target.gitRoot, branch } : {}),
+      ...(gitRoot ? { gitRoot, branch } : {}),
+      ...(committed ? { committed: true } : {}),
       error: error?.stderr?.toString().trim() || error?.message || String(error),
     };
   }
 });
 
+const riftWorktreeChangesFailure = async (gitRoot, branch, input) => {
+  if (!input?.isRift || (await readGitStatusEntries(gitRoot)).length === 0) return null;
+  return {
+    ok: false,
+    gitRoot,
+    branch,
+    error:
+      'This epic’s rift still has uncommitted changes. Commit and push them before opening a pull request.',
+  };
+};
+
 ipcMain.handle('epic:createPr', async (_event, input) => {
-  let target = null;
+  let gitRoot = '';
   let branch = '';
   try {
+    if (typeof input?.epicId !== 'string' || !input.epicId) {
+      return { ok: false, error: 'Missing epic id.' };
+    }
+    const riftSetupError = pendingRiftSetupError(input);
+    if (riftSetupError) {
+      return { ok: false, error: riftSetupError };
+    }
     const projectPath = input?.projectPath;
     if (!projectPath) {
       return { ok: false, error: 'Missing project path.' };
@@ -1736,26 +1952,36 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
       };
     }
 
-    const gitRoot = await getGitRoot(projectPath);
+    gitRoot = await getGitRoot(projectPath);
     branch = (await getCurrentGitBranch(gitRoot)) ?? '';
     if (!branch) {
       return { ok: false, error: 'Cannot open a PR from a detached HEAD.' };
     }
-    // Resolve and validate the target before any push. In particular, never
-    // publish local default-branch commits while preparing a PR.
-    target = await validateEpicGitTarget(gitRoot, branch, input);
-    if (!target.ok) return target;
-    const baseBranch = target.baseBranch;
 
-    // A staged snapshot is the only attributable Epic boundary. Require it to
-    // be committed before opening a PR; unstaged local work remains untouched.
-    const stagedHasChanges = !(
-      await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet'])
-    );
-    if (stagedHasChanges) {
+    const target = await validateEpicGitTarget(gitRoot, branch, input);
+    if (!target.ok) return target;
+    gitRoot = target.gitRoot;
+    const baseBranch = target.baseBranch;
+    const setupErrorAfterValidation = pendingRiftSetupError(input);
+    if (setupErrorAfterValidation) {
+      return { ok: false, gitRoot, branch, error: setupErrorAfterValidation };
+    }
+
+    // Every local change in a rift belongs to this epic. Opening or reusing a
+    // PR with any staged, unstaged, or untracked work would publish an
+    // incomplete snapshot. Shared workspaces retain the narrower staged guard
+    // because unrelated unstaged work can legitimately coexist there.
+    const riftWorktreeFailure = await riftWorktreeChangesFailure(gitRoot, branch, input);
+    const sharedWorkspaceHasStagedChanges =
+      !input?.isRift &&
+      !(await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet']));
+    if (riftWorktreeFailure || sharedWorkspaceHasStagedChanges) {
+      if (riftWorktreeFailure) return riftWorktreeFailure;
       return {
         ok: false,
-        error: 'Commit & push the staged epic changes before opening a PR.',
+        gitRoot,
+        branch,
+        error: 'This epic still has staged changes. Commit and push them before opening a pull request.',
       };
     }
 
@@ -1764,19 +1990,19 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     // valid open PR even though its non-fast-forward push would fail. With no
     // selector, gh resolves the checked-out branch and its head repository;
     // filtering only by branch name could select a same-named fork PR.
-    const currentBranch = await getCurrentGitBranch(gitRoot);
-    if (currentBranch !== branch) {
-      return {
-        ok: false,
-        gitRoot: target.gitRoot,
-        branch,
-        error:
-          currentBranch === null
-            ? 'The repository entered a detached HEAD while Orion was looking for an existing PR. Switch back to the epic branch and try again.'
-            : `The repository switched from ${branch} to ${currentBranch} while Orion was looking for an existing PR. Switch back to the epic branch and try again.`,
-      };
-    }
     try {
+      // `gh pr view` below intentionally relies on the checkout so it can
+      // distinguish the current repository's head from a same-named fork.
+      // Revalidate at the last possible moment so a concurrent agent or
+      // terminal checkout cannot attach another branch's PR to this epic.
+      if ((await getCurrentGitBranch(gitRoot)) !== branch) {
+        return {
+          ok: false,
+          gitRoot,
+          branch,
+          error: `The repository moved off ${branch} while Orion was checking for its pull request. Switch back and try again.`,
+        };
+      }
       const { stdout } = await execFileAsync(
         'gh',
         ['pr', 'view', '--json', 'url,state'],
@@ -1784,11 +2010,17 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
       );
       const existing = JSON.parse(stdout);
       if (existing?.url && existing?.state === 'OPEN') {
+        const worktreeFailure = await riftWorktreeChangesFailure(gitRoot, branch, input);
+        if (worktreeFailure) return worktreeFailure;
+        const setupErrorBeforeReuse = pendingRiftSetupError(input);
+        if (setupErrorBeforeReuse) {
+          return { ok: false, gitRoot, branch, error: setupErrorBeforeReuse };
+        }
         return {
           ok: true,
           url: existing.url,
           alreadyExists: true,
-          gitRoot: target.gitRoot,
+          gitRoot,
           branch,
           baseBranch,
         };
@@ -1798,6 +2030,12 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     }
 
     // The branch must exist on the remote before gh can target a new PR.
+    const worktreeFailureBeforePush = await riftWorktreeChangesFailure(gitRoot, branch, input);
+    if (worktreeFailureBeforePush) return worktreeFailureBeforePush;
+    const setupErrorBeforePush = pendingRiftSetupError(input);
+    if (setupErrorBeforePush) {
+      return { ok: false, gitRoot, branch, error: setupErrorBeforePush };
+    }
     await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
 
     let title = '';
@@ -1864,19 +2102,451 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     if (!title) title = input?.epicName || `Changes from ${branch}`;
     if (!body) body = `Changes from the Orion epic "${input?.epicName ?? branch}".`;
 
+    const worktreeFailureBeforeCreate = await riftWorktreeChangesFailure(
+      gitRoot,
+      branch,
+      input
+    );
+    if (worktreeFailureBeforeCreate) return worktreeFailureBeforeCreate;
+    const setupErrorBeforeCreate = pendingRiftSetupError(input);
+    if (setupErrorBeforeCreate) {
+      return { ok: false, gitRoot, branch, error: setupErrorBeforeCreate };
+    }
     const { stdout } = await execFileAsync(
       'gh',
       ['pr', 'create', '--head', branch, '--base', baseBranch, '--title', title, '--body', body],
       { cwd: gitRoot }
     );
     const url = stdout.match(/https?:\/\/\S+/)?.[0] ?? '';
-    return { ok: true, url, title, gitRoot: target.gitRoot, branch, baseBranch };
+    return { ok: true, url, title, gitRoot, branch, baseBranch };
   } catch (error) {
     return {
       ok: false,
-      ...(target?.ok ? { gitRoot: target.gitRoot, branch } : {}),
+      ...(gitRoot ? { gitRoot, branch } : {}),
       error: error?.stderr?.toString().trim() || error?.message || String(error),
     };
+  }
+});
+
+// Status backing the epic view's git buttons: whether "Commit & push" has
+// anything to do, and — when the epic already has a PR — that PR's lifecycle
+// state. The renderer polls this while an epic view is open, so the git
+// checks stay local-only (no ls-remote/fetch); only the optional PR lookup
+// talks to GitHub, and only when prUrl is passed.
+ipcMain.handle('epic:gitStatus', async (_event, input) => {
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+
+    const gitRoot = await getGitRoot(projectPath);
+    const branch = (await getCurrentGitBranch(gitRoot)) ?? '';
+
+    const { stdout: porcelain } = await execFileAsync(
+      'git',
+      ['-C', gitRoot, 'status', '--porcelain'],
+      { maxBuffer: 1024 * 1024 * 4 }
+    );
+    const hasChangesToCommit = porcelain.trim().length > 0;
+
+    // Commits origin does not have yet, judged purely from local tracking
+    // refs. With no origin refs at all every commit counts, which errs toward
+    // keeping the commit button enabled.
+    let hasUnpushedCommits = false;
+    if (branch) {
+      try {
+        const { stdout } = await execFileAsync('git', [
+          '-C',
+          gitRoot,
+          'rev-list',
+          '--count',
+          `refs/heads/${branch}`,
+          '--not',
+          '--remotes=origin',
+        ]);
+        hasUnpushedCommits = Number.parseInt(stdout.trim(), 10) > 0;
+      } catch {
+        hasUnpushedCommits = false;
+      }
+    }
+
+    let pr;
+    if (input?.prUrl && (await checkCommandAvailable('gh'))) {
+      try {
+        const { stdout } = await execFileAsync(
+          'gh',
+          ['pr', 'view', String(input.prUrl), '--json', 'state,url'],
+          { cwd: gitRoot, timeout: 15_000 }
+        );
+        const parsed = JSON.parse(stdout);
+        if (parsed?.state) {
+          pr = { state: parsed.state, url: parsed.url ?? String(input.prUrl) };
+        }
+      } catch {
+        // Offline, gh unauthenticated, or the PR is gone — the renderer keeps
+        // its last known state.
+      }
+    }
+
+    return {
+      ok: true,
+      gitRoot,
+      branch,
+      hasChangesToCommit,
+      hasUnpushedCommits,
+      ...(pr ? { pr } : {}),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.stderr?.toString().trim() || error?.message || String(error),
+    };
+  }
+});
+
+// --- Epics: rift workspaces (experimental) -------------------------------
+
+ipcMain.handle('rift:status', () => ({
+  available: Boolean(riftBinaryPath()),
+  version: riftPackageVersion(),
+  pendingEpicIds: [...pendingRiftEpicIds],
+  readyRifts: [...unacknowledgedRifts.values()],
+}));
+
+ipcMain.handle('epic:createRift', async (event, input) => {
+  if (riftShutdownRequested) {
+    return { ok: false, error: 'Rift creation was cancelled because Orion is quitting.' };
+  }
+  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
+  if (!epicId) {
+    return { ok: false, error: 'Missing epic id.' };
+  }
+  if (pendingRiftEpicIds.has(epicId)) {
+    return { ok: false, error: 'A rift is already being created for this epic.' };
+  }
+  // Register synchronously before the first await. Agent and terminal IPC
+  // handlers consult this main-owned lock, so a recreated renderer cannot run
+  // an epic thread in the source repository while setup is still pending.
+  pendingRiftEpicIds.add(epicId);
+  const abortController = new AbortController();
+  const cancelForDestroyedSender = () => abortController.abort();
+  event.sender.once('destroyed', cancelForDestroyedSender);
+  let settlePendingCreation;
+  const pendingCreation = new Promise((resolve) => {
+    settlePendingCreation = resolve;
+  });
+  let createdRiftPath = '';
+  let awaitingPersistenceAck = false;
+  const pendingEntry = {
+    promise: pendingCreation,
+    cancel: () => abortController.abort(),
+    riftPath: () => createdRiftPath,
+  };
+  pendingRiftCreations.add(pendingEntry);
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+    if (!riftBinaryPath()) {
+      return { ok: false, error: 'Rift is not available on this platform.' };
+    }
+
+    const gitRoot = await getGitRoot(projectPath);
+    const [canonicalGitRoot, canonicalProjectPath] = await Promise.all([
+      fs.realpath(gitRoot),
+      fs.realpath(projectPath),
+    ]);
+    const projectRelativePath = path.relative(canonicalGitRoot, canonicalProjectPath);
+    if (
+      path.isAbsolute(projectRelativePath) ||
+      projectRelativePath === '..' ||
+      projectRelativePath.startsWith(`..${path.sep}`)
+    ) {
+      return { ok: false, error: 'The selected project is outside its Git repository.' };
+    }
+    const sourceChanges = await readGitStatusEntries(gitRoot);
+    if (sourceChanges.length > 0) {
+      const examples = sourceChanges
+        .slice(0, 3)
+        .map((entry) => entry.relativePath)
+        .join(', ');
+      return {
+        ok: false,
+        error:
+          'The source repository has staged, unstaged, or untracked changes. ' +
+          'Commit, stash, or remove them before creating a rift.' +
+          (examples ? ` Changed: ${examples}${sourceChanges.length > 3 ? ', …' : ''}` : ''),
+      };
+    }
+    const { stdout: sourceHeadOutput } = await execFileAsync('git', [
+      '-C',
+      gitRoot,
+      'rev-parse',
+      '--verify',
+      'HEAD',
+    ]);
+    const sourceHead = sourceHeadOutput.trim();
+    if (!sourceHead) {
+      return { ok: false, error: 'The source repository does not have a commit to create a rift from.' };
+    }
+
+    // Idempotent: registers the repo with Rift on first use.
+    await riftInit(gitRoot, { signal: abortController.signal });
+
+    const slug = riftSlug(input?.epicName);
+    // The suffix is part of both the workspace and branch names. Always
+    // suffixing the branch prevents collisions with remote branches and with
+    // sibling rifts, whose local refs are intentionally isolated.
+    const suffix = crypto.randomBytes(12).toString('hex');
+    const riftName = `${slug}-${suffix}`;
+    // Rift's default layout is deterministic. Pass it explicitly and retain
+    // it before spawning so cancellations before Rift reports stdout can
+    // still be located and moved to Rift-owned trash.
+    const riftParentPath = path.join(
+      path.dirname(canonicalGitRoot),
+      '.rifts',
+      path.basename(canonicalGitRoot)
+    );
+    const expectedRiftPath = path.resolve(riftParentPath, riftName);
+    if (existsSync(expectedRiftPath)) {
+      throw new Error(`The planned rift destination already exists: ${expectedRiftPath}`);
+    }
+    createdRiftPath = expectedRiftPath;
+    // Persist the deterministic destination before spawning Rift. If Electron
+    // or the machine exits after the CLI starts copying, startup recovery can
+    // still find both markerful and markerless partial workspaces.
+    await rememberRiftCleanup(expectedRiftPath);
+    const reportedRiftPath = await riftCreate(gitRoot, {
+      name: riftName,
+      into: riftParentPath,
+      signal: abortController.signal,
+    });
+    const resolvedReportedRiftPath = path.resolve(reportedRiftPath);
+    if (resolvedReportedRiftPath !== expectedRiftPath) {
+      throw new Error(`rift create reported an unexpected workspace path: ${resolvedReportedRiftPath}`);
+    }
+    createdRiftPath = resolvedReportedRiftPath;
+    const riftWorkingDir = projectRelativePath
+      ? path.join(createdRiftPath, projectRelativePath)
+      : createdRiftPath;
+    const workingDirStat = await fs.stat(riftWorkingDir).catch(() => null);
+    if (!workingDirStat?.isDirectory()) {
+      throw new Error('The new rift does not contain the selected project directory.');
+    }
+    if (riftShutdownRequested) {
+      throw new Error('Rift creation was cancelled because Orion is quitting.');
+    }
+
+    // `--copy-all` copies the source worktree and index as well as ignored
+    // dependencies. Pin the new workspace to the clean snapshot captured
+    // above before exposing it: a source edit racing `rift create` cannot
+    // leak into the epic's first `git add -A`.
+    const { stdout: excludeOutput } = await execFileAsync('git', [
+      '-C',
+      createdRiftPath,
+      'rev-parse',
+      '--git-path',
+      'info/exclude',
+    ]);
+    const excludePath = path.isAbsolute(excludeOutput.trim())
+      ? excludeOutput.trim()
+      : path.resolve(createdRiftPath, excludeOutput.trim());
+    await fs.appendFile(excludePath, '\n# Orion Rift metadata\n.rift\n');
+    await execFileAsync('git', ['-C', createdRiftPath, 'reset', '--hard', sourceHead]);
+    await execFileAsync('git', [
+      '-C',
+      createdRiftPath,
+      'clean',
+      '-ffd',
+      '-e',
+      '.rift',
+      '-e',
+      '.rift/**',
+    ]);
+    const copiedChanges = await readGitStatusEntries(createdRiftPath);
+    if (copiedChanges.length > 0) {
+      throw new Error('The new rift could not be reset to a clean Git snapshot.');
+    }
+    if (riftShutdownRequested) {
+      throw new Error('Rift creation was cancelled because Orion is quitting.');
+    }
+
+    // The rift starts on a detached HEAD with the source's working tree and
+    // index reset above. Let the epic's message model pick the readable part
+    // of the branch name; fall back to a slug of the epic title.
+    let branchBase = '';
+    if (input?.modelId) {
+      try {
+        const prompt =
+          `Choose a git branch name for work on the epic "${input?.epicName ?? ''}"` +
+          (input?.epicDescription ? ` (${truncateForPrompt(String(input.epicDescription), 500)})` : '') +
+          '. Reply with ONLY the branch name: lowercase kebab-case, optionally namespaced with a ' +
+          'short prefix like "feat/" or "fix/", under 50 characters. No quotes, no commentary.';
+        const raw = cleanGeneratedGitMessage(
+          await runOneShotForModelId(input.modelId, prompt, riftWorkingDir, {
+            signal: abortController.signal,
+          })
+        );
+        const candidate = raw.split('\n')[0]?.trim().replace(/^["'`]+|["'`]+$/g, '').slice(0, 60);
+        if (candidate && (await validateNewBranchName(candidate))) branchBase = candidate;
+      } catch {
+        // Fall back to the slug below.
+      }
+    }
+    if (abortController.signal.aborted || riftShutdownRequested) {
+      throw new Error('Rift creation was cancelled because its Orion window closed.');
+    }
+    if (!branchBase) branchBase = `epic/${slug}`;
+    branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || `epic/${slug}`;
+    const branch = `${branchBase}-${suffix}`;
+    await execFileAsync('git', ['-C', createdRiftPath, 'checkout', '-b', branch]);
+
+    // The initiating renderer can reload or close while the copy/model turn
+    // is in flight. If its frame is gone there is nobody left to persist the
+    // returned path, so remove the completed workspace instead of orphaning
+    // it. Explicit app quit sets the same condition and waits for this cleanup.
+    let senderFrameDestroyed = false;
+    try {
+      senderFrameDestroyed = event.senderFrame?.isDestroyed?.() === true;
+    } catch {
+      // Electron can throw while resolving senderFrame after its frame is disposed.
+      senderFrameDestroyed = true;
+    }
+    if (
+      riftShutdownRequested ||
+      event.sender.isDestroyed() ||
+      senderFrameDestroyed
+    ) {
+      const abandonedRiftPath = createdRiftPath;
+      await riftRemove(abandonedRiftPath);
+      await forgetRiftCleanup(abandonedRiftPath);
+      createdRiftPath = '';
+      return {
+        ok: false,
+        error: 'Rift creation was cancelled because its Orion window closed.',
+      };
+    }
+
+    // Keep the pre-create journal entry until the renderer proves the epic
+    // binding reached disk. Until then pendingRiftEpicIds keeps all
+    // source-fallback IPCs locked.
+    unacknowledgedRifts.set(epicId, {
+      epicId,
+      projectId: typeof input?.projectId === 'string' ? input.projectId : undefined,
+      projectPath: canonicalProjectPath,
+      riftPath: createdRiftPath,
+      riftWorkingDir,
+      gitRoot,
+      branch,
+    });
+    awaitingPersistenceAck = true;
+    return { ok: true, riftPath: createdRiftPath, riftWorkingDir, gitRoot, branch };
+  } catch (error) {
+    const originalError = error?.stderr?.toString().trim() || error?.message || String(error);
+    if (!createdRiftPath || !existsSync(createdRiftPath)) {
+      if (createdRiftPath) await forgetRiftCleanup(createdRiftPath).catch(() => {});
+      return { ok: false, error: originalError };
+    }
+
+    try {
+      if (riftShutdownRequested) {
+        // Quit has a bounded barrier. Record the path before attempting Rift's
+        // recoverable removal so a forced app exit cannot lose cleanup state.
+        await rememberRiftCleanup(createdRiftPath).catch(() => {});
+      }
+      await removeRememberedRiftCleanup(createdRiftPath, { allowMarkerless: true });
+      await forgetRiftCleanup(createdRiftPath);
+      return { ok: false, error: originalError };
+    } catch (cleanupError) {
+      const cleanupMessage =
+        cleanupError?.stderr?.toString().trim() ||
+        cleanupError?.message ||
+        String(cleanupError);
+      await rememberRiftCleanup(createdRiftPath).catch(() => {});
+      return {
+        ok: false,
+        riftPath: createdRiftPath,
+        error:
+          `${originalError} Orion also could not move the incomplete rift to trash: ` +
+          `${cleanupMessage}. Incomplete rift: ${createdRiftPath}`,
+      };
+    }
+  } finally {
+    event.sender.removeListener('destroyed', cancelForDestroyedSender);
+    settlePendingCreation();
+    pendingRiftCreations.delete(pendingEntry);
+    if (!awaitingPersistenceAck) pendingRiftEpicIds.delete(epicId);
+  }
+});
+
+ipcMain.handle('epic:acknowledgeRift', async (_event, input) => {
+  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
+  const riftPath = typeof input?.riftPath === 'string' ? input.riftPath : '';
+  if (!epicId || !riftPath) {
+    return { ok: false, error: 'Missing epic id or rift path.' };
+  }
+  const ownership = unacknowledgedRifts.get(epicId);
+  if (!ownership) {
+    // A duplicate acknowledgement may race recovery with the original invoke
+    // continuation. It is safe once this exact epic owns the path on disk.
+    const persistedOwners = await readPersistedRiftOwners();
+    return persistedOwners.get(riftPath)?.epicId === epicId
+      ? { ok: true, skipped: true }
+      : { ok: false, error: 'No matching Rift creation is awaiting acknowledgement.' };
+  }
+  if (ownership.riftPath !== riftPath) {
+    return { ok: false, error: 'The Rift acknowledgement does not match the created workspace.' };
+  }
+
+  const persistedOwners = await readPersistedRiftOwners();
+  if (persistedOwners.get(riftPath)?.epicId !== epicId) {
+    return {
+      ok: false,
+      error: 'The epic’s Rift ownership has not reached durable storage yet.',
+    };
+  }
+
+  try {
+    await forgetRiftCleanup(riftPath);
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.message || String(error),
+    };
+  }
+  unacknowledgedRifts.delete(epicId);
+  pendingRiftEpicIds.delete(epicId);
+  return { ok: true };
+});
+
+ipcMain.handle('epic:removeRift', async (_event, input) => {
+  try {
+    const riftPath = input?.riftPath;
+    if (!riftPath) {
+      return { ok: false, error: 'Missing rift path.' };
+    }
+    // A path already gone is an idempotent success.
+    if (!existsSync(riftPath)) {
+      await forgetRiftCleanup(riftPath);
+      return { ok: true, skipped: true };
+    }
+
+    let allowMarkerless = false;
+    if (!existsSync(path.join(riftPath, '.rift'))) {
+      // Renderer input alone is not enough to authorize markerless removal.
+      // Require the main-owned pre-create journal for this exact destination.
+      allowMarkerless = await hasRememberedRiftCleanup(riftPath);
+    }
+    // `rift remove` moves the workspace into Rift-owned trash — nothing is
+    // physically deleted until `rift gc`, and source roots are refused
+    // without --force. Markerless partial creations go to the OS trash.
+    await removeRememberedRiftCleanup(riftPath, { allowMarkerless });
+    await forgetRiftCleanup(riftPath);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.stderr?.toString().trim() || error?.message || String(error) };
   }
 });
 
@@ -2625,10 +3295,19 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
   // Synchronous, before the first await: IPC handlers start in arrival
   // order, so a stop/steer sent after this runTurn is guaranteed to see the
   // entry (or the fully registered run).
-  if (input?.runId) startingAgentRuns.set(input.runId, { aborted: false });
+  if (input?.runId) {
+    startingAgentRuns.set(input.runId, {
+      aborted: false,
+      threadId: input.threadId,
+    });
+  }
   try {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
       return { ok: false, error: 'Missing threadId, projectPath, prompt, or modelId.' };
+    }
+    const riftSetupError = pendingRiftSetupError(input);
+    if (riftSetupError) {
+      return { ok: false, error: riftSetupError };
     }
 
     // A newly opened window can submit a turn while startup cleanup is still
@@ -2947,7 +3626,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       // The run owns its CLI process; whatever path finalized the run, the
       // process must not outlive it (ACP servers idle forever on their own).
       // No-op when the process already exited.
-      killAgentChild(child);
+      killAgentChild(child, input.threadId);
       activeAgentRuns.delete(runId);
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
@@ -3457,8 +4136,12 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
       await goalDriver.stopGoalRun();
     } catch {}
   }
-  killAgentChild(run.child);
+  const shutdown = killAgentChild(run.child, run.threadId);
   activeAgentRuns.delete(runId);
+  // Rift deletion uses terminateBackground and must not move the process's
+  // cwd until SIGTERM/SIGKILL has actually reaped it. Ordinary Stop/Steer
+  // remains responsive and lets the global shutdown tracker finish the reap.
+  if (options?.terminateBackground) await shutdown;
   return true;
 });
 
@@ -3469,20 +4152,43 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
 ipcMain.handle('agent:isRunFinalizing', (_event, runId) => finalizingAgentRuns.has(runId));
 
 ipcMain.handle('agent:codexGoal', async (_event, input) => {
+  const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
   try {
-    if (!input?.sessionId || !input?.projectPath || !input?.action) {
-      return { ok: false, error: 'Missing sessionId, projectPath, or action.' };
+    if (!input?.sessionId || !threadId || !input?.projectPath || !input?.action) {
+      return { ok: false, error: 'Missing sessionId, threadId, projectPath, or action.' };
     }
     if (!['pause', 'clear', 'get'].includes(input.action)) {
       return { ok: false, error: `Unsupported goal action: ${input.action}` };
     }
-    const available = await checkCommandAvailable('codex');
-    if (!available) return { ok: false, error: 'codex is not installed or not on PATH.' };
-    return await runCodexGoalOp({
-      sessionId: input.sessionId,
-      cwd: input.projectPath,
-      action: input.action,
-    });
+    const controller = new AbortController();
+    const operationEntry = { controller, promise: null };
+    let threadOperations = codexGoalOpsByThread.get(threadId);
+    if (!threadOperations) {
+      threadOperations = new Set();
+      codexGoalOpsByThread.set(threadId, threadOperations);
+    }
+    threadOperations.add(operationEntry);
+    const operation = (async () => {
+      const available = await checkCommandAvailable('codex');
+      if (controller.signal.aborted) {
+        return { ok: false, error: 'Codex goal operation was cancelled.' };
+      }
+      if (!available) return { ok: false, error: 'codex is not installed or not on PATH.' };
+      return await runCodexGoalOp({
+        sessionId: input.sessionId,
+        threadId,
+        cwd: input.projectPath,
+        action: input.action,
+        signal: controller.signal,
+      });
+    })();
+    operationEntry.promise = operation;
+    try {
+      return await operation;
+    } finally {
+      threadOperations.delete(operationEntry);
+      if (threadOperations.size === 0) codexGoalOpsByThread.delete(threadId);
+    }
   } catch (error) {
     console.error('agent:codexGoal error', error);
     return { ok: false, error: error?.message ?? String(error) };
@@ -3491,22 +4197,67 @@ ipcMain.handle('agent:codexGoal', async (_event, input) => {
 
 ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
   if (typeof threadId !== 'string' || !threadId) return false;
+  // Cancel and drain startup work too. It may not own a child process yet,
+  // but it can still be resolving sessions or snapshotting the soon-to-move
+  // workspace, and must not spawn after the rift is removed.
+  let cancelledStartup = false;
+  for (const starting of startingAgentRuns.values()) {
+    if (starting.threadId !== threadId) continue;
+    starting.aborted = true;
+    starting.terminateBackground = true;
+    cancelledStartup = true;
+  }
   invalidateTerminalSession(threadId);
-  const disposedTerminal = disposeTerminalSession(threadId);
+  const terminalShutdown = disposeTerminalSessionAndWait(threadId);
+  const goalShutdown = disposeCodexGoalOpsForThread(threadId);
+  const titleShutdown = disposeTitleGenerationsForThread(threadId);
   // Also reap any live run process for the thread (e.g. a wedged ACP server
   // whose run the renderer no longer tracks): thread teardown must not leave
   // an orphaned CLI behind.
-  let killedRun = false;
+  const runShutdowns = [];
   for (const [runId, run] of activeAgentRuns) {
     if (run.threadId !== threadId) continue;
     // Marks the exit as intentional so the run finalizes as stopped, not as a
     // provider error.
     stoppedAgentRuns.add(runId);
+    runShutdowns.push(killAgentChild(run.child, threadId));
     activeAgentRuns.delete(runId);
-    killAgentChild(run.child);
-    killedRun = true;
   }
-  return disposeClaudeSdkSession(threadId) || disposedTerminal || killedRun;
+  const [disposedTerminal, disposedClaude, disposedGoals, disposedTitles, disposedAgent] =
+    await Promise.all([
+      terminalShutdown,
+      disposeClaudeSdkSessionAndWait(threadId),
+      goalShutdown,
+      titleShutdown,
+      waitForAgentThreadShutdowns(threadId),
+      ...runShutdowns,
+    ]);
+  if (cancelledStartup) {
+    const deadline = Date.now() + 3000;
+    while (
+      [...startingAgentRuns.values()].some((starting) => starting.threadId === threadId) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if ([...startingAgentRuns.values()].some((starting) => starting.threadId === threadId)) {
+      throw new Error(`Agent startup for thread ${threadId} did not stop in time.`);
+    }
+  }
+  // A Claude startup can install a session after the first disposal snapshot
+  // but before it observes the aborted startup flag. Repeat the acknowledged
+  // disposal after startup drain so no late session outlives Rift removal.
+  const disposedLateClaude = await disposeClaudeSdkSessionAndWait(threadId);
+  return (
+    disposedClaude ||
+    disposedLateClaude ||
+    disposedTerminal ||
+    disposedGoals ||
+    disposedTitles ||
+    disposedAgent ||
+    runShutdowns.length > 0 ||
+    cancelledStartup
+  );
 });
 
 // -------------------- Claude Code CLI terminal sessions --------------------
@@ -3517,6 +4268,7 @@ ipcMain.handle('agent:disposeThread', async (_event, threadId) => {
 // ordered, so the per-session seq disambiguates).
 
 const terminalSessions = new Map(); // threadId -> { pty, scrollback, seq, exited, exitCode, accessMode, projectPath, claudeSessionId }
+const terminatingTerminalSessions = new Map(); // threadId -> Set<session>
 // Explicit teardown (model switch/thread deletion) can race an async
 // terminal:ensure before it has installed a session. Epochs let teardown
 // invalidate those pending starts so they cannot spawn an invisible PTY.
@@ -3531,12 +4283,44 @@ const disposeTerminalSession = (threadId) => {
   const session = terminalSessions.get(threadId);
   if (!session) return false;
   terminalSessions.delete(threadId);
+  if (!session.exited) {
+    let terminating = terminatingTerminalSessions.get(threadId);
+    if (!terminating) {
+      terminating = new Set();
+      terminatingTerminalSessions.set(threadId, terminating);
+    }
+    terminating.add(session);
+  }
   if (session.sessionWatcher) clearInterval(session.sessionWatcher);
   disposeTerminalHookSignals(session);
   try {
     if (!session.exited) session.pty.kill();
   } catch {
     // already gone
+  }
+  return true;
+};
+
+const disposeTerminalSessionAndWait = async (threadId, timeoutMs = 3000) => {
+  const sessions = new Set(terminatingTerminalSessions.get(threadId) ?? []);
+  const activeSession = terminalSessions.get(threadId);
+  if (activeSession) {
+    disposeTerminalSession(threadId);
+    sessions.add(activeSession);
+  }
+  if (sessions.size === 0) return false;
+  if ([...sessions].every((session) => session.exited)) return true;
+
+  let timeoutId;
+  const exited = await Promise.race([
+    Promise.all([...sessions].map((session) => session.exitPromise)).then(() => true),
+    new Promise((resolve) => {
+      timeoutId = setTimeout(() => resolve(false), timeoutMs);
+    }),
+  ]);
+  if (timeoutId) clearTimeout(timeoutId);
+  if (!exited) {
+    throw new Error(`Claude terminal for thread ${threadId} did not stop in time.`);
   }
   return true;
 };
@@ -3799,6 +4583,10 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
     if (!threadId || !projectPath) {
       return { ok: false, error: 'threadId and projectPath are required' };
     }
+    const riftSetupError = pendingRiftSetupError(input);
+    if (riftSetupError) {
+      return { ok: false, error: riftSetupError };
+    }
     // A newer ensure supersedes any older pending start for the same thread
     // (for example, when access mode changes while node-pty is still loading).
     const ensureEpoch = (terminalSessionEpochs.get(threadId) ?? 0) + 1;
@@ -3902,6 +4690,10 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
       env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
     });
 
+    let resolveExit;
+    const exitPromise = new Promise((resolve) => {
+      resolveExit = resolve;
+    });
     session = {
       pty: ptyProcess,
       scrollback: '',
@@ -3922,6 +4714,8 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
       settingsPath: hookFiles?.settingsPath ?? null,
       signalReadOffset: 0,
       signalWatcher: null,
+      exitPromise,
+      resolveExit,
     };
     terminalSessions.set(threadId, session);
     startTerminalSessionWatcher(threadId, session, projectPath);
@@ -3938,12 +4732,18 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
       sendToAllWindows('terminal:data', { threadId, data, seq: session.seq });
     });
     ptyProcess.onExit(({ exitCode }) => {
+      session.exited = true;
+      session.exitCode = exitCode ?? null;
+      session.resolveExit?.();
+      const terminating = terminatingTerminalSessions.get(threadId);
+      if (terminating) {
+        terminating.delete(session);
+        if (terminating.size === 0) terminatingTerminalSessions.delete(threadId);
+      }
       // disposeTerminalSession removes the old session before killing it. If
       // another PTY now owns this thread id, its view must not receive the
       // old process's delayed exit event.
       if (terminalSessions.get(threadId) !== session) return;
-      session.exited = true;
-      session.exitCode = exitCode ?? null;
       if (session.sessionWatcher) {
         clearInterval(session.sessionWatcher);
         session.sessionWatcher = null;
@@ -4057,8 +4857,14 @@ const titleFromResponseText = (responseText) => {
 // Run a single non-streaming prompt through a provider CLI in read-only mode
 // and return the model's plain-text reply ('' on any failure). Backs the
 // hidden utility turns: thread titles and epic commit/PR messages.
-const runOneShotAgentText = async (model, prompt, projectPath) => {
+const runOneShotAgentText = async (
+  model,
+  prompt,
+  projectPath,
+  { signal, threadId } = {}
+) => {
   const cwd = projectPath || process.cwd();
+  if (signal?.aborted) return '';
 
   // OpenCode's non-interactive command does not currently expose a mode that
   // Orion can enforce as read-only. Hidden utility turns must fail closed
@@ -4072,7 +4878,7 @@ const runOneShotAgentText = async (model, prompt, projectPath) => {
   // access. Drive the turn over ACP plan mode instead, which disables tool
   // execution.
   if (model.providerId === 'kimi') {
-    return (await kimiPlanModeOneShot(model, prompt, cwd)) || '';
+    return (await kimiPlanModeOneShot(model, prompt, cwd, { signal, threadId })) || '';
   }
 
   // Reuse the command builder but force read-only access for the hidden turn
@@ -4095,20 +4901,36 @@ const runOneShotAgentText = async (model, prompt, projectPath) => {
     });
 
     let settled = false;
+    let deadline = null;
+    const cleanup = () => {
+      if (deadline) clearTimeout(deadline);
+      signal?.removeEventListener('abort', abort);
+    };
     const finish = (value) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
+      cleanup();
       resolve(value);
     };
+    // Cancellation is stronger than ordinary completion: do not release the
+    // caller until the provider child has actually exited, because the caller
+    // may remove the child's working directory next.
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void killAgentChild(child, threadId).then(() => resolve(''));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
     // A provider CLI stalled on auth or network input would otherwise pin the
     // awaiting caller forever — the epic git actions hold their disabled-UI
     // busy state on this promise. Cap the turn and reap the child; callers
     // fall back to their non-LLM message.
-    const deadline = setTimeout(() => {
-      void killAgentChild(child);
-      finish('');
-    }, 120_000);
+    deadline = setTimeout(abort, 120_000);
 
     let stdout = '';
     child.stdout.on('data', (data) => {
@@ -4183,28 +5005,40 @@ const runOneShotAgentText = async (model, prompt, projectPath) => {
 };
 
 // Look up a model id, verify its CLI is on PATH, and run a one-shot prompt.
-const runOneShotForModelId = async (modelId, prompt, projectPath) => {
+const runOneShotForModelId = async (modelId, prompt, projectPath, options) => {
   if (!modelId) return '';
+  if (options?.signal?.aborted) return '';
   const models = await getAgentModels();
+  if (options?.signal?.aborted) return '';
   const model = models.find((candidate) => candidate.id === modelId);
   if (!model) return '';
   if (!(await checkCommandAvailable(model.command))) return '';
-  return runOneShotAgentText(model, prompt, projectPath);
+  if (options?.signal?.aborted) return '';
+  return runOneShotAgentText(model, prompt, projectPath, options);
 };
 
 // Generate a short, relevant title for a thread based on the first user prompt.
 // This runs a lightweight non-streaming call and returns just the title string.
 ipcMain.handle('agent:generateTitle', async (_event, input) => {
-  try {
-    if (!input?.prompt || !input?.modelId) {
-      return '';
-    }
+  const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
+  if (!threadId || !input?.prompt || !input?.modelId) return '';
+  const controller = new AbortController();
+  const generation = { controller, promise: null };
+  let threadGenerations = titleGenerationsByThread.get(threadId);
+  if (!threadGenerations) {
+    threadGenerations = new Set();
+    titleGenerationsByThread.set(threadId, threadGenerations);
+  }
+  threadGenerations.add(generation);
+  const operation = (async () => {
+    if (pendingRiftSetupError(input)) return '';
     const models = await getAgentModels();
+    if (controller.signal.aborted) return '';
     const model = models.find((candidate) => candidate.id === input.modelId);
     if (!model) return '';
 
     const available = await checkCommandAvailable(model.command);
-    if (!available) return '';
+    if (!available || controller.signal.aborted) return '';
 
     const titleInstruction =
       'Reply with ONLY a concise, specific title (3-8 words) for the following user request. ' +
@@ -4213,11 +5047,21 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
       input.prompt;
 
     return titleFromResponseText(
-      await runOneShotAgentText(model, titleInstruction, input.projectPath)
+      await runOneShotAgentText(model, titleInstruction, input.projectPath, {
+        signal: controller.signal,
+        threadId,
+      })
     );
+  })();
+  generation.promise = operation;
+  try {
+    return await operation;
   } catch (e) {
     console.error('agent:generateTitle error', e);
     return '';
+  } finally {
+    threadGenerations.delete(generation);
+    if (threadGenerations.size === 0) titleGenerationsByThread.delete(threadId);
   }
 });
 

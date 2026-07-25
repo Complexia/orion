@@ -29,6 +29,30 @@ export type Epic = {
   gitRoot?: string;
   /** Dedicated feature branch claimed by this epic's git actions. */
   gitBranch?: string;
+  /**
+   * Root of the copy-on-write rift workspace created for this epic. Git and
+   * removal use this root; threads use riftWorkingDir when the project is a
+   * repository subdirectory.
+   */
+  riftPath?: string;
+  /** Project-relative directory inside the rift where this epic's threads run. */
+  riftWorkingDir?: string;
+  /**
+   * Durable record that the user chose to work in a rift. It remains until
+   * setup succeeds, so a recoverable creation failure cannot silently send
+   * later turns to the shared source checkout.
+   */
+  riftRequest?: {
+    projectId: string;
+    projectPath: string;
+    error?: string;
+  };
+  /**
+   * The rift was created but post-create setup and automatic cleanup both
+   * failed. Keep its path durably so deletion can retry cleanup; threads and
+   * git actions must not use the incomplete workspace.
+   */
+  riftCleanupPending?: boolean;
 };
 
 export type EpicsSettings = {
@@ -41,6 +65,19 @@ export type EpicsSettings = {
 export const defaultEpicsSettings: EpicsSettings = {
   enabled: true,
   commitModelId: null,
+};
+
+/** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */
+export type RiftsSettings = {
+  /** Master switch for the experimental Rifts integration. */
+  enabled: boolean;
+  /** Create a rift (and branch) automatically for every new epic. */
+  autoCreateForEpics: boolean;
+};
+
+export const defaultRiftsSettings: RiftsSettings = {
+  enabled: false,
+  autoCreateForEpics: true,
 };
 
 const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -397,6 +434,7 @@ interface OrionState {
   /** Selected epic (epic view in the main panel). Cleared when a thread is selected. */
   selectedEpicId: string | null;
   epicsSettings: EpicsSettings;
+  riftsSettings: RiftsSettings;
 
   // Code tab workspace
   workspacePath: string | null;
@@ -422,7 +460,14 @@ interface OrionState {
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
-  addEpic: (name: string, options?: { description?: string }) => string; // returns new epic id
+  addEpic: (
+    name: string,
+    options?: {
+      description?: string;
+      repositoryProjectId?: string;
+      riftRequest?: Epic['riftRequest'];
+    }
+  ) => string; // returns new epic id
   renameEpic: (id: string, name: string) => void;
   updateEpic: (id: string, updates: Partial<Epic>) => void;
   /** Deletes the epic; its threads survive and just lose the grouping. */
@@ -431,6 +476,7 @@ interface OrionState {
   unsettleEpic: (id: string) => void;
   selectEpic: (id: string | null) => void;
   setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
+  setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
 
   createThread: (
     projectId: string,
@@ -497,23 +543,52 @@ const memoryStorage = new Map<string, string>();
 const STORE_SAVE_DEBOUNCE_MS = 400;
 let pendingStoreValue: string | null = null;
 let storeSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let storeSaveFlush: Promise<boolean> | null = null;
 
-const flushStoreSave = () => {
+export const flushOrionStoreSave = async (): Promise<boolean> => {
   if (storeSaveTimer !== null) {
     clearTimeout(storeSaveTimer);
     storeSaveTimer = null;
   }
-  if (pendingStoreValue === null) return;
-  const value = pendingStoreValue;
-  pendingStoreValue = null;
-  if (typeof window === 'undefined' || !window.orion?.saveStore) return;
-  void window.orion.saveStore(value).then((saved) => {
-    if (!saved) console.warn('Failed to persist orion-storage');
-  });
+  if (storeSaveFlush !== null) return storeSaveFlush;
+
+  const flush = (async () => {
+    while (pendingStoreValue !== null) {
+      if (typeof window === 'undefined' || !window.orion?.saveStore) return false;
+
+      const value = pendingStoreValue;
+      let saved = false;
+      try {
+        saved = await window.orion.saveStore(value);
+      } catch (error) {
+        console.warn('Failed to persist orion-storage', error);
+        return false;
+      }
+      if (!saved) {
+        console.warn('Failed to persist orion-storage');
+        return false;
+      }
+
+      // A newer snapshot may have arrived while this one was being written.
+      // Only clear the value that was actually persisted; the loop will drain
+      // a replacement before reporting success.
+      if (pendingStoreValue === value) pendingStoreValue = null;
+    }
+    return true;
+  })();
+
+  storeSaveFlush = flush;
+  try {
+    return await flush;
+  } finally {
+    if (storeSaveFlush === flush) storeSaveFlush = null;
+  }
 };
 
 if (typeof window !== 'undefined') {
-  window.addEventListener('beforeunload', flushStoreSave);
+  window.addEventListener('beforeunload', () => {
+    void flushOrionStoreSave();
+  });
 }
 
 // Threads (full transcripts) are excluded from the persisted store above and
@@ -609,16 +684,16 @@ const orionStorage: StateStorage = {
   },
   setItem: async (name, value) => {
     memoryStorage.set(name, value);
+    pendingStoreValue = value;
 
     if (typeof window === 'undefined' || !window.orion?.saveStore) {
       return;
     }
 
-    pendingStoreValue = value;
     if (storeSaveTimer === null) {
       storeSaveTimer = setTimeout(() => {
         storeSaveTimer = null;
-        flushStoreSave();
+        void flushOrionStoreSave();
       }, STORE_SAVE_DEBOUNCE_MS);
     }
   },
@@ -663,6 +738,7 @@ export const useOrionStore = create<OrionState>()(
       epics: [],
       selectedEpicId: null,
       epicsSettings: defaultEpicsSettings,
+      riftsSettings: defaultRiftsSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -809,17 +885,25 @@ export const useOrionStore = create<OrionState>()(
           id: crypto.randomUUID(),
           name,
           ...(description ? { description } : {}),
+          ...(options?.riftRequest ? { riftRequest: options.riftRequest } : {}),
           createdAt: new Date().toISOString(),
         };
-        set((state) => ({
-          epics: [newEpic, ...state.epics],
-          selectedEpicId: newEpic.id,
-          selectedThreadId: null,
-          // A new epic is intentionally unbound. Clear the shell repository so
-          // header git controls cannot keep targeting the previously selected
-          // project while the epic view asks the user to choose one.
-          selectedProjectId: null,
-        }));
+        set((state) => {
+          const repositoryProject = options?.repositoryProjectId
+            ? state.projects.find((project) => project.id === options.repositoryProjectId)
+            : undefined;
+          if (repositoryProject) newEpic.repositoryProjectId = repositoryProject.id;
+          return {
+            epics: [newEpic, ...state.epics],
+            selectedEpicId: newEpic.id,
+            selectedThreadId: null,
+            // The shell repository follows the epic's binding: the project
+            // picked in the create modal, or none — header git controls must
+            // not keep targeting the previously selected project while the
+            // epic view asks the user to choose one.
+            selectedProjectId: repositoryProject?.id ?? null,
+          };
+        });
         return newEpic.id;
       },
 
@@ -900,6 +984,15 @@ export const useOrionStore = create<OrionState>()(
           epicsSettings: {
             ...defaultEpicsSettings,
             ...state.epicsSettings,
+            ...updates,
+          },
+        })),
+
+      setRiftsSettings: (updates) =>
+        set((state) => ({
+          riftsSettings: {
+            ...defaultRiftsSettings,
+            ...state.riftsSettings,
             ...updates,
           },
         })),
@@ -1323,6 +1416,10 @@ export const useOrionStore = create<OrionState>()(
         epicsSettings: {
           ...defaultEpicsSettings,
           ...state.epicsSettings,
+        },
+        riftsSettings: {
+          ...defaultRiftsSettings,
+          ...state.riftsSettings,
         },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
