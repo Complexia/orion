@@ -1318,6 +1318,16 @@ body {
   overflow: hidden;
 }
 
+/* A group whose row opens a popover can't clip to its own rounded corners. */
+.settings-group-overflowing {
+  overflow: visible;
+}
+
+/* The row's description takes the slack; the trigger keeps its own width. */
+.setting-row > .model-picker-anchor {
+  flex-shrink: 0;
+}
+
 /* General settings rows */
 .setting-row {
   display: flex;
@@ -4093,10 +4103,112 @@ body {
   animation: popover-in 220ms var(--ease-out) both;
 }
 
+/* Settings mounts sit near the top of a scrolling pane and are right-aligned,
+   so the picker unfolds downward from the trigger's right edge. */
+.model-picker-popover.below {
+  top: calc(100% + 8px);
+  bottom: auto;
+  right: 0;
+  left: auto;
+  width: min(620px, calc(100vw - 420px));
+  min-width: 420px;
+  height: min(430px, calc(100vh - 260px));
+  animation-name: popover-in-below;
+}
+
+/* Not enough room under the trigger — unfold upward instead. */
+.model-picker-popover.below.flip-up {
+  top: auto;
+  bottom: calc(100% + 8px);
+  animation-name: popover-in;
+}
+
+/* Settings rows are a fraction of the composer's height, so the picker there
+   drops to a denser rail, search strip, and row. */
+.model-picker-popover.compact {
+  width: min(400px, calc(100vw - 460px));
+  min-width: 300px;
+  height: min(320px, calc(100vh - 260px));
+  grid-template-columns: 46px 1fr;
+}
+
+.model-picker-popover.compact .model-provider-rail {
+  gap: 3px;
+  padding: 7px 5px;
+}
+
+.model-picker-popover.compact .provider-rail-button {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+}
+
+.model-picker-popover.compact .provider-rail-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.model-picker-popover.compact .model-search {
+  flex-basis: 44px;
+  height: 44px;
+  padding: 8px 10px;
+  gap: 6px;
+}
+
+.model-picker-popover.compact .model-search svg {
+  width: 13px;
+  height: 13px;
+}
+
+.model-picker-popover.compact .model-search input {
+  height: 28px;
+  padding: 0 9px;
+  font-size: 12.5px;
+}
+
+.model-picker-popover.compact .model-list {
+  padding: 5px;
+}
+
+.model-picker-popover.compact .model-row {
+  min-height: 40px;
+  grid-template-columns: 20px minmax(0, 1fr) auto auto;
+  gap: 8px;
+  padding: 5px 9px;
+}
+
+.model-picker-popover.compact .model-row svg {
+  width: 14px;
+  height: 14px;
+}
+
+.model-picker-popover.compact .model-row-text {
+  gap: 0;
+}
+
+.model-picker-popover.compact .model-row-label {
+  font-size: 12.5px;
+}
+
+.model-picker-popover.compact .model-row-provider {
+  font-size: 10.5px;
+}
+
 @keyframes popover-in {
   from {
     opacity: 0;
     transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes popover-in-below {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
   }
   to {
     opacity: 1;

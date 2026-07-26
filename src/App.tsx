@@ -120,6 +120,8 @@ import { CodeEditorPane } from './app/CodeEditorPane';
 import { ProjectIcon } from './app/ProjectIcon';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
+import { ModelPickerPopover } from './app/ModelPickerPopover';
+import { SelectMenu } from './app/SelectMenu';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import { AttachmentThumb, buildPromptWithAttachments, formatAttachmentSize, getDroppedFilePath, isMediaFile, isVideoAttachment, isVideoFile } from './app/attachments';
 import { AgentFamilySwitcher, ChatTranscript, isProviderAuthErrorText } from './app/chat';
@@ -219,16 +221,17 @@ type SettingsTab =
 
 const THREADS_VISIBLE_LIMIT = 5;
 
-// Cheap models preferred for the hidden epic commit/PR-message turns when the
-// user hasn't picked one in Settings, best value first. Falls through to any
-// available model.
-const EPIC_MESSAGE_MODEL_PREFERENCE = [
-  'claude:claude-haiku-4-5',
-  'codex:gpt-5.4-mini',
-  'codex:gpt-5.3-codex-spark',
+// Default order for Orion's hidden text-generation turns (thread titles, epic
+// commit messages, PR descriptions) when the user hasn't picked a model in
+// Settings. One entry per provider — the fastest model that provider offers —
+// so a user with a single harness gets that harness's quick model, and a user
+// with several gets them in this order. Falls through to any usable model.
+const UTILITY_MODEL_PREFERENCE = [
+  'codex:gpt-5.6-luna',
   'grok:grok-composer-2.5-fast',
-  'cursor:composer-2.5-fast',
-  'kimi:kimi-code/kimi-for-coding-highspeed',
+  'cursor:composer-2.5',
+  'claude:claude-haiku-4-5',
+  'kimi:kimi-code/kimi-for-coding',
 ];
 
 // Threads grouped under an epic that has a rift workspace (experimental Rifts
@@ -388,6 +391,8 @@ const App: React.FC = () => {
     setOrchestrationGeneralInstructions,
     notificationSettings,
     setNotificationSettings,
+    textGenerationSettings,
+    setTextGenerationSettings,
     setThreadAgentSession,
     queueMessageToThread,
     removeQueuedThreadMessage,
@@ -443,6 +448,8 @@ const App: React.FC = () => {
       setOrchestrationGeneralInstructions: state.setOrchestrationGeneralInstructions,
       notificationSettings: state.notificationSettings,
       setNotificationSettings: state.setNotificationSettings,
+      textGenerationSettings: state.textGenerationSettings,
+      setTextGenerationSettings: state.setTextGenerationSettings,
       setThreadAgentSession: state.setThreadAgentSession,
       queueMessageToThread: state.queueMessageToThread,
       removeQueuedThreadMessage: state.removeQueuedThreadMessage,
@@ -502,6 +509,11 @@ const App: React.FC = () => {
   const [agentModels, setAgentModels] = useState<AgentModel[]>(fallbackAgentModels);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState('');
+  // Settings → General → Text generation drives its own copy of the picker
+  // state so opening it never disturbs the composer's picker.
+  const [utilityModelPickerOpen, setUtilityModelPickerOpen] = useState(false);
+  const [utilityModelSearch, setUtilityModelSearch] = useState('');
+  const [utilityModelTab, setUtilityModelTab] = useState<AgentProviderId>('codex');
   // Active @-mention token in the composer: index of the '@' and the query
   // typed after it (null when the caret isn't inside a mention token).
   const [chatMention, setChatMention] = useState<{ start: number; query: string } | null>(null);
@@ -787,6 +799,7 @@ const App: React.FC = () => {
   const chatPinnedRef = useRef(true);
   const chatScrollTopRef = useRef(0);
   const modelPickerRef = useRef<HTMLDivElement>(null);
+  const utilityModelPickerRef = useRef<HTMLDivElement>(null);
   const taskPickerRef = useRef<HTMLDivElement>(null);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
@@ -1468,35 +1481,89 @@ const App: React.FC = () => {
           ? { label: 'PR open', modifier: 'open' as const }
           : { label: 'PR created', modifier: 'open' as const };
 
-  // The model that writes epic commit/PR messages: the Settings pick when it's
-  // installed and its provider is enabled, else the cheapest enabled model.
-  const resolveEpicMessageModelId = useCallback(() => {
+  // Models eligible for the hidden text-generation turns. Orion can't delegate
+  // to itself, the Claude Code CLI pseudo-model is an interactive terminal, and
+  // OpenCode's non-interactive command has no mode Orion can pin to read-only —
+  // hidden turns there fail closed in main, so it is never offered.
+  const utilityCandidateModels = useMemo(
+    () =>
+      agentModels.filter(
+        (model) =>
+          !isOrionModelId(model.id) &&
+          model.id !== claudeCodeCliModelId &&
+          model.providerId !== 'opencode'
+      ),
+    [agentModels]
+  );
+  const utilityProviders = useMemo(
+    () =>
+      agentProviders.filter(
+        (provider) =>
+          provider.id !== 'orion' &&
+          enabledProviderIdSet.has(provider.id) &&
+          utilityCandidateModels.some((model) => model.providerId === provider.id)
+      ),
+    [enabledProviderIdSet, utilityCandidateModels]
+  );
+  // The model behind thread titles and epic commit/PR messages: the Settings
+  // pick when it's installed and its provider is enabled, else the fastest
+  // model on the first available provider in UTILITY_MODEL_PREFERENCE.
+  const resolvedUtilityModelId = useMemo(() => {
     const isUsable = (id: string | null | undefined): id is string => {
-      if (!id || isOrionModelId(id) || id === claudeCodeCliModelId) return false;
-      const model = agentModels.find((candidate) => candidate.id === id);
-      return (
-        !!model &&
-        model.providerId !== 'opencode' &&
-        model.available !== false &&
-        enabledProviderIdSet.has(model.providerId)
-      );
+      if (!id) return false;
+      const model = utilityCandidateModels.find((candidate) => candidate.id === id);
+      return !!model && model.available !== false && enabledProviderIdSet.has(model.providerId);
     };
-    const preferred = epicsSettings?.commitModelId ?? null;
+    const preferred = textGenerationSettings?.modelId ?? null;
     if (isUsable(preferred)) return preferred;
-    for (const id of EPIC_MESSAGE_MODEL_PREFERENCE) {
+    for (const id of UTILITY_MODEL_PREFERENCE) {
       if (isUsable(id)) return id;
     }
     return (
-      agentModels.find(
-        (model) =>
-          model.available !== false &&
-          model.providerId !== 'opencode' &&
-          enabledProviderIdSet.has(model.providerId) &&
-          !isOrionModelId(model.id) &&
-          model.id !== claudeCodeCliModelId
+      utilityCandidateModels.find(
+        (model) => model.available !== false && enabledProviderIdSet.has(model.providerId)
       )?.id ?? null
     );
-  }, [agentModels, enabledProviderIdSet, epicsSettings?.commitModelId]);
+  }, [enabledProviderIdSet, textGenerationSettings?.modelId, utilityCandidateModels]);
+  const resolvedUtilityModel = useMemo(
+    () => utilityCandidateModels.find((model) => model.id === resolvedUtilityModelId) ?? null,
+    [resolvedUtilityModelId, utilityCandidateModels]
+  );
+  const utilityModelProviderId = resolvedUtilityModel?.providerId ?? null;
+  // Reasoning tiers the picked model actually accepts, cheapest first. Cursor
+  // and Kimi take none, so they get no picker at all.
+  const utilityReasoningOptions = useMemo<Array<{ value: string; label: string }>>(() => {
+    const toOptions = (options: Array<{ value: string; label: string }>) =>
+      options.map(({ value, label }) => ({ value, label }));
+    if (!resolvedUtilityModel) return [];
+    if (resolvedUtilityModel.providerId === 'codex')
+      return toOptions(codexReasoningOptionsForModel(resolvedUtilityModel));
+    if (resolvedUtilityModel.providerId === 'claude') return toOptions(claudeReasoningOptions);
+    if (resolvedUtilityModel.providerId === 'grok') return toOptions(grokReasoningOptions);
+    return [];
+  }, [resolvedUtilityModel]);
+  // A hidden turn writes a title or a commit message, so an unset effort — and
+  // one the current model doesn't offer, e.g. Claude's Ultrathink after a
+  // switch to Codex — falls back to the cheapest tier rather than a provider
+  // default that would spend real reasoning on one sentence.
+  const resolvedUtilityReasoningEffort = useMemo(() => {
+    if (utilityReasoningOptions.length === 0) return null;
+    const stored = textGenerationSettings?.reasoningEffort ?? null;
+    if (stored && utilityReasoningOptions.some((option) => option.value === stored)) return stored;
+    return utilityReasoningOptions[0].value;
+  }, [textGenerationSettings?.reasoningEffort, utilityReasoningOptions]);
+  // Callers reach for these at the moment they fire a turn, so reading through
+  // a ref keeps them off the resolvers' identity and out of re-render churn.
+  const utilityTurnRef = useRef({
+    modelId: resolvedUtilityModelId,
+    reasoningEffort: resolvedUtilityReasoningEffort,
+  });
+  utilityTurnRef.current = {
+    modelId: resolvedUtilityModelId,
+    reasoningEffort: resolvedUtilityReasoningEffort,
+  };
+  /** `{ modelId, reasoningEffort }` for a hidden text-generation turn. */
+  const resolveUtilityTurn = useCallback(() => utilityTurnRef.current, []);
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
     try {
@@ -1712,6 +1779,28 @@ const App: React.FC = () => {
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [modelPickerOpen]);
+
+  useEffect(() => {
+    if (!utilityModelPickerOpen) return undefined;
+
+    const close = () => {
+      setUtilityModelPickerOpen(false);
+      setUtilityModelSearch('');
+    };
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!utilityModelPickerRef.current?.contains(event.target as Node)) close();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [utilityModelPickerOpen]);
 
   useEffect(() => {
     if (!taskPickerOpen) return undefined;
@@ -3490,7 +3579,7 @@ const App: React.FC = () => {
         projectPath: project.path,
         epicName: epic.name,
         epicDescription: epic.description,
-        modelId: resolveEpicMessageModelId(),
+        ...resolveUtilityTurn(),
         ...(request.baseBranch ? { baseBranch: request.baseBranch } : {}),
       });
       if (result.ok && result.riftPath) {
@@ -3896,7 +3985,7 @@ const App: React.FC = () => {
         epicId: epic.id,
         projectPath,
         // A hand-written message needs no model turn.
-        modelId: trimmedMessage ? null : resolveEpicMessageModelId(),
+        ...(trimmedMessage ? { modelId: null } : resolveUtilityTurn()),
         epicName: epic.name,
         ...(trimmedMessage ? { message: trimmedMessage } : {}),
         ...claim,
@@ -4059,7 +4148,7 @@ const App: React.FC = () => {
         epicId: epic.id,
         projectPath,
         // A hand-written title and description need no model turn.
-        modelId: trimmedMessage ? null : resolveEpicMessageModelId(),
+        ...(trimmedMessage ? { modelId: null } : resolveUtilityTurn()),
         epicName: epic.name,
         baseBranch,
         ...(trimmedMessage ? { message: trimmedMessage } : {}),
@@ -4759,11 +4848,13 @@ const App: React.FC = () => {
         if (isPlausibleTitle(initialTitle)) {
           updateThread(threadId, { title: initialTitle });
         }
-        // Kick off async LLM refinement for a nicer title
+        // Kick off async LLM refinement for a nicer title. The thread's own
+        // model may be a slow reasoning one (or Orion, which can't run a
+        // one-shot), so this goes through the text-generation model instead.
         void tryGenerateBetterTitle(
           threadId,
           titleSeed,
-          model.id,
+          resolveUtilityTurn(),
           threadWorkingDir(state.epics, thread, project),
           updateThread,
           thread.epicId
@@ -6080,7 +6171,7 @@ const App: React.FC = () => {
         void tryGenerateBetterTitle(
           submittedThreadId,
           promptText,
-          'claude:claude-haiku-4-5',
+          resolveUtilityTurn(),
           selectedThreadProjectPath ?? '',
           updateThread,
           currentThread.epicId
@@ -7515,6 +7606,86 @@ const App: React.FC = () => {
                     </div>
                   </div>
 
+                  <div className="settings-group-label">Text generation</div>
+                  <div className="settings-group settings-group-overflowing">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Model</div>
+                        <div className="setting-label-desc">
+                          Writes Orion's short generated text: thread titles, epic commit messages
+                          from staged changes, and PR descriptions from branch changes. Defaults to
+                          the fastest model on the providers you have installed.
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <div className="model-picker-anchor" ref={utilityModelPickerRef}>
+                          <button
+                            className="model-trigger"
+                            onClick={() => {
+                              setUtilityModelPickerOpen((open) => {
+                                if (!open) {
+                                  setUtilityModelSearch('');
+                                  // Open on the resolved model's provider, or the
+                                  // first one with rows if nothing resolved.
+                                  setUtilityModelTab(
+                                    utilityModelProviderId ??
+                                      utilityProviders[0]?.id ??
+                                      'codex'
+                                  );
+                                }
+                                return !open;
+                              });
+                            }}
+                          >
+                            {resolvedUtilityModel &&
+                              (() => {
+                                const ProviderIcon =
+                                  agentProviders.find(
+                                    (provider) => provider.id === resolvedUtilityModel.providerId
+                                  )?.icon ?? Play;
+                                return <ProviderIcon size={15} />;
+                              })()}
+                            <span>{resolvedUtilityModel?.label ?? 'No model available'}</span>
+                            <ChevronDown
+                              size={14}
+                              className={`model-trigger-chevron ${utilityModelPickerOpen ? 'open' : ''}`}
+                            />
+                          </button>
+
+                          {utilityModelPickerOpen && (
+                            <ModelPickerPopover
+                              placement="below"
+                              className="compact"
+                              providers={utilityProviders}
+                              models={utilityCandidateModels}
+                              activeProviderId={utilityModelTab}
+                              onActiveProviderChange={setUtilityModelTab}
+                              search={utilityModelSearch}
+                              onSearchChange={setUtilityModelSearch}
+                              selectedModelId={resolvedUtilityModelId}
+                              onSelect={(model) => {
+                                setTextGenerationSettings({ modelId: model.id });
+                                setUtilityModelPickerOpen(false);
+                                setUtilityModelSearch('');
+                              }}
+                            />
+                          )}
+                        </div>
+
+                        {utilityReasoningOptions.length > 0 && (
+                          <SelectMenu
+                            label="Reasoning effort"
+                            value={resolvedUtilityReasoningEffort}
+                            options={utilityReasoningOptions}
+                            onChange={(value) =>
+                              setTextGenerationSettings({ reasoningEffort: value })
+                            }
+                          />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="settings-group-label">Epics</div>
                   <div className="settings-group">
                     <div className="setting-row">
@@ -7552,38 +7723,6 @@ const App: React.FC = () => {
                           />
                           <span />
                         </label>
-                      </div>
-                    )}
-
-                    {epicsEnabled && (
-                      <div className="setting-row">
-                        <div className="setting-label">
-                          <div className="setting-label-title">Commit & PR message model</div>
-                          <div className="setting-label-desc">
-                            Writes an epic's commit messages from staged changes and its PR
-                            descriptions from branch changes. Auto picks the cheapest enabled model.
-                          </div>
-                        </div>
-                        <select
-                          className="setting-select"
-                          value={epicsSettings?.commitModelId ?? ''}
-                          onChange={(e) =>
-                            setEpicsSettings({ commitModelId: e.target.value || null })
-                          }
-                        >
-                          <option value="">Auto (cheapest available)</option>
-                          {orchestrationModelGroups
-                            .filter((group) => group.provider.id !== 'opencode')
-                            .map((group) => (
-                              <optgroup key={group.provider.id} label={group.provider.label}>
-                                {group.models.map((model) => (
-                                  <option key={model.id} value={model.id}>
-                                    {model.label}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            ))}
-                        </select>
                       </div>
                     )}
 
@@ -9914,127 +10053,76 @@ const App: React.FC = () => {
                             </button>
 
                             {modelPickerOpen && (
-                              <div className="model-picker-popover">
-                              <div className="model-provider-rail">
-                                {agentProviders.map((provider) => {
-                                  const Icon = provider.icon;
-                                  return (
+                              <ModelPickerPopover
+                                providers={agentProviders}
+                                models={visibleAgentModels}
+                                activeProviderId={activeProviderTab}
+                                onActiveProviderChange={setActiveProviderTab}
+                                search={modelSearch}
+                                onSearchChange={setModelSearch}
+                                selectedModelId={selectedThread.modelId}
+                                onSelect={async (model) => {
+                                  if (
+                                    selectedThread.modelId === claudeCodeCliModelId &&
+                                    model.id !== claudeCodeCliModelId
+                                  ) {
+                                    try {
+                                      await window.orion?.terminalKill?.(selectedThread.id);
+                                    } catch (error) {
+                                      console.error('Could not stop Claude Code terminal', error);
+                                    }
+                                  }
+                                  updateThread(selectedThread.id, {
+                                    modelId: model.id,
+                                    ...(selectedThread.modelId === claudeCodeCliModelId &&
+                                    model.id !== claudeCodeCliModelId
+                                      ? { status: 'idle' as const }
+                                      : {}),
+                                  });
+                                  setModelPickerOpen(false);
+                                  setModelSearch('');
+                                  if (
+                                    model.providerId !== 'codex' &&
+                                    model.providerId !== 'claude' &&
+                                    model.providerId !== 'grok'
+                                  ) {
+                                    setCodexSettingsOpen(false);
+                                  }
+                                }}
+                                overlay={
+                                  activeProviderTab === 'claude' && claudeCodeCliModel ? (
                                     <button
-                                      key={provider.id}
-                                      className={`provider-rail-button ${activeProviderTab === provider.id ? 'active' : ''}`}
-                                      onClick={() => setActiveProviderTab(provider.id)}
-                                      title={provider.label}
-                                    >
-                                      <Icon size={19} />
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                              <div
-                                className={`model-picker-panel${
-                                  activeProviderTab === 'claude' ? ' has-cli-overlay' : ''
-                                }`}
-                              >
-                                {activeProviderTab === 'claude' && claudeCodeCliModel && (
-                                  <button
-                                    type="button"
-                                    className={`model-cli-overlay${
-                                      selectedThread.modelId === claudeCodeCliModelId
-                                        ? ' selected'
-                                        : ''
-                                    }`}
-                                    onClick={async () => {
-                                      if (selectedThread.modelId === claudeCodeCliModelId) {
+                                      type="button"
+                                      className={`model-cli-overlay${
+                                        selectedThread.modelId === claudeCodeCliModelId
+                                          ? ' selected'
+                                          : ''
+                                      }`}
+                                      onClick={() => {
+                                        if (selectedThread.modelId !== claudeCodeCliModelId) {
+                                          updateThread(selectedThread.id, {
+                                            modelId: claudeCodeCliModelId,
+                                          });
+                                        }
                                         setModelPickerOpen(false);
                                         setModelSearch('');
-                                        return;
+                                      }}
+                                      disabled={claudeCodeCliModel.available === false}
+                                      title={
+                                        claudeCodeCliModel.unavailableReason ??
+                                        'Open an interactive Claude Code terminal in this thread'
                                       }
-                                      updateThread(selectedThread.id, {
-                                        modelId: claudeCodeCliModelId,
-                                      });
-                                      setModelPickerOpen(false);
-                                      setModelSearch('');
-                                    }}
-                                    disabled={claudeCodeCliModel.available === false}
-                                    title={
-                                      claudeCodeCliModel.unavailableReason ??
-                                      'Open an interactive Claude Code terminal in this thread'
-                                    }
-                                  >
-                                    <span className="model-cli-overlay-glow" aria-hidden />
-                                    <Terminal size={14} strokeWidth={2.25} />
-                                    <span className="model-cli-overlay-label">Claude Code CLI</span>
-                                    {selectedThread.modelId === claudeCodeCliModelId && (
-                                      <Check size={13} strokeWidth={2.5} />
-                                    )}
-                                  </button>
-                                )}
-                                <div className="model-search">
-                                  <Search size={16} />
-                                  <input
-                                    autoFocus
-                                    value={modelSearch}
-                                    onChange={(event) => setModelSearch(event.target.value)}
-                                    placeholder="Search models..."
-                                  />
-                                </div>
-                                <div className="model-list">
-                                  {visibleAgentModels.map((model) => {
-                                    const ProviderIcon =
-                                      agentProviders.find((provider) => provider.id === model.providerId)
-                                        ?.icon ?? Play;
-                                    const selected = selectedThread.modelId === model.id;
-                                    return (
-                                      <button
-                                        key={model.id}
-                                        className={`model-row ${selected ? 'selected' : ''}`}
-                                        onClick={async () => {
-                                          if (
-                                            selectedThread.modelId === claudeCodeCliModelId &&
-                                            model.id !== claudeCodeCliModelId
-                                          ) {
-                                            try {
-                                              await window.orion?.terminalKill?.(selectedThread.id);
-                                            } catch (error) {
-                                              console.error('Could not stop Claude Code terminal', error);
-                                            }
-                                          }
-                                          updateThread(selectedThread.id, {
-                                            modelId: model.id,
-                                            ...(selectedThread.modelId === claudeCodeCliModelId &&
-                                            model.id !== claudeCodeCliModelId
-                                              ? { status: 'idle' as const }
-                                              : {}),
-                                          });
-                                          setModelPickerOpen(false);
-                                          setModelSearch('');
-                                          if (
-                                            model.providerId !== 'codex' &&
-                                            model.providerId !== 'claude' &&
-                                            model.providerId !== 'grok'
-                                          ) {
-                                            setCodexSettingsOpen(false);
-                                          }
-                                        }}
-                                        disabled={model.available === false}
-                                        title={model.unavailableReason ?? model.slug}
-                                      >
-                                        <ProviderIcon size={18} />
-                                        <span className="model-row-text">
-                                          <span className="model-row-label">{model.label}</span>
-                                          <span className="model-row-provider">{model.providerLabel}</span>
-                                        </span>
-                                        {model.shortcut && <span className="model-shortcut">{model.shortcut}</span>}
-                                        {selected && <Check size={15} />}
-                                      </button>
-                                    );
-                                  })}
-                                  {visibleAgentModels.length === 0 && (
-                                    <div className="model-empty">No models</div>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
+                                    >
+                                      <span className="model-cli-overlay-glow" aria-hidden />
+                                      <Terminal size={14} strokeWidth={2.25} />
+                                      <span className="model-cli-overlay-label">Claude Code CLI</span>
+                                      {selectedThread.modelId === claudeCodeCliModelId && (
+                                        <Check size={13} strokeWidth={2.5} />
+                                      )}
+                                    </button>
+                                  ) : undefined
+                                }
+                              />
                           )}
                         </div>
 

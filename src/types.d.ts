@@ -279,6 +279,7 @@ type OrionComputerUsePermissions = {
         epicId: string;
         projectPath: string;
         modelId?: string | null;
+        reasoningEffort?: string | null;
         epicName?: string;
         /** Commit message written by the user; empty means the model writes it. */
         message?: string;
@@ -304,6 +305,7 @@ type OrionComputerUsePermissions = {
         epicId: string;
         projectPath: string;
         modelId?: string | null;
+        reasoningEffort?: string | null;
         epicName?: string;
         /** Base branch the PR merges into; defaults to the remote default branch. */
         baseBranch?: string;
@@ -375,6 +377,7 @@ type OrionComputerUsePermissions = {
         epicName?: string;
         epicDescription?: string;
         modelId?: string | null;
+        reasoningEffort?: string | null;
         /** Local branch the feature branch starts from; checked out inside the rift only. */
         baseBranch?: string;
       }) => Promise<{
@@ -665,6 +668,8 @@ type OrionComputerUsePermissions = {
         threadId: string;
         prompt: string;
         modelId: string;
+        /** Reasoning tier for the hidden turn; null falls back to the cheapest. */
+        reasoningEffort?: string | null;
         projectPath?: string;
         epicId?: string;
       }) => Promise<string>;

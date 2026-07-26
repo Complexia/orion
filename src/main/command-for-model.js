@@ -251,7 +251,11 @@ export const commandForModel = (model, input) => {
       ];
     }
 
-    // One-shot text-only path (thread title generation).
+    // One-shot text-only path (thread title generation). --reasoning-effort is
+    // a global flag, so it applies here as well as on the ACP path above.
+    const effortArgs = input.grokReasoningEffort
+      ? ['--reasoning-effort', input.grokReasoningEffort]
+      : [];
     const accessArgs =
       accessMode === 'full-access'
         ? ['--permission-mode', 'bypassPermissions', '--always-approve']
@@ -267,6 +271,7 @@ export const commandForModel = (model, input) => {
       modelArg,
       '--output-format',
       'streaming-json',
+      ...effortArgs,
       ...accessArgs,
       ...resumeArgs,
       ...extraArgs,

@@ -64,8 +64,6 @@ export type Epic = {
 export type EpicsSettings = {
   /** Show the Epics sidebar section and epic views. */
   enabled: boolean;
-  /** AgentModel id used to write commit/PR messages; null = cheapest available. */
-  commitModelId: string | null;
   /** Ask for confirmation before settling an epic. */
   confirmSettle: boolean;
   /**
@@ -79,9 +77,36 @@ export type EpicsSettings = {
 
 export const defaultEpicsSettings: EpicsSettings = {
   enabled: true,
-  commitModelId: null,
   confirmSettle: true,
   promptGitMessages: true,
+};
+
+/**
+ * The model behind Orion's hidden text-generation turns: thread titles, epic
+ * commit messages, and PR descriptions. These are short, latency-sensitive
+ * one-shots, so the default is the fastest model on whichever providers the
+ * user actually has installed.
+ */
+export type TextGenerationSettings = {
+  /**
+   * AgentModel id. `null` means the user has never picked one, so the model is
+   * resolved from the built-in preference order (see UTILITY_MODEL_PREFERENCE
+   * in App.tsx) against the installed, enabled providers.
+   */
+  modelId: string | null;
+  /**
+   * Reasoning effort for the providers that take one (codex, claude, grok).
+   * `null` means unset, which resolves to the cheapest tier — these turns are
+   * a title or a commit message, not work worth thinking hard about. Kept as a
+   * plain string because the accepted values differ per provider; the renderer
+   * clamps it to the selected model's own options.
+   */
+  reasoningEffort: string | null;
+};
+
+export const defaultTextGenerationSettings: TextGenerationSettings = {
+  modelId: null,
+  reasoningEffort: null,
 };
 
 /** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */
@@ -463,6 +488,7 @@ interface OrionState {
   providerSettings: ProviderSettings;
   orchestrationSettings: OrchestrationSettings;
   notificationSettings: NotificationSettings;
+  textGenerationSettings: TextGenerationSettings;
 
   // Actions
   setActiveTab: (tab: 'agents' | 'code') => void;
@@ -471,6 +497,7 @@ interface OrionState {
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
   setOrchestrationGeneralInstructions: (text: string) => void;
   setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
+  setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
   addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
@@ -763,6 +790,7 @@ export const useOrionStore = create<OrionState>()(
       providerSettings: defaultProviderSettings,
       orchestrationSettings: defaultOrchestrationSettings,
       notificationSettings: defaultNotificationSettings,
+      textGenerationSettings: defaultTextGenerationSettings,
 
       setActiveTab: (tab) => set({ activeTab: tab }),
       setProviderEnabled: (id, enabled) =>
@@ -816,6 +844,14 @@ export const useOrionStore = create<OrionState>()(
           notificationSettings: {
             ...defaultNotificationSettings,
             ...state.notificationSettings,
+            ...updates,
+          },
+        })),
+      setTextGenerationSettings: (updates) =>
+        set((state) => ({
+          textGenerationSettings: {
+            ...defaultTextGenerationSettings,
+            ...state.textGenerationSettings,
             ...updates,
           },
         })),
@@ -1456,9 +1492,27 @@ export const useOrionStore = create<OrionState>()(
           ...defaultNotificationSettings,
           ...state.notificationSettings,
         },
+        textGenerationSettings: {
+          ...defaultTextGenerationSettings,
+          ...state.textGenerationSettings,
+        },
       }),
       merge: (persisted, current) => {
         const merged = { ...current, ...(persisted as Partial<OrionState>) };
+        // The commit/PR message model used to live on epicsSettings; it now
+        // also writes thread titles, so it moved to textGenerationSettings.
+        // Carry an explicit pick over — the old "Auto (cheapest available)"
+        // was persisted as null, which is exactly the new "never picked"
+        // value, so those users simply fall into the new default order.
+        const legacyCommitModelId = (persisted as { epicsSettings?: { commitModelId?: unknown } })
+          ?.epicsSettings?.commitModelId;
+        merged.textGenerationSettings = {
+          ...defaultTextGenerationSettings,
+          ...(typeof legacyCommitModelId === 'string' && legacyCommitModelId
+            ? { modelId: legacyCommitModelId }
+            : {}),
+          ...(persisted as Partial<OrionState>)?.textGenerationSettings,
+        };
         // Agent runs can't survive an app restart — the CLI processes die with
         // the app — so any thread or message rehydrated as 'running' is a
         // leftover from the previous session. Left alone it pins the run

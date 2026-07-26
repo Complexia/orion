@@ -1878,7 +1878,11 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
         'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
         'message — no quotes, no code fences, no commentary.\n\n' +
         context;
-      message = cleanGeneratedGitMessage(await runOneShotForModelId(input.modelId, prompt, gitRoot));
+      message = cleanGeneratedGitMessage(
+        await runOneShotForModelId(input.modelId, prompt, gitRoot, {
+          reasoningEffort: input?.reasoningEffort,
+        })
+      );
     }
     if (!message) message = commitMessageForEntries(entries);
 
@@ -2158,7 +2162,9 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
           'list. Reply with ONLY the title and description — no quotes, no code fences, no commentary.\n\n' +
           `Commits:\n${truncateForPrompt(commits, 3000)}\n\nDiffstat:\n${truncateForPrompt(diffstat, 3000)}`;
         const text = cleanGeneratedGitMessage(
-          await runOneShotForModelId(input.modelId, prompt, gitRoot)
+          await runOneShotForModelId(input.modelId, prompt, gitRoot, {
+            reasoningEffort: input?.reasoningEffort,
+          })
         );
         if (text) {
           const newline = text.indexOf('\n');
@@ -2500,6 +2506,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
         const raw = cleanGeneratedGitMessage(
           await runOneShotForModelId(input.modelId, prompt, riftWorkingDir, {
             signal: abortController.signal,
+            reasoningEffort: input?.reasoningEffort,
           })
         );
         const candidate = raw.split('\n')[0]?.trim().replace(/^["'`]+|["'`]+$/g, '').slice(0, 60);
@@ -4974,7 +4981,7 @@ const runOneShotAgentText = async (
   model,
   prompt,
   projectPath,
-  { signal, threadId } = {}
+  { signal, threadId, reasoningEffort } = {}
 ) => {
   const cwd = projectPath || process.cwd();
   if (signal?.aborted) return '';
@@ -4994,11 +5001,18 @@ const runOneShotAgentText = async (
     return (await kimiPlanModeOneShot(model, prompt, cwd, { signal, threadId })) || '';
   }
 
-  // Reuse the command builder but force read-only access for the hidden turn
+  // Reuse the command builder but force read-only access for the hidden turn.
+  // The effort comes from Settings → Text generation (which defaults to the
+  // cheapest tier) rather than the provider default: inheriting GPT-5.6's
+  // 'high' spends and stalls far more than a title or commit message is worth.
+  const effort = reasoningEffort || 'low';
   const args = commandForModel(model, {
     prompt,
     projectPath: cwd,
     accessMode: 'read-only',
+    ...(model.providerId === 'codex' ? { codexReasoningEffort: effort } : {}),
+    ...(model.providerId === 'claude' ? { claudeReasoningEffort: effort } : {}),
+    ...(model.providerId === 'grok' ? { grokReasoningEffort: effort } : {}),
   });
 
   const commandString = args.map(shellQuote).join(' ');
@@ -5118,6 +5132,7 @@ const runOneShotAgentText = async (
 };
 
 // Look up a model id, verify its CLI is on PATH, and run a one-shot prompt.
+// `options.reasoningEffort` comes from Settings → Text generation.
 const runOneShotForModelId = async (modelId, prompt, projectPath, options) => {
   if (!modelId) return '';
   if (options?.signal?.aborted) return '';
@@ -5163,6 +5178,7 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
       await runOneShotAgentText(model, titleInstruction, input.projectPath, {
         signal: controller.signal,
         threadId,
+        reasoningEffort: input.reasoningEffort,
       })
     );
   })();
