@@ -265,7 +265,10 @@ export const createCodexAppServerDriver = ({
     callbacks.onGoal(codexGoalForRenderer(wireGoal));
     if (wireGoal.status !== 'active') {
       clearContinuationTimer();
-      if (!turnActive) endRun(CODEX_GOAL_END_NOTES[wireGoal.status] ?? '');
+      // thread/resume emits the authoritative goal snapshot before an inline
+      // review starts. Keep Orion's mirror synchronized without letting that
+      // snapshot terminate the review run.
+      if (!review && !turnActive) endRun(CODEX_GOAL_END_NOTES[wireGoal.status] ?? '');
     }
   };
 
@@ -547,7 +550,7 @@ export const createCodexAppServerDriver = ({
         goalStatus = 'cleared';
         callbacks.onGoal(null);
         clearContinuationTimer();
-        if (!turnActive) endRun('\n\n_Goal cleared._');
+        if (!review && !turnActive) endRun('\n\n_Goal cleared._');
         return;
       }
       case 'error': {
