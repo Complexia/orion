@@ -5386,6 +5386,20 @@ body {
   opacity: 0.85;
 }
 
+/* PR lifecycle, same colours as the epic view's .epic-view-pr-state badge.
+   Epics without a PR keep the default accent. */
+.epic-icon--open {
+  color: var(--success);
+}
+
+.epic-icon--merged {
+  color: #b794f6;
+}
+
+.epic-icon--closed {
+  color: var(--danger);
+}
+
 .epic-section-header {
   font-size: 13px;
 }
@@ -5511,6 +5525,24 @@ body {
   box-shadow: none;
 }
 
+.epic-settle-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 11px 12px;
+  border: 1px solid rgb(244 162 97 / 28%);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  background: rgb(244 162 97 / 8%);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.epic-settle-warnings p {
+  margin: 0;
+}
+
 @keyframes modal-backdrop-in {
   from {
     opacity: 0;
@@ -5604,6 +5636,19 @@ body {
   background: linear-gradient(135deg, var(--accent-soft), rgb(139 124 246 / 12%));
   border: 1px solid var(--border-default);
   color: var(--accent);
+}
+
+/* Matches the sidebar icon; the gradient backdrop stays neutral. */
+.epic-view-icon--open {
+  color: var(--success);
+}
+
+.epic-view-icon--merged {
+  color: #b794f6;
+}
+
+.epic-view-icon--closed {
+  color: var(--danger);
 }
 
 .epic-view-heading {

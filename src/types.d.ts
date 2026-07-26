@@ -354,6 +354,14 @@ type OrionComputerUsePermissions = {
         pr?: { state: 'OPEN' | 'CLOSED' | 'MERGED'; url: string };
         error?: string;
       }>;
+      epicPrStates: (input: {
+        epics: Array<{ epicId: string; prUrl: string; projectPath?: string }>;
+      }) => Promise<{
+        ok: boolean;
+        /** Only epics whose lookup succeeded; the rest keep their known state. */
+        states?: Array<{ epicId: string; state: 'OPEN' | 'CLOSED' | 'MERGED' }>;
+        error?: string;
+      }>;
       riftStatus: () => Promise<{
         available: boolean;
         version?: string | null;

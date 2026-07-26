@@ -40,6 +40,7 @@ contextBridge.exposeInMainWorld('orion', {
   epicCreatePr: (input) => ipcRenderer.invoke('epic:createPr', input),
   epicListRemoteBranches: (input) => ipcRenderer.invoke('epic:listRemoteBranches', input),
   epicGitStatus: (input) => ipcRenderer.invoke('epic:gitStatus', input),
+  epicPrStates: (input) => ipcRenderer.invoke('epic:prStates', input),
 
   // Rifts (experimental copy-on-write epic workspaces)
   riftStatus: () => ipcRenderer.invoke('rift:status'),
