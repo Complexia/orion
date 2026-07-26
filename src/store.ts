@@ -137,6 +137,8 @@ export type AgentActivity = {
   kind?: string;
   title: string;
   detail?: string;
+  /** Full tool input (command, pretty-printed arguments) shown when the row is expanded. */
+  input?: string;
   /** Live tool output (streaming terminal stdout, tool result text). */
   output?: string;
   exitCode?: number;
@@ -1213,6 +1215,13 @@ export const useOrionStore = create<OrionState>()(
             id: crypto.randomUUID(),
             ts: new Date().toISOString(),
           };
+          // Providers re-emit a keyed step as it progresses, and an update can
+          // omit a field it reported earlier (a tool's input is only in the
+          // call, its output only in the result). An explicit undefined must
+          // not erase what the row already knows.
+          const patch = Object.fromEntries(
+            Object.entries(activity).filter(([, value]) => value !== undefined)
+          ) as Partial<AgentActivity>;
 
           return {
             threads: state.threads.map((thread) =>
@@ -1234,7 +1243,7 @@ export const useOrionStore = create<OrionState>()(
                             index === existingIndex
                               ? {
                                   ...existing,
-                                  ...activity,
+                                  ...patch,
                                   ts: nextActivity.ts,
                                   contentOffset: existing.contentOffset,
                                 }

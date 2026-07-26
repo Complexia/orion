@@ -2,7 +2,7 @@ import { protocol } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import os from 'node:os';
-import { countDiffLines, stringifySummary } from './stream-adapters.js';
+import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 
 // --- grok: <session dir>/updates.jsonl holds raw session/update lines -------
 
@@ -91,6 +91,7 @@ export const handleGrokSubagentLine = (value, api, ctx) => {
 
   const rawInput = update.rawInput;
   if (rawInput && typeof rawInput === 'object') {
+    state.input = formatToolInput(rawInput);
     if (typeof rawInput.command === 'string') state.command = rawInput.command;
     const filePath = rawInput.file_path ?? rawInput.path;
     if (typeof filePath === 'string') state.filePath = filePath;
@@ -149,7 +150,8 @@ export const handleGrokSubagentLine = (value, api, ctx) => {
   if (state.command) activity.detail = state.command;
   else if (state.query) activity.detail = state.query;
   else if (state.filePath) activity.detail = state.filePath;
-  if (state.output) activity.output = state.output.slice(-4000);
+  if (state.input) activity.input = state.input;
+  if (state.output) activity.output = formatToolOutput(state.output);
   if (typeof state.exitCode === 'number') activity.exitCode = state.exitCode;
   if (state.diff) activity.diff = state.diff;
   api.activity(activity);
@@ -246,8 +248,11 @@ export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, a
     };
     if (state.kind) activity.kind = state.kind;
     if (state.detail) activity.detail = state.detail;
-    // Cap live output so a chatty command doesn't bloat the persisted store.
-    if (state.output) activity.output = state.output.slice(-4000);
+    // The expanded row shows the whole call: its arguments and what it
+    // returned. Both are capped so a chatty command or a whole-file write
+    // doesn't bloat the persisted store.
+    if (state.input) activity.input = state.input;
+    if (state.output) activity.output = formatToolOutput(state.output);
     if (typeof state.exitCode === 'number') activity.exitCode = state.exitCode;
     if (state.diff) activity.diff = state.diff;
     if (state.sources?.length) activity.sources = state.sources;
@@ -357,6 +362,7 @@ export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, a
 
     const rawInput = update.rawInput;
     if (rawInput && typeof rawInput === 'object') {
+      state.input = formatToolInput(rawInput);
       if (typeof rawInput.command === 'string') state.command = rawInput.command;
       const filePath = rawInput.file_path ?? rawInput.path;
       if (typeof filePath === 'string') state.filePath = filePath;

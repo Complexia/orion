@@ -3867,9 +3867,12 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       for (const { updateForKey, ...activity } of adapter.activities(parsed)) {
         if (updateForKey) {
           // A tool result: flip the original step to done/error in place
-          // instead of appending a detached "Tool result" row.
+          // instead of appending a detached "Tool result" row. What the tool
+          // returned only appears here, so fold it onto that row — the
+          // expanded step shows the call and its output together.
           const known = knownToolActivities.get(updateForKey);
           if (known) {
+            if (activity.output) known.output = activity.output;
             emitActivity({
               ...known,
               key: updateForKey,

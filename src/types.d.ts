@@ -725,6 +725,7 @@ type OrionComputerUsePermissions = {
           kind?: string;
           title: string;
           detail?: string;
+          input?: string;
           output?: string;
           exitCode?: number;
           diff?: { path: string; additions: number; deletions: number };

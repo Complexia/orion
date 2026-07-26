@@ -122,7 +122,7 @@ import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import { AttachmentThumb, buildPromptWithAttachments, formatAttachmentSize, getDroppedFilePath, isMediaFile, isVideoAttachment, isVideoFile } from './app/attachments';
-import { AgentFamilySwitcher, ChatTranscript, isProviderAuthErrorText } from './app/chat';
+import { AgentFamilySwitcher, type ChatScrollPosition, ChatTranscript, isProviderAuthErrorText } from './app/chat';
 import { type FileTreeItem, FileTreeNode, InlineRenameInput } from './app/fileTree';
 import { claudeOneMillionOnlyModelSlugs, getDefaultClaudeReasoningEffort, getEffectiveClaudeContextWindow } from './app/modelPrefs';
 import { accessModeOptions, buildLinkedTaskContext, buildModelMentionsContext, buildOrchestrationContext, buildReviewThreadContext, linkedTaskFromBoardTask, linkedTaskMediaAttachments, linkedTaskStatusLabel, modelMentionToken, orchestrationRoleMeta, parseModelMentions } from './app/promptContext';
@@ -724,6 +724,7 @@ const App: React.FC = () => {
   const [computerUsePerms, setComputerUsePerms] = useState<OrionComputerUsePermissions | null>(null);
   const [computerUseBusyKind, setComputerUseBusyKind] = useState<OrionComputerUsePermissionKind | null>(null);
   const [revealedProviderEmails, setRevealedProviderEmails] = useState<Record<string, boolean>>({});
+  const [revealedAccountIdentity, setRevealedAccountIdentity] = useState<string | null>(null);
   const [expandedProviderOptions, setExpandedProviderOptions] = useState<Record<string, boolean>>({});
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const branchPickerRef = useRef<HTMLDivElement>(null);
@@ -786,6 +787,9 @@ const App: React.FC = () => {
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatPinnedRef = useRef(true);
   const chatScrollTopRef = useRef(0);
+  // Per-thread transcript positions, owned here so they survive ChatTranscript
+  // unmounting (Code tab) and are shared by every thread the switcher can reach.
+  const chatScrollPositionsRef = useRef(new Map<string, ChatScrollPosition>());
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const taskPickerRef = useRef<HTMLDivElement>(null);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
@@ -802,10 +806,18 @@ const App: React.FC = () => {
     el.style.height = `${el.scrollHeight}px`;
   }, [chatInput, activeTab]);
 
+  // Selecting a thread no longer forces the transcript to the bottom — the
+  // transcript restores that thread's own position (bottom for never-visited
+  // ones). Positions for threads that are gone are dropped so the map tracks
+  // the live thread set.
   useEffect(() => {
-    chatPinnedRef.current = true;
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [selectedThreadId]);
+    const positions = chatScrollPositionsRef.current;
+    if (positions.size === 0) return;
+    const liveIds = new Set(threads.map((thread) => thread.id));
+    for (const threadId of positions.keys()) {
+      if (!liveIds.has(threadId)) positions.delete(threadId);
+    }
+  }, [threads]);
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
   const selectedThreadProject = selectedThread
@@ -1162,9 +1174,13 @@ const App: React.FC = () => {
         : appUpdateLabel;
   const accountName =
     accountState.user?.name ||
-    accountState.user?.email ||
     (accountState.authenticated ? 'Orion account' : 'Not signed in');
   const accountEmail = accountState.user?.email ?? null;
+  const accountIdentity = accountState.user
+    ? `${accountState.user.id}\n${accountEmail ?? ''}`
+    : null;
+  const accountEmailRevealed =
+    accountIdentity !== null && revealedAccountIdentity === accountIdentity;
   const accountInitials = (accountState.user?.name || accountState.user?.email || 'O')
     .split(/\s+|@/)
     .filter(Boolean)
@@ -1189,6 +1205,12 @@ const App: React.FC = () => {
         (lastActivityByProject.get(a.id) ?? -Infinity)
     );
   }, [projects, threads]);
+
+  // The Recent agents section spans every project, so its "new thread" button
+  // has no project of its own: it targets the project the last thread ran in.
+  // sortedProjects is already ordered by most recent thread activity, so that
+  // is simply the topmost project in the sidebar.
+  const recentAgentsTargetProject = sortedProjects[0] ?? null;
 
   // Subagent threads live in the in-thread subagents bar, not the sidebar.
   // A thread counts as a child only while its parent still exists — orphans
@@ -1785,6 +1807,13 @@ const App: React.FC = () => {
       setCodexSettingsOpen(false);
     }
   }, [shouldShowAgentSettings]);
+
+  // Re-blur the account email when Settings closes or the signed-in identity
+  // changes. Keying the reveal to the identity also keeps a newly rendered
+  // account concealed before this effect clears the previous state.
+  useEffect(() => {
+    setRevealedAccountIdentity(null);
+  }, [settingsOpen, accountIdentity]);
 
   // Poll while the Computer Use tab is visible so grants toggled over in
   // System Settings show up without a manual refresh.
@@ -7311,11 +7340,29 @@ const App: React.FC = () => {
                       <div className="account-card-text">
                         <div className="account-card-title">{accountName}</div>
                         <div className="account-card-subtitle">
-                          {accountLoading
-                            ? 'Checking Orion account...'
-                            : accountState.authenticated
-                              ? accountEmail || 'Signed in to Orion Web'
-                              : 'Sign in through Orion Web to authorize this desktop app.'}
+                          {accountLoading ? (
+                            'Checking Orion account...'
+                          ) : accountState.authenticated ? (
+                            accountEmail ? (
+                              <button
+                                type="button"
+                                className={`account-email-toggle${accountEmailRevealed ? ' revealed' : ''}`}
+                                onClick={() =>
+                                  setRevealedAccountIdentity((current) =>
+                                    current === accountIdentity ? null : accountIdentity
+                                  )
+                                }
+                                title={accountEmailRevealed ? 'Click to hide email' : 'Click to reveal email'}
+                                aria-label={accountEmailRevealed ? 'Hide email address' : 'Reveal email address'}
+                              >
+                                {accountEmail}
+                              </button>
+                            ) : (
+                              'Signed in to Orion Web'
+                            )
+                          ) : (
+                            'Sign in through Orion Web to authorize this desktop app.'
+                          )}
                         </div>
                       </div>
                     </div>
@@ -7693,8 +7740,6 @@ const App: React.FC = () => {
                         ? status.currentVersion.replace(/^v/i, '')
                         : null;
                       const hasUpdate = !!status?.updateAvailable;
-                      const isEarly =
-                        provider.id === 'cursor' || provider.id === 'grok' || provider.id === 'kimi';
 
                       // Determine subtitle
                       let subtitle = '';
@@ -7748,7 +7793,6 @@ const App: React.FC = () => {
                                 <span className="provider-name">{provider.label}</span>
                                 {version && <span className="provider-version">v{version}</span>}
                                 {hasUpdate && <span className="provider-update-arrow" title="Update available">↑</span>}
-                                {isEarly && <span className="provider-badge early">Early Access</span>}
                               </div>
                               <div
                                 className="provider-subtitle"
@@ -8745,27 +8789,45 @@ const App: React.FC = () => {
 
                 {projects.length > 0 && (
                   <div className="recent-agents-section">
-                    <button
-                      type="button"
-                      className="sidebar-section-toggle"
-                      onClick={() =>
-                        setRecentAgentsOpen((open) => {
-                          // Collapsing resets the list back to the default 5 on next expand.
-                          if (open) setRecentAgentsShowAll(false);
-                          return !open;
-                        })
-                      }
-                      aria-expanded={recentAgentsOpen}
-                    >
-                      <ChevronRight
-                        size={12}
-                        className={`sidebar-section-chevron ${recentAgentsOpen ? 'open' : ''}`}
-                      />
-                      <span>Recent agents</span>
-                      {runningAgentCount > 0 && (
-                        <span className="sidebar-section-count">{runningAgentCount}</span>
+                    <div className="recent-agents-header-row">
+                      <button
+                        type="button"
+                        className="sidebar-section-toggle"
+                        onClick={() =>
+                          setRecentAgentsOpen((open) => {
+                            // Collapsing resets the list back to the default 5 on next expand.
+                            if (open) setRecentAgentsShowAll(false);
+                            return !open;
+                          })
+                        }
+                        aria-expanded={recentAgentsOpen}
+                      >
+                        <ChevronRight
+                          size={12}
+                          className={`sidebar-section-chevron ${recentAgentsOpen ? 'open' : ''}`}
+                        />
+                        <span>Recent agents</span>
+                        {runningAgentCount > 0 && (
+                          <span className="sidebar-section-count">{runningAgentCount}</span>
+                        )}
+                      </button>
+                      {recentAgentsTargetProject && (
+                        <button
+                          type="button"
+                          className="project-new-thread"
+                          title={`New thread in ${recentAgentsTargetProject.name}`}
+                          aria-label={`New thread in ${recentAgentsTargetProject.name}`}
+                          onClick={() => {
+                            // The new thread lands at the top of this list, so
+                            // make sure the list is showing.
+                            setRecentAgentsOpen(true);
+                            handleCreateThread(recentAgentsTargetProject.id);
+                          }}
+                        >
+                          <SquarePen size={13} />
+                        </button>
                       )}
-                    </button>
+                    </div>
                     {recentAgentsOpen && (
                       <>
                       <div className="threads-list recent-agents-list">
@@ -9644,6 +9706,7 @@ const App: React.FC = () => {
                           chatEndRef={chatEndRef}
                           chatPinnedRef={chatPinnedRef}
                           chatScrollTopRef={chatScrollTopRef}
+                          chatScrollPositionsRef={chatScrollPositionsRef}
                           tasksCardPosition={tasksCardPosition}
                           tasksCardCollapsed={tasksCardCollapsed}
                           tasksCardDismissedFor={tasksCardDismissedFor}
