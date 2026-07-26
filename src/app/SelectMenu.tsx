@@ -43,8 +43,12 @@ export const SelectMenu = ({ label, value, options, onChange, disabled }: Select
   // Open upward when the menu would run off the bottom. Measured rather than
   // scrolled into view, so opening it never moves the page under the cursor.
   useLayoutEffect(() => {
+    if (!open) {
+      setFlipped(false);
+      return;
+    }
     const menu = menuRef.current;
-    if (!open || !menu) return;
+    if (!menu) return;
     const rect = menu.getBoundingClientRect();
     const anchorTop = anchorRef.current?.getBoundingClientRect().top ?? 0;
     setFlipped(rect.bottom > window.innerHeight - 8 && anchorTop - 8 >= rect.height);
