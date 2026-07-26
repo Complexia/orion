@@ -2441,13 +2441,33 @@ body {
   background: rgb(248 113 113 / 10%);
 }
 
-.thread-working-dot {
-  display: inline-block;
+/* Status dots ride in the gutter just outside the row's box, so the hover and
+   selection highlight starts at the title. Centered with a margin rather than a
+   translate, which the pulse keyframes' transform would overwrite. */
+.thread-working-dot,
+.thread-finished-dot {
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  margin-top: -3px;
   width: 6px;
   height: 6px;
   border-radius: 999px;
+}
+
+.thread-working-dot {
   background: var(--accent);
   animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+/* Steady (never pulsing) counterpart to the working dot: a finished run the
+   user has not opened yet. */
+.thread-finished-dot {
+  background: var(--success);
+}
+
+.thread-finished-dot.error {
+  background: var(--danger);
 }
 
 .threads-show-more {
@@ -5571,6 +5591,17 @@ body {
 
 .epic-section-header {
   font-size: 13px;
+}
+
+/* Project label for the whole epic, in place of a tag on every thread row. */
+.epic-project-tag {
+  flex-shrink: 0;
+  max-width: 38%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .epic-section-header-selected {

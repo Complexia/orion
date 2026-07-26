@@ -282,6 +282,9 @@ const threadShellSignature = (thread: Thread): string => {
     thread.hiddenFromRecent ? '1' : '0',
     thread.pinnedAt,
     thread.unpinnedAt,
+    // Drives the sidebar's finished-but-unopened dot, and clearing it on open
+    // changes nothing else — so the shell has to wake for it.
+    thread.finishedUnseenAt,
     thread.parentThreadId,
     thread.branchedFromThreadId,
     thread.epicId,
@@ -6786,6 +6789,23 @@ const App: React.FC = () => {
       </span>
     ) : null;
 
+  // Status dot at the head of a thread row: pulsing while the agent works, then
+  // steady for a run that finished while the user was elsewhere (cleared when
+  // the thread is opened). Nothing otherwise.
+  const renderThreadStatusDot = (thread: Thread) => {
+    if (thread.status === 'running') {
+      return <span className="thread-working-dot" title="Working" />;
+    }
+    if (!thread.finishedUnseenAt) return null;
+    const failed = thread.status === 'error';
+    return (
+      <span
+        className={`thread-finished-dot ${failed ? 'error' : ''}`}
+        title={failed ? 'Failed — not opened yet' : 'Finished — not opened yet'}
+      />
+    );
+  };
+
   const renderSidebarFooter = () => (
     <div className="sidebar-footer">
       {appUpdateVisible && (
@@ -8552,6 +8572,7 @@ const App: React.FC = () => {
                               if (threadRenameKey !== `pinned:${thread.id}`) selectThread(thread.id);
                             }}
                           >
+                            {renderThreadStatusDot(thread)}
                             {threadRenameKey === `pinned:${thread.id}` ? (
                               <InlineRenameInput
                                 className="thread-rename-input"
@@ -8572,11 +8593,7 @@ const App: React.FC = () => {
                               {projects.find((p) => p.id === thread.projectId)?.name}
                             </span>
                             <span className="thread-time thread-meta">
-                              {thread.status === 'running' ? (
-                                <span className="thread-working-dot" title="Working" />
-                              ) : (
-                                formatShortTime(getThreadActivityTime(thread))
-                              )}
+                              {formatShortTime(getThreadActivityTime(thread))}
                             </span>
                             <div
                               className="thread-menu-wrap"
@@ -8694,6 +8711,26 @@ const App: React.FC = () => {
                       <>
                         {activeEpics.map((epic) => {
                           const epicThreads = threadsByEpic.get(epic.id) ?? [];
+                          // The project label sits on the epic row instead of
+                          // repeating on every thread under it — but only while
+                          // those threads agree on one project, so a mixed epic
+                          // keeps its per-thread tags.
+                          const epicProjectNames = new Set(
+                            epicThreads
+                              .map((thread) => projects.find((p) => p.id === thread.projectId)?.name)
+                              .filter((name): name is string => Boolean(name))
+                          );
+                          const explicitlyBoundEpicProject = epic.gitRoot
+                            ? projectForGitRoot(epic.gitRoot, epic.repositoryProjectId)
+                            : epic.repositoryProjectId
+                              ? projects.find((project) => project.id === epic.repositoryProjectId)
+                              : undefined;
+                          const epicProjectName =
+                            epicThreads.length === 0
+                              ? explicitlyBoundEpicProject?.name
+                              : epicProjectNames.size === 1
+                                ? [...epicProjectNames][0]
+                                : undefined;
                           const isEpicCollapsed = collapsedEpics[epic.id] ?? false;
                           const isEpicSelected =
                             selectedEpicId === epic.id && !selectedThreadId;
@@ -8742,6 +8779,9 @@ const App: React.FC = () => {
                                     title={epic.name}
                                   >
                                     <SquareKanban size={13} className="epic-icon" />
+                                    {epicProjectName && (
+                                      <span className="epic-project-tag">{epicProjectName}</span>
+                                    )}
                                     <span className="truncate">{epic.name}</span>
                                     {isEpicCollapsed && epicThreads.length > 0 && (
                                       <span className="sidebar-section-count">
@@ -8844,6 +8884,7 @@ const App: React.FC = () => {
                                           }
                                         }}
                                       >
+                                        {renderThreadStatusDot(thread)}
                                         {threadRenameKey === `epic:${thread.id}` ? (
                                           <InlineRenameInput
                                             className="thread-rename-input"
@@ -8860,15 +8901,13 @@ const App: React.FC = () => {
                                             <span className="thread-title-text">{thread.title}</span>
                                           </span>
                                         )}
-                                        <span className="thread-project-tag thread-meta">
-                                          {projects.find((p) => p.id === thread.projectId)?.name}
-                                        </span>
+                                        {!epicProjectName && (
+                                          <span className="thread-project-tag thread-meta">
+                                            {projects.find((p) => p.id === thread.projectId)?.name}
+                                          </span>
+                                        )}
                                         <span className="thread-time thread-meta">
-                                          {thread.status === 'running' ? (
-                                            <span className="thread-working-dot" title="Working" />
-                                          ) : (
-                                            formatShortTime(getThreadActivityTime(thread))
-                                          )}
+                                          {formatShortTime(getThreadActivityTime(thread))}
                                         </span>
                                         <div
                                           className="thread-menu-wrap"
@@ -9012,6 +9051,7 @@ const App: React.FC = () => {
                                 if (threadRenameKey !== `recent:${thread.id}`) selectThread(thread.id);
                               }}
                             >
+                              {renderThreadStatusDot(thread)}
                               {threadRenameKey === `recent:${thread.id}` ? (
                                 <InlineRenameInput
                                   className="thread-rename-input"
@@ -9032,11 +9072,7 @@ const App: React.FC = () => {
                                 {projects.find((p) => p.id === thread.projectId)?.name}
                               </span>
                               <span className="thread-time thread-meta">
-                                {thread.status === 'running' ? (
-                                  <span className="thread-working-dot" title="Working" />
-                                ) : (
-                                  formatShortTime(getThreadActivityTime(thread))
-                                )}
+                                {formatShortTime(getThreadActivityTime(thread))}
                               </span>
                               <div
                                 className="thread-menu-wrap"
@@ -9303,6 +9339,7 @@ const App: React.FC = () => {
                                   if (threadRenameKey !== `project:${thread.id}`) selectThread(thread.id);
                                 }}
                               >
+                                {renderThreadStatusDot(thread)}
                                 {threadRenameKey === `project:${thread.id}` ? (
                                   <InlineRenameInput
                                     className="thread-rename-input"
@@ -9320,11 +9357,7 @@ const App: React.FC = () => {
                                   </span>
                                 )}
                                 <span className="thread-time thread-meta">
-                                  {thread.status === 'running' ? (
-                                    <span className="thread-working-dot" title="Working" />
-                                  ) : (
-                                    formatShortTime(getThreadActivityTime(thread))
-                                  )}
+                                  {formatShortTime(getThreadActivityTime(thread))}
                                 </span>
                                 <div
                                   className="thread-menu-wrap"
@@ -9797,6 +9830,7 @@ const App: React.FC = () => {
                             className="thread-item"
                             onClick={() => selectThread(thread.id)}
                           >
+                            {renderThreadStatusDot(thread)}
                             <span className="thread-title">
                               {renderThreadCliBadge(thread)}
                               <span className="thread-title-text">{thread.title}</span>
@@ -9805,11 +9839,7 @@ const App: React.FC = () => {
                               {projects.find((p) => p.id === thread.projectId)?.name}
                             </span>
                             <span className="thread-time thread-meta">
-                              {thread.status === 'running' ? (
-                                <span className="thread-working-dot" title="Working" />
-                              ) : (
-                                formatShortTime(getThreadActivityTime(thread))
-                              )}
+                              {formatShortTime(getThreadActivityTime(thread))}
                             </span>
                           </div>
                         ))}

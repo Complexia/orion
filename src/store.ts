@@ -345,6 +345,11 @@ export type Thread = {
   pinnedAt?: string;
   /** Set on unpin so the thread surfaces at the top of Recent agents. */
   unpinnedAt?: string;
+  /**
+   * Set when a run finished while the user was looking at something else, and
+   * cleared once the thread is opened. Drives the green sidebar dot.
+   */
+  finishedUnseenAt?: string;
   messages: Message[];
   // Per-provider harness session ids so follow-up turns resume the same
   // conversation (claude --resume, codex exec resume, etc.).
@@ -794,7 +799,26 @@ export const useOrionStore = create<OrionState>()(
       notificationSettings: defaultNotificationSettings,
       textGenerationSettings: defaultTextGenerationSettings,
 
-      setActiveTab: (tab) => set({ activeTab: tab }),
+      setActiveTab: (tab) =>
+        set((state) => {
+          const selectedThread =
+            tab === 'agents'
+              ? state.threads.find((thread) => thread.id === state.selectedThreadId)
+              : undefined;
+
+          return {
+            activeTab: tab,
+            // Returning from Code reveals the selected transcript without
+            // selecting its row again, so that also counts as opening it.
+            threads: selectedThread?.finishedUnseenAt
+              ? state.threads.map((thread) =>
+                  thread.id === selectedThread.id
+                    ? { ...thread, finishedUnseenAt: undefined }
+                    : thread
+                )
+              : state.threads,
+          };
+        }),
       setProviderEnabled: (id, enabled) =>
         set((state) => ({
           providerSettings: {
@@ -1175,12 +1199,35 @@ export const useOrionStore = create<OrionState>()(
             // that epic. Selecting an unrelated (or missing) thread must not
             // leave a stale epic view waiting behind it.
             selectedEpicId: thread?.epicId ?? null,
+            // Opening a thread clears its "finished while you were away" mark.
+            threads: thread?.finishedUnseenAt
+              ? state.threads.map((t) =>
+                  t.id === id ? { ...t, finishedUnseenAt: undefined } : t
+                )
+              : state.threads,
           };
         }),
 
       updateThread: (id, updates) =>
         set((state) => ({
-          threads: state.threads.map((t) => (t.id === id ? { ...t, ...updates } : t)),
+          threads: state.threads.map((t) => {
+            if (t.id !== id) return t;
+            const next = { ...t, ...updates };
+            // A run that ends while the user is elsewhere leaves a dot in the
+            // sidebar until the thread is opened; starting a new run (or
+            // finishing one in the open thread) clears it again. Only a run
+            // that ran to completion counts — a stop (-> idle) was deliberate,
+            // so it needs no follow-up marker.
+            if (updates.status && updates.status !== t.status) {
+              next.finishedUnseenAt =
+                t.status === 'running' &&
+                (updates.status === 'done' || updates.status === 'error') &&
+                (state.activeTab !== 'agents' || state.selectedThreadId !== id)
+                  ? new Date().toISOString()
+                  : undefined;
+            }
+            return next;
+          }),
         })),
 
       deleteThread: (id) =>
@@ -1539,6 +1586,15 @@ export const useOrionStore = create<OrionState>()(
         // history, and history must not be rebranded as a restart casualty.
         const waitingOnBackground = /^Waiting on \d+ background agents?…$/;
         merged.threads = merged.threads.map((thread) => {
+          // The thread the app reopens visibly on counts as opened. Keep the
+          // marker if the selected transcript is still hidden behind Code.
+          if (
+            merged.activeTab === 'agents' &&
+            thread.id === merged.selectedThreadId &&
+            thread.finishedUnseenAt
+          ) {
+            thread = { ...thread, finishedUnseenAt: undefined };
+          }
           const waitUnresolved = thread.status === 'running';
           const stale =
             waitUnresolved || thread.messages.some((message) => message.status === 'running');
