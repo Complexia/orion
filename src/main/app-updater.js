@@ -1,4 +1,4 @@
-import { BrowserWindow, app } from 'electron';
+import { BrowserWindow, app, autoUpdater as nativeAutoUpdater } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
@@ -18,6 +18,47 @@ export let lastAppUpdateCheckAt = 0;
 export let appUpdateRetryTimer = null;
 export const APP_UPDATE_CHECK_DEDUP_MS = 60 * 1000;
 export const APP_UPDATE_RETRY_MS = 30 * 1000;
+// Squirrel has to pull the downloaded zip through electron-updater's local
+// proxy server and unpack it before it can install anything. That is a local
+// copy of a few hundred megabytes, so allow for a slow disk before giving up.
+export const APP_UPDATE_STAGE_TIMEOUT_MS = 3 * 60 * 1000;
+
+// electron-updater emits its own 'update-downloaded' as soon as the zip is on
+// disk and the proxy server is listening — Squirrel has not fetched or staged
+// anything at that point, and quitAndInstall() is a silent no-op until it has
+// (it only registers a listener and returns). That is why the first "Restart
+// to update" click appeared to do nothing. Track Squirrel's own
+// 'update-downloaded' so a restart can wait for the update to be installable.
+export let appUpdateStagedForInstall = false;
+const appUpdateStagedWaiters = new Set();
+
+const settleAppUpdateStagedWaiters = (staged) => {
+  const waiters = [...appUpdateStagedWaiters];
+  appUpdateStagedWaiters.clear();
+  for (const waiter of waiters) waiter(staged);
+};
+
+export const invalidateAppUpdateDownload = () => {
+  appUpdateDownloadedVersion = null;
+  appUpdateStagedForInstall = false;
+  settleAppUpdateStagedWaiters(false);
+};
+
+export const waitForAppUpdateStagedForInstall = (timeoutMs = APP_UPDATE_STAGE_TIMEOUT_MS) => {
+  if (appUpdateStagedForInstall) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const waiter = (staged) => {
+      clearTimeout(timer);
+      resolve(staged);
+    };
+    const timer = setTimeout(() => {
+      appUpdateStagedWaiters.delete(waiter);
+      resolve(false);
+    }, timeoutMs);
+    appUpdateStagedWaiters.add(waiter);
+  });
+};
+
 export const getAppIconPath = () => {
   if (app.isPackaged) {
     return path.join(process.resourcesPath, 'icon.png');
@@ -74,9 +115,24 @@ export const initializeAppUpdaterOnce = async () => {
     url: getAppUpdateFeedUrl(),
   });
 
+  // Squirrel reports separately from electron-updater, and only its event
+  // means quitAndInstall() will actually do something.
+  nativeAutoUpdater.on('update-downloaded', () => {
+    appUpdateStagedForInstall = true;
+    settleAppUpdateStagedWaiters(true);
+  });
+  nativeAutoUpdater.on('error', () => {
+    // Staging failed. Invalidate the downloaded-version shortcut so the error
+    // button performs a real download/staging retry instead of restoring the
+    // same permanently unstaged "downloaded" state.
+    invalidateAppUpdateDownload();
+  });
+
   autoUpdater.on('checking-for-update', () => {
     // Background re-checks (the startup timer, the 2h interval) must not hide
-    // the update button while a download is in flight or already staged.
+    // the update button while a download is in flight or already staged, nor
+    // interrupt a restart the user already committed to.
+    if (appUpdateState.status === 'restarting') return;
     if (appUpdateState.status === 'downloading' || appUpdateState.status === 'downloaded') return;
     publishAppUpdateState({
       status: 'checking',
@@ -88,6 +144,10 @@ export const initializeAppUpdaterOnce = async () => {
 
   autoUpdater.on('update-available', (info) => {
     const availableVersion = info?.version ?? null;
+
+    // A restart is already under way — leave the staged update alone. Starting
+    // a fresh download here would reset Squirrel's staging and strand it.
+    if (appUpdateState.status === 'restarting') return;
 
     // This fires on every check, including background re-checks that race a
     // just-finished download. If this exact version is already staged, keep
@@ -124,6 +184,7 @@ export const initializeAppUpdaterOnce = async () => {
   });
 
   autoUpdater.on('update-not-available', () => {
+    if (appUpdateState.status === 'restarting') return;
     publishAppUpdateState({
       status: 'not-available',
       availableVersion: null,
@@ -148,6 +209,8 @@ export const initializeAppUpdaterOnce = async () => {
 
   autoUpdater.on('update-downloaded', (info) => {
     appUpdateDownloadedVersion = info?.version ?? appUpdateState.availableVersion;
+    // A new zip means a new proxy server, so Squirrel starts staging over.
+    appUpdateStagedForInstall = false;
     publishAppUpdateState({
       status: 'downloaded',
       availableVersion: info?.version ?? appUpdateState.availableVersion,

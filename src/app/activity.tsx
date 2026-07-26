@@ -35,6 +35,14 @@ export const AgentActivityIcon: React.FC<{ activity: AgentActivity }> = ({ activ
 export const isExpandableDetail = (detail?: string) =>
   !!detail && (detail.length > 160 || detail.includes('\n'));
 
+// Tool input only adds expandable content when it is not already the visible
+// detail line. Output and truncated/multiline details remain expandable.
+export const isExpandableActivity = (activity: AgentActivity) =>
+  activity.type !== 'plan' &&
+  (!!activity.output ||
+    isExpandableDetail(activity.detail) ||
+    (!!activity.input && activity.input !== activity.detail));
+
 export const hostnameForUrl = (url: string) => {
   try {
     return new URL(url).hostname.replace(/^www\./, '');
@@ -273,7 +281,7 @@ export const AgentActivityCard: React.FC<{
             (activity.status === 'running' || activity.status === 'waiting')
               ? 'done'
               : activity.status ?? 'done';
-          const expandable = isExpandableDetail(activity.detail) || !!activity.output;
+          const expandable = isExpandableActivity(activity);
           const rowExpanded = expandable && expandedRows.has(activity.id);
           // Live terminal output shows a short tail while the tool runs so
           // the user watches the command work; the full text sits behind the
@@ -283,6 +291,10 @@ export const AgentActivityCard: React.FC<{
             rowExpanded || !activity.output
               ? activity.output
               : activity.output.slice(-400).replace(/^[^\n]*\n/, '');
+          // The detail line already previews a single-argument call (a path, a
+          // command); repeating it verbatim as the input block is noise.
+          const showInput =
+            rowExpanded && !!activity.input && activity.input !== activity.detail;
 
           if (activity.type === 'plan') {
             return (
@@ -303,9 +315,25 @@ export const AgentActivityCard: React.FC<{
               key={activity.id}
               className={`agent-tool-row ${status}${expandable ? ' expandable' : ''}${rowExpanded ? ' open' : ''}`}
               onClick={expandable ? () => toggleRow(activity.id) : undefined}
+              onKeyDown={
+                expandable
+                  ? (event) => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key !== 'Enter' && event.key !== ' ') return;
+                      event.preventDefault();
+                      toggleRow(activity.id);
+                    }
+                  : undefined
+              }
               role={expandable ? 'button' : undefined}
+              tabIndex={expandable ? 0 : undefined}
+              aria-expanded={expandable ? rowExpanded : undefined}
               title={
-                expandable ? (rowExpanded ? 'Collapse full text' : 'Expand full text') : undefined
+                expandable
+                  ? rowExpanded
+                    ? 'Collapse this step'
+                    : 'Expand to see the call and its output'
+                  : undefined
               }
             >
               <span className="agent-tool-icon">
@@ -332,8 +360,20 @@ export const AgentActivityCard: React.FC<{
                     {rowExpanded ? activity.detail : collapsedDetailPreview(activity)}
                   </span>
                 )}
+                {showInput && (
+                  <div className="agent-tool-io" onClick={(event) => event.stopPropagation()}>
+                    <span className="agent-tool-io-label">Called with</span>
+                    <pre className="agent-tool-output input">{activity.input}</pre>
+                  </div>
+                )}
                 {showOutput && outputText && (
-                  <pre className="agent-tool-output">{outputText}</pre>
+                  <div
+                    className="agent-tool-io"
+                    onClick={rowExpanded ? (event) => event.stopPropagation() : undefined}
+                  >
+                    {rowExpanded && <span className="agent-tool-io-label">Output</span>}
+                    <pre className="agent-tool-output">{outputText}</pre>
+                  </div>
                 )}
                 {!!activity.sources?.length && (
                   <span className="agent-tool-sources">

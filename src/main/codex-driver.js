@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
 import { killAgentChild } from './run-registry.js';
 import { loginShell } from './shell-env.js';
-import { stringifySummary } from './stream-adapters.js';
+import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 
 // ---------------------------------------------------------------------------
 // Codex app-server runs. Goals (/goal) live in the app-server's thread manager:
@@ -87,9 +87,11 @@ export const codexAppServerActivityFromItem = (item, completed) => {
       kind: 'execute',
       title: `Command - ${stringifySummary(item.command, 80)}`,
       detail: stringifySummary(item.command),
+      input: formatToolInput(item.command),
     };
-    if (completed && typeof item.aggregatedOutput === 'string' && item.aggregatedOutput) {
-      activity.output = item.aggregatedOutput.slice(-4000);
+    if (completed) {
+      const output = formatToolOutput(item.aggregatedOutput);
+      if (output) activity.output = output;
     }
     if (typeof item.exitCode === 'number') activity.exitCode = item.exitCode;
     return activity;
@@ -104,16 +106,21 @@ export const codexAppServerActivityFromItem = (item, completed) => {
       kind: 'edit',
       title: `File changes (${paths.length})`,
       detail: stringifySummary(paths.join(', ')),
+      input: formatToolInput(item.changes),
     };
   }
   if (item.type === 'mcpToolCall') {
     const name = [item.server, item.tool].filter(Boolean).join('.');
-    return {
+    const activity = {
       ...base,
       type: 'tool',
       title: `Tool - ${name || 'MCP'}`,
       detail: stringifySummary(item.arguments ?? ''),
+      input: formatToolInput(item.arguments),
     };
+    const output = formatToolOutput(item.result ?? item.output);
+    if (output) activity.output = output;
+    return activity;
   }
   if (item.type === 'webSearch') {
     return {
@@ -122,6 +129,7 @@ export const codexAppServerActivityFromItem = (item, completed) => {
       kind: 'search',
       title: `Web search - ${stringifySummary(item.query ?? '', 80)}`,
       detail: stringifySummary(item.query ?? ''),
+      input: formatToolInput(item.query),
     };
   }
   if (item.type === 'imageGeneration') {
@@ -265,7 +273,10 @@ export const createCodexAppServerDriver = ({
     callbacks.onGoal(codexGoalForRenderer(wireGoal));
     if (wireGoal.status !== 'active') {
       clearContinuationTimer();
-      if (!turnActive) endRun(CODEX_GOAL_END_NOTES[wireGoal.status] ?? '');
+      // thread/resume emits the authoritative goal snapshot before an inline
+      // review starts. Keep Orion's mirror synchronized without letting that
+      // snapshot terminate the review run.
+      if (!review && !turnActive) endRun(CODEX_GOAL_END_NOTES[wireGoal.status] ?? '');
     }
   };
 
@@ -547,7 +558,7 @@ export const createCodexAppServerDriver = ({
         goalStatus = 'cleared';
         callbacks.onGoal(null);
         clearContinuationTimer();
-        if (!turnActive) endRun('\n\n_Goal cleared._');
+        if (!review && !turnActive) endRun('\n\n_Goal cleared._');
         return;
       }
       case 'error': {

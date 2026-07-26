@@ -4,7 +4,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { emitAgentEvent } from './events.js';
-import { codexPlanActivity, extractActivitiesFromJsonEvent, stringifySummary } from './stream-adapters.js';
+import { codexPlanActivity, extractActivitiesFromJsonEvent, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 
 // ---------------------------------------------------------------------------
 // Native provider subagents. Every provider CLI can spawn subagents (claude
@@ -184,6 +184,10 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
       if (updateForKey) {
         const known = sub.knownToolActivities.get(updateForKey);
         if (known) {
+          // Keep what the tool returned (and its exit code) on the original
+          // row — the result event is the only place they appear.
+          if (activity.output) known.output = activity.output;
+          if (typeof activity.exitCode === 'number') known.exitCode = activity.exitCode;
           emit({
             type: 'subagent-activity',
             subagentId: sub.meta.id,
@@ -703,6 +707,7 @@ export const handleCodexRolloutLine = (value, api, ctx) => {
           type: 'command',
           title: `Command - ${codexRolloutCommandSummary(payload.command)}`,
           detail: codexRolloutCommandSummary(payload.command),
+          input: formatToolInput(payload.command),
           status: 'running',
         });
         return;
@@ -713,6 +718,11 @@ export const handleCodexRolloutLine = (value, api, ctx) => {
             updateForKey: payload.call_id,
             type: 'result',
             title: 'Command finished',
+            output: formatToolOutput(
+              payload.aggregated_output ??
+                [payload.stdout, payload.stderr].filter(Boolean).join('\n')
+            ),
+            exitCode: typeof payload.exit_code === 'number' ? payload.exit_code : undefined,
             status:
               typeof payload.exit_code === 'number' && payload.exit_code !== 0
                 ? 'error'
@@ -786,6 +796,7 @@ export const handleCodexRolloutLine = (value, api, ctx) => {
             ? `Command - ${stringifySummary(input, 80)}`
             : `Tool - ${payload.name ?? 'call'}`,
         detail: stringifySummary(input),
+        input: formatToolInput(input),
         status: 'running',
       });
       return;
@@ -803,6 +814,7 @@ export const handleCodexRolloutLine = (value, api, ctx) => {
           updateForKey: payload.call_id,
           type: 'result',
           title: 'Tool result',
+          output: formatToolOutput(payload.output ?? payload.result ?? payload.content),
           status: 'done',
         });
       }

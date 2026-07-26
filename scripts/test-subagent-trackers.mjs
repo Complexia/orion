@@ -12,9 +12,11 @@ const source = (await fs.readFile(sourceUrl, 'utf8'))
     'const emitAgentEvent = globalThis.__testEmitAgentEvent;'
   )
   .replace(
-    "import { codexPlanActivity, extractActivitiesFromJsonEvent, stringifySummary } from './stream-adapters.js';",
+    "import { codexPlanActivity, extractActivitiesFromJsonEvent, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';",
     `const codexPlanActivity = () => null;
 const extractActivitiesFromJsonEvent = () => [];
+const formatToolInput = (value) => String(value ?? '');
+const formatToolOutput = (value) => String(value ?? '');
 const stringifySummary = (value, limit = 120) => String(value ?? '').slice(0, limit);`
   );
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;

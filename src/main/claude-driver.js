@@ -792,6 +792,9 @@ export const handleClaudeSessionMessage = async (session, message) => {
     if (updateForKey) {
       const known = turn.knownToolActivities.get(updateForKey);
       if (known) {
+        // The result block carries what the tool returned; fold it onto the
+        // original row so expanding it shows the call and its output.
+        if (activity.output) known.output = activity.output;
         emitAgentEvent(session.sender, {
           runId: turn.runId,
           threadId: session.threadId,

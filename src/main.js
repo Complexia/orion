@@ -29,7 +29,7 @@ import {
   pullRepo,
   pushRepo,
 } from './cloud-sync.js';
-import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, publishAppUpdateState, scheduleAppUpdateChecks } from './main/app-updater.js';
+import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
@@ -59,6 +59,7 @@ app.setAppUserModelId('com.complexia.orion');
 const hiddenSystemDirectories = new Set(['.git']);
 let quitAfterPendingWork = false;
 let quitBarrierSatisfied = false;
+let appShutdownRequested = false;
 let riftShutdownRequested = false;
 const pendingRiftCreations = new Set();
 const pendingRiftEpicIds = new Set();
@@ -917,7 +918,8 @@ app.on('window-all-closed', () => {
 
 // Persistent claude sessions outlive individual turns; kill their CLI
 // processes (and any background subagents inside them) when Orion exits.
-app.on('will-quit', (event) => {
+const disposeForQuit = () => {
+  appShutdownRequested = true;
   riftShutdownRequested = true;
   rememberRiftCleanupForQuit(
     [...pendingRiftCreations].map((creation) => creation.riftPath()).filter(Boolean)
@@ -928,24 +930,44 @@ app.on('will-quit', (event) => {
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
   reapActiveAgentRuns();
+};
+
+// Resolves once active children have exited (including the SIGKILL fallback),
+// any /goal pauses are recorded, and the latest transcript queue has settled.
+// Waiting for the queue after agent shutdown matters: shutdown can enqueue a
+// goal-pause persistence write of its own.
+const waitForPendingQuitWork = () =>
+  Promise.all([waitForPendingAgentShutdowns(), waitForPendingRiftCreations()])
+    .then(() => threadsSaveQueue.catch(() => {}));
+
+app.on('will-quit', (event) => {
+  disposeForQuit();
   if (quitBarrierSatisfied) return;
 
-  // Hold quit open until active children exit (including the SIGKILL
-  // fallback), any /goal pauses are recorded, and the latest transcript
-  // queue has settled. Waiting for the queue after agent shutdown matters:
-  // shutdown can enqueue a goal-pause persistence write of its own.
+  // Hold quit open until the pending work above has landed.
   event.preventDefault();
   if (!quitAfterPendingWork) {
     quitAfterPendingWork = true;
-    void Promise.all([waitForPendingAgentShutdowns(), waitForPendingRiftCreations()])
-      .then(() => threadsSaveQueue.catch(() => {}))
-      .finally(() => {
-        quitAfterPendingWork = false;
-        quitBarrierSatisfied = true;
-        app.quit();
-      });
+    void waitForPendingQuitWork().finally(() => {
+      quitAfterPendingWork = false;
+      quitBarrierSatisfied = true;
+      app.quit();
+    });
   }
 });
+
+// The updater installs by quitting the app, and the barrier above answers that
+// quit with preventDefault() — which cancels the terminate Squirrel is waiting
+// on. Drain the same work up front so the installing quit runs straight
+// through instead of being held (and possibly dropped).
+const settleQuitBarrierForUpdate = async () => {
+  if (quitBarrierSatisfied) return;
+  disposeForQuit();
+  // If a quit is already draining this same work, waiting on it here settles at
+  // the same time; either way the barrier is open once the work has landed.
+  await waitForPendingQuitWork().catch(() => {});
+  quitBarrierSatisfied = true;
+};
 
 // In this file you can include the rest of your app's specific main process
 // code. You can also put them in separate files and import them here.
@@ -1878,7 +1900,11 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
         'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
         'message — no quotes, no code fences, no commentary.\n\n' +
         context;
-      message = cleanGeneratedGitMessage(await runOneShotForModelId(input.modelId, prompt, gitRoot));
+      message = cleanGeneratedGitMessage(
+        await runOneShotForModelId(input.modelId, prompt, gitRoot, {
+          reasoningEffort: input?.reasoningEffort,
+        })
+      );
     }
     if (!message) message = commitMessageForEntries(entries);
 
@@ -2158,7 +2184,9 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
           'list. Reply with ONLY the title and description — no quotes, no code fences, no commentary.\n\n' +
           `Commits:\n${truncateForPrompt(commits, 3000)}\n\nDiffstat:\n${truncateForPrompt(diffstat, 3000)}`;
         const text = cleanGeneratedGitMessage(
-          await runOneShotForModelId(input.modelId, prompt, gitRoot)
+          await runOneShotForModelId(input.modelId, prompt, gitRoot, {
+            reasoningEffort: input?.reasoningEffort,
+          })
         );
         if (text) {
           const newline = text.indexOf('\n');
@@ -2500,6 +2528,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
         const raw = cleanGeneratedGitMessage(
           await runOneShotForModelId(input.modelId, prompt, riftWorkingDir, {
             signal: abortController.signal,
+            reasoningEffort: input?.reasoningEffort,
           })
         );
         const candidate = raw.split('\n')[0]?.trim().replace(/^["'`]+|["'`]+$/g, '').slice(0, 60);
@@ -3369,11 +3398,45 @@ ipcMain.handle('appUpdate:download', async () => {
   return appUpdateState;
 });
 
+let appUpdateRestartRequested = false;
+
+const restartForAppUpdate = async () => {
+  if (appUpdateRestartRequested) return { ok: true };
+  appUpdateRestartRequested = true;
+  publishAppUpdateState({ status: 'restarting', progress: null, error: null });
+
+  try {
+    // "Downloaded" only means the zip is on disk; Squirrel still has to pull it
+    // through electron-updater's proxy server and stage it. quitAndInstall()
+    // before that finishes is swallowed — the click looks like a no-op — so
+    // wait for the update to actually be installable first.
+    const staged = await waitForAppUpdateStagedForInstall();
+    if (!staged) {
+      appUpdateRestartRequested = false;
+      invalidateAppUpdateDownload();
+      const error =
+        appUpdateState.error ??
+        'Orion could not prepare the update. Try downloading it again.';
+      publishAppUpdateState({ status: 'error', progress: null, error });
+      return { ok: false, error };
+    }
+
+    await settleQuitBarrierForUpdate();
+    const autoUpdater = await initializeAppUpdater();
+    autoUpdater.quitAndInstall(false, true);
+    return { ok: true };
+  } catch (error) {
+    appUpdateRestartRequested = false;
+    publishAppUpdateState({ status: 'downloaded', progress: null, error: null });
+    return { ok: false, error: error?.message ?? 'Could not restart to update' };
+  }
+};
+
 ipcMain.handle('appUpdate:restart', async () => {
-  if (appUpdateState.status !== 'downloaded') return false;
-  const autoUpdater = await initializeAppUpdater();
-  autoUpdater.quitAndInstall(false, true);
-  return true;
+  if (appUpdateState.status !== 'downloaded' && appUpdateState.status !== 'restarting') {
+    return { ok: false, error: 'No update is ready to install' };
+  }
+  return restartForAppUpdate();
 });
 
 // The renderer reports a spawned subagent's outcome here, unblocking the
@@ -3405,15 +3468,17 @@ ipcMain.handle('orchestration:subagentStopResult', (_event, payload) => {
 });
 
 ipcMain.handle('agent:runTurn', async (event, input) => {
+  if (appShutdownRequested) {
+    return { ok: false, error: 'Orion is restarting to install an update.' };
+  }
+  const runId = input?.runId || crypto.randomUUID();
   // Synchronous, before the first await: IPC handlers start in arrival
   // order, so a stop/steer sent after this runTurn is guaranteed to see the
   // entry (or the fully registered run).
-  if (input?.runId) {
-    startingAgentRuns.set(input.runId, {
-      aborted: false,
-      threadId: input.threadId,
-    });
-  }
+  startingAgentRuns.set(runId, {
+    aborted: false,
+    threadId: input?.threadId,
+  });
   try {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
       return { ok: false, error: 'Missing threadId, projectPath, prompt, or modelId.' };
@@ -3450,8 +3515,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (!available) {
       return { ok: false, error: `${model.command} is not installed or not on PATH.` };
     }
-
-    const runId = input.runId || crypto.randomUUID();
 
     // Capture before Orion's own managed-file writes so they remain visible
     // in the run's changed-files summary. Read only must not mutate the
@@ -3897,9 +3960,12 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       for (const { updateForKey, ...activity } of adapter.activities(parsed)) {
         if (updateForKey) {
           // A tool result: flip the original step to done/error in place
-          // instead of appending a detached "Tool result" row.
+          // instead of appending a detached "Tool result" row. What the tool
+          // returned only appears here, so fold it onto that row — the
+          // expanded step shows the call and its output together.
           const known = knownToolActivities.get(updateForKey);
           if (known) {
+            if (activity.output) known.output = activity.output;
             emitActivity({
               ...known,
               key: updateForKey,
@@ -4249,7 +4315,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     console.error('agent:runTurn error', error);
     return { ok: false, error: error?.message ?? String(error) };
   } finally {
-    if (input?.runId) startingAgentRuns.delete(input.runId);
+    startingAgentRuns.delete(runId);
   }
 });
 
@@ -4297,6 +4363,9 @@ ipcMain.handle('agent:isRunFinalizing', (_event, runId) => finalizingAgentRuns.h
 ipcMain.handle('agent:codexGoal', async (_event, input) => {
   const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
   try {
+    if (appShutdownRequested) {
+      return { ok: false, error: 'Orion is restarting to install an update.' };
+    }
     if (!input?.sessionId || !threadId || !input?.projectPath || !input?.action) {
       return { ok: false, error: 'Missing sessionId, threadId, projectPath, or action.' };
     }
@@ -4716,6 +4785,9 @@ const disposeAllTerminalSessions = () => {
 // the watcher discover the CLI's persisted session id for restart/resume.
 ipcMain.handle('terminal:ensure', async (_event, input) => {
   try {
+    if (appShutdownRequested) {
+      return { ok: false, error: 'Orion is restarting to install an update.' };
+    }
     const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
     const projectPath = typeof input?.projectPath === 'string' ? input.projectPath : '';
     const accessMode = ['read-only', 'workspace-write', 'full-access'].includes(
@@ -5004,7 +5076,7 @@ const runOneShotAgentText = async (
   model,
   prompt,
   projectPath,
-  { signal, threadId } = {}
+  { signal, threadId, reasoningEffort } = {}
 ) => {
   const cwd = projectPath || process.cwd();
   if (signal?.aborted) return '';
@@ -5024,11 +5096,18 @@ const runOneShotAgentText = async (
     return (await kimiPlanModeOneShot(model, prompt, cwd, { signal, threadId })) || '';
   }
 
-  // Reuse the command builder but force read-only access for the hidden turn
+  // Reuse the command builder but force read-only access for the hidden turn.
+  // The effort comes from Settings → Text generation (which defaults to the
+  // cheapest tier) rather than the provider default: inheriting GPT-5.6's
+  // 'high' spends and stalls far more than a title or commit message is worth.
+  const effort = reasoningEffort || 'low';
   const args = commandForModel(model, {
     prompt,
     projectPath: cwd,
     accessMode: 'read-only',
+    ...(model.providerId === 'codex' ? { codexReasoningEffort: effort } : {}),
+    ...(model.providerId === 'claude' ? { claudeReasoningEffort: effort } : {}),
+    ...(model.providerId === 'grok' ? { grokReasoningEffort: effort } : {}),
   });
 
   const commandString = args.map(shellQuote).join(' ');
@@ -5148,6 +5227,7 @@ const runOneShotAgentText = async (
 };
 
 // Look up a model id, verify its CLI is on PATH, and run a one-shot prompt.
+// `options.reasoningEffort` comes from Settings → Text generation.
 const runOneShotForModelId = async (modelId, prompt, projectPath, options) => {
   if (!modelId) return '';
   if (options?.signal?.aborted) return '';
@@ -5163,6 +5243,7 @@ const runOneShotForModelId = async (modelId, prompt, projectPath, options) => {
 // Generate a short, relevant title for a thread based on the first user prompt.
 // This runs a lightweight non-streaming call and returns just the title string.
 ipcMain.handle('agent:generateTitle', async (_event, input) => {
+  if (appShutdownRequested) return '';
   const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
   if (!threadId || !input?.prompt || !input?.modelId) return '';
   const controller = new AbortController();
@@ -5193,6 +5274,7 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
       await runOneShotAgentText(model, titleInstruction, input.projectPath, {
         signal: controller.signal,
         threadId,
+        reasoningEffort: input.reasoningEffort,
       })
     );
   })();
