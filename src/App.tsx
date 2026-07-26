@@ -186,7 +186,15 @@ type ProviderUpdateState = {
 };
 
 type AppUpdateState = {
-  status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error';
+  status:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'downloading'
+    | 'downloaded'
+    | 'restarting'
+    | 'not-available'
+    | 'error';
   currentVersion: string;
   checkedAt?: string | null;
   availableVersion?: string | null;
@@ -1164,27 +1172,31 @@ const App: React.FC = () => {
   );
   const appUpdateVisible =
     !!appUpdateState &&
-    ['available', 'downloading', 'downloaded', 'error'].includes(appUpdateState.status);
+    ['available', 'downloading', 'downloaded', 'restarting', 'error'].includes(appUpdateState.status);
   const appUpdatePercent = Math.max(
     0,
     Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0))
   );
   const appUpdateLabel =
-    appUpdateState?.status === 'downloaded'
-      ? 'Restart to update'
-      : appUpdateState?.status === 'downloading'
-        ? `Downloading ${appUpdatePercent}%`
-        : appUpdateState?.status === 'error'
-          ? 'Update failed'
-          : appUpdateState?.availableVersion
-            ? `Update ${appUpdateState.availableVersion}`
-            : 'Update available';
+    appUpdateState?.status === 'restarting'
+      ? 'Restarting…'
+      : appUpdateState?.status === 'downloaded'
+        ? 'Restart to update'
+        : appUpdateState?.status === 'downloading'
+          ? `Downloading ${appUpdatePercent}%`
+          : appUpdateState?.status === 'error'
+            ? 'Update failed'
+            : appUpdateState?.availableVersion
+              ? `Update ${appUpdateState.availableVersion}`
+              : 'Update available';
   const appUpdateTitle =
     appUpdateState?.status === 'error'
       ? appUpdateState.error ?? 'Update failed'
-      : appUpdateState?.availableVersion
-        ? `Orion ${appUpdateState.availableVersion} is available`
-        : appUpdateLabel;
+      : appUpdateState?.status === 'restarting'
+        ? 'Finishing the update, then reopening Orion'
+        : appUpdateState?.availableVersion
+          ? `Orion ${appUpdateState.availableVersion} is available`
+          : appUpdateLabel;
   const accountName =
     accountState.user?.name ||
     (accountState.authenticated ? 'Orion account' : 'Not signed in');
@@ -2025,12 +2037,24 @@ const App: React.FC = () => {
 
   const handleAppUpdateClick = useCallback(async () => {
     if (!appUpdateState || appUpdateBusy) return;
-    if (appUpdateState.status === 'downloading' || appUpdateState.status === 'checking') return;
+    if (
+      appUpdateState.status === 'downloading' ||
+      appUpdateState.status === 'checking' ||
+      appUpdateState.status === 'restarting'
+    ) {
+      return;
+    }
 
     setAppUpdateBusy(true);
     try {
       if (appUpdateState.status === 'downloaded') {
-        await window.orion?.restartToUpdate?.();
+        // Stays busy on success: the app is on its way out. Only a restart that
+        // could not go through hands the button back.
+        const result = await window.orion?.restartToUpdate?.();
+        if (result && result.ok === false) {
+          toast.error(result.error ?? 'Could not restart to update');
+          setAppUpdateBusy(false);
+        }
         return;
       }
 
@@ -6770,9 +6794,13 @@ const App: React.FC = () => {
           className={`sidebar-update-button ${appUpdateState?.status ?? 'idle'}`}
           onClick={handleAppUpdateClick}
           title={appUpdateTitle}
-          disabled={appUpdateBusy || appUpdateState?.status === 'downloading'}
+          disabled={
+            appUpdateBusy ||
+            appUpdateState?.status === 'downloading' ||
+            appUpdateState?.status === 'restarting'
+          }
         >
-          {appUpdateState?.status === 'downloaded' ? (
+          {appUpdateState?.status === 'downloaded' || appUpdateState?.status === 'restarting' ? (
             <RefreshCw size={15} />
           ) : appUpdateState?.status === 'downloading' ? (
             <span className="sidebar-update-progress" style={{ '--update-progress': `${appUpdatePercent}%` } as React.CSSProperties}>
