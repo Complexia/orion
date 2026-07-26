@@ -38,17 +38,17 @@ export const deriveTitle = (prompt: string): string => {
 export const tryGenerateBetterTitle = async (
   threadId: string,
   prompt: string,
-  modelId: string,
+  turn: { modelId: string | null; reasoningEffort: string | null },
   projectPath: string,
   update: (id: string, updates: { title: string }) => void,
   epicId?: string
 ) => {
-  if (!window.orion?.generateThreadTitle) return;
+  if (!window.orion?.generateThreadTitle || !turn.modelId) return;
   try {
     const title = await window.orion.generateThreadTitle({
       threadId,
       prompt,
-      modelId,
+      ...turn,
       projectPath,
       ...(epicId ? { epicId } : {}),
     });
