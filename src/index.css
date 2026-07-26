@@ -896,6 +896,29 @@ body {
   line-height: 1.35;
 }
 
+.account-email-toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
+  filter: blur(4px);
+  user-select: none;
+  transition: filter 120ms ease;
+}
+
+.account-email-toggle.revealed {
+  filter: none;
+  user-select: text;
+}
+
+.account-email-toggle:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 2px;
+}
+
 .account-status-chip {
   height: 24px;
   display: inline-flex;
@@ -1121,21 +1144,6 @@ body {
   font-size: 11px;
   color: #f4a261;
   line-height: 1;
-}
-
-.provider-badge {
-  font-size: 9px;
-  line-height: 1;
-  padding: 1px 5px;
-  border-radius: 4px;
-  font-weight: 700;
-  background: #3a2f00;
-  color: #f4d35e;
-}
-
-.provider-badge.early {
-  background: #3a2f00;
-  color: #f4d35e;
 }
 
 .provider-subtitle {
@@ -1791,6 +1799,22 @@ body {
   user-select: none;
 }
 
+/* Mirrors .project-section-header-row: the toggle fills the row and the
+   hover-revealed new-thread button sits at its right edge. */
+.recent-agents-header-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 2px 6px;
+}
+
+.recent-agents-header-row .sidebar-section-toggle {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  margin: 0;
+}
+
 .sidebar-section-toggle {
   display: flex;
   align-items: center;
@@ -1813,9 +1837,22 @@ body {
   color: var(--text-secondary);
 }
 
+/* The expand/collapse arrow is an on-demand affordance: it fades in when its
+   header row is hovered or keyboard-focused. Reserving the space with opacity
+   (rather than display/visibility) keeps the label from shifting. */
 .sidebar-section-chevron {
   flex-shrink: 0;
-  transition: transform var(--transition-fast);
+  opacity: 0;
+  transition: transform var(--transition-fast), opacity var(--transition-fast);
+}
+
+.sidebar-section-toggle:hover .sidebar-section-chevron,
+.sidebar-section-toggle:focus-visible .sidebar-section-chevron,
+.epics-section-header:hover .sidebar-section-chevron,
+.recent-agents-header-row:hover .sidebar-section-chevron,
+.project-section-header-row:hover .sidebar-section-chevron,
+.project-collapse-toggle:focus-visible .sidebar-section-chevron {
+  opacity: 1;
 }
 
 .sidebar-section-chevron.open {
@@ -2130,6 +2167,7 @@ body {
 }
 
 .project-section-header-row:hover .project-new-thread,
+.recent-agents-header-row:hover .project-new-thread,
 .project-new-thread:focus-visible,
 .project-section-header-row:hover .project-options-trigger,
 .project-options-trigger:focus-visible,
@@ -3152,6 +3190,23 @@ body {
   color: var(--warning);
 }
 
+/* Expanded tool step: what the tool was called with, and what it returned. */
+.agent-tool-io {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.agent-tool-io-label {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
 /* Live terminal output — a short tail while the command runs, full text when
    the row is expanded. */
 .agent-tool-output {
@@ -3174,6 +3229,17 @@ body {
 
 .agent-tool-row.running .agent-tool-output {
   border-color: rgb(77 141 255 / 18%);
+}
+
+.agent-tool-output.input {
+  color: #b0b0b0;
+  background: rgb(255 255 255 / 3%);
+  max-height: 260px;
+}
+
+.agent-tool-row.expandable:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .agent-tool-sources {
