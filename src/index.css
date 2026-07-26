@@ -2003,6 +2003,16 @@ body {
   color: var(--text-primary);
 }
 
+.project-menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.project-menu-item:disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
 .project-menu-item.danger:hover {
   background: rgb(248 113 113 / 12%);
   color: var(--danger);

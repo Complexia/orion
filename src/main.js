@@ -1911,6 +1911,40 @@ const riftWorktreeChangesFailure = async (gitRoot, branch, input) => {
   };
 };
 
+// Branches currently on origin, for the PR base picker. Asks the remote
+// directly (not local tracking refs) so a stale clone still offers every
+// branch a PR could actually target.
+ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const currentBranch = (await getCurrentGitBranch(gitRoot)) ?? null;
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', gitRoot, 'ls-remote', '--heads', 'origin'],
+      {
+        timeout: 15_000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        maxBuffer: 1024 * 1024 * 4,
+      }
+    );
+    const branches = stdout
+      .split('\n')
+      .map((line) => line.match(/refs\/heads\/(.+)$/)?.[1]?.trim())
+      .filter(Boolean);
+    const defaultBranch = await resolveRemoteDefaultBranch(gitRoot);
+    return { ok: true, gitRoot, currentBranch, defaultBranch, branches };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.stderr?.toString().trim() || error?.message || String(error),
+    };
+  }
+});
+
 ipcMain.handle('epic:createPr', async (_event, input) => {
   let gitRoot = '';
   let branch = '';
@@ -1942,7 +1976,18 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     const target = await validateEpicGitTarget(gitRoot, branch, input);
     if (!target.ok) return target;
     gitRoot = target.gitRoot;
-    const baseBranch = target.baseBranch;
+    // The renderer's base picker may target any origin branch; without a
+    // choice, fall back to the remote default branch.
+    const requestedBase = String(input?.baseBranch ?? '').trim();
+    const baseBranch = requestedBase || target.baseBranch;
+    if (baseBranch === branch) {
+      return {
+        ok: false,
+        gitRoot,
+        branch,
+        error: `Cannot open a pull request from ${branch} into itself. Choose a different base branch.`,
+      };
+    }
     const setupErrorAfterValidation = pendingRiftSetupError(input);
     if (setupErrorAfterValidation) {
       return { ok: false, gitRoot, branch, error: setupErrorAfterValidation };
@@ -2273,6 +2318,28 @@ ipcMain.handle('epic:createRift', async (event, input) => {
       return { ok: false, error: 'The source repository does not have a commit to create a rift from.' };
     }
 
+    // Optional base for the epic's feature branch. Resolved in the source
+    // repository up front so a stale selection fails before the expensive
+    // copy, but never checked out there — the switch happens inside the rift
+    // below, so local work in the source checkout is never at risk.
+    const requestedBaseBranch = String(input?.baseBranch ?? '').trim();
+    if (requestedBaseBranch) {
+      const baseExists = await commandSucceeds('git', [
+        '-C',
+        gitRoot,
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        `refs/heads/${requestedBaseBranch}`,
+      ]);
+      if (!baseExists) {
+        return {
+          ok: false,
+          error: `The selected base branch ${requestedBaseBranch} no longer exists in the source repository.`,
+        };
+      }
+    }
+
     // Idempotent: registers the repo with Rift on first use.
     await riftInit(gitRoot, { signal: abortController.signal });
 
@@ -2352,6 +2419,17 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     }
     if (riftShutdownRequested) {
       throw new Error('Rift creation was cancelled because Orion is quitting.');
+    }
+
+    // Start the feature branch from the requested base instead of the source
+    // checkout's HEAD. The rift copied the source's local refs, so the branch
+    // is switched here — inside the rift only.
+    if (requestedBaseBranch) {
+      await execFileAsync('git', ['-C', createdRiftPath, 'checkout', requestedBaseBranch]);
+      const switchedChanges = await readGitStatusEntries(createdRiftPath);
+      if (switchedChanges.length > 0) {
+        throw new Error(`The rift could not switch cleanly to ${requestedBaseBranch}.`);
+      }
     }
 
     // The rift starts on a detached HEAD with the source's working tree and

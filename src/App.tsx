@@ -562,6 +562,16 @@ const App: React.FC = () => {
   // Per-epic opt-out for the modal's "Create a rift" checkbox; the default
   // comes from the experimental Rifts settings when the modal opens.
   const [newEpicCreateRift, setNewEpicCreateRift] = useState(false);
+  // Local branch the rift's feature branch starts from; null = the source
+  // checkout's current branch (which needs no checkout anywhere).
+  const [newEpicRiftBaseBranch, setNewEpicRiftBaseBranch] = useState<string | null>(null);
+  // Local branches of the modal's selected project, for the base picker.
+  // Tagged with the project id so a stale list can't feed another project.
+  const [newEpicRiftBranches, setNewEpicRiftBranches] = useState<{
+    projectId: string;
+    currentBranch: string | null;
+    branches: string[];
+  } | null>(null);
   // Rift binary availability, fetched once (null while unknown).
   const [riftStatus, setRiftStatus] = useState<{
     available: boolean;
@@ -615,7 +625,17 @@ const App: React.FC = () => {
   const [epicRepoPickerOpen, setEpicRepoPickerOpen] = useState(false);
   // One epic git action (commit/PR) at a time; the epic view's buttons disable
   // while it runs.
-  const [epicGitBusy, setEpicGitBusy] = useState<'commit' | 'pr' | null>(null);
+  const [epicGitBusy, setEpicGitBusy] = useState<
+    'commit' | 'pr' | 'pr-branches' | 'settle' | null
+  >(null);
+  // Base-branch picker shown before opening an epic's pull request. Holds the
+  // origin branches fetched for the picker and the user's current selection.
+  const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<{
+    epic: Epic;
+    branches: string[];
+    defaultBranch: string;
+    baseBranch: string;
+  } | null>(null);
   // Live workspace status behind the epic git buttons: "Commit & push" greys
   // out when the workspace is clean and fully pushed, and a created PR shows
   // its lifecycle state (open/merged/closed) instead of the Create PR button.
@@ -1246,6 +1266,32 @@ const App: React.FC = () => {
     return grouped;
   }, [childThreadIds, epicsEnabled, threads]);
 
+  // Epics that still have a live agent: any thread grouped under the epic —
+  // including hidden subagent children — that is running or has a tracked run.
+  // Children spawned before epic inheritance carry no epicId, so resolve
+  // through the parent chain. Drives disabling commit/PR/settle for the epic.
+  const runningAgentEpicIds = useMemo(() => {
+    const running = new Set<string>();
+    if (!epicsEnabled) return running;
+    const threadsById = new Map(threads.map((thread) => [thread.id, thread]));
+    const epicIdForThread = (thread: Thread): string | undefined => {
+      const seen = new Set<string>();
+      let current: Thread | undefined = thread;
+      while (current && !seen.has(current.id)) {
+        if (current.epicId) return current.epicId;
+        seen.add(current.id);
+        current = current.parentThreadId ? threadsById.get(current.parentThreadId) : undefined;
+      }
+      return undefined;
+    };
+    for (const thread of threads) {
+      if (thread.status !== 'running' && !activeRunsByThread[thread.id]) continue;
+      const epicId = epicIdForThread(thread);
+      if (epicId) running.add(epicId);
+    }
+    return running;
+  }, [activeRunsByThread, epicsEnabled, threads]);
+
   const projectForGitRoot = useCallback(
     (gitRoot: string | undefined, preferredProjectId?: string) => {
       if (!gitRoot) return null;
@@ -1338,6 +1384,9 @@ const App: React.FC = () => {
   }, [activeRiftUnavailable, activeWorkingDir, activeTab, setActiveTab]);
 
   const selectedEpicThreads = selectedEpic ? threadsByEpic.get(selectedEpic.id) ?? [] : [];
+  const selectedEpicHasRunningAgents = selectedEpic
+    ? runningAgentEpicIds.has(selectedEpic.id)
+    : false;
   const selectedEpicRepositoryProject = selectedEpic?.repositoryProjectId
     ? projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null
     : null;
@@ -1350,6 +1399,12 @@ const App: React.FC = () => {
     !selectedEpicGitStatus ||
     selectedEpicGitStatus.hasChangesToCommit ||
     selectedEpicGitStatus.hasUnpushedCommits;
+  // Unlike selectedEpicHasWorkToPush this needs a known status: an unknown
+  // one must not disable Settle — handleSettleEpic re-verifies on click.
+  const selectedEpicHasUnsettledWork = Boolean(
+    selectedEpicGitStatus &&
+      (selectedEpicGitStatus.hasChangesToCommit || selectedEpicGitStatus.hasUnpushedCommits)
+  );
   const selectedEpicPrBadge = !selectedEpic?.prUrl
     ? null
     : selectedEpicGitStatus?.prState === 'MERGED'
@@ -3277,7 +3332,35 @@ const App: React.FC = () => {
     setNewEpicName('');
     setNewEpicDescription('');
     setNewEpicProjectId(null);
+    setNewEpicRiftBaseBranch(null);
+    setNewEpicRiftBranches(null);
   }, []);
+
+  // Local branches for the create-epic modal's rift base picker. Refetched
+  // when the selected project changes; the selection resets to the current
+  // branch (null) so a choice made for one project can't apply to another.
+  useEffect(() => {
+    setNewEpicRiftBaseBranch(null);
+    setNewEpicRiftBranches(null);
+    if (!createEpicOpen || !newEpicCreateRift || !riftsActive) return;
+    const project = projects.find((candidate) => candidate.id === newEpicProjectId);
+    if (!project || !window.orion?.getGitState) return;
+    let cancelled = false;
+    void window.orion
+      .getGitState(project.path)
+      .then((state) => {
+        if (cancelled || !state.ok) return;
+        setNewEpicRiftBranches({
+          projectId: project.id,
+          currentBranch: state.currentBranch ?? null,
+          branches: state.branches.map((candidate) => candidate.name),
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [createEpicOpen, newEpicCreateRift, newEpicProjectId, riftsActive, projects]);
 
   // Creates the epic's copy-on-write rift workspace and its feature branch
   // (named by the epic message model), then binds them to the epic. Runs in
@@ -3339,6 +3422,7 @@ const App: React.FC = () => {
         epicName: epic.name,
         epicDescription: epic.description,
         modelId: resolveEpicMessageModelId(),
+        ...(request.baseBranch ? { baseBranch: request.baseBranch } : {}),
       });
       if (result.ok && result.riftPath) {
         // Keep the local launch lock if persistence throws as well as when it
@@ -3426,11 +3510,22 @@ const App: React.FC = () => {
     const description = newEpicDescription.trim();
     const epicProject = projects.find((project) => project.id === newEpicProjectId) ?? null;
     const riftProject = epicProject;
+    // Only a base differing from the current branch is recorded: the current
+    // branch needs no checkout, and a list fetched for another project is
+    // ignored rather than trusted.
+    const riftBaseBranch =
+      newEpicRiftBaseBranch &&
+      riftProject &&
+      newEpicRiftBranches?.projectId === riftProject.id &&
+      newEpicRiftBaseBranch !== newEpicRiftBranches.currentBranch
+        ? newEpicRiftBaseBranch
+        : undefined;
     const riftRequest =
       newEpicCreateRift && riftsActive && riftProject
         ? {
             projectId: riftProject.id,
             projectPath: riftProject.path,
+            ...(riftBaseBranch ? { baseBranch: riftBaseBranch } : {}),
           }
         : undefined;
     const epicId = addEpic(trimmed, {
@@ -3614,6 +3709,43 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedEpic, epicGitBusy, activeRiftUnavailable, riftRemovalEpicIds]);
 
+  // Click-time recheck that no agent grouped under the epic — including
+  // descendant subagent threads — is still running. The rendered disabled
+  // state can lag a just-started run, and the sidebar Settle menu reuses the
+  // same guard. The ref can lag until the next render while the output map is
+  // updated synchronously, so merge both views (same as handleDeleteEpic).
+  const epicHasRunningAgents = (epicId: string) => {
+    const state = useOrionStore.getState();
+    const runsByThread = new Map<string, string>(
+      Object.entries(activeRunsByThreadRef.current)
+    );
+    for (const [runId, tracked] of runOutputMessages.current) {
+      runsByThread.set(tracked.threadId, runId);
+    }
+    const epicThreadIds = new Set(
+      state.threads.filter((thread) => thread.epicId === epicId).map((thread) => thread.id)
+    );
+    let foundChild = true;
+    while (foundChild) {
+      foundChild = false;
+      for (const thread of state.threads) {
+        if (
+          thread.parentThreadId &&
+          epicThreadIds.has(thread.parentThreadId) &&
+          !epicThreadIds.has(thread.id)
+        ) {
+          epicThreadIds.add(thread.id);
+          foundChild = true;
+        }
+      }
+    }
+    return state.threads.some(
+      (thread) =>
+        epicThreadIds.has(thread.id) &&
+        (thread.status === 'running' || runsByThread.has(thread.id))
+    );
+  };
+
   const handleEpicCommitAndPush = async (epic: Epic) => {
     if (
       repositoryOperationBusy ||
@@ -3624,6 +3756,10 @@ const App: React.FC = () => {
       (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
       !window.orion?.epicCommitAndPush
     ) {
+      return;
+    }
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before committing');
       return;
     }
     const { project, projectPath, claim } = resolveEpicGitTarget(epic);
@@ -3661,16 +3797,70 @@ const App: React.FC = () => {
     }
   };
 
-  const handleEpicCreatePr = async (epic: Epic) => {
-    if (
-      repositoryOperationBusy ||
-      riftSetupEpicIdsRef.current[epic.id] ||
-      riftRemovalEpicIdsRef.current.has(epic.id) ||
-      epic.riftRequest ||
-      epic.riftCleanupPending ||
-      (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
-      !window.orion?.epicCreatePr
-    ) {
+  const epicCreatePrBlocked = (epic: Epic) =>
+    repositoryOperationBusy ||
+    riftSetupEpicIdsRef.current[epic.id] ||
+    riftRemovalEpicIdsRef.current.has(epic.id) ||
+    epic.riftRequest ||
+    epic.riftCleanupPending ||
+    (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
+    !window.orion?.epicCreatePr;
+
+  // Step one of Create PR: fetch the branches on origin and let the user pick
+  // the base the pull request merges into. The actual create happens when the
+  // picker is submitted.
+  const openEpicPrBaseDialog = async (epic: Epic) => {
+    if (epicCreatePrBlocked(epic) || !window.orion?.epicListRemoteBranches) return;
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
+      return;
+    }
+    const { projectPath } = resolveEpicGitTarget(epic);
+    if (!projectPath) {
+      toast.error('Select a repository for this epic before opening a PR');
+      return;
+    }
+
+    setEpicGitBusy('pr-branches');
+    try {
+      const result = await window.orion.epicListRemoteBranches({ projectPath });
+      if (!result.ok) {
+        toast.error(result.error ?? 'Could not list the branches on origin');
+        return;
+      }
+      // The PR's head branch cannot be its own base.
+      const branches = (result.branches ?? []).filter(
+        (name) => name !== result.currentBranch
+      );
+      if (branches.length === 0) {
+        toast.error('No branches found on origin to use as the PR base');
+        return;
+      }
+      const defaultBranch =
+        result.defaultBranch && branches.includes(result.defaultBranch)
+          ? result.defaultBranch
+          : '';
+      setEpicPrBaseDialog({
+        epic,
+        branches,
+        defaultBranch,
+        baseBranch: defaultBranch || branches[0],
+      });
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : 'Could not list the branches on origin'
+      );
+    } finally {
+      setEpicGitBusy(null);
+    }
+  };
+
+  const handleEpicCreatePr = async (epic: Epic, baseBranch: string) => {
+    if (epicCreatePrBlocked(epic)) {
+      return;
+    }
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
       return;
     }
     const { projectPath, claim } = resolveEpicGitTarget(epic);
@@ -3686,6 +3876,7 @@ const App: React.FC = () => {
         projectPath,
         modelId: resolveEpicMessageModelId(),
         epicName: epic.name,
+        baseBranch,
         ...claim,
       });
       claimEpicGitTarget(epic, result);
@@ -4001,8 +4192,51 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSettleEpic = (epic: Epic) => {
+  const handleSettleEpic = async (epic: Epic) => {
+    if (epicGitBusy) return;
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
+      return;
+    }
+    // Verify at click time instead of trusting the rendered status: the poll
+    // refetches PR state only on its first pass, so the badge can lag a merge
+    // that happened on GitHub while the epic stayed selected. An epic with no
+    // repository (or a failed status read) falls through to the confirm — the
+    // epic git buttons all fail open without a status.
+    setEpicGitBusy('settle');
+    let status;
+    try {
+      status = await refreshEpicGitStatus(epic, { includePr: true });
+    } finally {
+      setEpicGitBusy(null);
+    }
+    if (status) {
+      setEpicGitStatuses((current) => ({
+        ...current,
+        [epic.id]: {
+          hasChangesToCommit: Boolean(status.hasChangesToCommit),
+          hasUnpushedCommits: Boolean(status.hasUnpushedCommits),
+          prState: status.pr?.state ?? current[epic.id]?.prState,
+        },
+      }));
+      if (status.hasChangesToCommit) {
+        toast.error('This epic has uncommitted changes — commit and push them before settling it');
+        return;
+      }
+      if (status.hasUnpushedCommits) {
+        toast.error('This epic has unpushed commits — push them before settling it');
+        return;
+      }
+      // A closed-without-merge PR does not block: that path abandons the PR
+      // deliberately (the epic view offers a replacement PR instead).
+      if (epic.prUrl && (status.pr?.state ?? epicGitStatuses[epic.id]?.prState) === 'OPEN') {
+        toast.error('This epic’s pull request is still open — merge it before settling');
+        return;
+      }
+    }
+    const confirmSettle = epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle;
     if (
+      confirmSettle &&
       !confirm(
         `Settle "${epic.name}"? It moves to the archive (Settings → General); its threads stay in Recent agents and their projects.`
       )
@@ -7085,6 +7319,26 @@ const App: React.FC = () => {
                     {epicsEnabled && (
                       <div className="setting-row">
                         <div className="setting-label">
+                          <div className="setting-label-title">Settle confirmation</div>
+                          <div className="setting-label-desc">
+                            Ask before settling an epic. Turn off to settle immediately without a
+                            yes/no prompt.
+                          </div>
+                        </div>
+                        <label className="provider-toggle" title="Settle confirmation">
+                          <input
+                            type="checkbox"
+                            checked={epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle}
+                            onChange={(e) => setEpicsSettings({ confirmSettle: e.target.checked })}
+                          />
+                          <span />
+                        </label>
+                      </div>
+                    )}
+
+                    {epicsEnabled && (
+                      <div className="setting-row">
+                        <div className="setting-label">
                           <div className="setting-label-title">Commit & PR message model</div>
                           <div className="setting-label-desc">
                             Writes an epic's commit messages from staged changes and its PR
@@ -8070,9 +8324,15 @@ const App: React.FC = () => {
                                         type="button"
                                         className="project-menu-item"
                                         role="menuitem"
+                                        disabled={runningAgentEpicIds.has(epic.id)}
+                                        title={
+                                          runningAgentEpicIds.has(epic.id)
+                                            ? 'Agents are still running in this epic — wait for them to finish before settling it'
+                                            : undefined
+                                        }
                                         onClick={() => {
                                           setEpicMenuOpenId(null);
-                                          handleSettleEpic(epic);
+                                          void handleSettleEpic(epic);
                                         }}
                                       >
                                         <Archive size={13} /> Settle
@@ -8877,13 +9137,16 @@ const App: React.FC = () => {
                         activeRiftUnavailable ||
                         riftRemovalEpicIds[selectedEpic.id] ||
                         (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
-                        !selectedEpicHasWorkToPush
+                        !selectedEpicHasWorkToPush ||
+                        selectedEpicHasRunningAgents
                       }
                       onClick={() => void handleEpicCommitAndPush(selectedEpic)}
                       title={
-                        selectedEpicHasWorkToPush
-                          ? 'Stage all changes, generate a commit message, then commit and push'
-                          : 'Nothing to commit — the workspace is clean and fully pushed'
+                        selectedEpicHasRunningAgents
+                          ? 'Agents are still running in this epic — wait for them to finish before committing'
+                          : selectedEpicHasWorkToPush
+                            ? 'Stage all changes, generate a commit message, then commit and push'
+                            : 'Nothing to commit — the workspace is clean and fully pushed'
                       }
                     >
                       <GitCommit size={14} />
@@ -8920,29 +9183,45 @@ const App: React.FC = () => {
                           repositoryOperationBusy ||
                           activeRiftUnavailable ||
                           riftRemovalEpicIds[selectedEpic.id] ||
-                          (!selectedEpicRepositoryProject && !selectedEpic.gitRoot)
+                          (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
+                          selectedEpicHasRunningAgents
                         }
-                        onClick={() => void handleEpicCreatePr(selectedEpic)}
+                        onClick={() => void openEpicPrBaseDialog(selectedEpic)}
                         title={
-                          selectedEpicPrBadge?.modifier === 'closed'
-                            ? 'Open a replacement pull request for this branch'
-                            : 'Open a pull request with a generated title and description'
+                          selectedEpicHasRunningAgents
+                            ? 'Agents are still running in this epic — wait for them to finish before opening a PR'
+                            : selectedEpicPrBadge?.modifier === 'closed'
+                              ? 'Open a replacement pull request for this branch'
+                              : 'Choose a base branch, then open a pull request with a generated title and description'
                         }
                       >
                         <GitPullRequest size={14} />
                         {epicGitBusy === 'pr'
                           ? 'Opening PR…'
-                          : selectedEpicPrBadge?.modifier === 'closed'
-                            ? 'Create replacement PR'
-                            : 'Create PR'}
+                          : epicGitBusy === 'pr-branches'
+                            ? 'Loading branches…'
+                            : selectedEpicPrBadge?.modifier === 'closed'
+                              ? 'Create replacement PR'
+                              : 'Create PR'}
                       </button>
                     )}
                     <button
                       type="button"
                       className="btn epic-view-settle"
-                      disabled={!!epicGitBusy || activeRiftUnavailable}
-                      onClick={() => handleSettleEpic(selectedEpic)}
-                      title="Settle the epic once its PR is merged — it moves to the archive"
+                      disabled={
+                        !!epicGitBusy ||
+                        activeRiftUnavailable ||
+                        selectedEpicHasRunningAgents ||
+                        selectedEpicHasUnsettledWork
+                      }
+                      onClick={() => void handleSettleEpic(selectedEpic)}
+                      title={
+                        selectedEpicHasRunningAgents
+                          ? 'Agents are still running in this epic — wait for them to finish before settling it'
+                          : selectedEpicHasUnsettledWork
+                            ? 'Commit and push this epic’s work before settling it'
+                            : 'Settle the epic once its PR is merged — it moves to the archive'
+                      }
                     >
                       <Archive size={14} />
                       Settle
@@ -8960,7 +9239,11 @@ const App: React.FC = () => {
                         ? 'Creating the epic’s rift workspace and branch…'
                         : epicGitBusy === 'commit'
                           ? 'Staging all changes and writing a commit message, then pushing…'
-                          : 'Writing the PR message and opening the pull request…'}
+                          : epicGitBusy === 'pr-branches'
+                            ? 'Fetching the branches on origin…'
+                            : epicGitBusy === 'settle'
+                              ? 'Checking the workspace and pull request state…'
+                              : 'Writing the PR message and opening the pull request…'}
                     </div>
                   )}
 
@@ -9947,6 +10230,70 @@ const App: React.FC = () => {
       </div>
       )}
 
+      {epicPrBaseDialog && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => setEpicPrBaseDialog(null)}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="epic-pr-base-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="epic-pr-base-title" className="modal-title">
+              Create pull request
+            </h2>
+            <p className="modal-subtitle">
+              Choose the branch the pull request merges into.
+            </p>
+            <form
+              className="modal-form"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const dialog = epicPrBaseDialog;
+                setEpicPrBaseDialog(null);
+                void handleEpicCreatePr(dialog.epic, dialog.baseBranch);
+              }}
+            >
+              <label className="modal-field">
+                <span className="modal-field-label">Base branch</span>
+                <select
+                  className="modal-input"
+                  value={epicPrBaseDialog.baseBranch}
+                  onChange={(e) =>
+                    setEpicPrBaseDialog((current) =>
+                      current ? { ...current, baseBranch: e.target.value } : current
+                    )
+                  }
+                >
+                  {epicPrBaseDialog.branches.map((name) => (
+                    <option key={name} value={name}>
+                      {name === epicPrBaseDialog.defaultBranch ? `${name} (default)` : name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn secondary"
+                  onClick={() => setEpicPrBaseDialog(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn">
+                  <GitPullRequest size={14} />
+                  Create PR
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {createEpicOpen && (
         <div
           className="modal-backdrop"
@@ -10034,6 +10381,40 @@ const App: React.FC = () => {
                   </span>
                 </label>
               )}
+              {riftsActive &&
+                newEpicCreateRift &&
+                newEpicRiftBranches &&
+                newEpicRiftBranches.projectId === newEpicProjectId &&
+                newEpicRiftBranches.branches.length > 0 && (
+                  <label className="modal-field">
+                    <span className="modal-field-label">Rift branch from</span>
+                    <select
+                      className="modal-input"
+                      value={
+                        newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch ?? ''
+                      }
+                      onChange={(e) =>
+                        setNewEpicRiftBaseBranch(
+                          !e.target.value ||
+                            e.target.value === newEpicRiftBranches.currentBranch
+                            ? null
+                            : e.target.value
+                        )
+                      }
+                    >
+                      {newEpicRiftBranches.currentBranch === null && (
+                        <option value="">Current commit (detached HEAD)</option>
+                      )}
+                      {newEpicRiftBranches.branches.map((name) => (
+                        <option key={name} value={name}>
+                          {name === newEpicRiftBranches.currentBranch
+                            ? `${name} (current)`
+                            : name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
               <div className="modal-actions">
                 <button
                   type="button"

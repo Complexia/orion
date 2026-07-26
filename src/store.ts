@@ -45,6 +45,12 @@ export type Epic = {
   riftRequest?: {
     projectId: string;
     projectPath: string;
+    /**
+     * Local branch the rift's feature branch starts from. Only set when it
+     * differs from the source checkout's current branch; the switch happens
+     * inside the rift so the source worktree is never touched.
+     */
+    baseBranch?: string;
     error?: string;
   };
   /**
@@ -60,11 +66,14 @@ export type EpicsSettings = {
   enabled: boolean;
   /** AgentModel id used to write commit/PR messages; null = cheapest available. */
   commitModelId: string | null;
+  /** Ask for confirmation before settling an epic. */
+  confirmSettle: boolean;
 };
 
 export const defaultEpicsSettings: EpicsSettings = {
   enabled: true,
   commitModelId: null,
+  confirmSettle: true,
 };
 
 /** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */

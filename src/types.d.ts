@@ -301,6 +301,8 @@ type OrionComputerUsePermissions = {
         projectPath: string;
         modelId?: string | null;
         epicName?: string;
+        /** Base branch the PR merges into; defaults to the remote default branch. */
+        baseBranch?: string;
         /** projectPath is the epic's own rift workspace — claims don't apply. */
         isRift?: boolean;
         expectedGitRoot?: string;
@@ -318,6 +320,14 @@ type OrionComputerUsePermissions = {
         branch?: string;
         baseBranch?: string;
         alreadyExists?: boolean;
+        error?: string;
+      }>;
+      epicListRemoteBranches: (input: { projectPath: string }) => Promise<{
+        ok: boolean;
+        gitRoot?: string;
+        currentBranch?: string | null;
+        defaultBranch?: string;
+        branches?: string[];
         error?: string;
       }>;
       epicGitStatus: (input: { projectPath: string; prUrl?: string }) => Promise<{
@@ -350,6 +360,8 @@ type OrionComputerUsePermissions = {
         epicName?: string;
         epicDescription?: string;
         modelId?: string | null;
+        /** Local branch the feature branch starts from; checked out inside the rift only. */
+        baseBranch?: string;
       }) => Promise<{
         ok: boolean;
         riftPath?: string;
