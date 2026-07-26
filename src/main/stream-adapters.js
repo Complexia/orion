@@ -273,24 +273,30 @@ export const codexActivityFromItem = (item, eventType) => {
     return codexPlanActivity(item.items);
   }
   if (item.type === 'collab_tool_call') {
-    // Multi-agent collaboration calls (spawn_agent/wait/send_message). The
-    // items carry no receiver thread ids on current codex, so the actual
-    // subagents are detected from their rollout files; this row just shows
-    // the parent's collaboration step.
+    // Multi-agent collaboration calls (spawn_agent/wait/send_input/close_agent).
+    // receiver_thread_ids and agents_states arrive empty on current codex
+    // (0.145.0) and no item is emitted for spawn_agent at all, so the real
+    // subagents are discovered from their rollout files and mirrored onto the
+    // run as their own steps. This row is just the parent's collaboration step.
     const tool = String(item.tool ?? 'collaboration');
     const titles = {
       spawn_agent: 'Spawning subagent',
       wait: 'Waiting for subagents',
+      send_input: 'Messaging subagent',
       send_message: 'Messaging subagent',
       interrupt_agent: 'Interrupting subagent',
       close_agent: 'Closing subagent',
     };
+    const receivers = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids : [];
     return {
       ...base,
+      // A turn typically waits on its subagents over and over; keyed per tool
+      // those collapse into one live row instead of stacking identical steps.
+      key: tool === 'wait' ? 'collab-wait' : base.key,
       type: 'tool',
       kind: 'task',
       title: titles[tool] ?? `Subagents - ${tool}`,
-      detail: stringifySummary(item.prompt ?? '', 160),
+      detail: stringifySummary(item.prompt ?? receivers.join(', '), 160),
     };
   }
   if (item.type === 'error') {

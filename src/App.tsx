@@ -245,6 +245,28 @@ const threadWorkingDir = (
     : project.path;
 };
 
+// Provider-native ids are not necessarily globally unique (Kimi uses values
+// such as agent-0 per session). Reload recovery may search nested descendants,
+// but it must never escape the Orion thread whose run emitted the event.
+const descendantThreadIds = (threads: Thread[], rootThreadId: string): Set<string> => {
+  const ids = new Set<string>([rootThreadId]);
+  let foundChild = true;
+  while (foundChild) {
+    foundChild = false;
+    for (const thread of threads) {
+      if (
+        thread.parentThreadId &&
+        ids.has(thread.parentThreadId) &&
+        !ids.has(thread.id)
+      ) {
+        ids.add(thread.id);
+        foundChild = true;
+      }
+    }
+  }
+  return ids;
+};
+
 // Keep the shell/sidebar subscription independent from transcript payloads.
 // A token chunk replaces a Thread object, but none of these metadata fields,
 // so useShallow keeps App asleep while ChatTranscript handles the update.
@@ -762,8 +784,8 @@ const App: React.FC = () => {
   // touch thread status, queued-message dispatch, or the active-run map.
   const btwRuns = useRef(new Map<string, { threadId: string; exchangeId: string }>());
   // Provider-native subagents streamed by main (subagent/subagent-chunk/
-  // subagent-activity events): `${parentThreadId}:${subagentId}` → the child
-  // thread + agent-run message their transcript streams into.
+  // subagent-activity events): `${parentThreadId}:${providerId}:${subagentId}`
+  // → the child thread + agent-run message their transcript streams into.
   const nativeSubagentTargets = useRef(
     new Map<string, { threadId: string; messageId: string }>()
   );
@@ -2427,16 +2449,28 @@ const App: React.FC = () => {
         const info = event.type === 'subagent' ? event.subagent : undefined;
         const subagentId = info?.id ?? event.subagentId;
         if (!subagentId) return;
-        const key = `${event.threadId}:${subagentId}`;
         const state = useOrionStore.getState();
+        const runThread = state.threads.find((t) => t.id === event.threadId);
+        if (!runThread) return;
+        const providerId = (info?.providerId ??
+          event.providerId ??
+          runThread.modelId.split(':')[0]) as ProviderId;
+        const key = `${event.threadId}:${providerId}:${subagentId}`;
+        const familyThreadIds = descendantThreadIds(state.threads, runThread.id);
+        const findFamilySubagent = (providerSubagentId: string) =>
+          state.threads.find(
+            (thread) =>
+              familyThreadIds.has(thread.id) &&
+              thread.subagent?.providerId === providerId &&
+              thread.subagent.id === providerSubagentId
+          );
         let target = nativeSubagentTargets.current.get(key) ?? null;
 
         // Rebind after an app reload: the child thread persists, the ref map
-        // doesn't.
+        // doesn't. Search the run's descendants for nested agents, but keep
+        // provider-local ids inside this run's thread family.
         if (!target) {
-          const existing = state.threads.find(
-            (t) => t.parentThreadId === event.threadId && t.subagent?.id === subagentId
-          );
+          const existing = findFamilySubagent(subagentId);
           const lastRun = existing
             ? [...existing.messages].reverse().find((m) => m.kind === 'agent-run')
             : undefined;
@@ -2447,8 +2481,13 @@ const App: React.FC = () => {
         }
 
         if (!target && info) {
-          const parent = state.threads.find((t) => t.id === event.threadId);
-          if (!parent) return;
+          // A subagent can spawn its own subagents (codex collaboration
+          // spawns). Hang it off the spawning subagent's thread when main
+          // reports one, so the switcher shows the real tree instead of
+          // flattening every descendant onto the run's thread.
+          const parent =
+            (info.parentSubagentId && findFamilySubagent(info.parentSubagentId)) ||
+            runThread;
           const childThreadId = state.createThread(
             parent.projectId,
             info.title || info.kind || 'Subagent',
@@ -2461,8 +2500,7 @@ const App: React.FC = () => {
               select: false,
               subagent: {
                 id: subagentId,
-                providerId: (info.providerId ??
-                  parent.modelId.split(':')[0]) as ProviderId,
+                providerId,
                 kind: info.kind,
                 model: info.model,
                 prompt: info.prompt,
