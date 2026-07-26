@@ -72,8 +72,6 @@ export type Epic = {
 export type EpicsSettings = {
   /** Show the Epics sidebar section and epic views. */
   enabled: boolean;
-  /** AgentModel id used to write commit/PR messages; null = cheapest available. */
-  commitModelId: string | null;
   /** Ask for confirmation before settling an epic. */
   confirmSettle: boolean;
   /**
@@ -87,9 +85,36 @@ export type EpicsSettings = {
 
 export const defaultEpicsSettings: EpicsSettings = {
   enabled: true,
-  commitModelId: null,
   confirmSettle: true,
   promptGitMessages: true,
+};
+
+/**
+ * The model behind Orion's hidden text-generation turns: thread titles, epic
+ * commit messages, and PR descriptions. These are short, latency-sensitive
+ * one-shots, so the default is the fastest model on whichever providers the
+ * user actually has installed.
+ */
+export type TextGenerationSettings = {
+  /**
+   * AgentModel id. `null` means the user has never picked one, so the model is
+   * resolved from the built-in preference order (see UTILITY_MODEL_PREFERENCE
+   * in App.tsx) against the installed, enabled providers.
+   */
+  modelId: string | null;
+  /**
+   * Reasoning effort for the providers that take one (codex, claude, grok).
+   * `null` means unset, which resolves to the cheapest tier — these turns are
+   * a title or a commit message, not work worth thinking hard about. Kept as a
+   * plain string because the accepted values differ per provider; the renderer
+   * clamps it to the selected model's own options.
+   */
+  reasoningEffort: string | null;
+};
+
+export const defaultTextGenerationSettings: TextGenerationSettings = {
+  modelId: null,
+  reasoningEffort: null,
 };
 
 /** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */
@@ -145,6 +170,8 @@ export type AgentActivity = {
   kind?: string;
   title: string;
   detail?: string;
+  /** Full tool input (command, pretty-printed arguments) shown when the row is expanded. */
+  input?: string;
   /** Live tool output (streaming terminal stdout, tool result text). */
   output?: string;
   exitCode?: number;
@@ -326,6 +353,11 @@ export type Thread = {
   pinnedAt?: string;
   /** Set on unpin so the thread surfaces at the top of Recent agents. */
   unpinnedAt?: string;
+  /**
+   * Set when a run finished while the user was looking at something else, and
+   * cleared once the thread is opened. Drives the green sidebar dot.
+   */
+  finishedUnseenAt?: string;
   messages: Message[];
   // Per-provider harness session ids so follow-up turns resume the same
   // conversation (claude --resume, codex exec resume, etc.).
@@ -471,6 +503,7 @@ interface OrionState {
   providerSettings: ProviderSettings;
   orchestrationSettings: OrchestrationSettings;
   notificationSettings: NotificationSettings;
+  textGenerationSettings: TextGenerationSettings;
 
   // Actions
   setActiveTab: (tab: 'agents' | 'code') => void;
@@ -479,6 +512,7 @@ interface OrionState {
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
   setOrchestrationGeneralInstructions: (text: string) => void;
   setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
+  setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
   addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
@@ -771,8 +805,28 @@ export const useOrionStore = create<OrionState>()(
       providerSettings: defaultProviderSettings,
       orchestrationSettings: defaultOrchestrationSettings,
       notificationSettings: defaultNotificationSettings,
+      textGenerationSettings: defaultTextGenerationSettings,
 
-      setActiveTab: (tab) => set({ activeTab: tab }),
+      setActiveTab: (tab) =>
+        set((state) => {
+          const selectedThread =
+            tab === 'agents'
+              ? state.threads.find((thread) => thread.id === state.selectedThreadId)
+              : undefined;
+
+          return {
+            activeTab: tab,
+            // Returning from Code reveals the selected transcript without
+            // selecting its row again, so that also counts as opening it.
+            threads: selectedThread?.finishedUnseenAt
+              ? state.threads.map((thread) =>
+                  thread.id === selectedThread.id
+                    ? { ...thread, finishedUnseenAt: undefined }
+                    : thread
+                )
+              : state.threads,
+          };
+        }),
       setProviderEnabled: (id, enabled) =>
         set((state) => ({
           providerSettings: {
@@ -824,6 +878,14 @@ export const useOrionStore = create<OrionState>()(
           notificationSettings: {
             ...defaultNotificationSettings,
             ...state.notificationSettings,
+            ...updates,
+          },
+        })),
+      setTextGenerationSettings: (updates) =>
+        set((state) => ({
+          textGenerationSettings: {
+            ...defaultTextGenerationSettings,
+            ...state.textGenerationSettings,
             ...updates,
           },
         })),
@@ -1145,12 +1207,35 @@ export const useOrionStore = create<OrionState>()(
             // that epic. Selecting an unrelated (or missing) thread must not
             // leave a stale epic view waiting behind it.
             selectedEpicId: thread?.epicId ?? null,
+            // Opening a thread clears its "finished while you were away" mark.
+            threads: thread?.finishedUnseenAt
+              ? state.threads.map((t) =>
+                  t.id === id ? { ...t, finishedUnseenAt: undefined } : t
+                )
+              : state.threads,
           };
         }),
 
       updateThread: (id, updates) =>
         set((state) => ({
-          threads: state.threads.map((t) => (t.id === id ? { ...t, ...updates } : t)),
+          threads: state.threads.map((t) => {
+            if (t.id !== id) return t;
+            const next = { ...t, ...updates };
+            // A run that ends while the user is elsewhere leaves a dot in the
+            // sidebar until the thread is opened; starting a new run (or
+            // finishing one in the open thread) clears it again. Only a run
+            // that ran to completion counts — a stop (-> idle) was deliberate,
+            // so it needs no follow-up marker.
+            if (updates.status && updates.status !== t.status) {
+              next.finishedUnseenAt =
+                t.status === 'running' &&
+                (updates.status === 'done' || updates.status === 'error') &&
+                (state.activeTab !== 'agents' || state.selectedThreadId !== id)
+                  ? new Date().toISOString()
+                  : undefined;
+            }
+            return next;
+          }),
         })),
 
       deleteThread: (id) =>
@@ -1221,6 +1306,13 @@ export const useOrionStore = create<OrionState>()(
             id: crypto.randomUUID(),
             ts: new Date().toISOString(),
           };
+          // Providers re-emit a keyed step as it progresses, and an update can
+          // omit a field it reported earlier (a tool's input is only in the
+          // call, its output only in the result). An explicit undefined must
+          // not erase what the row already knows.
+          const patch = Object.fromEntries(
+            Object.entries(activity).filter(([, value]) => value !== undefined)
+          ) as Partial<AgentActivity>;
 
           return {
             threads: state.threads.map((thread) =>
@@ -1242,7 +1334,7 @@ export const useOrionStore = create<OrionState>()(
                             index === existingIndex
                               ? {
                                   ...existing,
-                                  ...activity,
+                                  ...patch,
                                   ts: nextActivity.ts,
                                   contentOffset: existing.contentOffset,
                                 }
@@ -1464,9 +1556,27 @@ export const useOrionStore = create<OrionState>()(
           ...defaultNotificationSettings,
           ...state.notificationSettings,
         },
+        textGenerationSettings: {
+          ...defaultTextGenerationSettings,
+          ...state.textGenerationSettings,
+        },
       }),
       merge: (persisted, current) => {
         const merged = { ...current, ...(persisted as Partial<OrionState>) };
+        // The commit/PR message model used to live on epicsSettings; it now
+        // also writes thread titles, so it moved to textGenerationSettings.
+        // Carry an explicit pick over — the old "Auto (cheapest available)"
+        // was persisted as null, which is exactly the new "never picked"
+        // value, so those users simply fall into the new default order.
+        const legacyCommitModelId = (persisted as { epicsSettings?: { commitModelId?: unknown } })
+          ?.epicsSettings?.commitModelId;
+        merged.textGenerationSettings = {
+          ...defaultTextGenerationSettings,
+          ...(typeof legacyCommitModelId === 'string' && legacyCommitModelId
+            ? { modelId: legacyCommitModelId }
+            : {}),
+          ...(persisted as Partial<OrionState>)?.textGenerationSettings,
+        };
         // Agent runs can't survive an app restart — the CLI processes die with
         // the app — so any thread or message rehydrated as 'running' is a
         // leftover from the previous session. Left alone it pins the run
@@ -1484,6 +1594,15 @@ export const useOrionStore = create<OrionState>()(
         // history, and history must not be rebranded as a restart casualty.
         const waitingOnBackground = /^Waiting on \d+ background agents?…$/;
         merged.threads = merged.threads.map((thread) => {
+          // The thread the app reopens visibly on counts as opened. Keep the
+          // marker if the selected transcript is still hidden behind Code.
+          if (
+            merged.activeTab === 'agents' &&
+            thread.id === merged.selectedThreadId &&
+            thread.finishedUnseenAt
+          ) {
+            thread = { ...thread, finishedUnseenAt: undefined };
+          }
           const waitUnresolved = thread.status === 'running';
           const stale =
             waitUnresolved || thread.messages.some((message) => message.status === 'running');

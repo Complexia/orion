@@ -120,9 +120,11 @@ import { CodeEditorPane } from './app/CodeEditorPane';
 import { ProjectIcon } from './app/ProjectIcon';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
+import { ModelPickerPopover } from './app/ModelPickerPopover';
+import { SelectMenu } from './app/SelectMenu';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import { AttachmentThumb, buildPromptWithAttachments, formatAttachmentSize, getDroppedFilePath, isMediaFile, isVideoAttachment, isVideoFile } from './app/attachments';
-import { AgentFamilySwitcher, ChatTranscript, isProviderAuthErrorText } from './app/chat';
+import { AgentFamilySwitcher, type ChatScrollPosition, ChatTranscript, isProviderAuthErrorText } from './app/chat';
 import { type FileTreeItem, FileTreeNode, InlineRenameInput } from './app/fileTree';
 import { claudeOneMillionOnlyModelSlugs, getDefaultClaudeReasoningEffort, getEffectiveClaudeContextWindow } from './app/modelPrefs';
 import { accessModeOptions, buildLinkedTaskContext, buildModelMentionsContext, buildOrchestrationContext, buildReviewThreadContext, linkedTaskFromBoardTask, linkedTaskMediaAttachments, linkedTaskStatusLabel, modelMentionToken, orchestrationRoleMeta, parseModelMentions } from './app/promptContext';
@@ -184,7 +186,15 @@ type ProviderUpdateState = {
 };
 
 type AppUpdateState = {
-  status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error';
+  status:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'downloading'
+    | 'downloaded'
+    | 'restarting'
+    | 'not-available'
+    | 'error';
   currentVersion: string;
   checkedAt?: string | null;
   availableVersion?: string | null;
@@ -253,16 +263,17 @@ const epicPrStatus = (
   }
 };
 
-// Cheap models preferred for the hidden epic commit/PR-message turns when the
-// user hasn't picked one in Settings, best value first. Falls through to any
-// available model.
-const EPIC_MESSAGE_MODEL_PREFERENCE = [
-  'claude:claude-haiku-4-5',
-  'codex:gpt-5.4-mini',
-  'codex:gpt-5.3-codex-spark',
+// Default order for Orion's hidden text-generation turns (thread titles, epic
+// commit messages, PR descriptions) when the user hasn't picked a model in
+// Settings. One entry per provider — the fastest model that provider offers —
+// so a user with a single harness gets that harness's quick model, and a user
+// with several gets them in this order. Falls through to any usable model.
+const UTILITY_MODEL_PREFERENCE = [
+  'codex:gpt-5.6-luna',
   'grok:grok-composer-2.5-fast',
-  'cursor:composer-2.5-fast',
-  'kimi:kimi-code/kimi-for-coding-highspeed',
+  'cursor:composer-2.5',
+  'claude:claude-haiku-4-5',
+  'kimi:kimi-code/kimi-for-coding',
 ];
 
 // Threads grouped under an epic that has a rift workspace (experimental Rifts
@@ -277,6 +288,28 @@ const threadWorkingDir = (
   return epic?.riftPath && !epic.riftCleanupPending
     ? epic.riftWorkingDir ?? epic.riftPath
     : project.path;
+};
+
+// Provider-native ids are not necessarily globally unique (Kimi uses values
+// such as agent-0 per session). Reload recovery may search nested descendants,
+// but it must never escape the Orion thread whose run emitted the event.
+const descendantThreadIds = (threads: Thread[], rootThreadId: string): Set<string> => {
+  const ids = new Set<string>([rootThreadId]);
+  let foundChild = true;
+  while (foundChild) {
+    foundChild = false;
+    for (const thread of threads) {
+      if (
+        thread.parentThreadId &&
+        ids.has(thread.parentThreadId) &&
+        !ids.has(thread.id)
+      ) {
+        ids.add(thread.id);
+        foundChild = true;
+      }
+    }
+  }
+  return ids;
 };
 
 // Keep the shell/sidebar subscription independent from transcript payloads.
@@ -305,6 +338,9 @@ const threadShellSignature = (thread: Thread): string => {
     thread.hiddenFromRecent ? '1' : '0',
     thread.pinnedAt,
     thread.unpinnedAt,
+    // Drives the sidebar's finished-but-unopened dot, and clearing it on open
+    // changes nothing else — so the shell has to wake for it.
+    thread.finishedUnseenAt,
     thread.parentThreadId,
     thread.branchedFromThreadId,
     thread.epicId,
@@ -422,6 +458,8 @@ const App: React.FC = () => {
     setOrchestrationGeneralInstructions,
     notificationSettings,
     setNotificationSettings,
+    textGenerationSettings,
+    setTextGenerationSettings,
     setThreadAgentSession,
     queueMessageToThread,
     removeQueuedThreadMessage,
@@ -477,6 +515,8 @@ const App: React.FC = () => {
       setOrchestrationGeneralInstructions: state.setOrchestrationGeneralInstructions,
       notificationSettings: state.notificationSettings,
       setNotificationSettings: state.setNotificationSettings,
+      textGenerationSettings: state.textGenerationSettings,
+      setTextGenerationSettings: state.setTextGenerationSettings,
       setThreadAgentSession: state.setThreadAgentSession,
       queueMessageToThread: state.queueMessageToThread,
       removeQueuedThreadMessage: state.removeQueuedThreadMessage,
@@ -536,6 +576,11 @@ const App: React.FC = () => {
   const [agentModels, setAgentModels] = useState<AgentModel[]>(fallbackAgentModels);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState('');
+  // Settings → General → Text generation drives its own copy of the picker
+  // state so opening it never disturbs the composer's picker.
+  const [utilityModelPickerOpen, setUtilityModelPickerOpen] = useState(false);
+  const [utilityModelSearch, setUtilityModelSearch] = useState('');
+  const [utilityModelTab, setUtilityModelTab] = useState<AgentProviderId>('codex');
   // Active @-mention token in the composer: index of the '@' and the query
   // typed after it (null when the caret isn't inside a mention token).
   const [chatMention, setChatMention] = useState<{ start: number; query: string } | null>(null);
@@ -763,6 +808,7 @@ const App: React.FC = () => {
   const [computerUsePerms, setComputerUsePerms] = useState<OrionComputerUsePermissions | null>(null);
   const [computerUseBusyKind, setComputerUseBusyKind] = useState<OrionComputerUsePermissionKind | null>(null);
   const [revealedProviderEmails, setRevealedProviderEmails] = useState<Record<string, boolean>>({});
+  const [revealedAccountIdentity, setRevealedAccountIdentity] = useState<string | null>(null);
   const [expandedProviderOptions, setExpandedProviderOptions] = useState<Record<string, boolean>>({});
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const branchPickerRef = useRef<HTMLDivElement>(null);
@@ -801,8 +847,8 @@ const App: React.FC = () => {
   // touch thread status, queued-message dispatch, or the active-run map.
   const btwRuns = useRef(new Map<string, { threadId: string; exchangeId: string }>());
   // Provider-native subagents streamed by main (subagent/subagent-chunk/
-  // subagent-activity events): `${parentThreadId}:${subagentId}` → the child
-  // thread + agent-run message their transcript streams into.
+  // subagent-activity events): `${parentThreadId}:${providerId}:${subagentId}`
+  // → the child thread + agent-run message their transcript streams into.
   const nativeSubagentTargets = useRef(
     new Map<string, { threadId: string; messageId: string }>()
   );
@@ -825,7 +871,11 @@ const App: React.FC = () => {
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatPinnedRef = useRef(true);
   const chatScrollTopRef = useRef(0);
+  // Per-thread transcript positions, owned here so they survive ChatTranscript
+  // unmounting (Code tab) and are shared by every thread the switcher can reach.
+  const chatScrollPositionsRef = useRef(new Map<string, ChatScrollPosition>());
   const modelPickerRef = useRef<HTMLDivElement>(null);
+  const utilityModelPickerRef = useRef<HTMLDivElement>(null);
   const taskPickerRef = useRef<HTMLDivElement>(null);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
@@ -841,10 +891,18 @@ const App: React.FC = () => {
     el.style.height = `${el.scrollHeight}px`;
   }, [chatInput, activeTab]);
 
+  // Selecting a thread no longer forces the transcript to the bottom — the
+  // transcript restores that thread's own position (bottom for never-visited
+  // ones). Positions for threads that are gone are dropped so the map tracks
+  // the live thread set.
   useEffect(() => {
-    chatPinnedRef.current = true;
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [selectedThreadId]);
+    const positions = chatScrollPositionsRef.current;
+    if (positions.size === 0) return;
+    const liveIds = new Set(threads.map((thread) => thread.id));
+    for (const threadId of positions.keys()) {
+      if (!liveIds.has(threadId)) positions.delete(threadId);
+    }
+  }, [threads]);
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
   const selectedThreadProject = selectedThread
@@ -1178,32 +1236,40 @@ const App: React.FC = () => {
   );
   const appUpdateVisible =
     !!appUpdateState &&
-    ['available', 'downloading', 'downloaded', 'error'].includes(appUpdateState.status);
+    ['available', 'downloading', 'downloaded', 'restarting', 'error'].includes(appUpdateState.status);
   const appUpdatePercent = Math.max(
     0,
     Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0))
   );
   const appUpdateLabel =
-    appUpdateState?.status === 'downloaded'
-      ? 'Restart to update'
-      : appUpdateState?.status === 'downloading'
-        ? `Downloading ${appUpdatePercent}%`
-        : appUpdateState?.status === 'error'
-          ? 'Update failed'
-          : appUpdateState?.availableVersion
-            ? `Update ${appUpdateState.availableVersion}`
-            : 'Update available';
+    appUpdateState?.status === 'restarting'
+      ? 'Restarting…'
+      : appUpdateState?.status === 'downloaded'
+        ? 'Restart to update'
+        : appUpdateState?.status === 'downloading'
+          ? `Downloading ${appUpdatePercent}%`
+          : appUpdateState?.status === 'error'
+            ? 'Update failed'
+            : appUpdateState?.availableVersion
+              ? `Update ${appUpdateState.availableVersion}`
+              : 'Update available';
   const appUpdateTitle =
     appUpdateState?.status === 'error'
       ? appUpdateState.error ?? 'Update failed'
-      : appUpdateState?.availableVersion
-        ? `Orion ${appUpdateState.availableVersion} is available`
-        : appUpdateLabel;
+      : appUpdateState?.status === 'restarting'
+        ? 'Finishing the update, then reopening Orion'
+        : appUpdateState?.availableVersion
+          ? `Orion ${appUpdateState.availableVersion} is available`
+          : appUpdateLabel;
   const accountName =
     accountState.user?.name ||
-    accountState.user?.email ||
     (accountState.authenticated ? 'Orion account' : 'Not signed in');
   const accountEmail = accountState.user?.email ?? null;
+  const accountIdentity = accountState.user
+    ? `${accountState.user.id}\n${accountEmail ?? ''}`
+    : null;
+  const accountEmailRevealed =
+    accountIdentity !== null && revealedAccountIdentity === accountIdentity;
   const accountInitials = (accountState.user?.name || accountState.user?.email || 'O')
     .split(/\s+|@/)
     .filter(Boolean)
@@ -1228,6 +1294,12 @@ const App: React.FC = () => {
         (lastActivityByProject.get(a.id) ?? -Infinity)
     );
   }, [projects, threads]);
+
+  // The Recent agents section spans every project, so its "new thread" button
+  // has no project of its own: it targets the project the last thread ran in.
+  // sortedProjects is already ordered by most recent thread activity, so that
+  // is simply the topmost project in the sidebar.
+  const recentAgentsTargetProject = sortedProjects[0] ?? null;
 
   // Subagent threads live in the in-thread subagents bar, not the sidebar.
   // A thread counts as a child only while its parent still exists — orphans
@@ -1508,35 +1580,89 @@ const App: React.FC = () => {
                   : 'PR created',
       };
 
-  // The model that writes epic commit/PR messages: the Settings pick when it's
-  // installed and its provider is enabled, else the cheapest enabled model.
-  const resolveEpicMessageModelId = useCallback(() => {
+  // Models eligible for the hidden text-generation turns. Orion can't delegate
+  // to itself, the Claude Code CLI pseudo-model is an interactive terminal, and
+  // OpenCode's non-interactive command has no mode Orion can pin to read-only —
+  // hidden turns there fail closed in main, so it is never offered.
+  const utilityCandidateModels = useMemo(
+    () =>
+      agentModels.filter(
+        (model) =>
+          !isOrionModelId(model.id) &&
+          model.id !== claudeCodeCliModelId &&
+          model.providerId !== 'opencode'
+      ),
+    [agentModels]
+  );
+  const utilityProviders = useMemo(
+    () =>
+      agentProviders.filter(
+        (provider) =>
+          provider.id !== 'orion' &&
+          enabledProviderIdSet.has(provider.id) &&
+          utilityCandidateModels.some((model) => model.providerId === provider.id)
+      ),
+    [enabledProviderIdSet, utilityCandidateModels]
+  );
+  // The model behind thread titles and epic commit/PR messages: the Settings
+  // pick when it's installed and its provider is enabled, else the fastest
+  // model on the first available provider in UTILITY_MODEL_PREFERENCE.
+  const resolvedUtilityModelId = useMemo(() => {
     const isUsable = (id: string | null | undefined): id is string => {
-      if (!id || isOrionModelId(id) || id === claudeCodeCliModelId) return false;
-      const model = agentModels.find((candidate) => candidate.id === id);
-      return (
-        !!model &&
-        model.providerId !== 'opencode' &&
-        model.available !== false &&
-        enabledProviderIdSet.has(model.providerId)
-      );
+      if (!id) return false;
+      const model = utilityCandidateModels.find((candidate) => candidate.id === id);
+      return !!model && model.available !== false && enabledProviderIdSet.has(model.providerId);
     };
-    const preferred = epicsSettings?.commitModelId ?? null;
+    const preferred = textGenerationSettings?.modelId ?? null;
     if (isUsable(preferred)) return preferred;
-    for (const id of EPIC_MESSAGE_MODEL_PREFERENCE) {
+    for (const id of UTILITY_MODEL_PREFERENCE) {
       if (isUsable(id)) return id;
     }
     return (
-      agentModels.find(
-        (model) =>
-          model.available !== false &&
-          model.providerId !== 'opencode' &&
-          enabledProviderIdSet.has(model.providerId) &&
-          !isOrionModelId(model.id) &&
-          model.id !== claudeCodeCliModelId
+      utilityCandidateModels.find(
+        (model) => model.available !== false && enabledProviderIdSet.has(model.providerId)
       )?.id ?? null
     );
-  }, [agentModels, enabledProviderIdSet, epicsSettings?.commitModelId]);
+  }, [enabledProviderIdSet, textGenerationSettings?.modelId, utilityCandidateModels]);
+  const resolvedUtilityModel = useMemo(
+    () => utilityCandidateModels.find((model) => model.id === resolvedUtilityModelId) ?? null,
+    [resolvedUtilityModelId, utilityCandidateModels]
+  );
+  const utilityModelProviderId = resolvedUtilityModel?.providerId ?? null;
+  // Reasoning tiers the picked model actually accepts, cheapest first. Cursor
+  // and Kimi take none, so they get no picker at all.
+  const utilityReasoningOptions = useMemo<Array<{ value: string; label: string }>>(() => {
+    const toOptions = (options: Array<{ value: string; label: string }>) =>
+      options.map(({ value, label }) => ({ value, label }));
+    if (!resolvedUtilityModel) return [];
+    if (resolvedUtilityModel.providerId === 'codex')
+      return toOptions(codexReasoningOptionsForModel(resolvedUtilityModel));
+    if (resolvedUtilityModel.providerId === 'claude') return toOptions(claudeReasoningOptions);
+    if (resolvedUtilityModel.providerId === 'grok') return toOptions(grokReasoningOptions);
+    return [];
+  }, [resolvedUtilityModel]);
+  // A hidden turn writes a title or a commit message, so an unset effort — and
+  // one the current model doesn't offer, e.g. Claude's Ultrathink after a
+  // switch to Codex — falls back to the cheapest tier rather than a provider
+  // default that would spend real reasoning on one sentence.
+  const resolvedUtilityReasoningEffort = useMemo(() => {
+    if (utilityReasoningOptions.length === 0) return null;
+    const stored = textGenerationSettings?.reasoningEffort ?? null;
+    if (stored && utilityReasoningOptions.some((option) => option.value === stored)) return stored;
+    return utilityReasoningOptions[0].value;
+  }, [textGenerationSettings?.reasoningEffort, utilityReasoningOptions]);
+  // Callers reach for these at the moment they fire a turn, so reading through
+  // a ref keeps them off the resolvers' identity and out of re-render churn.
+  const utilityTurnRef = useRef({
+    modelId: resolvedUtilityModelId,
+    reasoningEffort: resolvedUtilityReasoningEffort,
+  });
+  utilityTurnRef.current = {
+    modelId: resolvedUtilityModelId,
+    reasoningEffort: resolvedUtilityReasoningEffort,
+  };
+  /** `{ modelId, reasoningEffort }` for a hidden text-generation turn. */
+  const resolveUtilityTurn = useCallback(() => utilityTurnRef.current, []);
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
     try {
@@ -1754,6 +1880,28 @@ const App: React.FC = () => {
   }, [modelPickerOpen]);
 
   useEffect(() => {
+    if (!utilityModelPickerOpen) return undefined;
+
+    const close = () => {
+      setUtilityModelPickerOpen(false);
+      setUtilityModelSearch('');
+    };
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!utilityModelPickerRef.current?.contains(event.target as Node)) close();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [utilityModelPickerOpen]);
+
+  useEffect(() => {
     if (!taskPickerOpen) return undefined;
 
     const handlePointerDown = (event: MouseEvent) => {
@@ -1825,6 +1973,13 @@ const App: React.FC = () => {
       setCodexSettingsOpen(false);
     }
   }, [shouldShowAgentSettings]);
+
+  // Re-blur the account email when Settings closes or the signed-in identity
+  // changes. Keying the reveal to the identity also keeps a newly rendered
+  // account concealed before this effect clears the previous state.
+  useEffect(() => {
+    setRevealedAccountIdentity(null);
+  }, [settingsOpen, accountIdentity]);
 
   // Poll while the Computer Use tab is visible so grants toggled over in
   // System Settings show up without a manual refresh.
@@ -1947,12 +2102,24 @@ const App: React.FC = () => {
 
   const handleAppUpdateClick = useCallback(async () => {
     if (!appUpdateState || appUpdateBusy) return;
-    if (appUpdateState.status === 'downloading' || appUpdateState.status === 'checking') return;
+    if (
+      appUpdateState.status === 'downloading' ||
+      appUpdateState.status === 'checking' ||
+      appUpdateState.status === 'restarting'
+    ) {
+      return;
+    }
 
     setAppUpdateBusy(true);
     try {
       if (appUpdateState.status === 'downloaded') {
-        await window.orion?.restartToUpdate?.();
+        // Stays busy on success: the app is on its way out. Only a restart that
+        // could not go through hands the button back.
+        const result = await window.orion?.restartToUpdate?.();
+        if (result && result.ok === false) {
+          toast.error(result.error ?? 'Could not restart to update');
+          setAppUpdateBusy(false);
+        }
         return;
       }
 
@@ -2467,16 +2634,28 @@ const App: React.FC = () => {
         const info = event.type === 'subagent' ? event.subagent : undefined;
         const subagentId = info?.id ?? event.subagentId;
         if (!subagentId) return;
-        const key = `${event.threadId}:${subagentId}`;
         const state = useOrionStore.getState();
+        const runThread = state.threads.find((t) => t.id === event.threadId);
+        if (!runThread) return;
+        const providerId = (info?.providerId ??
+          event.providerId ??
+          runThread.modelId.split(':')[0]) as ProviderId;
+        const key = `${event.threadId}:${providerId}:${subagentId}`;
+        const familyThreadIds = descendantThreadIds(state.threads, runThread.id);
+        const findFamilySubagent = (providerSubagentId: string) =>
+          state.threads.find(
+            (thread) =>
+              familyThreadIds.has(thread.id) &&
+              thread.subagent?.providerId === providerId &&
+              thread.subagent.id === providerSubagentId
+          );
         let target = nativeSubagentTargets.current.get(key) ?? null;
 
         // Rebind after an app reload: the child thread persists, the ref map
-        // doesn't.
+        // doesn't. Search the run's descendants for nested agents, but keep
+        // provider-local ids inside this run's thread family.
         if (!target) {
-          const existing = state.threads.find(
-            (t) => t.parentThreadId === event.threadId && t.subagent?.id === subagentId
-          );
+          const existing = findFamilySubagent(subagentId);
           const lastRun = existing
             ? [...existing.messages].reverse().find((m) => m.kind === 'agent-run')
             : undefined;
@@ -2487,8 +2666,13 @@ const App: React.FC = () => {
         }
 
         if (!target && info) {
-          const parent = state.threads.find((t) => t.id === event.threadId);
-          if (!parent) return;
+          // A subagent can spawn its own subagents (codex collaboration
+          // spawns). Hang it off the spawning subagent's thread when main
+          // reports one, so the switcher shows the real tree instead of
+          // flattening every descendant onto the run's thread.
+          const parent =
+            (info.parentSubagentId && findFamilySubagent(info.parentSubagentId)) ||
+            runThread;
           const childThreadId = state.createThread(
             parent.projectId,
             info.title || info.kind || 'Subagent',
@@ -2501,8 +2685,7 @@ const App: React.FC = () => {
               select: false,
               subagent: {
                 id: subagentId,
-                providerId: (info.providerId ??
-                  parent.modelId.split(':')[0]) as ProviderId,
+                providerId,
                 kind: info.kind,
                 model: info.model,
                 prompt: info.prompt,
@@ -3530,7 +3713,7 @@ const App: React.FC = () => {
         projectPath: project.path,
         epicName: epic.name,
         epicDescription: epic.description,
-        modelId: resolveEpicMessageModelId(),
+        ...resolveUtilityTurn(),
         ...(request.baseBranch ? { baseBranch: request.baseBranch } : {}),
       });
       if (result.ok && result.riftPath) {
@@ -4089,7 +4272,7 @@ const App: React.FC = () => {
         epicId: epic.id,
         projectPath,
         // A hand-written message needs no model turn.
-        modelId: trimmedMessage ? null : resolveEpicMessageModelId(),
+        ...(trimmedMessage ? { modelId: null } : resolveUtilityTurn()),
         epicName: epic.name,
         ...(trimmedMessage ? { message: trimmedMessage } : {}),
         ...claim,
@@ -4252,7 +4435,7 @@ const App: React.FC = () => {
         epicId: epic.id,
         projectPath,
         // A hand-written title and description need no model turn.
-        modelId: trimmedMessage ? null : resolveEpicMessageModelId(),
+        ...(trimmedMessage ? { modelId: null } : resolveUtilityTurn()),
         epicName: epic.name,
         baseBranch,
         ...(trimmedMessage ? { message: trimmedMessage } : {}),
@@ -4970,11 +5153,13 @@ const App: React.FC = () => {
         if (isPlausibleTitle(initialTitle)) {
           updateThread(threadId, { title: initialTitle });
         }
-        // Kick off async LLM refinement for a nicer title
+        // Kick off async LLM refinement for a nicer title. The thread's own
+        // model may be a slow reasoning one (or Orion, which can't run a
+        // one-shot), so this goes through the text-generation model instead.
         void tryGenerateBetterTitle(
           threadId,
           titleSeed,
-          model.id,
+          resolveUtilityTurn(),
           threadWorkingDir(state.epics, thread, project),
           updateThread,
           thread.epicId
@@ -6291,7 +6476,7 @@ const App: React.FC = () => {
         void tryGenerateBetterTitle(
           submittedThreadId,
           promptText,
-          'claude:claude-haiku-4-5',
+          resolveUtilityTurn(),
           selectedThreadProjectPath ?? '',
           updateThread,
           currentThread.epicId
@@ -6853,6 +7038,23 @@ const App: React.FC = () => {
       </span>
     ) : null;
 
+  // Status dot at the head of a thread row: pulsing while the agent works, then
+  // steady for a run that finished while the user was elsewhere (cleared when
+  // the thread is opened). Nothing otherwise.
+  const renderThreadStatusDot = (thread: Thread) => {
+    if (thread.status === 'running') {
+      return <span className="thread-working-dot" title="Working" />;
+    }
+    if (!thread.finishedUnseenAt) return null;
+    const failed = thread.status === 'error';
+    return (
+      <span
+        className={`thread-finished-dot ${failed ? 'error' : ''}`}
+        title={failed ? 'Failed — not opened yet' : 'Finished — not opened yet'}
+      />
+    );
+  };
+
   const renderSidebarFooter = () => (
     <div className="sidebar-footer">
       {appUpdateVisible && (
@@ -6861,9 +7063,13 @@ const App: React.FC = () => {
           className={`sidebar-update-button ${appUpdateState?.status ?? 'idle'}`}
           onClick={handleAppUpdateClick}
           title={appUpdateTitle}
-          disabled={appUpdateBusy || appUpdateState?.status === 'downloading'}
+          disabled={
+            appUpdateBusy ||
+            appUpdateState?.status === 'downloading' ||
+            appUpdateState?.status === 'restarting'
+          }
         >
-          {appUpdateState?.status === 'downloaded' ? (
+          {appUpdateState?.status === 'downloaded' || appUpdateState?.status === 'restarting' ? (
             <RefreshCw size={15} />
           ) : appUpdateState?.status === 'downloading' ? (
             <span className="sidebar-update-progress" style={{ '--update-progress': `${appUpdatePercent}%` } as React.CSSProperties}>
@@ -7522,11 +7728,29 @@ const App: React.FC = () => {
                       <div className="account-card-text">
                         <div className="account-card-title">{accountName}</div>
                         <div className="account-card-subtitle">
-                          {accountLoading
-                            ? 'Checking Orion account...'
-                            : accountState.authenticated
-                              ? accountEmail || 'Signed in to Orion Web'
-                              : 'Sign in through Orion Web to authorize this desktop app.'}
+                          {accountLoading ? (
+                            'Checking Orion account...'
+                          ) : accountState.authenticated ? (
+                            accountEmail ? (
+                              <button
+                                type="button"
+                                className={`account-email-toggle${accountEmailRevealed ? ' revealed' : ''}`}
+                                onClick={() =>
+                                  setRevealedAccountIdentity((current) =>
+                                    current === accountIdentity ? null : accountIdentity
+                                  )
+                                }
+                                title={accountEmailRevealed ? 'Click to hide email' : 'Click to reveal email'}
+                                aria-label={accountEmailRevealed ? 'Hide email address' : 'Reveal email address'}
+                              >
+                                {accountEmail}
+                              </button>
+                            ) : (
+                              'Signed in to Orion Web'
+                            )
+                          ) : (
+                            'Sign in through Orion Web to authorize this desktop app.'
+                          )}
                         </div>
                       </div>
                     </div>
@@ -7726,6 +7950,86 @@ const App: React.FC = () => {
                     </div>
                   </div>
 
+                  <div className="settings-group-label">Text generation</div>
+                  <div className="settings-group settings-group-overflowing">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Model</div>
+                        <div className="setting-label-desc">
+                          Writes Orion's short generated text: thread titles, epic commit messages
+                          from staged changes, and PR descriptions from branch changes. Defaults to
+                          the fastest model on the providers you have installed.
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <div className="model-picker-anchor" ref={utilityModelPickerRef}>
+                          <button
+                            className="model-trigger"
+                            onClick={() => {
+                              setUtilityModelPickerOpen((open) => {
+                                if (!open) {
+                                  setUtilityModelSearch('');
+                                  // Open on the resolved model's provider, or the
+                                  // first one with rows if nothing resolved.
+                                  setUtilityModelTab(
+                                    utilityModelProviderId ??
+                                      utilityProviders[0]?.id ??
+                                      'codex'
+                                  );
+                                }
+                                return !open;
+                              });
+                            }}
+                          >
+                            {resolvedUtilityModel &&
+                              (() => {
+                                const ProviderIcon =
+                                  agentProviders.find(
+                                    (provider) => provider.id === resolvedUtilityModel.providerId
+                                  )?.icon ?? Play;
+                                return <ProviderIcon size={15} />;
+                              })()}
+                            <span>{resolvedUtilityModel?.label ?? 'No model available'}</span>
+                            <ChevronDown
+                              size={14}
+                              className={`model-trigger-chevron ${utilityModelPickerOpen ? 'open' : ''}`}
+                            />
+                          </button>
+
+                          {utilityModelPickerOpen && (
+                            <ModelPickerPopover
+                              placement="below"
+                              className="compact"
+                              providers={utilityProviders}
+                              models={utilityCandidateModels}
+                              activeProviderId={utilityModelTab}
+                              onActiveProviderChange={setUtilityModelTab}
+                              search={utilityModelSearch}
+                              onSearchChange={setUtilityModelSearch}
+                              selectedModelId={resolvedUtilityModelId}
+                              onSelect={(model) => {
+                                setTextGenerationSettings({ modelId: model.id });
+                                setUtilityModelPickerOpen(false);
+                                setUtilityModelSearch('');
+                              }}
+                            />
+                          )}
+                        </div>
+
+                        {utilityReasoningOptions.length > 0 && (
+                          <SelectMenu
+                            label="Reasoning effort"
+                            value={resolvedUtilityReasoningEffort}
+                            options={utilityReasoningOptions}
+                            onChange={(value) =>
+                              setTextGenerationSettings({ reasoningEffort: value })
+                            }
+                          />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="settings-group-label">Epics</div>
                   <div className="settings-group">
                     <div className="setting-row">
@@ -7763,38 +8067,6 @@ const App: React.FC = () => {
                           />
                           <span />
                         </label>
-                      </div>
-                    )}
-
-                    {epicsEnabled && (
-                      <div className="setting-row">
-                        <div className="setting-label">
-                          <div className="setting-label-title">Commit & PR message model</div>
-                          <div className="setting-label-desc">
-                            Writes an epic's commit messages from staged changes and its PR
-                            descriptions from branch changes. Auto picks the cheapest enabled model.
-                          </div>
-                        </div>
-                        <select
-                          className="setting-select"
-                          value={epicsSettings?.commitModelId ?? ''}
-                          onChange={(e) =>
-                            setEpicsSettings({ commitModelId: e.target.value || null })
-                          }
-                        >
-                          <option value="">Auto (cheapest available)</option>
-                          {orchestrationModelGroups
-                            .filter((group) => group.provider.id !== 'opencode')
-                            .map((group) => (
-                              <optgroup key={group.provider.id} label={group.provider.label}>
-                                {group.models.map((model) => (
-                                  <option key={model.id} value={model.id}>
-                                    {model.label}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            ))}
-                        </select>
                       </div>
                     )}
 
@@ -7910,8 +8182,6 @@ const App: React.FC = () => {
                         ? status.currentVersion.replace(/^v/i, '')
                         : null;
                       const hasUpdate = !!status?.updateAvailable;
-                      const isEarly =
-                        provider.id === 'cursor' || provider.id === 'grok' || provider.id === 'kimi';
 
                       // Determine subtitle
                       let subtitle = '';
@@ -7965,7 +8235,6 @@ const App: React.FC = () => {
                                 <span className="provider-name">{provider.label}</span>
                                 {version && <span className="provider-version">v{version}</span>}
                                 {hasUpdate && <span className="provider-update-arrow" title="Update available">↑</span>}
-                                {isEarly && <span className="provider-badge early">Early Access</span>}
                               </div>
                               <div
                                 className="provider-subtitle"
@@ -8558,6 +8827,7 @@ const App: React.FC = () => {
                               if (threadRenameKey !== `pinned:${thread.id}`) selectThread(thread.id);
                             }}
                           >
+                            {renderThreadStatusDot(thread)}
                             {threadRenameKey === `pinned:${thread.id}` ? (
                               <InlineRenameInput
                                 className="thread-rename-input"
@@ -8578,11 +8848,7 @@ const App: React.FC = () => {
                               {projects.find((p) => p.id === thread.projectId)?.name}
                             </span>
                             <span className="thread-time thread-meta">
-                              {thread.status === 'running' ? (
-                                <span className="thread-working-dot" title="Working" />
-                              ) : (
-                                formatShortTime(getThreadActivityTime(thread))
-                              )}
+                              {formatShortTime(getThreadActivityTime(thread))}
                             </span>
                             <div
                               className="thread-menu-wrap"
@@ -8700,6 +8966,26 @@ const App: React.FC = () => {
                       <>
                         {activeEpics.map((epic) => {
                           const epicThreads = threadsByEpic.get(epic.id) ?? [];
+                          // The project label sits on the epic row instead of
+                          // repeating on every thread under it — but only while
+                          // those threads agree on one project, so a mixed epic
+                          // keeps its per-thread tags.
+                          const epicProjectNames = new Set(
+                            epicThreads
+                              .map((thread) => projects.find((p) => p.id === thread.projectId)?.name)
+                              .filter((name): name is string => Boolean(name))
+                          );
+                          const explicitlyBoundEpicProject = epic.gitRoot
+                            ? projectForGitRoot(epic.gitRoot, epic.repositoryProjectId)
+                            : epic.repositoryProjectId
+                              ? projects.find((project) => project.id === epic.repositoryProjectId)
+                              : undefined;
+                          const epicProjectName =
+                            epicThreads.length === 0
+                              ? explicitlyBoundEpicProject?.name
+                              : epicProjectNames.size === 1
+                                ? [...epicProjectNames][0]
+                                : undefined;
                           const isEpicCollapsed = collapsedEpics[epic.id] ?? false;
                           const isEpicSelected =
                             selectedEpicId === epic.id && !selectedThreadId;
@@ -8757,6 +9043,9 @@ const App: React.FC = () => {
                                       size={13}
                                       className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
                                     />
+                                    {epicProjectName && (
+                                      <span className="epic-project-tag">{epicProjectName}</span>
+                                    )}
                                     <span className="truncate">{epic.name}</span>
                                     {isEpicCollapsed && epicThreads.length > 0 && (
                                       <span className="sidebar-section-count">
@@ -8859,6 +9148,7 @@ const App: React.FC = () => {
                                           }
                                         }}
                                       >
+                                        {renderThreadStatusDot(thread)}
                                         {threadRenameKey === `epic:${thread.id}` ? (
                                           <InlineRenameInput
                                             className="thread-rename-input"
@@ -8875,15 +9165,13 @@ const App: React.FC = () => {
                                             <span className="thread-title-text">{thread.title}</span>
                                           </span>
                                         )}
-                                        <span className="thread-project-tag thread-meta">
-                                          {projects.find((p) => p.id === thread.projectId)?.name}
-                                        </span>
+                                        {!epicProjectName && (
+                                          <span className="thread-project-tag thread-meta">
+                                            {projects.find((p) => p.id === thread.projectId)?.name}
+                                          </span>
+                                        )}
                                         <span className="thread-time thread-meta">
-                                          {thread.status === 'running' ? (
-                                            <span className="thread-working-dot" title="Working" />
-                                          ) : (
-                                            formatShortTime(getThreadActivityTime(thread))
-                                          )}
+                                          {formatShortTime(getThreadActivityTime(thread))}
                                         </span>
                                         <div
                                           className="thread-menu-wrap"
@@ -8971,27 +9259,45 @@ const App: React.FC = () => {
 
                 {projects.length > 0 && (
                   <div className="recent-agents-section">
-                    <button
-                      type="button"
-                      className="sidebar-section-toggle"
-                      onClick={() =>
-                        setRecentAgentsOpen((open) => {
-                          // Collapsing resets the list back to the default 5 on next expand.
-                          if (open) setRecentAgentsShowAll(false);
-                          return !open;
-                        })
-                      }
-                      aria-expanded={recentAgentsOpen}
-                    >
-                      <ChevronRight
-                        size={12}
-                        className={`sidebar-section-chevron ${recentAgentsOpen ? 'open' : ''}`}
-                      />
-                      <span>Recent agents</span>
-                      {runningAgentCount > 0 && (
-                        <span className="sidebar-section-count">{runningAgentCount}</span>
+                    <div className="recent-agents-header-row">
+                      <button
+                        type="button"
+                        className="sidebar-section-toggle"
+                        onClick={() =>
+                          setRecentAgentsOpen((open) => {
+                            // Collapsing resets the list back to the default 5 on next expand.
+                            if (open) setRecentAgentsShowAll(false);
+                            return !open;
+                          })
+                        }
+                        aria-expanded={recentAgentsOpen}
+                      >
+                        <ChevronRight
+                          size={12}
+                          className={`sidebar-section-chevron ${recentAgentsOpen ? 'open' : ''}`}
+                        />
+                        <span>Recent agents</span>
+                        {runningAgentCount > 0 && (
+                          <span className="sidebar-section-count">{runningAgentCount}</span>
+                        )}
+                      </button>
+                      {recentAgentsTargetProject && (
+                        <button
+                          type="button"
+                          className="project-new-thread"
+                          title={`New thread in ${recentAgentsTargetProject.name}`}
+                          aria-label={`New thread in ${recentAgentsTargetProject.name}`}
+                          onClick={() => {
+                            // The new thread lands at the top of this list, so
+                            // make sure the list is showing.
+                            setRecentAgentsOpen(true);
+                            handleCreateThread(recentAgentsTargetProject.id);
+                          }}
+                        >
+                          <SquarePen size={13} />
+                        </button>
                       )}
-                    </button>
+                    </div>
                     {recentAgentsOpen && (
                       <>
                       <div className="threads-list recent-agents-list">
@@ -9009,6 +9315,7 @@ const App: React.FC = () => {
                                 if (threadRenameKey !== `recent:${thread.id}`) selectThread(thread.id);
                               }}
                             >
+                              {renderThreadStatusDot(thread)}
                               {threadRenameKey === `recent:${thread.id}` ? (
                                 <InlineRenameInput
                                   className="thread-rename-input"
@@ -9029,11 +9336,7 @@ const App: React.FC = () => {
                                 {projects.find((p) => p.id === thread.projectId)?.name}
                               </span>
                               <span className="thread-time thread-meta">
-                                {thread.status === 'running' ? (
-                                  <span className="thread-working-dot" title="Working" />
-                                ) : (
-                                  formatShortTime(getThreadActivityTime(thread))
-                                )}
+                                {formatShortTime(getThreadActivityTime(thread))}
                               </span>
                               <div
                                 className="thread-menu-wrap"
@@ -9300,6 +9603,7 @@ const App: React.FC = () => {
                                   if (threadRenameKey !== `project:${thread.id}`) selectThread(thread.id);
                                 }}
                               >
+                                {renderThreadStatusDot(thread)}
                                 {threadRenameKey === `project:${thread.id}` ? (
                                   <InlineRenameInput
                                     className="thread-rename-input"
@@ -9317,11 +9621,7 @@ const App: React.FC = () => {
                                   </span>
                                 )}
                                 <span className="thread-time thread-meta">
-                                  {thread.status === 'running' ? (
-                                    <span className="thread-working-dot" title="Working" />
-                                  ) : (
-                                    formatShortTime(getThreadActivityTime(thread))
-                                  )}
+                                  {formatShortTime(getThreadActivityTime(thread))}
                                 </span>
                                 <div
                                   className="thread-menu-wrap"
@@ -9794,6 +10094,7 @@ const App: React.FC = () => {
                             className="thread-item"
                             onClick={() => selectThread(thread.id)}
                           >
+                            {renderThreadStatusDot(thread)}
                             <span className="thread-title">
                               {renderThreadCliBadge(thread)}
                               <span className="thread-title-text">{thread.title}</span>
@@ -9802,11 +10103,7 @@ const App: React.FC = () => {
                               {projects.find((p) => p.id === thread.projectId)?.name}
                             </span>
                             <span className="thread-time thread-meta">
-                              {thread.status === 'running' ? (
-                                <span className="thread-working-dot" title="Working" />
-                              ) : (
-                                formatShortTime(getThreadActivityTime(thread))
-                              )}
+                              {formatShortTime(getThreadActivityTime(thread))}
                             </span>
                           </div>
                         ))}
@@ -9870,6 +10167,7 @@ const App: React.FC = () => {
                           chatEndRef={chatEndRef}
                           chatPinnedRef={chatPinnedRef}
                           chatScrollTopRef={chatScrollTopRef}
+                          chatScrollPositionsRef={chatScrollPositionsRef}
                           tasksCardPosition={tasksCardPosition}
                           tasksCardCollapsed={tasksCardCollapsed}
                           tasksCardDismissedFor={tasksCardDismissedFor}
@@ -10140,127 +10438,76 @@ const App: React.FC = () => {
                             </button>
 
                             {modelPickerOpen && (
-                              <div className="model-picker-popover">
-                              <div className="model-provider-rail">
-                                {agentProviders.map((provider) => {
-                                  const Icon = provider.icon;
-                                  return (
+                              <ModelPickerPopover
+                                providers={agentProviders}
+                                models={visibleAgentModels}
+                                activeProviderId={activeProviderTab}
+                                onActiveProviderChange={setActiveProviderTab}
+                                search={modelSearch}
+                                onSearchChange={setModelSearch}
+                                selectedModelId={selectedThread.modelId}
+                                onSelect={async (model) => {
+                                  if (
+                                    selectedThread.modelId === claudeCodeCliModelId &&
+                                    model.id !== claudeCodeCliModelId
+                                  ) {
+                                    try {
+                                      await window.orion?.terminalKill?.(selectedThread.id);
+                                    } catch (error) {
+                                      console.error('Could not stop Claude Code terminal', error);
+                                    }
+                                  }
+                                  updateThread(selectedThread.id, {
+                                    modelId: model.id,
+                                    ...(selectedThread.modelId === claudeCodeCliModelId &&
+                                    model.id !== claudeCodeCliModelId
+                                      ? { status: 'idle' as const }
+                                      : {}),
+                                  });
+                                  setModelPickerOpen(false);
+                                  setModelSearch('');
+                                  if (
+                                    model.providerId !== 'codex' &&
+                                    model.providerId !== 'claude' &&
+                                    model.providerId !== 'grok'
+                                  ) {
+                                    setCodexSettingsOpen(false);
+                                  }
+                                }}
+                                overlay={
+                                  activeProviderTab === 'claude' && claudeCodeCliModel ? (
                                     <button
-                                      key={provider.id}
-                                      className={`provider-rail-button ${activeProviderTab === provider.id ? 'active' : ''}`}
-                                      onClick={() => setActiveProviderTab(provider.id)}
-                                      title={provider.label}
-                                    >
-                                      <Icon size={19} />
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                              <div
-                                className={`model-picker-panel${
-                                  activeProviderTab === 'claude' ? ' has-cli-overlay' : ''
-                                }`}
-                              >
-                                {activeProviderTab === 'claude' && claudeCodeCliModel && (
-                                  <button
-                                    type="button"
-                                    className={`model-cli-overlay${
-                                      selectedThread.modelId === claudeCodeCliModelId
-                                        ? ' selected'
-                                        : ''
-                                    }`}
-                                    onClick={async () => {
-                                      if (selectedThread.modelId === claudeCodeCliModelId) {
+                                      type="button"
+                                      className={`model-cli-overlay${
+                                        selectedThread.modelId === claudeCodeCliModelId
+                                          ? ' selected'
+                                          : ''
+                                      }`}
+                                      onClick={() => {
+                                        if (selectedThread.modelId !== claudeCodeCliModelId) {
+                                          updateThread(selectedThread.id, {
+                                            modelId: claudeCodeCliModelId,
+                                          });
+                                        }
                                         setModelPickerOpen(false);
                                         setModelSearch('');
-                                        return;
+                                      }}
+                                      disabled={claudeCodeCliModel.available === false}
+                                      title={
+                                        claudeCodeCliModel.unavailableReason ??
+                                        'Open an interactive Claude Code terminal in this thread'
                                       }
-                                      updateThread(selectedThread.id, {
-                                        modelId: claudeCodeCliModelId,
-                                      });
-                                      setModelPickerOpen(false);
-                                      setModelSearch('');
-                                    }}
-                                    disabled={claudeCodeCliModel.available === false}
-                                    title={
-                                      claudeCodeCliModel.unavailableReason ??
-                                      'Open an interactive Claude Code terminal in this thread'
-                                    }
-                                  >
-                                    <span className="model-cli-overlay-glow" aria-hidden />
-                                    <Terminal size={14} strokeWidth={2.25} />
-                                    <span className="model-cli-overlay-label">Claude Code CLI</span>
-                                    {selectedThread.modelId === claudeCodeCliModelId && (
-                                      <Check size={13} strokeWidth={2.5} />
-                                    )}
-                                  </button>
-                                )}
-                                <div className="model-search">
-                                  <Search size={16} />
-                                  <input
-                                    autoFocus
-                                    value={modelSearch}
-                                    onChange={(event) => setModelSearch(event.target.value)}
-                                    placeholder="Search models..."
-                                  />
-                                </div>
-                                <div className="model-list">
-                                  {visibleAgentModels.map((model) => {
-                                    const ProviderIcon =
-                                      agentProviders.find((provider) => provider.id === model.providerId)
-                                        ?.icon ?? Play;
-                                    const selected = selectedThread.modelId === model.id;
-                                    return (
-                                      <button
-                                        key={model.id}
-                                        className={`model-row ${selected ? 'selected' : ''}`}
-                                        onClick={async () => {
-                                          if (
-                                            selectedThread.modelId === claudeCodeCliModelId &&
-                                            model.id !== claudeCodeCliModelId
-                                          ) {
-                                            try {
-                                              await window.orion?.terminalKill?.(selectedThread.id);
-                                            } catch (error) {
-                                              console.error('Could not stop Claude Code terminal', error);
-                                            }
-                                          }
-                                          updateThread(selectedThread.id, {
-                                            modelId: model.id,
-                                            ...(selectedThread.modelId === claudeCodeCliModelId &&
-                                            model.id !== claudeCodeCliModelId
-                                              ? { status: 'idle' as const }
-                                              : {}),
-                                          });
-                                          setModelPickerOpen(false);
-                                          setModelSearch('');
-                                          if (
-                                            model.providerId !== 'codex' &&
-                                            model.providerId !== 'claude' &&
-                                            model.providerId !== 'grok'
-                                          ) {
-                                            setCodexSettingsOpen(false);
-                                          }
-                                        }}
-                                        disabled={model.available === false}
-                                        title={model.unavailableReason ?? model.slug}
-                                      >
-                                        <ProviderIcon size={18} />
-                                        <span className="model-row-text">
-                                          <span className="model-row-label">{model.label}</span>
-                                          <span className="model-row-provider">{model.providerLabel}</span>
-                                        </span>
-                                        {model.shortcut && <span className="model-shortcut">{model.shortcut}</span>}
-                                        {selected && <Check size={15} />}
-                                      </button>
-                                    );
-                                  })}
-                                  {visibleAgentModels.length === 0 && (
-                                    <div className="model-empty">No models</div>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
+                                    >
+                                      <span className="model-cli-overlay-glow" aria-hidden />
+                                      <Terminal size={14} strokeWidth={2.25} />
+                                      <span className="model-cli-overlay-label">Claude Code CLI</span>
+                                      {selectedThread.modelId === claudeCodeCliModelId && (
+                                        <Check size={13} strokeWidth={2.5} />
+                                      )}
+                                    </button>
+                                  ) : undefined
+                                }
+                              />
                           )}
                         </div>
 

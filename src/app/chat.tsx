@@ -593,6 +593,9 @@ export const AgentsWelcome: React.FC<{
   );
 };
 
+/** A thread's last transcript position: raw offset plus whether it sat at the end. */
+export type ChatScrollPosition = { top: number; pinned: boolean };
+
 export type ChatTranscriptProps = {
   threadId: string;
   projectName?: string | null;
@@ -610,6 +613,8 @@ export type ChatTranscriptProps = {
   chatEndRef: React.RefObject<HTMLDivElement | null>;
   chatPinnedRef: React.MutableRefObject<boolean>;
   chatScrollTopRef: React.MutableRefObject<number>;
+  /** Where each thread was left, so switching agents comes back to that spot. */
+  chatScrollPositionsRef: React.MutableRefObject<Map<string, ChatScrollPosition>>;
   tasksCardPosition: { x: number; y: number } | null;
   tasksCardCollapsed: boolean;
   tasksCardDismissedFor: string | null;
@@ -644,6 +649,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   chatEndRef,
   chatPinnedRef,
   chatScrollTopRef,
+  chatScrollPositionsRef,
   tasksCardPosition,
   tasksCardCollapsed,
   tasksCardDismissedFor,
@@ -738,16 +744,40 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     chatPinnedRef.current =
       element.scrollHeight - element.scrollTop - element.clientHeight < 80;
     chatScrollTopRef.current = element.scrollTop;
-  }, [chatPinnedRef, chatScrollRef, chatScrollTopRef]);
-
-  useLayoutEffect(() => {
-    const element = chatScrollRef.current;
-    if (!element) return;
-    element.scrollTo({
-      top: chatPinnedRef.current ? element.scrollHeight : chatScrollTopRef.current,
-      behavior: 'instant',
+    chatScrollPositionsRef.current.set(threadId, {
+      top: element.scrollTop,
+      pinned: chatPinnedRef.current,
     });
-  }, [chatPinnedRef, chatScrollRef, chatScrollTopRef]);
+  }, [chatPinnedRef, chatScrollPositionsRef, chatScrollRef, chatScrollTopRef, threadId]);
+
+  // The subagent switcher swaps transcripts inside the *same* scroll container,
+  // so the browser has nothing to restore: main came back pinned to whatever
+  // offset the (much shorter) subagent transcript allowed, which reads as
+  // "scrolled all the way back up". Each thread's last position is remembered on
+  // scroll and re-applied here whenever the rendered thread changes — including
+  // on remount, e.g. after a trip through the Code tab. Threads never visited
+  // default to pinned, so a freshly opened thread still opens at the latest
+  // message.
+  useLayoutEffect(() => {
+    const saved = chatScrollPositionsRef.current.get(threadId);
+    chatPinnedRef.current = saved?.pinned ?? true;
+    chatScrollTopRef.current = saved?.top ?? 0;
+
+    const applyPosition = () => {
+      const element = chatScrollRef.current;
+      if (!element) return;
+      element.scrollTo({
+        top: chatPinnedRef.current ? element.scrollHeight : chatScrollTopRef.current,
+        behavior: 'instant',
+      });
+    };
+
+    applyPosition();
+    // Markdown, code blocks and images can settle a frame late and shift the
+    // transcript out from under the restored offset; re-apply once they have.
+    const frame = requestAnimationFrame(applyPosition);
+    return () => cancelAnimationFrame(frame);
+  }, [chatPinnedRef, chatScrollPositionsRef, chatScrollRef, chatScrollTopRef, threadId]);
 
   useEffect(() => {
     if (!chatPinnedRef.current) return;

@@ -1,7 +1,15 @@
 export {};
 
 type AppUpdateState = {
-  status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error';
+  status:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'downloading'
+    | 'downloaded'
+    | 'restarting'
+    | 'not-available'
+    | 'error';
   currentVersion: string;
   checkedAt?: string | null;
   availableVersion?: string | null;
@@ -279,6 +287,7 @@ type OrionComputerUsePermissions = {
         epicId: string;
         projectPath: string;
         modelId?: string | null;
+        reasoningEffort?: string | null;
         epicName?: string;
         /** Commit message written by the user; empty means the model writes it. */
         message?: string;
@@ -304,6 +313,7 @@ type OrionComputerUsePermissions = {
         epicId: string;
         projectPath: string;
         modelId?: string | null;
+        reasoningEffort?: string | null;
         epicName?: string;
         /** Base branch the PR merges into; defaults to the remote default branch. */
         baseBranch?: string;
@@ -383,6 +393,7 @@ type OrionComputerUsePermissions = {
         epicName?: string;
         epicDescription?: string;
         modelId?: string | null;
+        reasoningEffort?: string | null;
         /** Local branch the feature branch starts from; checked out inside the rift only. */
         baseBranch?: string;
       }) => Promise<{
@@ -560,7 +571,7 @@ type OrionComputerUsePermissions = {
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: (input?: { force?: boolean }) => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
-      restartToUpdate: () => Promise<boolean>;
+      restartToUpdate: () => Promise<{ ok: boolean; error?: string }>;
       runAgentTurn: (input: {
         runId?: string;
         threadId: string;
@@ -673,6 +684,8 @@ type OrionComputerUsePermissions = {
         threadId: string;
         prompt: string;
         modelId: string;
+        /** Reasoning tier for the hidden turn; null falls back to the cheapest. */
+        reasoningEffort?: string | null;
         projectPath?: string;
         epicId?: string;
       }) => Promise<string>;
@@ -699,6 +712,8 @@ type OrionComputerUsePermissions = {
           model?: string;
           prompt?: string;
           summary?: string;
+          /** Provider id of the subagent that spawned this one, when it was not the run's own thread. */
+          parentSubagentId?: string;
           startedAt?: number;
           completedAt?: number;
           stats?: { totalTokens?: number };
@@ -733,6 +748,7 @@ type OrionComputerUsePermissions = {
           kind?: string;
           title: string;
           detail?: string;
+          input?: string;
           output?: string;
           exitCode?: number;
           diff?: { path: string; additions: number; deletions: number };

@@ -234,12 +234,17 @@ export const codexActivityFromItem = (item, eventType) => {
   const base = { key: typeof item.id === 'string' ? item.id : undefined, status };
 
   if (item.type === 'command_execution') {
-    return {
+    const activity = {
       ...base,
       type: 'command',
       title: `Command - ${stringifySummary(item.command, 80)}`,
       detail: stringifySummary(item.command),
+      input: formatToolInput(item.command),
     };
+    const output = formatToolOutput(item.aggregated_output ?? item.output);
+    if (output) activity.output = output;
+    if (typeof item.exit_code === 'number') activity.exitCode = item.exit_code;
+    return activity;
   }
   if (item.type === 'file_change') {
     const paths = Array.isArray(item.changes)
@@ -250,16 +255,21 @@ export const codexActivityFromItem = (item, eventType) => {
       type: 'tool',
       title: `File changes (${paths.length})`,
       detail: stringifySummary(paths.join(', ')),
+      input: formatToolInput(item.changes),
     };
   }
   if (item.type === 'mcp_tool_call') {
     const name = [item.server, item.tool].filter(Boolean).join('.');
-    return {
+    const activity = {
       ...base,
       type: 'tool',
       title: `Tool - ${name || 'MCP'}`,
       detail: stringifySummary(item.arguments ?? ''),
+      input: formatToolInput(item.arguments),
     };
+    const output = formatToolOutput(item.result ?? item.output);
+    if (output) activity.output = output;
+    return activity;
   }
   if (item.type === 'web_search') {
     return {
@@ -267,30 +277,38 @@ export const codexActivityFromItem = (item, eventType) => {
       type: 'tool',
       title: 'Web search',
       detail: stringifySummary(item.query ?? ''),
+      input: formatToolInput(item.query),
     };
   }
   if (item.type === 'todo_list') {
     return codexPlanActivity(item.items);
   }
   if (item.type === 'collab_tool_call') {
-    // Multi-agent collaboration calls (spawn_agent/wait/send_message). The
-    // items carry no receiver thread ids on current codex, so the actual
-    // subagents are detected from their rollout files; this row just shows
-    // the parent's collaboration step.
+    // Multi-agent collaboration calls (spawn_agent/wait/send_input/close_agent).
+    // receiver_thread_ids and agents_states arrive empty on current codex
+    // (0.145.0) and no item is emitted for spawn_agent at all, so the real
+    // subagents are discovered from their rollout files and mirrored onto the
+    // run as their own steps. This row is just the parent's collaboration step.
     const tool = String(item.tool ?? 'collaboration');
     const titles = {
       spawn_agent: 'Spawning subagent',
       wait: 'Waiting for subagents',
+      send_input: 'Messaging subagent',
       send_message: 'Messaging subagent',
       interrupt_agent: 'Interrupting subagent',
       close_agent: 'Closing subagent',
     };
+    const receivers = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids : [];
     return {
       ...base,
+      // A turn typically waits on its subagents over and over; keyed per tool
+      // those collapse into one live row instead of stacking identical steps.
+      key: tool === 'wait' ? 'collab-wait' : base.key,
       type: 'tool',
       kind: 'task',
       title: titles[tool] ?? `Subagents - ${tool}`,
-      detail: stringifySummary(item.prompt ?? '', 160),
+      detail: stringifySummary(item.prompt ?? receivers.join(', '), 160),
+      input: formatToolInput(item.prompt ?? item.arguments),
     };
   }
   if (item.type === 'error') {
@@ -325,6 +343,94 @@ export const extractCodexActivitiesFromJsonEvent = (value) => {
   const activity = codexActivityFromItem(value.item, value.type);
   return activity ? [activity] : [];
 };
+
+// Tool rows expand to show the call and its result in full, so every provider
+// keeps the raw input/output alongside the one-line summary. Cap the text so a
+// whole-file write or a chatty command doesn't bloat the persisted store:
+// inputs keep their head (a call reads from the top), outputs keep both ends
+// (what came back first, and how it ended).
+export const TOOL_TEXT_LIMIT = 4000;
+
+export const clampToolText = (text, keep = 'head', limit = TOOL_TEXT_LIMIT) => {
+  if (typeof text !== 'string' || !text.trim()) return undefined;
+  const trimmed = text.replace(/\s+$/, '');
+  if (trimmed.length <= limit) return trimmed;
+  const dropped = trimmed.length - limit;
+  const marker = `\n…(${dropped.toLocaleString()} characters hidden)…\n`;
+  if (keep === 'head') return `${trimmed.slice(0, limit)}${marker}`;
+  if (keep === 'tail') return `${marker}${trimmed.slice(-limit)}`;
+  // Results read from both ends: the head holds what was returned first (file
+  // contents, the first matches), the tail holds how it ended (errors).
+  const half = Math.floor(limit / 2);
+  return `${trimmed.slice(0, half)}${marker}${trimmed.slice(-half)}`;
+};
+
+// An argument-less call has nothing to show — "{}" is noise, not information.
+const isEmptyPayload = (value) =>
+  value !== null &&
+  typeof value === 'object' &&
+  (Array.isArray(value) ? value.length === 0 : Object.keys(value).length === 0);
+
+// Pretty-print a tool call's arguments. Objects become indented JSON; strings
+// pass through, except JSON-encoded argument blobs (codex/openai-style
+// function calls), which read far better re-indented.
+export const formatToolInput = (input) => {
+  if (input === null || input === undefined || isEmptyPayload(input)) return undefined;
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return isEmptyPayload(parsed)
+          ? undefined
+          : clampToolText(JSON.stringify(parsed, null, 2));
+      } catch {}
+    }
+    return clampToolText(input);
+  }
+  if (Array.isArray(input) && input.every((part) => typeof part === 'string')) {
+    return clampToolText(input.join(' '));
+  }
+  try {
+    return clampToolText(JSON.stringify(input, null, 2));
+  } catch {
+    return clampToolText(String(input));
+  }
+};
+
+// Tool results arrive as a plain string, as content blocks (claude/cursor
+// tool_result, ACP content entries), or as a structured payload.
+export const toolResultText = (value) => {
+  if (value === null || value === undefined || isEmptyPayload(value)) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (!part || typeof part !== 'object') return '';
+        if (typeof part.text === 'string') return part.text;
+        if (typeof part.content?.text === 'string') return part.content.text;
+        if (part.type === 'image') return '[image]';
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text;
+    if (typeof value.output === 'string') return value.output;
+    if (Array.isArray(value.content)) return toolResultText(value.content);
+    if (typeof value.content === 'string') return value.content;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return '';
+    }
+  }
+  return String(value);
+};
+
+export const formatToolOutput = (value) => clampToolText(toolResultText(value), 'both');
 
 export const stringifySummary = (value, maxLength = 180) => {
   if (value === null || value === undefined) return '';
@@ -451,7 +557,7 @@ export const activityFromCandidate = (candidate) => {
     candidate.is_error === true;
   const isCommand = rawType.includes('command') || rawType.includes('shell') || Boolean(command);
   const name = rawName || (isCommand ? 'Command' : 'Tool');
-  const detail = summarizeToolInput(input) || stringifySummary(output);
+  const detail = summarizeToolInput(input) || stringifySummary(toolResultText(output));
   const title = isResult
     ? `${name} result`
     : isCommand
@@ -464,6 +570,17 @@ export const activityFromCandidate = (candidate) => {
     detail,
     status: candidate.is_error === true ? 'error' : isResult ? 'done' : 'running',
   };
+
+  // The expanded row shows the call itself and what it returned. A tool_use
+  // block carries only the input; its tool_result counterpart only the output,
+  // which the drivers merge back onto the original row via updateForKey.
+  if (isResult) {
+    const outputText = formatToolOutput(output);
+    if (outputText) activity.output = outputText;
+  } else {
+    const inputText = formatToolInput(input);
+    if (inputText) activity.input = inputText;
+  }
 
   // Claude/cursor tool_use blocks carry an id and tool_result blocks point
   // back at it via tool_use_id — used to flip the original step to done.

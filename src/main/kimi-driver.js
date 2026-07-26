@@ -7,7 +7,7 @@ import { getMimeTypeForMediaPath } from './media.js';
 import { killAgentChild } from './run-registry.js';
 import { findKimiSessionIndexEntry } from './session-fork.js';
 import { loginShell } from './shell-env.js';
-import { countDiffLines, stringifySummary } from './stream-adapters.js';
+import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 
 // ---------------------------------------------------------------------------
 // Kimi ACP driver. kimi's prompt mode (`kimi -p --output-format stream-json`)
@@ -279,6 +279,8 @@ export const handleKimiSubagentLine = (value, api, ctx) => {
     };
     if (kind) activity.kind = kind;
     if (detail) activity.detail = detail;
+    const input = formatToolInput(event.args);
+    if (input) activity.input = input;
     api.activity(activity);
     return;
   }
@@ -289,6 +291,7 @@ export const handleKimiSubagentLine = (value, api, ctx) => {
         updateForKey: event.toolCallId,
         type: 'result',
         title: 'Tool result',
+        output: formatToolOutput(event.result?.content ?? event.result),
         status: event.result?.isError ? 'error' : 'done',
       });
     }
@@ -387,8 +390,13 @@ export const createKimiAcpDriver = ({
     };
     if (state.kind) activity.kind = state.kind;
     if (state.detail) activity.detail = state.detail;
-    // Cap live output so a chatty command doesn't bloat the persisted store.
-    if (state.output) activity.output = state.output.slice(-4000);
+    // The expanded row shows the whole call: its arguments and what it
+    // returned. Both are capped so a chatty command or a whole-file write
+    // doesn't bloat the persisted store. Before the real input lands, the
+    // streamed argument preview is the only view of the call there is.
+    const input = state.input ?? formatToolInput(state.argsPreview);
+    if (input) activity.input = input;
+    if (state.output) activity.output = formatToolOutput(state.output);
     if (typeof state.exitCode === 'number') activity.exitCode = state.exitCode;
     if (state.diff) activity.diff = state.diff;
     return activity;
@@ -478,6 +486,7 @@ export const createKimiAcpDriver = ({
     const rawInput = update.rawInput;
     if (rawInput && typeof rawInput === 'object') {
       state.preparing = false;
+      state.input = formatToolInput(rawInput);
       if (typeof rawInput.command === 'string') state.command = rawInput.command;
       const filePath = rawInput.file_path ?? rawInput.path;
       if (typeof filePath === 'string') state.filePath = filePath;
