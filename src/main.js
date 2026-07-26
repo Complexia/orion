@@ -1866,8 +1866,10 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     // would ship changes the generated message never described.
     const indexTree = await readGitIndexTree(gitRoot);
     const entries = await readStagedGitEntries(gitRoot);
-    let message = '';
-    if (input?.modelId) {
+    // A message typed in the commit dialog is used verbatim — no model turn,
+    // and no cleanup pass (that one strips artifacts of generated text).
+    let message = String(input?.message ?? '').trim();
+    if (!message && input?.modelId) {
       const context = await readStagedGitChangesContext(gitRoot, entries);
       const prompt =
         'Write a git commit message for the changes below' +
@@ -1930,6 +1932,53 @@ const riftWorktreeChangesFailure = async (gitRoot, branch, input) => {
   };
 };
 
+// Branches currently on origin, for the PR base picker. Asks the remote
+// directly (not local tracking refs) so a stale clone still offers every
+// branch a PR could actually target.
+//
+// sourceProjectPath is the epic's real repository checkout (the one a rift was
+// cloned from). Its branch is what the PR should default to merging back into,
+// so it is reported alongside the remote branches.
+ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const currentBranch = (await getCurrentGitBranch(gitRoot)) ?? null;
+    let sourceBranch = null;
+    if (input?.sourceProjectPath) {
+      try {
+        sourceBranch =
+          (await getCurrentGitBranch(await getGitRoot(input.sourceProjectPath))) ?? null;
+      } catch {
+        // The source checkout may be gone; the picker just loses its default.
+      }
+    }
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', gitRoot, 'ls-remote', '--heads', 'origin'],
+      {
+        timeout: 15_000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        maxBuffer: 1024 * 1024 * 4,
+      }
+    );
+    const branches = stdout
+      .split('\n')
+      .map((line) => line.match(/refs\/heads\/(.+)$/)?.[1]?.trim())
+      .filter(Boolean);
+    const defaultBranch = await resolveRemoteDefaultBranch(gitRoot);
+    return { ok: true, gitRoot, currentBranch, sourceBranch, defaultBranch, branches };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.stderr?.toString().trim() || error?.message || String(error),
+    };
+  }
+});
+
 ipcMain.handle('epic:createPr', async (_event, input) => {
   let gitRoot = '';
   let branch = '';
@@ -1961,7 +2010,18 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     const target = await validateEpicGitTarget(gitRoot, branch, input);
     if (!target.ok) return target;
     gitRoot = target.gitRoot;
-    const baseBranch = target.baseBranch;
+    // The renderer's base picker may target any origin branch; without a
+    // choice, fall back to the remote default branch.
+    const requestedBase = String(input?.baseBranch ?? '').trim();
+    const baseBranch = requestedBase || target.baseBranch;
+    if (baseBranch === branch) {
+      return {
+        ok: false,
+        gitRoot,
+        branch,
+        error: `Cannot open a pull request from ${branch} into itself. Choose a different base branch.`,
+      };
+    }
     const setupErrorAfterValidation = pendingRiftSetupError(input);
     if (setupErrorAfterValidation) {
       return { ok: false, gitRoot, branch, error: setupErrorAfterValidation };
@@ -2040,7 +2100,15 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
 
     let title = '';
     let body = '';
-    if (input?.modelId) {
+    // A message typed in the PR dialog replaces the generated one: its first
+    // line is the title, the rest is the description.
+    const userMessage = String(input?.message ?? '').trim();
+    if (userMessage) {
+      const newline = userMessage.indexOf('\n');
+      title = (newline === -1 ? userMessage : userMessage.slice(0, newline)).trim();
+      body = newline === -1 ? '' : userMessage.slice(newline + 1).trim();
+    }
+    if (!title && input?.modelId) {
       // Ensure the range used for message generation exists locally even when
       // the clone did not previously have an origin/HEAD tracking reference.
       // Only the generated message needs it — gh targets the remote directly,
@@ -2292,6 +2360,28 @@ ipcMain.handle('epic:createRift', async (event, input) => {
       return { ok: false, error: 'The source repository does not have a commit to create a rift from.' };
     }
 
+    // Optional base for the epic's feature branch. Resolved in the source
+    // repository up front so a stale selection fails before the expensive
+    // copy, but never checked out there — the switch happens inside the rift
+    // below, so local work in the source checkout is never at risk.
+    const requestedBaseBranch = String(input?.baseBranch ?? '').trim();
+    if (requestedBaseBranch) {
+      const baseExists = await commandSucceeds('git', [
+        '-C',
+        gitRoot,
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        `refs/heads/${requestedBaseBranch}`,
+      ]);
+      if (!baseExists) {
+        return {
+          ok: false,
+          error: `The selected base branch ${requestedBaseBranch} no longer exists in the source repository.`,
+        };
+      }
+    }
+
     // Idempotent: registers the repo with Rift on first use.
     await riftInit(gitRoot, { signal: abortController.signal });
 
@@ -2371,6 +2461,29 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     }
     if (riftShutdownRequested) {
       throw new Error('Rift creation was cancelled because Orion is quitting.');
+    }
+
+    // Start the feature branch from the requested base instead of the source
+    // checkout's HEAD. The rift copied the source's local refs, so the branch
+    // is switched here — inside the rift only.
+    if (requestedBaseBranch) {
+      // The trailing `--` forces the argument to be read as a ref. Without it a
+      // branch name that also names a tracked path (`src`, `docs`) and is missing
+      // from the copied refs restores that path instead: exit 0, HEAD unmoved,
+      // clean tree — so the epic would silently branch off sourceHead.
+      try {
+        await execFileAsync('git', ['-C', createdRiftPath, 'checkout', requestedBaseBranch, '--']);
+      } catch (checkoutError) {
+        const detail = checkoutError?.stderr?.toString().trim();
+        throw new Error(
+          `The rift could not check out the base branch ${requestedBaseBranch}.` +
+            (detail ? ` ${detail}` : '')
+        );
+      }
+      const switchedChanges = await readGitStatusEntries(createdRiftPath);
+      if (switchedChanges.length > 0) {
+        throw new Error(`The rift could not switch cleanly to ${requestedBaseBranch}.`);
+      }
     }
 
     // The rift starts on a detached HEAD with the source's working tree and

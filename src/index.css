@@ -1994,6 +1994,7 @@ body {
   background: transparent;
   color: var(--text-secondary);
   font-size: 12px;
+  white-space: nowrap;
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast);
 }
@@ -2001,6 +2002,16 @@ body {
 .project-menu-item:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+.project-menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.project-menu-item:disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
 }
 
 .project-menu-item.danger:hover {
@@ -2047,7 +2058,7 @@ body {
   top: calc(100% + 6px);
   left: 0;
   z-index: 30;
-  min-width: 142px;
+  min-width: 168px;
   padding: 4px;
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
