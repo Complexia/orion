@@ -4194,6 +4194,24 @@ const App: React.FC = () => {
 
   const handleSettleEpic = async (epic: Epic) => {
     if (epicGitBusy) return;
+    // The same rift-state guard the other epic git actions use, checked here
+    // rather than per caller: the epic view disables Settle through
+    // activeRiftUnavailable, but the sidebar epic menu only disables it for
+    // running agents. While a rift is being created or removed
+    // resolveEpicGitTarget still resolves to the source checkout (or to
+    // nothing), so the status check below would inspect the wrong tree — and
+    // settling mid-setup lets setupRiftForEpic attach a live workspace to an
+    // already-archived epic.
+    if (
+      riftSetupEpicIdsRef.current[epic.id] ||
+      riftRemovalEpicIdsRef.current.has(epic.id) ||
+      epic.riftRequest ||
+      epic.riftCleanupPending ||
+      (!epic.riftPath && riftsSettings.enabled && riftStatus === null)
+    ) {
+      toast.error('This epic’s Rift workspace is still settling — try again once it is ready');
+      return;
+    }
     if (epicHasRunningAgents(epic.id)) {
       toast.error('Agents are still running in this epic — wait for them to finish before settling it');
       return;

@@ -2425,7 +2425,19 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     // checkout's HEAD. The rift copied the source's local refs, so the branch
     // is switched here — inside the rift only.
     if (requestedBaseBranch) {
-      await execFileAsync('git', ['-C', createdRiftPath, 'checkout', requestedBaseBranch]);
+      // The trailing `--` forces the argument to be read as a ref. Without it a
+      // branch name that also names a tracked path (`src`, `docs`) and is missing
+      // from the copied refs restores that path instead: exit 0, HEAD unmoved,
+      // clean tree — so the epic would silently branch off sourceHead.
+      try {
+        await execFileAsync('git', ['-C', createdRiftPath, 'checkout', requestedBaseBranch, '--']);
+      } catch (checkoutError) {
+        const detail = checkoutError?.stderr?.toString().trim();
+        throw new Error(
+          `The rift could not check out the base branch ${requestedBaseBranch}.` +
+            (detail ? ` ${detail}` : '')
+        );
+      }
       const switchedChanges = await readGitStatusEntries(createdRiftPath);
       if (switchedChanges.length > 0) {
         throw new Error(`The rift could not switch cleanly to ${requestedBaseBranch}.`);
