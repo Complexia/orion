@@ -1498,9 +1498,14 @@ body {
   white-space: nowrap;
 }
 
-.sidebar-update-button.downloaded {
+.sidebar-update-button.downloaded,
+.sidebar-update-button.restarting {
   border-color: rgb(66 211 146 / 36%);
   background: rgb(66 211 146 / 13%);
+}
+
+.sidebar-update-button.restarting svg {
+  animation: spin 900ms linear infinite;
 }
 
 .sidebar-update-button.error {

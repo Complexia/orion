@@ -1,7 +1,15 @@
 export {};
 
 type AppUpdateState = {
-  status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error';
+  status:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'downloading'
+    | 'downloaded'
+    | 'restarting'
+    | 'not-available'
+    | 'error';
   currentVersion: string;
   checkedAt?: string | null;
   availableVersion?: string | null;
@@ -552,7 +560,7 @@ type OrionComputerUsePermissions = {
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: (input?: { force?: boolean }) => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
-      restartToUpdate: () => Promise<boolean>;
+      restartToUpdate: () => Promise<{ ok: boolean; error?: string }>;
       runAgentTurn: (input: {
         runId?: string;
         threadId: string;

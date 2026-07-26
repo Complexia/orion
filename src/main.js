@@ -29,7 +29,7 @@ import {
   pullRepo,
   pushRepo,
 } from './cloud-sync.js';
-import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, publishAppUpdateState, scheduleAppUpdateChecks } from './main/app-updater.js';
+import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
@@ -59,6 +59,7 @@ app.setAppUserModelId('com.complexia.orion');
 const hiddenSystemDirectories = new Set(['.git']);
 let quitAfterPendingWork = false;
 let quitBarrierSatisfied = false;
+let appShutdownRequested = false;
 let riftShutdownRequested = false;
 const pendingRiftCreations = new Set();
 const pendingRiftEpicIds = new Set();
@@ -917,7 +918,8 @@ app.on('window-all-closed', () => {
 
 // Persistent claude sessions outlive individual turns; kill their CLI
 // processes (and any background subagents inside them) when Orion exits.
-app.on('will-quit', (event) => {
+const disposeForQuit = () => {
+  appShutdownRequested = true;
   riftShutdownRequested = true;
   rememberRiftCleanupForQuit(
     [...pendingRiftCreations].map((creation) => creation.riftPath()).filter(Boolean)
@@ -928,24 +930,44 @@ app.on('will-quit', (event) => {
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
   reapActiveAgentRuns();
+};
+
+// Resolves once active children have exited (including the SIGKILL fallback),
+// any /goal pauses are recorded, and the latest transcript queue has settled.
+// Waiting for the queue after agent shutdown matters: shutdown can enqueue a
+// goal-pause persistence write of its own.
+const waitForPendingQuitWork = () =>
+  Promise.all([waitForPendingAgentShutdowns(), waitForPendingRiftCreations()])
+    .then(() => threadsSaveQueue.catch(() => {}));
+
+app.on('will-quit', (event) => {
+  disposeForQuit();
   if (quitBarrierSatisfied) return;
 
-  // Hold quit open until active children exit (including the SIGKILL
-  // fallback), any /goal pauses are recorded, and the latest transcript
-  // queue has settled. Waiting for the queue after agent shutdown matters:
-  // shutdown can enqueue a goal-pause persistence write of its own.
+  // Hold quit open until the pending work above has landed.
   event.preventDefault();
   if (!quitAfterPendingWork) {
     quitAfterPendingWork = true;
-    void Promise.all([waitForPendingAgentShutdowns(), waitForPendingRiftCreations()])
-      .then(() => threadsSaveQueue.catch(() => {}))
-      .finally(() => {
-        quitAfterPendingWork = false;
-        quitBarrierSatisfied = true;
-        app.quit();
-      });
+    void waitForPendingQuitWork().finally(() => {
+      quitAfterPendingWork = false;
+      quitBarrierSatisfied = true;
+      app.quit();
+    });
   }
 });
+
+// The updater installs by quitting the app, and the barrier above answers that
+// quit with preventDefault() — which cancels the terminate Squirrel is waiting
+// on. Drain the same work up front so the installing quit runs straight
+// through instead of being held (and possibly dropped).
+const settleQuitBarrierForUpdate = async () => {
+  if (quitBarrierSatisfied) return;
+  disposeForQuit();
+  // If a quit is already draining this same work, waiting on it here settles at
+  // the same time; either way the barrier is open once the work has landed.
+  await waitForPendingQuitWork().catch(() => {});
+  quitBarrierSatisfied = true;
+};
 
 // In this file you can include the rest of your app's specific main process
 // code. You can also put them in separate files and import them here.
@@ -3369,11 +3391,45 @@ ipcMain.handle('appUpdate:download', async () => {
   return appUpdateState;
 });
 
+let appUpdateRestartRequested = false;
+
+const restartForAppUpdate = async () => {
+  if (appUpdateRestartRequested) return { ok: true };
+  appUpdateRestartRequested = true;
+  publishAppUpdateState({ status: 'restarting', progress: null, error: null });
+
+  try {
+    // "Downloaded" only means the zip is on disk; Squirrel still has to pull it
+    // through electron-updater's proxy server and stage it. quitAndInstall()
+    // before that finishes is swallowed — the click looks like a no-op — so
+    // wait for the update to actually be installable first.
+    const staged = await waitForAppUpdateStagedForInstall();
+    if (!staged) {
+      appUpdateRestartRequested = false;
+      invalidateAppUpdateDownload();
+      const error =
+        appUpdateState.error ??
+        'Orion could not prepare the update. Try downloading it again.';
+      publishAppUpdateState({ status: 'error', progress: null, error });
+      return { ok: false, error };
+    }
+
+    await settleQuitBarrierForUpdate();
+    const autoUpdater = await initializeAppUpdater();
+    autoUpdater.quitAndInstall(false, true);
+    return { ok: true };
+  } catch (error) {
+    appUpdateRestartRequested = false;
+    publishAppUpdateState({ status: 'downloaded', progress: null, error: null });
+    return { ok: false, error: error?.message ?? 'Could not restart to update' };
+  }
+};
+
 ipcMain.handle('appUpdate:restart', async () => {
-  if (appUpdateState.status !== 'downloaded') return false;
-  const autoUpdater = await initializeAppUpdater();
-  autoUpdater.quitAndInstall(false, true);
-  return true;
+  if (appUpdateState.status !== 'downloaded' && appUpdateState.status !== 'restarting') {
+    return { ok: false, error: 'No update is ready to install' };
+  }
+  return restartForAppUpdate();
 });
 
 // The renderer reports a spawned subagent's outcome here, unblocking the
@@ -3405,15 +3461,17 @@ ipcMain.handle('orchestration:subagentStopResult', (_event, payload) => {
 });
 
 ipcMain.handle('agent:runTurn', async (event, input) => {
+  if (appShutdownRequested) {
+    return { ok: false, error: 'Orion is restarting to install an update.' };
+  }
+  const runId = input?.runId || crypto.randomUUID();
   // Synchronous, before the first await: IPC handlers start in arrival
   // order, so a stop/steer sent after this runTurn is guaranteed to see the
   // entry (or the fully registered run).
-  if (input?.runId) {
-    startingAgentRuns.set(input.runId, {
-      aborted: false,
-      threadId: input.threadId,
-    });
-  }
+  startingAgentRuns.set(runId, {
+    aborted: false,
+    threadId: input?.threadId,
+  });
   try {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
       return { ok: false, error: 'Missing threadId, projectPath, prompt, or modelId.' };
@@ -3450,8 +3508,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (!available) {
       return { ok: false, error: `${model.command} is not installed or not on PATH.` };
     }
-
-    const runId = input.runId || crypto.randomUUID();
 
     // Capture before Orion's own managed-file writes so they remain visible
     // in the run's changed-files summary. Read only must not mutate the
@@ -4219,7 +4275,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     console.error('agent:runTurn error', error);
     return { ok: false, error: error?.message ?? String(error) };
   } finally {
-    if (input?.runId) startingAgentRuns.delete(input.runId);
+    startingAgentRuns.delete(runId);
   }
 });
 
@@ -4267,6 +4323,9 @@ ipcMain.handle('agent:isRunFinalizing', (_event, runId) => finalizingAgentRuns.h
 ipcMain.handle('agent:codexGoal', async (_event, input) => {
   const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
   try {
+    if (appShutdownRequested) {
+      return { ok: false, error: 'Orion is restarting to install an update.' };
+    }
     if (!input?.sessionId || !threadId || !input?.projectPath || !input?.action) {
       return { ok: false, error: 'Missing sessionId, threadId, projectPath, or action.' };
     }
@@ -4686,6 +4745,9 @@ const disposeAllTerminalSessions = () => {
 // the watcher discover the CLI's persisted session id for restart/resume.
 ipcMain.handle('terminal:ensure', async (_event, input) => {
   try {
+    if (appShutdownRequested) {
+      return { ok: false, error: 'Orion is restarting to install an update.' };
+    }
     const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
     const projectPath = typeof input?.projectPath === 'string' ? input.projectPath : '';
     const accessMode = ['read-only', 'workspace-write', 'full-access'].includes(
@@ -5133,6 +5195,7 @@ const runOneShotForModelId = async (modelId, prompt, projectPath, options) => {
 // Generate a short, relevant title for a thread based on the first user prompt.
 // This runs a lightweight non-streaming call and returns just the title string.
 ipcMain.handle('agent:generateTitle', async (_event, input) => {
+  if (appShutdownRequested) return '';
   const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
   if (!threadId || !input?.prompt || !input?.modelId) return '';
   const controller = new AbortController();
