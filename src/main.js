@@ -2301,6 +2301,51 @@ ipcMain.handle('epic:gitStatus', async (_event, input) => {
   }
 });
 
+// Batch PR-state lookup behind the sidebar's epic icon colours. Deliberately
+// not a loop over epic:gitStatus: that also runs `git status` and `rev-list`
+// against each epic's workspace, which is wasted work here and throws for
+// rifts that are pending or mid-removal. Per-epic failures are dropped from
+// the response so the renderer keeps the state it already has.
+ipcMain.handle('epic:prStates', async (_event, input) => {
+  const requested = Array.isArray(input?.epics) ? input.epics : [];
+  const targets = requested.filter((entry) => entry?.epicId && entry?.prUrl);
+  if (targets.length === 0) return { ok: true, states: [] };
+  if (!(await checkCommandAvailable('gh'))) {
+    return { ok: false, error: 'The GitHub CLI (gh) is not available.' };
+  }
+
+  const states = [];
+  const queue = [...targets];
+  const lookup = async () => {
+    for (;;) {
+      const target = queue.shift();
+      if (!target) return;
+      // prUrl is a full URL, so gh resolves the repo from it; cwd only decides
+      // which credentials apply. Fall back to the app cwd when the epic's
+      // workspace is gone rather than failing the lookup outright.
+      let cwd;
+      try {
+        cwd = target.projectPath ? await getGitRoot(target.projectPath) : undefined;
+      } catch {
+        cwd = undefined;
+      }
+      try {
+        const { stdout } = await execFileAsync(
+          'gh',
+          ['pr', 'view', String(target.prUrl), '--json', 'state'],
+          { ...(cwd ? { cwd } : {}), timeout: 15_000 }
+        );
+        const parsed = JSON.parse(stdout);
+        if (parsed?.state) states.push({ epicId: target.epicId, state: parsed.state });
+      } catch {
+        // Offline, gh unauthenticated, or the PR is gone.
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, targets.length) }, lookup));
+  return { ok: true, states };
+});
+
 // --- Epics: rift workspaces (experimental) -------------------------------
 
 ipcMain.handle('rift:status', () => ({

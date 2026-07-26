@@ -19,10 +19,18 @@ export type Epic = {
   /** Optional longer notes for the epic (editable in the epic view). */
   description?: string;
   createdAt: string;
-  /** Set when the epic is settled (PR merged); settled epics are archived. */
+  /** Set when the user settles the epic; settled epics are archived. */
   settledAt?: string;
   /** URL of the PR opened from this epic, if any. */
   prUrl?: string;
+  /**
+   * Last known lifecycle state of prUrl's pull request. Persisted so the
+   * sidebar can colour every epic's icon on first paint instead of waiting on
+   * a round of `gh pr view` calls.
+   */
+  prState?: 'OPEN' | 'CLOSED' | 'MERGED';
+  /** ISO start timestamp of the last accepted successful prState refresh. */
+  prStateCheckedAt?: string;
   /** Project explicitly selected as the repository for this epic's git actions. */
   repositoryProjectId?: string;
   /** Canonical repository root claimed by this epic's git actions. */

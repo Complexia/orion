@@ -229,6 +229,40 @@ type SettingsTab =
 
 const THREADS_VISIBLE_LIMIT = 5;
 
+// How often the sidebar refreshes non-merged PRs. This hits the network (one
+// `gh pr view` per epic), so keep it far slower than the 5s local-git poll
+// behind the selected epic's buttons. Focus refreshes share this same throttle.
+const EPIC_PR_STATE_REFRESH_MS = 5 * 60_000;
+
+type EpicPrStatus = 'open' | 'merged' | 'closed';
+
+type EpicPrLookupRequest = {
+  expectedPrUrl: string;
+  order: number;
+  startedAt: string;
+};
+
+// Single source of truth for "what state is this epic's PR in", shared by the
+// sidebar icon colour and the epic view's badge. Successful selected-workspace
+// reads and URL-only batch reads both update the persisted epic, so rendering
+// from that value prevents an older local status cache masking a newer batch
+// result when the selected workspace later becomes unavailable.
+const epicPrStatus = (
+  epic: Pick<Epic, 'prUrl' | 'prState'> | undefined | null
+): EpicPrStatus | null => {
+  if (!epic?.prUrl) return null;
+  switch (epic.prState) {
+    case 'OPEN':
+      return 'open';
+    case 'MERGED':
+      return 'merged';
+    case 'CLOSED':
+      return 'closed';
+    default:
+      return null;
+  }
+};
+
 // Default order for Orion's hidden text-generation turns (thread titles, epic
 // commit messages, PR descriptions) when the user hasn't picked a model in
 // Settings. One entry per provider — the fastest model that provider offers —
@@ -673,7 +707,7 @@ const App: React.FC = () => {
   const [epicMenuOpenId, setEpicMenuOpenId] = useState<string | null>(null);
   const [epicRenameId, setEpicRenameId] = useState<string | null>(null);
   const [epicRepoPickerOpen, setEpicRepoPickerOpen] = useState(false);
-  // One epic git action (commit/PR) at a time; the epic view's buttons disable
+  // One epic git action (commit/PR/status) at a time; the epic view's buttons disable
   // while it runs.
   const [epicGitBusy, setEpicGitBusy] = useState<
     'commit' | 'pr' | 'pr-branches' | 'settle' | null
@@ -695,12 +729,16 @@ const App: React.FC = () => {
     baseBranch: string;
     message: string;
   } | null>(null);
+  const [epicSettleDialog, setEpicSettleDialog] = useState<{
+    epic: Epic;
+    warnings: string[];
+  } | null>(null);
   const [epicPrBaseBranchPickerOpen, setEpicPrBaseBranchPickerOpen] = useState(false);
   const epicPrBaseBranchPickerRef = useRef<HTMLDivElement>(null);
-  // Escape dismisses either git-message dialog, matching the create-epic modal.
+  // Escape dismisses any epic-action dialog, matching the create-epic modal.
   // An open base-branch dropdown closes first before the dialog itself.
   useEffect(() => {
-    if (!epicCommitDialog && !epicPrBaseDialog) return undefined;
+    if (!epicCommitDialog && !epicPrBaseDialog && !epicSettleDialog) return undefined;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       e.preventDefault();
@@ -710,10 +748,11 @@ const App: React.FC = () => {
       }
       setEpicCommitDialog(null);
       setEpicPrBaseDialog(null);
+      setEpicSettleDialog(null);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [epicCommitDialog, epicPrBaseDialog, epicPrBaseBranchPickerOpen]);
+  }, [epicCommitDialog, epicPrBaseDialog, epicPrBaseBranchPickerOpen, epicSettleDialog]);
 
   // Click-outside for the Create PR base-branch Tailwind dropdown.
   useEffect(() => {
@@ -733,15 +772,15 @@ const App: React.FC = () => {
     if (!epicPrBaseDialog) setEpicPrBaseBranchPickerOpen(false);
   }, [epicPrBaseDialog]);
   // Live workspace status behind the epic git buttons: "Commit & push" greys
-  // out when the workspace is clean and fully pushed, and a created PR shows
-  // its lifecycle state (open/merged/closed) instead of the Create PR button.
+  // out when the workspace is clean and fully pushed. PR lifecycle is kept in
+  // the persisted epic instead so URL-only refreshes and workspace reads do
+  // not create competing caches.
   const [epicGitStatuses, setEpicGitStatuses] = useState<
     Record<
       string,
       {
         hasChangesToCommit: boolean;
         hasUnpushedCommits: boolean;
-        prState?: 'OPEN' | 'CLOSED' | 'MERGED';
       }
     >
   >({});
@@ -1524,21 +1563,22 @@ const App: React.FC = () => {
     !selectedEpicGitStatus ||
     selectedEpicGitStatus.hasChangesToCommit ||
     selectedEpicGitStatus.hasUnpushedCommits;
-  // Unlike selectedEpicHasWorkToPush this needs a known status: an unknown
-  // one must not disable Settle — handleSettleEpic re-verifies on click.
-  const selectedEpicHasUnsettledWork = Boolean(
-    selectedEpicGitStatus &&
-      (selectedEpicGitStatus.hasChangesToCommit || selectedEpicGitStatus.hasUnpushedCommits)
-  );
-  const selectedEpicPrBadge = !selectedEpic?.prUrl
+  const selectedEpicPrStatus = epicPrStatus(selectedEpic);
+  const selectedEpicPrBadge = !selectedEpicPrStatus
     ? null
-    : selectedEpicGitStatus?.prState === 'MERGED'
-      ? { label: 'PR merged', modifier: 'merged' as const }
-      : selectedEpicGitStatus?.prState === 'CLOSED'
-        ? { label: 'PR closed', modifier: 'closed' as const }
-        : selectedEpicGitStatus?.prState === 'OPEN'
-          ? { label: 'PR open', modifier: 'open' as const }
-          : { label: 'PR created', modifier: 'open' as const };
+    : {
+        modifier: selectedEpicPrStatus,
+        label:
+          selectedEpicPrStatus === 'merged'
+            ? 'PR merged'
+            : selectedEpicPrStatus === 'closed'
+              ? 'PR closed'
+              : // Distinguish a confirmed-open PR from one we've only just
+                // created and not yet read back.
+                selectedEpic?.prState
+                  ? 'PR open'
+                  : 'PR created',
+      };
 
   // Models eligible for the hidden text-generation turns. Orion can't delegate
   // to itself, the Claude Code CLI pseudo-model is an interactive terminal, and
@@ -3960,18 +4000,74 @@ const App: React.FC = () => {
     }
   };
 
+  // Order every PR lookup when it starts. A later request immediately
+  // supersedes an earlier one for the same epic, regardless of which network
+  // response completes first.
+  const epicPrLookupOrderRef = useRef(0);
+  const latestEpicPrLookupOrderRef = useRef<Map<string, number>>(new Map());
+  const beginEpicPrLookup = (
+    epicId: string,
+    expectedPrUrl: string
+  ): EpicPrLookupRequest => {
+    const order = ++epicPrLookupOrderRef.current;
+    latestEpicPrLookupOrderRef.current.set(epicId, order);
+    return {
+      expectedPrUrl,
+      order,
+      startedAt: new Date().toISOString(),
+    };
+  };
+
+  const persistEpicPrLookup = (
+    epicId: string,
+    state: 'OPEN' | 'CLOSED' | 'MERGED',
+    request: EpicPrLookupRequest
+  ) => {
+    const currentEpic = useOrionStore
+      .getState()
+      .epics.find((epic) => epic.id === epicId);
+    if (
+      !currentEpic ||
+      currentEpic.prUrl !== request.expectedPrUrl ||
+      latestEpicPrLookupOrderRef.current.get(epicId) !== request.order
+    ) {
+      return;
+    }
+    updateEpic(epicId, {
+      prState: state,
+      // Record the accepted request's start time rather than its completion
+      // time, which could make an older slow request appear newer in storage.
+      prStateCheckedAt: request.startedAt,
+    });
+  };
+
+  const selectedEpicGitPollKey = selectedEpic
+    ? JSON.stringify([
+        selectedEpic.id,
+        selectedEpic.prUrl ?? null,
+        resolveEpicGitTarget(selectedEpic).projectPath ?? null,
+      ])
+    : null;
+  const selectedEpicRemovalPending = selectedEpic
+    ? Boolean(riftRemovalEpicIds[selectedEpic.id])
+    : false;
+
   useEffect(() => {
     if (
       !selectedEpic ||
       epicGitBusy ||
       activeRiftUnavailable ||
-      riftRemovalEpicIds[selectedEpic.id]
+      selectedEpicRemovalPending
     ) {
       return;
     }
     let cancelled = false;
     let refreshTimer: number | undefined;
     const run = async (includePr: boolean) => {
+      const prLookup =
+        includePr && selectedEpic.prUrl
+          ? beginEpicPrLookup(selectedEpic.id, selectedEpic.prUrl)
+          : null;
       const result = await refreshEpicGitStatus(selectedEpic, { includePr });
       if (cancelled) return;
       if (result) {
@@ -3980,9 +4076,12 @@ const App: React.FC = () => {
           [selectedEpic.id]: {
             hasChangesToCommit: Boolean(result.hasChangesToCommit),
             hasUnpushedCommits: Boolean(result.hasUnpushedCommits),
-            prState: result.pr?.state ?? current[selectedEpic.id]?.prState,
           },
         }));
+        // Mirror into the store so the sidebar icon agrees with the badge.
+        if (result.pr?.state && prLookup) {
+          persistEpicPrLookup(selectedEpic.id, result.pr.state, prLookup);
+        }
       }
       refreshTimer = window.setTimeout(() => void run(false), 5000);
     };
@@ -3994,7 +4093,101 @@ const App: React.FC = () => {
     // refreshEpicGitStatus is recreated every render; depending on it would
     // refire the effect every render and defeat the refresh loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedEpic, epicGitBusy, activeRiftUnavailable, riftRemovalEpicIds]);
+  }, [
+    selectedEpicGitPollKey,
+    epicGitBusy,
+    activeRiftUnavailable,
+    selectedEpicRemovalPending,
+  ]);
+
+  // The sidebar and archive both colour epic icons by PR state, so include
+  // settled epics as well as active ones. Merged PRs are immutable and need no
+  // further network reads; excluding them keeps the archive cheap after its
+  // initial migration from epics that predate persisted prState.
+  const epicPrTargets = useMemo(() => {
+    if (!epicsEnabled) return [];
+    const projectPathsById = new Map(projects.map((project) => [project.id, project.path]));
+    return epics.flatMap((epic) => {
+      if (!epic.prUrl || epic.prState === 'MERGED') return [];
+      const projectPath = epic.riftCleanupPending
+        ? undefined
+        : epic.riftPath ??
+          epic.gitRoot ??
+          (epic.repositoryProjectId
+            ? projectPathsById.get(epic.repositoryProjectId)
+            : undefined);
+      return [{ epicId: epic.id, prUrl: epic.prUrl, ...(projectPath ? { projectPath } : {}) }];
+    });
+  }, [epics, epicsEnabled, projects]);
+  const epicPrTargetsRef = useRef(epicPrTargets);
+  epicPrTargetsRef.current = epicPrTargets;
+  const hasEpicPrTargets = epicPrTargets.length > 0;
+
+  useEffect(() => {
+    if (!hasEpicPrTargets || !window.orion?.epicPrStates) return;
+    let cancelled = false;
+    let inFlight = false;
+    let timer: number | undefined;
+    let lastLookupAt = 0;
+
+    const run = async () => {
+      if (cancelled || inFlight) return;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+      // Do not wake up periodically while hidden. Focus catches up using the
+      // same elapsed-time throttle as the visible timer.
+      if (document.hidden) return;
+      const elapsed = Date.now() - lastLookupAt;
+      if (lastLookupAt > 0 && elapsed < EPIC_PR_STATE_REFRESH_MS) {
+        timer = window.setTimeout(() => void run(), EPIC_PR_STATE_REFRESH_MS - elapsed);
+        return;
+      }
+      inFlight = true;
+      lastLookupAt = Date.now();
+      try {
+        const requestedTargets = epicPrTargetsRef.current;
+        const lookupRequests = new Map(
+          requestedTargets.map((target) => [
+            target.epicId,
+            beginEpicPrLookup(target.epicId, target.prUrl),
+          ])
+        );
+        const result = await window.orion.epicPrStates({ epics: requestedTargets });
+        if (cancelled) return;
+        const knownById = new Map(
+          useOrionStore.getState().epics.map((epic) => [epic.id, epic])
+        );
+        for (const entry of result.states ?? []) {
+          if (!knownById.has(entry.epicId)) continue;
+          const request = lookupRequests.get(entry.epicId);
+          if (request) persistEpicPrLookup(entry.epicId, entry.state, request);
+        }
+      } catch {
+        // Offline or gh unavailable: keep the persisted colours.
+      } finally {
+        inFlight = false;
+      }
+      if (cancelled) return;
+      // Always reschedule off the latest run so a focus-triggered refresh
+      // replaces the pending tick instead of stacking a second chain.
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => void run(), EPIC_PR_STATE_REFRESH_MS);
+    };
+
+    void run();
+    const onFocus = () => void run();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+    // updateEpic is a stable store action; target changes are read from a ref
+    // and do not restart the timer or duplicate a whole batch lookup.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasEpicPrTargets]);
 
   // Click-time recheck that no agent grouped under the epic — including
   // descendant subagent threads — is still running. The rendered disabled
@@ -4252,18 +4445,10 @@ const App: React.FC = () => {
         claimEpicGitTarget(epic, result);
         const url = result.url;
         if (url) {
-          updateEpic(epic.id, { prUrl: url });
-          setEpicGitStatuses((current) => {
-            const status = current[epic.id];
-            return status
-              ? {
-                  ...current,
-                  [epic.id]: {
-                    ...status,
-                    prState: 'OPEN',
-                  },
-                }
-              : current;
+          updateEpic(epic.id, {
+            prUrl: url,
+            prState: 'OPEN',
+            prStateCheckedAt: new Date().toISOString(),
           });
         }
         toast.success(
@@ -4563,75 +4748,101 @@ const App: React.FC = () => {
 
   const handleSettleEpic = async (epic: Epic) => {
     if (epicGitBusy) return;
-    // The same rift-state guard the other epic git actions use, checked here
-    // rather than per caller: the epic view disables Settle through
-    // activeRiftUnavailable, but the sidebar epic menu only disables it for
-    // running agents. While a rift is being created or removed
-    // resolveEpicGitTarget still resolves to the source checkout (or to
-    // nothing), so the status check below would inspect the wrong tree — and
-    // settling mid-setup lets setupRiftForEpic attach a live workspace to an
-    // already-archived epic.
-    if (
-      riftSetupEpicIdsRef.current[epic.id] ||
-      riftRemovalEpicIdsRef.current.has(epic.id) ||
-      epic.riftRequest ||
-      epic.riftCleanupPending ||
-      (!epic.riftPath && riftsSettings.enabled && riftStatus === null)
-    ) {
-      toast.error('This epic’s Rift workspace is still settling — try again once it is ready');
-      return;
-    }
     if (epicHasRunningAgents(epic.id)) {
       toast.error('Agents are still running in this epic — wait for them to finish before settling it');
       return;
     }
-    // Verify at click time instead of trusting the rendered status: the poll
-    // refetches PR state only on its first pass, so the badge can lag a merge
-    // that happened on GitHub while the epic stayed selected. An epic with no
-    // repository (or a failed status read) falls through to the confirm — the
-    // epic git buttons all fail open without a status.
-    setEpicGitBusy('settle');
+
+    // Git and PR state only shapes the warning. It never blocks settlement:
+    // archiving an epic is a user choice, even when its work has not been
+    // committed, pushed, or opened as a pull request.
     let status;
-    try {
-      status = await refreshEpicGitStatus(epic, { includePr: true });
-    } finally {
-      setEpicGitBusy(null);
+    const riftUnavailable =
+      riftSetupEpicIdsRef.current[epic.id] ||
+      riftRemovalEpicIdsRef.current.has(epic.id) ||
+      epic.riftRequest ||
+      epic.riftCleanupPending ||
+      (!epic.riftPath && riftsSettings.enabled && riftStatus === null);
+    if (!riftUnavailable) {
+      setEpicGitBusy('settle');
+      const prLookup = epic.prUrl ? beginEpicPrLookup(epic.id, epic.prUrl) : null;
+      try {
+        status = await refreshEpicGitStatus(epic, { includePr: true });
+      } finally {
+        setEpicGitBusy(null);
+      }
+      if (status?.pr?.state && prLookup) {
+        persistEpicPrLookup(epic.id, status.pr.state, prLookup);
+      }
     }
+
     if (status) {
       setEpicGitStatuses((current) => ({
         ...current,
         [epic.id]: {
           hasChangesToCommit: Boolean(status.hasChangesToCommit),
           hasUnpushedCommits: Boolean(status.hasUnpushedCommits),
-          prState: status.pr?.state ?? current[epic.id]?.prState,
         },
       }));
-      if (status.hasChangesToCommit) {
-        toast.error('This epic has uncommitted changes — commit and push them before settling it');
-        return;
-      }
-      if (status.hasUnpushedCommits) {
-        toast.error('This epic has unpushed commits — push them before settling it');
-        return;
-      }
-      // A closed-without-merge PR does not block: that path abandons the PR
-      // deliberately (the epic view offers a replacement PR instead).
-      if (epic.prUrl && (status.pr?.state ?? epicGitStatuses[epic.id]?.prState) === 'OPEN') {
-        toast.error('This epic’s pull request is still open — merge it before settling');
-        return;
-      }
     }
+
+    const warnings: string[] = [];
+    if (status?.hasChangesToCommit) {
+      warnings.push(
+        'This workspace has uncommitted changes. The epic will be archived without committing them.'
+      );
+    }
+    if (status?.hasUnpushedCommits) {
+      warnings.push(
+        'This workspace has commits that have not been pushed. Settling will not publish them.'
+      );
+    }
+    if (!epic.prUrl) {
+      warnings.push('This epic has no pull request. It will be archived without one.');
+    } else if (status?.pr?.state === 'OPEN') {
+      warnings.push(
+        'Its pull request is still open. Settling only archives the epic in Orion; it will not merge or close the pull request.'
+      );
+    } else if (!status?.pr) {
+      warnings.push(
+        'Orion could not verify the pull request state. Settling will not merge or close the pull request.'
+      );
+    }
+    if (!status) {
+      warnings.push(
+        'Orion could not inspect the workspace. Any work that has not been committed or pushed will remain unpublished.'
+      );
+    }
+
+    // A run may have started while the status request was in flight.
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
+      return;
+    }
+
     const confirmSettle = epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle;
-    if (
-      confirmSettle &&
-      !confirm(
-        `Settle "${epic.name}"? It moves to the archive (Settings → General); its threads stay in Recent agents and their projects.`
-      )
-    ) {
+    if (confirmSettle || warnings.length > 0) {
+      setEpicSettleDialog({ epic, warnings });
       return;
     }
     settleEpic(epic.id);
     toast.success(`Settled ${epic.name}`);
+  };
+
+  const confirmEpicSettlement = (epic: Epic) => {
+    setEpicSettleDialog(null);
+    // The dialog can stay open while a new run starts, so the sole settlement
+    // blocker gets one final click-time check.
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
+      return;
+    }
+    const currentEpic = useOrionStore
+      .getState()
+      .epics.find((candidate) => candidate.id === epic.id);
+    if (!currentEpic || currentEpic.settledAt) return;
+    settleEpic(epic.id);
+    toast.success(`Settled ${currentEpic.name}`);
   };
 
   const attachMediaFiles = useCallback(
@@ -7844,8 +8055,8 @@ const App: React.FC = () => {
                         <div className="setting-label">
                           <div className="setting-label-title">Settle confirmation</div>
                           <div className="setting-label-desc">
-                            Ask before settling an epic. Turn off to settle immediately without a
-                            yes/no prompt.
+                            Ask before every settlement. Orion still warns when work may be
+                            archived without a commit, push, or pull request.
                           </div>
                         </div>
                         <label className="provider-toggle" title="Settle confirmation">
@@ -7868,46 +8079,52 @@ const App: React.FC = () => {
                           </div>
                         </div>
                         <div className="archived-epics-list">
-                          {archivedEpics.map((epic) => (
-                            <div key={epic.id} className="archived-epic-row">
-                              <SquareKanban size={13} className="epic-icon" />
-                              <span className="archived-epic-name truncate" title={epic.name}>
-                                {epic.name}
-                              </span>
-                              <span className="archived-epic-date">
-                                Settled{' '}
-                                {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
-                              </span>
-                              {epic.prUrl && (
+                          {archivedEpics.map((epic) => {
+                            const prStatus = epicPrStatus(epic);
+                            return (
+                              <div key={epic.id} className="archived-epic-row">
+                                <SquareKanban
+                                  size={13}
+                                  className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
+                                />
+                                <span className="archived-epic-name truncate" title={epic.name}>
+                                  {epic.name}
+                                </span>
+                                <span className="archived-epic-date">
+                                  Settled{' '}
+                                  {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
+                                </span>
+                                {epic.prUrl && (
+                                  <button
+                                    type="button"
+                                    className="archived-epic-action"
+                                    title="Open the pull request"
+                                    onClick={() =>
+                                      void window.orion?.openExternalUrl?.(epic.prUrl as string)
+                                    }
+                                  >
+                                    <GitPullRequest size={13} />
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="archived-epic-action"
-                                  title="Open the pull request"
-                                  onClick={() =>
-                                    void window.orion?.openExternalUrl?.(epic.prUrl as string)
-                                  }
+                                  title="Restore to the sidebar"
+                                  onClick={() => unsettleEpic(epic.id)}
                                 >
-                                  <GitPullRequest size={13} />
+                                  <RefreshCw size={13} />
                                 </button>
-                              )}
-                              <button
-                                type="button"
-                                className="archived-epic-action"
-                                title="Restore to the sidebar"
-                                onClick={() => unsettleEpic(epic.id)}
-                              >
-                                <RefreshCw size={13} />
-                              </button>
-                              <button
-                                type="button"
-                                className="archived-epic-action danger"
-                                title="Delete epic"
-                                onClick={() => handleDeleteEpic(epic)}
-                              >
-                                <Trash2 size={13} />
-                              </button>
-                            </div>
-                          ))}
+                                <button
+                                  type="button"
+                                  className="archived-epic-action danger"
+                                  title="Delete epic"
+                                  onClick={() => handleDeleteEpic(epic)}
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     )}
@@ -8772,6 +8989,7 @@ const App: React.FC = () => {
                           const isEpicCollapsed = collapsedEpics[epic.id] ?? false;
                           const isEpicSelected =
                             selectedEpicId === epic.id && !selectedThreadId;
+                          const prStatus = epicPrStatus(epic);
 
                           return (
                             <div key={epic.id} className="project-section epic-section">
@@ -8795,7 +9013,10 @@ const App: React.FC = () => {
                                 </button>
                                 {epicRenameId === epic.id ? (
                                   <div className="project-section-header project-section-header-renaming">
-                                    <SquareKanban size={13} className="epic-icon" />
+                                    <SquareKanban
+                                      size={13}
+                                      className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
+                                    />
                                     <InlineRenameInput
                                       className="thread-rename-input"
                                       initialValue={epic.name}
@@ -8814,9 +9035,14 @@ const App: React.FC = () => {
                                       selectEpic(epic.id);
                                       setActiveTab('agents');
                                     }}
-                                    title={epic.name}
+                                    title={
+                                      prStatus ? `${epic.name} — PR ${prStatus}` : epic.name
+                                    }
                                   >
-                                    <SquareKanban size={13} className="epic-icon" />
+                                    <SquareKanban
+                                      size={13}
+                                      className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
+                                    />
                                     {epicProjectName && (
                                       <span className="epic-project-tag">{epicProjectName}</span>
                                     )}
@@ -9514,7 +9740,11 @@ const App: React.FC = () => {
               {!selectedThread && selectedEpic ? (
                 <div className="epic-view">
                   <div className="epic-view-header">
-                    <div className="epic-view-icon">
+                    <div
+                      className={`epic-view-icon ${
+                        selectedEpicPrStatus ? `epic-view-icon--${selectedEpicPrStatus}` : ''
+                      }`}
+                    >
                       <SquareKanban size={24} />
                     </div>
                     <div className="epic-view-heading">
@@ -9771,17 +10001,13 @@ const App: React.FC = () => {
                       className="btn epic-view-settle"
                       disabled={
                         !!epicGitBusy ||
-                        activeRiftUnavailable ||
-                        selectedEpicHasRunningAgents ||
-                        selectedEpicHasUnsettledWork
+                        selectedEpicHasRunningAgents
                       }
                       onClick={() => void handleSettleEpic(selectedEpic)}
                       title={
                         selectedEpicHasRunningAgents
                           ? 'Agents are still running in this epic — wait for them to finish before settling it'
-                          : selectedEpicHasUnsettledWork
-                            ? 'Commit and push this epic’s work before settling it'
-                            : 'Settle the epic once its PR is merged — it moves to the archive'
+                          : 'Archive this epic; uncommitted work or pull request state will be explained before settling'
                       }
                     >
                       <Archive size={14} />
@@ -10936,6 +11162,53 @@ const App: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {epicSettleDialog && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => setEpicSettleDialog(null)}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="epic-settle-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="epic-settle-title" className="modal-title">
+              Settle “{epicSettleDialog.epic.name}”?
+            </h2>
+            <p className="modal-subtitle">
+              The epic moves to the archive. Its threads stay in Recent agents and their projects.
+            </p>
+            {epicSettleDialog.warnings.length > 0 && (
+              <div className="epic-settle-warnings">
+                {epicSettleDialog.warnings.map((warning) => (
+                  <p key={warning}>{warning}</p>
+                ))}
+              </div>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => setEpicSettleDialog(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => confirmEpicSettlement(epicSettleDialog.epic)}
+              >
+                <Archive size={14} />
+                Settle epic
+              </button>
+            </div>
           </div>
         </div>
       )}
