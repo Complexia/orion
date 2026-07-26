@@ -11,6 +11,7 @@
     "make": "electron-forge make",
     "deploy": "node scripts/deploy.mjs",
     "update-rifts": "node scripts/update-rifts.mjs",
+    "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",
     "postinstall": "node -e \"const fs=require('fs');try{for(const d of fs.readdirSync('node_modules/node-pty/prebuilds')){try{fs.chmodSync('node_modules/node-pty/prebuilds/'+d+'/spawn-helper',0o755)}catch{}}}catch{};try{for(const d of fs.readdirSync('node_modules/rift-snapshot/prebuilds')){for(const b of ['rift','rift.exe']){try{fs.chmodSync('node_modules/rift-snapshot/prebuilds/'+d+'/'+b,0o755)}catch{}}}}catch{}\""

@@ -110,18 +110,32 @@ export const createJsonlTailer = ({ resolveFile, onLine }) => {
 
 export const SUBAGENT_REASONING_EMIT_MS = 200;
 
-export const createSubagentTracker = ({ providerId, threadId, getSender, getRunId }) => {
+// onMeta (optional) observes every subagent lifecycle upsert. Providers whose
+// stream says nothing about their own spawns use it to mirror each subagent as
+// a step on the parent run, the way claude's Task tool_use row does.
+export const createSubagentTracker = ({ providerId, threadId, getSender, getRunId, onMeta }) => {
   const subagents = new Map();
 
   const emit = (event) => {
     const sender = getSender();
     if (!sender || sender.isDestroyed()) return;
-    emitAgentEvent(sender, { runId: getRunId(), threadId, ...event });
+    // The renderer cannot infer this from the Orion thread model: orchestrator
+    // threads intentionally retain `orion:orchestrator` while the configured
+    // provider owns the turn. Stamp the tracker provider onto every lifecycle,
+    // transcript, and activity event so they all bind to the same child.
+    emitAgentEvent(sender, { runId: getRunId(), threadId, ...event, providerId });
   };
 
-  const emitMeta = (sub, patch = {}) => {
+  const notifyMeta = (meta) => {
+    try {
+      onMeta?.({ ...meta });
+    } catch {}
+  };
+
+  const emitMeta = (sub, patch = {}, { notify = true } = {}) => {
     Object.assign(sub.meta, patch);
     emit({ type: 'subagent', subagent: { ...sub.meta } });
+    if (notify) notifyMeta(sub.meta);
   };
 
   const sendReasoning = (sub, status = 'running') => {
@@ -196,7 +210,12 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
       sub.meta.stats = { ...sub.meta.stats, ...stats };
     },
     prompt: (prompt) => {
-      if (!sub.meta.prompt && prompt) emitMeta(sub, { prompt });
+      if (!sub.meta.prompt && prompt) {
+        // The final tail can discover a prompt after the parent run has
+        // already torn down. Keep the subagent transcript metadata current,
+        // but do not send a late parent-step update after completion.
+        emitMeta(sub, { prompt }, { notify: !sub.finished });
+      }
     },
     finish: (info) => finish(sub.meta.id, info),
   });
@@ -230,6 +249,18 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
       clearTimeout(sub.finishTimer);
       sub.finishTimer = null;
     }
+    // Parent runs can finish while the final transcript-tail delay below is
+    // still pending. Resolve the mirrored parent step synchronously, before
+    // the renderer processes the parent's done event and drops its run state.
+    // Keep the subagent itself running until its final transcript read so its
+    // own event order remains unchanged.
+    notifyMeta({
+      ...sub.meta,
+      status,
+      completedAt: Date.now(),
+      ...(stats ? { stats: { ...sub.meta.stats, ...stats } } : {}),
+      ...(summary ? { summary } : {}),
+    });
     void (async () => {
       // Some CLIs (cursor) flush the subagent transcript to disk only at
       // completion, so the "finished" signal can beat the file write. Give
@@ -239,12 +270,18 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
         await sub.tailer?.finish();
       } catch {}
       flushReasoning(sub, 'done');
-      emitMeta(sub, {
-        status,
-        completedAt: Date.now(),
-        ...(stats ? { stats: { ...sub.meta.stats, ...stats } } : {}),
-        ...(summary ? { summary } : {}),
-      });
+      // The final read may add token stats or prompt metadata. Refresh the
+      // subagent itself without re-emitting a late parent lifecycle step.
+      emitMeta(
+        sub,
+        {
+          status,
+          completedAt: Date.now(),
+          ...(stats ? { stats: { ...sub.meta.stats, ...stats } } : {}),
+          ...(summary ? { summary } : {}),
+        },
+        { notify: false }
+      );
     })();
   };
 
@@ -409,12 +446,22 @@ export const readFirstJsonLine = async (filePath) => {
   }
 };
 
-// exec --json's collab items never carry receiver thread ids (experimental
-// serialization gap, verified on codex 0.144.5), so spawns are detected from
-// the filesystem: a new rollout whose session_meta names this thread as its
-// spawn parent is a subagent of this run.
-export const watchCodexSubagentSpawns = ({ parentThreadId, onSpawn }) => {
+// codex announces nothing usable about its collaboration spawns on the exec
+// --json stream: no item is emitted for spawn_agent at all, and the `wait`
+// collab_tool_call items that do arrive carry an empty receiver_thread_ids and
+// agents_states (verified on codex 0.145.0). So spawns are detected from the
+// filesystem: a new rollout whose session_meta names a thread of this run as
+// its spawn parent is a subagent of this run.
+export const watchCodexSubagentSpawns = ({ parentThreadId, isTrackedThread, onSpawn }) => {
   const seen = new Set();
+  // Rollouts that are subagents of *something*, but whose parent isn't known
+  // to this run yet. A subagent can itself spawn subagents, and the grandchild
+  // rollout may land before its parent has been matched, so unmatched spawns
+  // are re-checked on later polls instead of being dropped. Concurrent runs in
+  // other threads land here too and never match, so the oldest entries are
+  // evicted rather than retained for the life of the run.
+  const pending = new Map();
+  const PENDING_LIMIT = 200;
   // Baseline every rollout that already exists before this run starts. A
   // resumed parent keeps the same thread id across turns, so a time-window
   // lookback would rediscover the previous turn's recent subagents and tail
@@ -430,6 +477,9 @@ export const watchCodexSubagentSpawns = ({ parentThreadId, onSpawn }) => {
   }
   let stopped = false;
   let polling = false;
+
+  const isOurs = (spawnParentId) =>
+    spawnParentId === parentThreadId || Boolean(isTrackedThread?.(spawnParentId));
 
   const poll = async () => {
     if (stopped || polling) return;
@@ -451,15 +501,30 @@ export const watchCodexSubagentSpawns = ({ parentThreadId, onSpawn }) => {
           seen.add(name);
           const spawn = head?.payload?.source?.subagent?.thread_spawn;
           const childThreadId = head?.payload?.id;
-          if (!spawn || !childThreadId || spawn.parent_thread_id !== parentThreadId) continue;
-          onSpawn({
+          if (!spawn || !childThreadId || typeof spawn.parent_thread_id !== 'string') continue;
+          pending.set(childThreadId, {
             threadId: childThreadId,
+            parentThreadId: spawn.parent_thread_id,
             nickname: typeof spawn.agent_nickname === 'string' ? spawn.agent_nickname : undefined,
             role: typeof spawn.agent_role === 'string' ? spawn.agent_role : undefined,
+            // Set when the parent named the task (spawn_agent's task_name);
+            // null for plain fork_context spawns.
+            agentPath: typeof spawn.agent_path === 'string' ? spawn.agent_path : undefined,
+            depth: typeof spawn.depth === 'number' ? spawn.depth : undefined,
             filePath,
           });
         }
       }
+      // Announce shallowest-first so a nested spawn's parent is always tracked
+      // before the child that hangs off it.
+      for (const candidate of [...pending.values()].sort(
+        (a, b) => (a.depth ?? 0) - (b.depth ?? 0)
+      )) {
+        if (!isOurs(candidate.parentThreadId)) continue;
+        pending.delete(candidate.threadId);
+        onSpawn(candidate);
+      }
+      while (pending.size > PENDING_LIMIT) pending.delete(pending.keys().next().value);
     } finally {
       polling = false;
     }
@@ -480,37 +545,139 @@ export const codexRolloutCommandSummary = (raw) => {
   return stringifySummary(command, 80);
 };
 
-// Subagent rollouts come in two shapes. Fresh-context, role-based spawns hold
-// only the subagent's own transcript (their thread_spawn has agent_role but no
-// agent_path). Collaboration spawns carry an agent_path and replay the parent
-// history before inter_agent_communication_metadata, where the NEW_TASK
-// envelope starts the subagent's own work. Current Codex rollouts do not add a
-// second session_meta before that replay, so the source metadata — not the
-// number of session_meta lines — must decide whether the prefix is live.
+export const codexSubagentTitle = (spawn) => {
+  const taskName =
+    typeof spawn?.agentPath === 'string'
+      ? spawn.agentPath.split('/').filter(Boolean).pop() ?? ''
+      : '';
+  // task_name rollouts also carry a random nickname. The path is the stable,
+  // user-meaningful delegation label, so prefer it whenever it is available.
+  return taskName || spawn?.nickname || 'Codex subagent';
+};
+
+const CODEX_UUID_V7_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const codexUuidV7TimestampMs = (id) => {
+  if (typeof id !== 'string' || !CODEX_UUID_V7_PATTERN.test(id)) return null;
+  const timestamp = Number.parseInt(id.replaceAll('-', '').slice(0, 12), 16);
+  return Number.isSafeInteger(timestamp) ? timestamp : null;
+};
+
+// Codex session and turn ids are timestamp-ordered UUIDv7 values. A forked
+// rollout's own turn id is created after the child session id, while every
+// replayed turn id was created before it. The embedded millisecond boundary
+// remains exact when parent and child share payload.started_at's coarse second.
+const codexTurnFollowsSession = (turnId, sessionId) => {
+  const turnTimestamp = codexUuidV7TimestampMs(turnId);
+  const sessionTimestamp = codexUuidV7TimestampMs(sessionId);
+  return (
+    typeof turnTimestamp === 'number' &&
+    typeof sessionTimestamp === 'number' &&
+    turnTimestamp > sessionTimestamp
+  );
+};
+
+// Subagent rollouts come in multiple shapes:
+//
+//   agent_path hand-off — verified on codex 0.144.5 and 0.145.0. These can
+//     contain a replayed parent prefix with only one session_meta. Suppress the
+//     prefix until inter_agent_communication_metadata marks the NEW_TASK
+//     hand-off. Fresh task_name spawns use the same boundary without a replay.
+//
+//   second-meta fork — verified on codex 0.145.0. The subagent's own
+//     session_meta comes first, then a SECOND session_meta naming the parent
+//     thread, then a verbatim replay of the parent's entire transcript, and
+//     only after that the subagent's own turn. The child turn is identified by
+//     its UUIDv7 timestamp following the child session id.
+//
+// Streaming that replay is what made every forked subagent mirror its siblings:
+// all of them showed the parent's transcript — including the parent's earlier
+// turns, its cumulative token totals, and a task_complete that finished the
+// subagent seconds after it started. The child session id is the structural
+// fork boundary: the subagent's own task_started is the first turn whose
+// UUIDv7 timestamp follows that session id.
 export const handleCodexRolloutLine = (value, api, ctx) => {
   if (!value || typeof value !== 'object') return;
+
   if (value.type === 'session_meta') {
-    const spawn = value.payload?.source?.subagent?.thread_spawn;
-    if (spawn && typeof spawn === 'object') {
-      ctx.forked = typeof spawn.agent_path === 'string' && spawn.agent_path.length > 0;
-      ctx.decided = true;
-      ctx.live = !ctx.forked;
+    const id = typeof value.payload?.id === 'string' ? value.payload.id : null;
+    if (!ctx.metaSeen) {
+      const agentPath = value.payload?.source?.subagent?.thread_spawn?.agent_path;
+      ctx.metaSeen = true;
+      ctx.threadId = id;
+      // Codex 0.144 agent_path rollouts may replay parent history without a
+      // second session_meta. Their inter-agent hand-off is the only reliable
+      // boundary, so preserve that shape detection alongside the newer fork.
+      ctx.awaitingAgentPathHandoff =
+        typeof agentPath === 'string' && agentPath.length > 0;
+      ctx.live = !ctx.awaitingAgentPathHandoff;
+      return;
+    }
+    // A second session_meta naming a different thread is the parent's, and a
+    // replay of the parent's transcript follows it.
+    if (id && id !== ctx.threadId) {
+      ctx.live = false;
+      ctx.replayingFork = true;
     }
     return;
   }
-  if (!ctx.decided) {
-    // Older/unknown rollout sources have no thread_spawn metadata. Preserve
-    // the historical fresh-context behavior for those files.
-    ctx.decided = true;
+  if (!ctx.metaSeen) {
+    // Older/unknown rollout sources have no session_meta ids. Preserve the
+    // historical stream-everything behavior for those files.
+    ctx.metaSeen = true;
     ctx.live = true;
   }
-  if (value.type === 'inter_agent_communication_metadata') {
-    ctx.live = true;
-    return;
-  }
-  if (!ctx.live) return;
+
   const payload = value.payload;
   if (!payload || typeof payload !== 'object') return;
+
+  // The subagent's own turn begins here, which also ends any parent replay.
+  if (value.type === 'event_msg' && payload.type === 'task_started') {
+    const followsSession = codexTurnFollowsSession(payload.turn_id, ctx.threadId);
+    if (ctx.awaitingAgentPathHandoff && !ctx.replayingFork) {
+      // The hand-off marker follows task_started in agent_path rollouts. Keep
+      // suppressing until it arrives, but retain the child turn id so only its
+      // later task_complete can finish the subagent.
+      if (followsSession && typeof payload.turn_id === 'string') {
+        ctx.pendingOwnTurnId = payload.turn_id;
+      }
+      return;
+    }
+    const own = !ctx.replayingFork || followsSession;
+    if (own) {
+      ctx.live = true;
+      ctx.replayingFork = false;
+      ctx.awaitingAgentPathHandoff = false;
+      ctx.pendingOwnTurnId = null;
+      // Pins which turn's completion actually ends this subagent, so a
+      // replayed parent task_complete can never finish it early.
+      if (!ctx.ownTurnId && typeof payload.turn_id === 'string') ctx.ownTurnId = payload.turn_id;
+    }
+    return;
+  }
+  // A fresh-context spawn's own work opens with the inter-agent hand-off.
+  if (value.type === 'inter_agent_communication_metadata') {
+    // A nested fork can replay a task_name parent's hand-off marker. It still
+    // belongs to parent history and must not make the child live.
+    if (!ctx.replayingFork) {
+      ctx.live = true;
+      ctx.awaitingAgentPathHandoff = false;
+      if (!ctx.ownTurnId && ctx.pendingOwnTurnId) ctx.ownTurnId = ctx.pendingOwnTurnId;
+      ctx.pendingOwnTurnId = null;
+    }
+    return;
+  }
+  if (!ctx.live) {
+    // A forked subagent inherits the parent's cumulative token total (the
+    // replay runs to millions of tokens on a long parent thread), so remember
+    // where the replay left off and report only the subagent's own usage.
+    if (value.type === 'event_msg' && payload.type === 'token_count') {
+      const total = payload.info?.total_token_usage?.total_tokens;
+      if (typeof total === 'number') ctx.tokenBaseline = total;
+    }
+    return;
+  }
 
   if (value.type === 'event_msg') {
     switch (payload.type) {
@@ -570,10 +737,21 @@ export const handleCodexRolloutLine = (value, api, ctx) => {
       }
       case 'token_count': {
         const total = payload.info?.total_token_usage?.total_tokens;
-        if (typeof total === 'number') api.stats({ totalTokens: total });
+        if (typeof total === 'number') {
+          api.stats({ totalTokens: Math.max(0, total - (ctx.tokenBaseline ?? 0)) });
+        }
         return;
       }
       case 'task_complete': {
+        // Only this subagent's own turn ending finishes it.
+        if (
+          ctx.replayingFork ||
+          (ctx.ownTurnId &&
+            typeof payload.turn_id === 'string' &&
+            payload.turn_id !== ctx.ownTurnId)
+        ) {
+          return;
+        }
         api.finish({ status: 'done' });
         return;
       }

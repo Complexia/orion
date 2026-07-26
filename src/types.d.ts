@@ -704,6 +704,8 @@ type OrionComputerUsePermissions = {
           model?: string;
           prompt?: string;
           summary?: string;
+          /** Provider id of the subagent that spawned this one, when it was not the run's own thread. */
+          parentSubagentId?: string;
           startedAt?: number;
           completedAt?: number;
           stats?: { totalTokens?: number };

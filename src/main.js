@@ -42,11 +42,11 @@ import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachme
 import { authenticateProviderTool, checkProviderUpdate, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
-import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents } from './main/stream-adapters.js';
+import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents, stringifySummary } from './main/stream-adapters.js';
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { emitAgentEvent, sendToAllWindows } from './main/events.js';
-import { createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
+import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
 import { riftBinaryPath, riftCreate, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
 
@@ -3638,6 +3638,27 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const streamContext = { textSeen: false };
     const knownToolActivities = new Map();
 
+    // codex's exec --json stream emits no item at all when the model spawns a
+    // collaboration subagent — only bare "Waiting for subagents" rows once it
+    // waits on them — so the parent's steps never said what was delegated.
+    // Mirror each tracked subagent as a step naming it and its task, matching
+    // how claude's Task tool_use row reads.
+    const emitCodexSubagentStep = (meta) => {
+      emitAgentEvent(event.sender, {
+        runId,
+        threadId: input.threadId,
+        type: 'activity',
+        activity: {
+          key: `subagent:${meta.id}`,
+          type: 'tool',
+          kind: 'task',
+          title: `Subagent - ${meta.title || meta.kind || 'codex agent'}`,
+          detail: stringifySummary(meta.prompt ?? '', 300),
+          status: meta.status === 'error' ? 'error' : meta.status === 'running' ? 'running' : 'done',
+        },
+      });
+    };
+
     // Native subagents (codex collaboration spawns, cursor Task tool): tail
     // each spawned subagent's on-disk transcript and stream it to the
     // renderer as its own switchable thread.
@@ -3646,6 +3667,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       threadId: input.threadId,
       getSender: () => event.sender,
       getRunId: () => runId,
+      onMeta: model.providerId === 'codex' ? emitCodexSubagentStep : undefined,
     });
     let codexSpawnWatcher = null;
     let kimiSpawnWatcher = null;
@@ -3686,12 +3708,20 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       if (codexSpawnWatcher || model.providerId !== 'codex' || !parentThreadId) return;
       codexSpawnWatcher = watchCodexSubagentSpawns({
         parentThreadId,
+        // A codex subagent can spawn its own subagents; those name the
+        // subagent, not the run's thread, as their spawn parent.
+        isTrackedThread: (threadId) => subagentTracker.has(threadId),
         onSpawn: (spawn) => {
           subagentTracker.start(
             {
               id: spawn.threadId,
-              title: spawn.nickname || 'Codex subagent',
+              title: codexSubagentTitle(spawn),
               kind: spawn.role || 'codex agent',
+              // Nest under the spawning subagent rather than flattening every
+              // descendant onto the run's thread.
+              ...(spawn.parentThreadId !== parentThreadId
+                ? { parentSubagentId: spawn.parentThreadId }
+                : {}),
             },
             {
               resolveFile: async () => spawn.filePath,
