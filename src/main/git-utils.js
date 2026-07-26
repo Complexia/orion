@@ -142,17 +142,49 @@ export const readNumstatMap = async (gitRoot) => {
   return numstat;
 };
 
-export const summarizeChangedFiles = async (dirPath, beforeSnapshot) => {
+// Content versions already reported by a finished run: gitRoot ->
+// (relativePath -> signature). Concurrent turns in the same workspace (epic
+// threads sharing a rift) each diff the working tree against their own
+// turn-start snapshot, so one agent's save lands inside every overlapping
+// turn's window and would show up in each of their summaries. The first run
+// to finalize claims that content version; later runs skip it unless they
+// wrote the file themselves (`toolWrittenPaths`).
+const attributedSignatures = new Map();
+
+export const summarizeChangedFiles = async (dirPath, beforeSnapshot, { toolWrittenPaths } = {}) => {
   try {
     const gitRoot = beforeSnapshot?.gitRoot ?? (await getGitRoot(dirPath));
     const [entries, numstat] = await Promise.all([readGitStatusEntries(gitRoot), readNumstatMap(gitRoot)]);
+    const claimed = attributedSignatures.get(gitRoot);
+    const nextClaimed = new Map();
+    // git reports the physical toplevel while tool inputs may spell the same
+    // file through a symlink (e.g. /tmp vs /private/tmp) — index both forms.
+    let writtenPaths = null;
+    if (toolWrittenPaths?.size) {
+      writtenPaths = new Set();
+      for (const writtenPath of toolWrittenPaths) {
+        writtenPaths.add(writtenPath);
+        try {
+          writtenPaths.add(await fs.realpath(writtenPath));
+        } catch {}
+      }
+    }
     const summaries = [];
 
     for (const entry of entries) {
       const signature = await getFileSignature(entry.fullPath);
+      const priorClaim = claimed?.get(entry.relativePath);
       if (beforeSnapshot?.signatures.get(entry.relativePath) === signature) {
+        if (priorClaim !== undefined) nextClaimed.set(entry.relativePath, priorClaim);
         continue;
       }
+
+      const wroteItself = writtenPaths?.has(entry.fullPath) === true;
+      if (!wroteItself && priorClaim === signature) {
+        nextClaimed.set(entry.relativePath, signature);
+        continue;
+      }
+      nextClaimed.set(entry.relativePath, signature);
 
       let counts = numstat.get(entry.relativePath);
       if (!counts && (entry.kind === 'added' || entry.kind === 'untracked')) {
@@ -170,6 +202,7 @@ export const summarizeChangedFiles = async (dirPath, beforeSnapshot) => {
       });
     }
 
+    attributedSignatures.set(gitRoot, nextClaimed);
     summaries.sort((a, b) => a.path.localeCompare(b.path));
     return summaries;
   } catch {

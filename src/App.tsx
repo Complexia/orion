@@ -559,6 +559,9 @@ const App: React.FC = () => {
   // Project the new epic binds to; preset on open to the project the user
   // last sent a message in.
   const [newEpicProjectId, setNewEpicProjectId] = useState<string | null>(null);
+  // Tailwind dropdown open state for the create-epic project / base-branch pickers.
+  const [createEpicProjectPickerOpen, setCreateEpicProjectPickerOpen] = useState(false);
+  const [createEpicRiftBranchPickerOpen, setCreateEpicRiftBranchPickerOpen] = useState(false);
   // Per-epic opt-out for the modal's "Create a rift" checkbox; the default
   // comes from the experimental Rifts settings when the modal opens.
   const [newEpicCreateRift, setNewEpicCreateRift] = useState(false);
@@ -620,6 +623,8 @@ const App: React.FC = () => {
     setRiftSetupEpicIds(next);
   }, []);
   const createEpicTitleRef = useRef<HTMLInputElement>(null);
+  const createEpicProjectPickerRef = useRef<HTMLDivElement>(null);
+  const createEpicRiftBranchPickerRef = useRef<HTMLDivElement>(null);
   const [epicMenuOpenId, setEpicMenuOpenId] = useState<string | null>(null);
   const [epicRenameId, setEpicRenameId] = useState<string | null>(null);
   const [epicRepoPickerOpen, setEpicRepoPickerOpen] = useState(false);
@@ -628,14 +633,60 @@ const App: React.FC = () => {
   const [epicGitBusy, setEpicGitBusy] = useState<
     'commit' | 'pr' | 'pr-branches' | 'settle' | null
   >(null);
-  // Base-branch picker shown before opening an epic's pull request. Holds the
-  // origin branches fetched for the picker and the user's current selection.
+  // Message dialog shown before an epic's commit & push. An empty message
+  // hands the write back to the epic message model.
+  const [epicCommitDialog, setEpicCommitDialog] = useState<{
+    epic: Epic;
+    message: string;
+  } | null>(null);
+  // Base-branch and message picker shown before opening an epic's pull
+  // request. Holds the origin branches fetched for the picker, the user's
+  // current selection, and their optional hand-written title/description.
   const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<{
     epic: Epic;
     branches: string[];
     defaultBranch: string;
+    sourceBranch: string;
     baseBranch: string;
+    message: string;
   } | null>(null);
+  const [epicPrBaseBranchPickerOpen, setEpicPrBaseBranchPickerOpen] = useState(false);
+  const epicPrBaseBranchPickerRef = useRef<HTMLDivElement>(null);
+  // Escape dismisses either git-message dialog, matching the create-epic modal.
+  // An open base-branch dropdown closes first before the dialog itself.
+  useEffect(() => {
+    if (!epicCommitDialog && !epicPrBaseDialog) return undefined;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      if (epicPrBaseBranchPickerOpen) {
+        setEpicPrBaseBranchPickerOpen(false);
+        return;
+      }
+      setEpicCommitDialog(null);
+      setEpicPrBaseDialog(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [epicCommitDialog, epicPrBaseDialog, epicPrBaseBranchPickerOpen]);
+
+  // Click-outside for the Create PR base-branch Tailwind dropdown.
+  useEffect(() => {
+    if (!epicPrBaseBranchPickerOpen) return undefined;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (!epicPrBaseBranchPickerRef.current?.contains(target)) {
+        setEpicPrBaseBranchPickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [epicPrBaseBranchPickerOpen]);
+
+  // Reset the branch picker whenever the Create PR dialog is dismissed.
+  useEffect(() => {
+    if (!epicPrBaseDialog) setEpicPrBaseBranchPickerOpen(false);
+  }, [epicPrBaseDialog]);
   // Live workspace status behind the epic git buttons: "Commit & push" greys
   // out when the workspace is clean and fully pushed, and a created PR shows
   // its lifecycle state (open/merged/closed) instead of the Create PR button.
@@ -1234,6 +1285,8 @@ const App: React.FC = () => {
   );
 
   const epicsEnabled = epicsSettings?.enabled ?? defaultEpicsSettings.enabled;
+  const epicPromptGitMessages =
+    epicsSettings?.promptGitMessages ?? defaultEpicsSettings.promptGitMessages;
 
   const activeEpics = useMemo(() => epics.filter((epic) => !epic.settledAt), [epics]);
 
@@ -3334,6 +3387,8 @@ const App: React.FC = () => {
     setNewEpicProjectId(null);
     setNewEpicRiftBaseBranch(null);
     setNewEpicRiftBranches(null);
+    setCreateEpicProjectPickerOpen(false);
+    setCreateEpicRiftBranchPickerOpen(false);
   }, []);
 
   // Local branches for the create-epic modal's rift base picker. Refetched
@@ -3342,6 +3397,7 @@ const App: React.FC = () => {
   useEffect(() => {
     setNewEpicRiftBaseBranch(null);
     setNewEpicRiftBranches(null);
+    setCreateEpicRiftBranchPickerOpen(false);
     if (!createEpicOpen || !newEpicCreateRift || !riftsActive) return;
     const project = projects.find((candidate) => candidate.id === newEpicProjectId);
     if (!project || !window.orion?.getGitState) return;
@@ -3548,17 +3604,52 @@ const App: React.FC = () => {
     if (!createEpicOpen) return;
     const id = window.setTimeout(() => createEpicTitleRef.current?.focus(), 0);
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        closeCreateEpicModal();
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      // Close an open dropdown first; only dismiss the modal when none are open.
+      if (createEpicProjectPickerOpen) {
+        setCreateEpicProjectPickerOpen(false);
+        return;
       }
+      if (createEpicRiftBranchPickerOpen) {
+        setCreateEpicRiftBranchPickerOpen(false);
+        return;
+      }
+      closeCreateEpicModal();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => {
       window.clearTimeout(id);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [closeCreateEpicModal, createEpicOpen]);
+  }, [
+    closeCreateEpicModal,
+    createEpicOpen,
+    createEpicProjectPickerOpen,
+    createEpicRiftBranchPickerOpen,
+  ]);
+
+  // Click-outside for create-epic Tailwind dropdowns.
+  useEffect(() => {
+    if (!createEpicProjectPickerOpen && !createEpicRiftBranchPickerOpen) return undefined;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        createEpicProjectPickerOpen &&
+        !createEpicProjectPickerRef.current?.contains(target)
+      ) {
+        setCreateEpicProjectPickerOpen(false);
+      }
+      if (
+        createEpicRiftBranchPickerOpen &&
+        !createEpicRiftBranchPickerRef.current?.contains(target)
+      ) {
+        setCreateEpicRiftBranchPickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [createEpicProjectPickerOpen, createEpicRiftBranchPickerOpen]);
 
   const handleCreateThreadForEpic = async (epic: Epic) => {
     const project = projectForEpic(epic);
@@ -3746,16 +3837,33 @@ const App: React.FC = () => {
     );
   };
 
-  const handleEpicCommitAndPush = async (epic: Epic) => {
-    if (
-      repositoryOperationBusy ||
-      riftSetupEpicIdsRef.current[epic.id] ||
-      riftRemovalEpicIdsRef.current.has(epic.id) ||
-      epic.riftRequest ||
-      epic.riftCleanupPending ||
-      (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
-      !window.orion?.epicCommitAndPush
-    ) {
+  const epicCommitBlocked = (epic: Epic) =>
+    repositoryOperationBusy ||
+    riftSetupEpicIdsRef.current[epic.id] ||
+    riftRemovalEpicIdsRef.current.has(epic.id) ||
+    epic.riftRequest ||
+    epic.riftCleanupPending ||
+    (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
+    !window.orion?.epicCommitAndPush;
+
+  // "Commit & push" with the message prompt on: run the same click-time guards
+  // the commit itself runs, then let the user write the message (or leave it
+  // empty for the epic message model).
+  const openEpicCommitDialog = (epic: Epic) => {
+    if (epicCommitBlocked(epic)) return;
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before committing');
+      return;
+    }
+    if (!resolveEpicGitTarget(epic).projectPath) {
+      toast.error('Select a repository for this epic before committing');
+      return;
+    }
+    setEpicCommitDialog({ epic, message: '' });
+  };
+
+  const handleEpicCommitAndPush = async (epic: Epic, message = '') => {
+    if (epicCommitBlocked(epic) || !window.orion?.epicCommitAndPush) {
       return;
     }
     if (epicHasRunningAgents(epic.id)) {
@@ -3770,11 +3878,14 @@ const App: React.FC = () => {
 
     setEpicGitBusy('commit');
     try {
+      const trimmedMessage = message.trim();
       const result = await window.orion.epicCommitAndPush({
         epicId: epic.id,
         projectPath,
-        modelId: resolveEpicMessageModelId(),
+        // A hand-written message needs no model turn.
+        modelId: trimmedMessage ? null : resolveEpicMessageModelId(),
         epicName: epic.name,
+        ...(trimmedMessage ? { message: trimmedMessage } : {}),
         ...claim,
       });
       claimEpicGitTarget(epic, result);
@@ -3806,9 +3917,55 @@ const App: React.FC = () => {
     (!epic.riftPath && riftsSettings.enabled && riftStatus === null) ||
     !window.orion?.epicCreatePr;
 
-  // Step one of Create PR: fetch the branches on origin and let the user pick
-  // the base the pull request merges into. The actual create happens when the
-  // picker is submitted.
+  // The epic's real repository checkout. A rift-backed epic works in a clone,
+  // so its own projectPath is the rift; the branch a PR should merge back into
+  // lives in the source repository the rift was made from.
+  const resolveEpicSourceProjectPath = (epic: Epic) => {
+    const project = epic.repositoryProjectId
+      ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
+      : null;
+    return epic.gitRoot ?? project?.path;
+  };
+
+  // Step one of Create PR: fetch the branches on origin and work out which one
+  // to merge into by default — the branch checked out in the epic's real
+  // repository, whenever origin has a branch by that name — falling back to
+  // the remote default branch.
+  const resolveEpicPrBaseOptions = async (epic: Epic) => {
+    if (!window.orion?.epicListRemoteBranches) return null;
+    const { projectPath } = resolveEpicGitTarget(epic);
+    if (!projectPath) return null;
+    const result = await window.orion.epicListRemoteBranches({
+      projectPath,
+      ...(() => {
+        const sourceProjectPath = resolveEpicSourceProjectPath(epic);
+        return sourceProjectPath ? { sourceProjectPath } : {};
+      })(),
+    });
+    if (!result.ok) {
+      return { error: result.error ?? 'Could not list the branches on origin' };
+    }
+    // The PR's head branch cannot be its own base.
+    const branches = (result.branches ?? []).filter((name) => name !== result.currentBranch);
+    if (branches.length === 0) {
+      return { error: 'No branches found on origin to use as the PR base' };
+    }
+    const defaultBranch =
+      result.defaultBranch && branches.includes(result.defaultBranch)
+        ? result.defaultBranch
+        : '';
+    const sourceBranch =
+      result.sourceBranch && branches.includes(result.sourceBranch) ? result.sourceBranch : '';
+    return {
+      branches,
+      defaultBranch,
+      sourceBranch,
+      baseBranch: sourceBranch || defaultBranch || branches[0],
+    };
+  };
+
+  // "Create PR" with the message prompt on: resolve the base options, then let
+  // the user adjust the base and optionally write the title/description.
   const openEpicPrBaseDialog = async (epic: Epic) => {
     if (epicCreatePrBlocked(epic) || !window.orion?.epicListRemoteBranches) return;
     if (epicHasRunningAgents(epic.id)) {
@@ -3823,29 +3980,13 @@ const App: React.FC = () => {
 
     setEpicGitBusy('pr-branches');
     try {
-      const result = await window.orion.epicListRemoteBranches({ projectPath });
-      if (!result.ok) {
-        toast.error(result.error ?? 'Could not list the branches on origin');
+      const options = await resolveEpicPrBaseOptions(epic);
+      if (!options) return;
+      if ('error' in options) {
+        toast.error(options.error);
         return;
       }
-      // The PR's head branch cannot be its own base.
-      const branches = (result.branches ?? []).filter(
-        (name) => name !== result.currentBranch
-      );
-      if (branches.length === 0) {
-        toast.error('No branches found on origin to use as the PR base');
-        return;
-      }
-      const defaultBranch =
-        result.defaultBranch && branches.includes(result.defaultBranch)
-          ? result.defaultBranch
-          : '';
-      setEpicPrBaseDialog({
-        epic,
-        branches,
-        defaultBranch,
-        baseBranch: defaultBranch || branches[0],
-      });
+      setEpicPrBaseDialog({ epic, ...options, message: '' });
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : 'Could not list the branches on origin'
@@ -3855,7 +3996,34 @@ const App: React.FC = () => {
     }
   };
 
-  const handleEpicCreatePr = async (epic: Epic, baseBranch: string) => {
+  // "Create PR" with the message prompt off: no dialog, and the PR targets the
+  // branch checked out in the epic's real repository. If origin cannot be
+  // reached, an empty base lets main fall back to the remote default branch.
+  const createEpicPrWithoutPrompt = async (epic: Epic) => {
+    if (epicCreatePrBlocked(epic)) return;
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
+      return;
+    }
+    if (!resolveEpicGitTarget(epic).projectPath) {
+      toast.error('Select a repository for this epic before opening a PR');
+      return;
+    }
+
+    let baseBranch = '';
+    setEpicGitBusy('pr-branches');
+    try {
+      const options = await resolveEpicPrBaseOptions(epic);
+      if (options && !('error' in options)) baseBranch = options.baseBranch;
+    } catch {
+      // Fall through to the remote default branch.
+    } finally {
+      setEpicGitBusy(null);
+    }
+    await handleEpicCreatePr(epic, baseBranch);
+  };
+
+  const handleEpicCreatePr = async (epic: Epic, baseBranch: string, message = '') => {
     if (epicCreatePrBlocked(epic)) {
       return;
     }
@@ -3871,12 +4039,15 @@ const App: React.FC = () => {
 
     setEpicGitBusy('pr');
     try {
+      const trimmedMessage = message.trim();
       const result = await window.orion.epicCreatePr({
         epicId: epic.id,
         projectPath,
-        modelId: resolveEpicMessageModelId(),
+        // A hand-written title and description need no model turn.
+        modelId: trimmedMessage ? null : resolveEpicMessageModelId(),
         epicName: epic.name,
         baseBranch,
+        ...(trimmedMessage ? { message: trimmedMessage } : {}),
         ...claim,
       });
       claimEpicGitTarget(epic, result);
@@ -7954,6 +8125,38 @@ const App: React.FC = () => {
               )}
               {settingsTab === 'experimental' && (
                 <>
+                  {epicsEnabled && (
+                    <>
+                      <div className="settings-group-label">Epics</div>
+                      <div className="settings-group">
+                        <div className="setting-row">
+                          <div className="setting-label">
+                            <div className="setting-label-title">
+                              Commit &amp; PR message prompts
+                            </div>
+                            <div className="setting-label-desc">
+                              Ask before an epic commits or opens a PR, so you can write the
+                              message yourself (leave it empty and the epic message model still
+                              writes it) and pick the PR's base branch. Turn off to skip both
+                              dialogs: messages are always generated, and PRs target your
+                              project's current branch on origin.
+                            </div>
+                          </div>
+                          <label className="provider-toggle" title="Commit & PR message prompts">
+                            <input
+                              type="checkbox"
+                              checked={epicPromptGitMessages}
+                              onChange={(e) =>
+                                setEpicsSettings({ promptGitMessages: e.target.checked })
+                              }
+                            />
+                            <span />
+                          </label>
+                        </div>
+                      </div>
+                    </>
+                  )}
+
                   <div className="settings-group-label">Rifts</div>
                   <div className="settings-group">
                     <div className="setting-row">
@@ -9158,13 +9361,18 @@ const App: React.FC = () => {
                         !selectedEpicHasWorkToPush ||
                         selectedEpicHasRunningAgents
                       }
-                      onClick={() => void handleEpicCommitAndPush(selectedEpic)}
+                      onClick={() => {
+                        if (epicPromptGitMessages) openEpicCommitDialog(selectedEpic);
+                        else void handleEpicCommitAndPush(selectedEpic);
+                      }}
                       title={
                         selectedEpicHasRunningAgents
                           ? 'Agents are still running in this epic — wait for them to finish before committing'
-                          : selectedEpicHasWorkToPush
-                            ? 'Stage all changes, generate a commit message, then commit and push'
-                            : 'Nothing to commit — the workspace is clean and fully pushed'
+                          : !selectedEpicHasWorkToPush
+                            ? 'Nothing to commit — the workspace is clean and fully pushed'
+                            : epicPromptGitMessages
+                              ? 'Stage all changes, write or generate a commit message, then commit and push'
+                              : 'Stage all changes, generate a commit message, then commit and push'
                       }
                     >
                       <GitCommit size={14} />
@@ -9204,13 +9412,18 @@ const App: React.FC = () => {
                           (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
                           selectedEpicHasRunningAgents
                         }
-                        onClick={() => void openEpicPrBaseDialog(selectedEpic)}
+                        onClick={() => {
+                          if (epicPromptGitMessages) void openEpicPrBaseDialog(selectedEpic);
+                          else void createEpicPrWithoutPrompt(selectedEpic);
+                        }}
                         title={
                           selectedEpicHasRunningAgents
                             ? 'Agents are still running in this epic — wait for them to finish before opening a PR'
                             : selectedEpicPrBadge?.modifier === 'closed'
                               ? 'Open a replacement pull request for this branch'
-                              : 'Choose a base branch, then open a pull request with a generated title and description'
+                              : epicPromptGitMessages
+                                ? 'Choose a base branch and optionally write the title and description, then open a pull request'
+                                : 'Open a pull request into your project’s current branch with a generated title and description'
                         }
                       >
                         <GitPullRequest size={14} />
@@ -10248,6 +10461,75 @@ const App: React.FC = () => {
       </div>
       )}
 
+      {epicCommitDialog && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => setEpicCommitDialog(null)}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="epic-commit-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="epic-commit-title" className="modal-title">
+              Commit &amp; push
+            </h2>
+            <p className="modal-subtitle">
+              Stages everything in {epicCommitDialog.epic.riftPath ? 'this epic’s rift' : 'the repository'}, then pushes.
+            </p>
+            <form
+              className="modal-form"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const dialog = epicCommitDialog;
+                setEpicCommitDialog(null);
+                void handleEpicCommitAndPush(dialog.epic, dialog.message);
+              }}
+            >
+              <label className="modal-field">
+                <span className="modal-field-label">
+                  Commit message <span className="modal-optional">optional</span>
+                </span>
+                <textarea
+                  className="modal-textarea"
+                  value={epicCommitDialog.message}
+                  onChange={(e) =>
+                    setEpicCommitDialog((current) =>
+                      current ? { ...current, message: e.target.value } : current
+                    )
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      e.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  placeholder="Leave empty and Orion writes one from the staged changes"
+                  rows={5}
+                  autoFocus
+                />
+              </label>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn secondary"
+                  onClick={() => setEpicCommitDialog(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn">
+                  <GitCommit size={14} />
+                  Commit &amp; push
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {epicPrBaseDialog && (
         <div
           className="modal-backdrop"
@@ -10265,7 +10547,7 @@ const App: React.FC = () => {
               Create pull request
             </h2>
             <p className="modal-subtitle">
-              Choose the branch the pull request merges into.
+              Choose the branch the pull request merges into, and optionally write it yourself.
             </p>
             <form
               className="modal-form"
@@ -10273,26 +10555,95 @@ const App: React.FC = () => {
                 e.preventDefault();
                 const dialog = epicPrBaseDialog;
                 setEpicPrBaseDialog(null);
-                void handleEpicCreatePr(dialog.epic, dialog.baseBranch);
+                void handleEpicCreatePr(dialog.epic, dialog.baseBranch, dialog.message);
               }}
             >
-              <label className="modal-field">
+              <div className="modal-field">
                 <span className="modal-field-label">Base branch</span>
-                <select
-                  className="modal-input"
-                  value={epicPrBaseDialog.baseBranch}
+                <div className="relative" ref={epicPrBaseBranchPickerRef}>
+                  <button
+                    type="button"
+                    className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
+                    onClick={() => setEpicPrBaseBranchPickerOpen((open) => !open)}
+                    aria-haspopup="listbox"
+                    aria-expanded={epicPrBaseBranchPickerOpen}
+                  >
+                    <span className="truncate">
+                      {epicPrBaseDialog.baseBranch === epicPrBaseDialog.sourceBranch
+                        ? `${epicPrBaseDialog.baseBranch} (your current branch)`
+                        : epicPrBaseDialog.baseBranch === epicPrBaseDialog.defaultBranch
+                          ? `${epicPrBaseDialog.baseBranch} (default)`
+                          : epicPrBaseDialog.baseBranch}
+                    </span>
+                    <ChevronDown
+                      size={14}
+                      className={`shrink-0 text-[var(--text-muted)] transition-transform ${
+                        epicPrBaseBranchPickerOpen ? 'rotate-180' : ''
+                      }`}
+                    />
+                  </button>
+                  {epicPrBaseBranchPickerOpen && (
+                    <div
+                      role="listbox"
+                      aria-label="Base branch"
+                      className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
+                    >
+                      {epicPrBaseDialog.branches.map((name) => {
+                        const selected = name === epicPrBaseDialog.baseBranch;
+                        const label =
+                          name === epicPrBaseDialog.sourceBranch
+                            ? `${name} (your current branch)`
+                            : name === epicPrBaseDialog.defaultBranch
+                              ? `${name} (default)`
+                              : name;
+                        return (
+                          <button
+                            key={name}
+                            type="button"
+                            role="option"
+                            aria-selected={selected}
+                            className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                              selected
+                                ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                                : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                            }`}
+                            onClick={() => {
+                              setEpicPrBaseDialog((current) =>
+                                current ? { ...current, baseBranch: name } : current
+                              );
+                              setEpicPrBaseBranchPickerOpen(false);
+                            }}
+                          >
+                            <span className="min-w-0 flex-1 truncate">{label}</span>
+                            {selected && <Check size={13} className="shrink-0" />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <label className="modal-field">
+                <span className="modal-field-label">
+                  Title and description <span className="modal-optional">optional</span>
+                </span>
+                <textarea
+                  className="modal-textarea"
+                  value={epicPrBaseDialog.message}
                   onChange={(e) =>
                     setEpicPrBaseDialog((current) =>
-                      current ? { ...current, baseBranch: e.target.value } : current
+                      current ? { ...current, message: e.target.value } : current
                     )
                   }
-                >
-                  {epicPrBaseDialog.branches.map((name) => (
-                    <option key={name} value={name}>
-                      {name === epicPrBaseDialog.defaultBranch ? `${name} (default)` : name}
-                    </option>
-                  ))}
-                </select>
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      e.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  placeholder="Leave empty and Orion writes them from the branch changes. Otherwise: first line is the title, the rest is the description."
+                  rows={6}
+                />
               </label>
               <div className="modal-actions">
                 <button
@@ -10365,21 +10716,94 @@ const App: React.FC = () => {
                 />
               </label>
               {projects.length > 0 && (
-                <label className="modal-field">
+                <div className="modal-field">
                   <span className="modal-field-label">Project</span>
-                  <select
-                    className="modal-input"
-                    value={newEpicProjectId ?? ''}
-                    onChange={(e) => setNewEpicProjectId(e.target.value || null)}
-                  >
-                    <option value="">No project</option>
-                    {projects.map((project) => (
-                      <option key={project.id} value={project.id}>
-                        {project.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                  <div className="relative" ref={createEpicProjectPickerRef}>
+                    {(() => {
+                      const selectedProject =
+                        projects.find((project) => project.id === newEpicProjectId) ?? null;
+                      return (
+                    <button
+                      type="button"
+                      className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
+                      onClick={() => {
+                        setCreateEpicRiftBranchPickerOpen(false);
+                        setCreateEpicProjectPickerOpen((open) => !open);
+                      }}
+                      aria-haspopup="listbox"
+                      aria-expanded={createEpicProjectPickerOpen}
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        {selectedProject ? (
+                          <>
+                            <ProjectIcon projectPath={selectedProject.path} size={13} />
+                            <span className="truncate">{selectedProject.name}</span>
+                          </>
+                        ) : (
+                          <span className="truncate text-[var(--text-muted)]">No project</span>
+                        )}
+                      </span>
+                      <ChevronDown
+                        size={14}
+                        className={`shrink-0 text-[var(--text-muted)] transition-transform ${
+                          createEpicProjectPickerOpen ? 'rotate-180' : ''
+                        }`}
+                      />
+                    </button>
+                      );
+                    })()}
+                    {createEpicProjectPickerOpen && (
+                      <div
+                        role="listbox"
+                        aria-label="Project"
+                        className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
+                      >
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={!newEpicProjectId}
+                          className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                            !newEpicProjectId
+                              ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                              : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                          }`}
+                          onClick={() => {
+                            setNewEpicProjectId(null);
+                            setCreateEpicProjectPickerOpen(false);
+                          }}
+                        >
+                          <span className="min-w-0 flex-1 truncate">No project</span>
+                          {!newEpicProjectId && <Check size={13} className="shrink-0" />}
+                        </button>
+                        {projects.map((project) => {
+                          const selected = project.id === newEpicProjectId;
+                          return (
+                            <button
+                              key={project.id}
+                              type="button"
+                              role="option"
+                              aria-selected={selected}
+                              title={project.path}
+                              className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                                selected
+                                  ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                                  : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                              }`}
+                              onClick={() => {
+                                setNewEpicProjectId(project.id);
+                                setCreateEpicProjectPickerOpen(false);
+                              }}
+                            >
+                              <ProjectIcon projectPath={project.path} size={13} />
+                              <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                              {selected && <Check size={13} className="shrink-0" />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
               )}
               {riftsActive && (
                 <label className="modal-field modal-field-checkbox">
@@ -10404,34 +10828,114 @@ const App: React.FC = () => {
                 newEpicRiftBranches &&
                 newEpicRiftBranches.projectId === newEpicProjectId &&
                 newEpicRiftBranches.branches.length > 0 && (
-                  <label className="modal-field">
+                  <div className="modal-field">
                     <span className="modal-field-label">Rift branch from</span>
-                    <select
-                      className="modal-input"
-                      value={
-                        newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch ?? ''
-                      }
-                      onChange={(e) =>
-                        setNewEpicRiftBaseBranch(
-                          !e.target.value ||
-                            e.target.value === newEpicRiftBranches.currentBranch
-                            ? null
-                            : e.target.value
-                        )
-                      }
-                    >
-                      {newEpicRiftBranches.currentBranch === null && (
-                        <option value="">Current commit (detached HEAD)</option>
+                    <div className="relative" ref={createEpicRiftBranchPickerRef}>
+                      <button
+                        type="button"
+                        className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
+                        onClick={() => {
+                          setCreateEpicProjectPickerOpen(false);
+                          setCreateEpicRiftBranchPickerOpen((open) => !open);
+                        }}
+                        aria-haspopup="listbox"
+                        aria-expanded={createEpicRiftBranchPickerOpen}
+                      >
+                        <span className="truncate">
+                          {(() => {
+                            const selectedBranch =
+                              newEpicRiftBaseBranch ??
+                              newEpicRiftBranches.currentBranch ??
+                              '';
+                            if (!selectedBranch) return 'Current commit (detached HEAD)';
+                            return selectedBranch === newEpicRiftBranches.currentBranch
+                              ? `${selectedBranch} (current)`
+                              : selectedBranch;
+                          })()}
+                        </span>
+                        <ChevronDown
+                          size={14}
+                          className={`shrink-0 text-[var(--text-muted)] transition-transform ${
+                            createEpicRiftBranchPickerOpen ? 'rotate-180' : ''
+                          }`}
+                        />
+                      </button>
+                      {createEpicRiftBranchPickerOpen && (
+                        <div
+                          role="listbox"
+                          aria-label="Rift branch from"
+                          className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
+                        >
+                          {newEpicRiftBranches.currentBranch === null && (
+                            <button
+                              type="button"
+                              role="option"
+                              aria-selected={
+                                !(
+                                  newEpicRiftBaseBranch ??
+                                  newEpicRiftBranches.currentBranch
+                                )
+                              }
+                              className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                                !(
+                                  newEpicRiftBaseBranch ??
+                                  newEpicRiftBranches.currentBranch
+                                )
+                                  ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                                  : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                              }`}
+                              onClick={() => {
+                                setNewEpicRiftBaseBranch(null);
+                                setCreateEpicRiftBranchPickerOpen(false);
+                              }}
+                            >
+                              <span className="min-w-0 flex-1 truncate">
+                                Current commit (detached HEAD)
+                              </span>
+                              {!(
+                                newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch
+                              ) && <Check size={13} className="shrink-0" />}
+                            </button>
+                          )}
+                          {newEpicRiftBranches.branches.map((name) => {
+                            const selectedBranch =
+                              newEpicRiftBaseBranch ??
+                              newEpicRiftBranches.currentBranch ??
+                              '';
+                            const selected = name === selectedBranch;
+                            const label =
+                              name === newEpicRiftBranches.currentBranch
+                                ? `${name} (current)`
+                                : name;
+                            return (
+                              <button
+                                key={name}
+                                type="button"
+                                role="option"
+                                aria-selected={selected}
+                                className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                                  selected
+                                    ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                                    : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                                }`}
+                                onClick={() => {
+                                  setNewEpicRiftBaseBranch(
+                                    name === newEpicRiftBranches.currentBranch
+                                      ? null
+                                      : name
+                                  );
+                                  setCreateEpicRiftBranchPickerOpen(false);
+                                }}
+                              >
+                                <span className="min-w-0 flex-1 truncate">{label}</span>
+                                {selected && <Check size={13} className="shrink-0" />}
+                              </button>
+                            );
+                          })}
+                        </div>
                       )}
-                      {newEpicRiftBranches.branches.map((name) => (
-                        <option key={name} value={name}>
-                          {name === newEpicRiftBranches.currentBranch
-                            ? `${name} (current)`
-                            : name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                    </div>
+                  </div>
                 )}
               <div className="modal-actions">
                 <button

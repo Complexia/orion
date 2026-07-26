@@ -68,12 +68,20 @@ export type EpicsSettings = {
   commitModelId: string | null;
   /** Ask for confirmation before settling an epic. */
   confirmSettle: boolean;
+  /**
+   * Open a dialog before "Commit & push" and "Create PR" so the message can be
+   * written by hand (empty still means the model writes it) and the PR's base
+   * branch picked. Off skips both dialogs: the message is always generated and
+   * the PR targets the source project's current branch on origin.
+   */
+  promptGitMessages: boolean;
 };
 
 export const defaultEpicsSettings: EpicsSettings = {
   enabled: true,
   commitModelId: null,
   confirmSettle: true,
+  promptGitMessages: true,
 };
 
 /** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */

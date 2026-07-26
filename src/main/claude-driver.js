@@ -290,7 +290,26 @@ export const createClaudeTurnState = (runId, snapshot) => ({
   reasoningText: '',
   reasoningEmitTimer: null,
   lastReasoningEmitAt: 0,
+  toolWrittenPaths: new Set(),
 });
+
+// Files this turn edited through the harness's file tools. Changed-files
+// summaries diff the shared working tree, so this is the only signal that a
+// change detected during the turn's window was actually this turn's doing
+// (vs. a concurrent thread in the same workspace) — see summarizeChangedFiles.
+export const CLAUDE_FILE_WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+export const trackClaudeFileWrites = (turn, message) => {
+  if (message?.type !== 'assistant') return;
+  const content = Array.isArray(message?.message?.content) ? message.message.content : [];
+  for (const part of content) {
+    if (part?.type !== 'tool_use' || !CLAUDE_FILE_WRITE_TOOLS.has(part?.name)) continue;
+    const filePath = part.input?.file_path ?? part.input?.notebook_path;
+    if (typeof filePath === 'string' && filePath) {
+      turn.toolWrittenPaths.add(path.resolve(filePath));
+    }
+  }
+};
 
 export const sendClaudeTurnReasoning = (session, turn, status = 'running') => {
   const detail = turn.reasoningText.trim();
@@ -522,7 +541,9 @@ export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
   finishClaudeTurnReasoning(session, turn);
   let changedFiles = [];
   try {
-    changedFiles = await summarizeChangedFiles(session.projectPath, turn.snapshot);
+    changedFiles = await summarizeChangedFiles(session.projectPath, turn.snapshot, {
+      toolWrittenPaths: turn.toolWrittenPaths,
+    });
     // Refresh the baseline so a later harness-initiated turn attributes the
     // files that background agents change while the thread sits idle.
     session.lastTurnEndSnapshot = await captureGitChangeSnapshot(session.projectPath);
@@ -746,6 +767,8 @@ export const handleClaudeSessionMessage = async (session, message) => {
     turn.reasoningText = `${turn.reasoningText}${reasoningDelta}`;
     queueClaudeTurnReasoning(session, turn);
   }
+
+  trackClaudeFileWrites(turn, message);
 
   // Task tools drive the live checklist card instead of generic tool rows.
   if (processClaudeTaskMessage(session, message)) {

@@ -1849,8 +1849,10 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     // would ship changes the generated message never described.
     const indexTree = await readGitIndexTree(gitRoot);
     const entries = await readStagedGitEntries(gitRoot);
-    let message = '';
-    if (input?.modelId) {
+    // A message typed in the commit dialog is used verbatim — no model turn,
+    // and no cleanup pass (that one strips artifacts of generated text).
+    let message = String(input?.message ?? '').trim();
+    if (!message && input?.modelId) {
       const context = await readStagedGitChangesContext(gitRoot, entries);
       const prompt =
         'Write a git commit message for the changes below' +
@@ -1914,6 +1916,10 @@ const riftWorktreeChangesFailure = async (gitRoot, branch, input) => {
 // Branches currently on origin, for the PR base picker. Asks the remote
 // directly (not local tracking refs) so a stale clone still offers every
 // branch a PR could actually target.
+//
+// sourceProjectPath is the epic's real repository checkout (the one a rift was
+// cloned from). Its branch is what the PR should default to merging back into,
+// so it is reported alongside the remote branches.
 ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
   try {
     const projectPath = input?.projectPath;
@@ -1922,6 +1928,15 @@ ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
     }
     const gitRoot = await getGitRoot(projectPath);
     const currentBranch = (await getCurrentGitBranch(gitRoot)) ?? null;
+    let sourceBranch = null;
+    if (input?.sourceProjectPath) {
+      try {
+        sourceBranch =
+          (await getCurrentGitBranch(await getGitRoot(input.sourceProjectPath))) ?? null;
+      } catch {
+        // The source checkout may be gone; the picker just loses its default.
+      }
+    }
     const { stdout } = await execFileAsync(
       'git',
       ['-C', gitRoot, 'ls-remote', '--heads', 'origin'],
@@ -1936,7 +1951,7 @@ ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
       .map((line) => line.match(/refs\/heads\/(.+)$/)?.[1]?.trim())
       .filter(Boolean);
     const defaultBranch = await resolveRemoteDefaultBranch(gitRoot);
-    return { ok: true, gitRoot, currentBranch, defaultBranch, branches };
+    return { ok: true, gitRoot, currentBranch, sourceBranch, defaultBranch, branches };
   } catch (error) {
     return {
       ok: false,
@@ -2066,7 +2081,15 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
 
     let title = '';
     let body = '';
-    if (input?.modelId) {
+    // A message typed in the PR dialog replaces the generated one: its first
+    // line is the title, the rest is the description.
+    const userMessage = String(input?.message ?? '').trim();
+    if (userMessage) {
+      const newline = userMessage.indexOf('\n');
+      title = (newline === -1 ? userMessage : userMessage.slice(0, newline)).trim();
+      body = newline === -1 ? '' : userMessage.slice(newline + 1).trim();
+    }
+    if (!title && input?.modelId) {
       // Ensure the range used for message generation exists locally even when
       // the clone did not previously have an origin/HEAD tracking reference.
       // Only the generated message needs it — gh targets the remote directly,
