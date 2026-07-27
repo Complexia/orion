@@ -16,29 +16,24 @@ export const linkedTaskFromBoardTask = (task: OrionBoardTask): LinkedBoardTask =
   injected: false,
 });
 
-export const linkedTaskMediaAttachments = (task: LinkedBoardTask): ImageAttachment[] =>
-  (task.attachments ?? [])
-    .filter(
-      (attachment) =>
-        Boolean(attachment.path) &&
-        (attachment.mimeType.startsWith('image/') || attachment.mimeType.startsWith('video/'))
-    )
-    .map((attachment) => ({
-      id: `board-${task.id}-${attachment.id}`,
-      name: attachment.name,
-      path: attachment.path!,
-      mimeType: attachment.mimeType,
-      size: attachment.size,
-    }));
+export const linkedTaskMediaAttachments = (tasks: LinkedBoardTask[]): ImageAttachment[] =>
+  tasks.flatMap((task) =>
+    (task.attachments ?? [])
+      .filter(
+        (attachment) =>
+          Boolean(attachment.path) &&
+          (attachment.mimeType.startsWith('image/') || attachment.mimeType.startsWith('video/'))
+      )
+      .map((attachment) => ({
+        id: `board-${task.id}-${attachment.id}`,
+        name: attachment.name,
+        path: attachment.path!,
+        mimeType: attachment.mimeType,
+        size: attachment.size,
+      }))
+  );
 
-// Context block prepended to the first agent turn of a thread linked to an
-// Orion board task, so the agent knows what card it's working on and can read
-// local copies of every board attachment.
-export const buildLinkedTaskContext = (task: LinkedBoardTask, hasUserMessage: boolean) => {
-  const lines = [
-    '## Linked task from the Orion board',
-    `Title: ${task.title}`,
-  ];
+const linkedTaskBody = (task: LinkedBoardTask, lines: string[]) => {
   const description = task.description.trim();
   if (description) {
     lines.push('', 'Description:', description);
@@ -57,19 +52,43 @@ export const buildLinkedTaskContext = (task: LinkedBoardTask, hasUserMessage: bo
         );
       }
     });
+  }
+};
+
+// Context block prepended to the first agent turn carrying a thread's linked
+// Orion board tasks, so the agent knows what cards it's working on and can read
+// local copies of every board attachment. A thread may link any number of
+// cards; they are all presented together as one body of work.
+export const buildLinkedTaskContext = (tasks: LinkedBoardTask[], hasUserMessage: boolean) => {
+  if (tasks.length === 0) return '';
+  const multiple = tasks.length > 1;
+  const noun = multiple ? 'tasks' : 'task';
+  const pronoun = multiple ? 'them' : 'it';
+  const lines = multiple
+    ? [`## Linked tasks from the Orion board`, `${tasks.length} board tasks are linked to this thread.`]
+    : ['## Linked task from the Orion board', `Title: ${tasks[0].title}`];
+  if (multiple) {
+    tasks.forEach((task, index) => {
+      lines.push('', `### Task ${index + 1}: ${task.title}`);
+      linkedTaskBody(task, lines);
+    });
+  } else {
+    linkedTaskBody(tasks[0], lines);
+  }
+  if (tasks.some((task) => (task.attachments ?? []).length > 0)) {
     lines.push('', 'Treat these attachments as part of the task context and inspect them as needed.');
   }
   if (hasUserMessage) {
     lines.push(
       '',
-      'This thread is linked to the board task above; treat it as the goal of the work. The user message follows.',
+      `This thread is linked to the board ${noun} above; treat ${pronoun} as the goal of the work. The user message follows.`,
       '',
       '---'
     );
   } else {
     lines.push(
       '',
-      'This thread is linked to the board task above; treat it as the goal of the work and carry it out.'
+      `This thread is linked to the board ${noun} above; treat ${pronoun} as the goal of the work and carry ${pronoun} out.`
     );
   }
   return lines.join('\n');
@@ -114,7 +133,7 @@ export const buildReviewThreadContext = (thread: Thread) => {
   }
 
   const sections: string[] = [];
-  if (thread.linkedTask) sections.push(buildLinkedTaskContext(thread.linkedTask, false));
+  if (thread.linkedTasks?.length) sections.push(buildLinkedTaskContext(thread.linkedTasks, false));
   if (selected.length > 0) {
     sections.push(
       [

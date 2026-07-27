@@ -356,7 +356,7 @@ const threadShellSignature = (thread: Thread): string => {
     JSON.stringify(thread.pendingForkProviders ?? null),
     JSON.stringify(thread.subagent ?? null),
     JSON.stringify(thread.goal ?? null),
-    JSON.stringify(thread.linkedTask ?? null),
+    JSON.stringify(thread.linkedTasks ?? null),
   ].join('\u0000');
   threadShellSignatureCache.set(thread, signature);
   return signature;
@@ -861,9 +861,11 @@ const App: React.FC = () => {
       ) => Promise<{ ok: boolean; error?: string }>)
     | null
   >(null);
-  const linkedTaskRefreshesRef = useRef(
-    new Map<string, { taskId: string; promise: Promise<void> }>()
-  );
+  // In-flight snapshot refreshes, keyed by `${threadId} ${taskId}`.
+  const linkedTaskRefreshesRef = useRef(new Map<string, Promise<void>>());
+  // Shared unlink requests prevent the picker and composer chip from issuing
+  // competing mutations for the same thread/task pair.
+  const linkedTaskUnlinksRef = useRef(new Map<string, Promise<boolean>>());
   const pendingTurnStartsRef = useRef(new Set<string>());
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
@@ -2283,29 +2285,67 @@ const App: React.FC = () => {
 
   // --- Linked board tasks (Orion web kanban) -----------------------------------
 
+  // Forget one card locally (the web side unlinked or deleted it, or the user
+  // unlinked it here). `undefined` rather than an empty array once the last one
+  // goes, so a thread that never linked anything looks the same as one that
+  // unlinked everything.
+  // Replace one card in place, keeping its position in the list.
+  const updateLinkedTask = useCallback(
+    (threadId: string, taskId: string, next: LinkedBoardTask) => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
+      const linkedTasks = thread?.linkedTasks;
+      if (!linkedTasks?.some((task) => task.id === taskId)) return;
+      updateThread(threadId, {
+        linkedTasks: linkedTasks.map((task) => (task.id === taskId ? next : task)),
+      });
+    },
+    [updateThread]
+  );
+
+  const dropLinkedTask = useCallback(
+    (threadId: string, taskId: string) => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
+      const remaining = (thread?.linkedTasks ?? []).filter((task) => task.id !== taskId);
+      if (remaining.length === (thread?.linkedTasks?.length ?? 0)) return;
+      updateThread(threadId, { linkedTasks: remaining.length > 0 ? remaining : undefined });
+    },
+    [updateThread]
+  );
+
+  // Push a status to the thread's injected cards by default, or just `taskIds`
+  // when the action targets one chip (e.g. "mark done"). Pending cards have
+  // not been sent to the agent and must not inherit the active run's lifecycle.
   const pushLinkedTaskStatus = useCallback(
     (
       threadId: string,
       status: 'running' | 'finished' | 'done' | 'error',
-      notes?: string
+      notes?: string,
+      taskIds?: string[]
     ) => {
       const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
-      const linked = thread?.linkedTask;
-      if (!linked || !window.orion?.updateBoardTaskThreadStatus) return;
-      updateThread(threadId, { linkedTask: { ...linked, lastStatus: status } });
-      void window.orion
-        .updateBoardTaskThreadStatus({ taskId: linked.id, threadId, status, notes })
-        .then((result) => {
-          if (result.ok || !result.stale) return;
-          // The card was unlinked or relinked on the web — drop our side.
-          const current = useOrionStore.getState().threads.find((t) => t.id === threadId);
-          if (current?.linkedTask?.id === linked.id) {
-            updateThread(threadId, { linkedTask: undefined });
-          }
-        })
-        .catch(() => {});
+      const linkedTasks = thread?.linkedTasks ?? [];
+      const targets = taskIds
+        ? linkedTasks.filter((task) => taskIds.includes(task.id))
+        : linkedTasks.filter((task) => task.injected);
+      if (targets.length === 0 || !window.orion?.updateBoardTaskThreadStatus) return;
+      const targetIds = new Set(targets.map((task) => task.id));
+      updateThread(threadId, {
+        linkedTasks: linkedTasks.map((task) =>
+          targetIds.has(task.id) ? { ...task, lastStatus: status } : task
+        ),
+      });
+      for (const linked of targets) {
+        void window.orion
+          .updateBoardTaskThreadStatus({ taskId: linked.id, threadId, status, notes })
+          .then((result) => {
+            if (result.ok || !result.stale) return;
+            // The card was unlinked or relinked on the web — drop our side.
+            dropLinkedTask(threadId, linked.id);
+          })
+          .catch(() => {});
+      }
     },
-    [updateThread]
+    [dropLinkedTask, updateThread]
   );
 
   // Desktop notification when a thread finishes. Suppressed while the user is
@@ -2351,8 +2391,16 @@ const App: React.FC = () => {
           terminalActivityAt: new Date().toISOString(),
         });
         notifyThreadFinished(event.threadId, 'done');
-        if (thread.linkedTask && thread.linkedTask.lastStatus === 'running') {
-          pushLinkedTaskStatus(event.threadId, 'finished');
+        const stillRunning = (thread.linkedTasks ?? []).filter(
+          (task) => task.lastStatus === 'running'
+        );
+        if (stillRunning.length > 0) {
+          pushLinkedTaskStatus(
+            event.threadId,
+            'finished',
+            undefined,
+            stillRunning.map((task) => task.id)
+          );
         }
         return;
       }
@@ -2368,12 +2416,18 @@ const App: React.FC = () => {
         status: 'running',
         terminalActivityAt: new Date().toISOString(),
       });
-      if (
-        event.kind === 'prompt' &&
-        thread.linkedTask &&
-        thread.linkedTask.lastStatus !== 'running'
-      ) {
-        pushLinkedTaskStatus(event.threadId, 'running');
+      if (event.kind === 'prompt') {
+        const notRunning = (thread.linkedTasks ?? []).filter(
+          (task) => task.injected && task.lastStatus !== 'running'
+        );
+        if (notRunning.length > 0) {
+          pushLinkedTaskStatus(
+            event.threadId,
+            'running',
+            undefined,
+            notRunning.map((task) => task.id)
+          );
+        }
       }
     });
     const offExit = window.orion.onTerminalExit((event) => {
@@ -2387,7 +2441,7 @@ const App: React.FC = () => {
       if (thread.status === 'running') {
         notifyThreadFinished(event.threadId, failed ? 'error' : 'done');
       }
-      if (thread.linkedTask) {
+      if (thread.linkedTasks?.length) {
         pushLinkedTaskStatus(event.threadId, failed ? 'error' : 'finished');
       }
     });
@@ -2398,33 +2452,69 @@ const App: React.FC = () => {
   }, [notifyThreadFinished, pushLinkedTaskStatus, updateThread]);
 
   const unlinkTaskFromThread = useCallback(
-    (threadId: string) => {
+    async (threadId: string, taskId: string): Promise<boolean> => {
       const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
-      const linked = thread?.linkedTask;
-      if (!linked) return;
-      updateThread(threadId, { linkedTask: undefined });
-      void window.orion?.unlinkBoardTask?.({ taskId: linked.id, threadId }).catch(() => {});
+      if (!thread?.linkedTasks?.some((task) => task.id === taskId)) return true;
+
+      const key = `${threadId}:${taskId}`;
+      const existing = linkedTaskUnlinksRef.current.get(key);
+      if (existing) return existing;
+
+      const unlink = (async () => {
+        if (!window.orion?.unlinkBoardTask) {
+          toast.error('Board tasks are unavailable in this build.');
+          return false;
+        }
+        try {
+          const result = await window.orion.unlinkBoardTask({ taskId, threadId });
+          if (!result.ok && !result.stale) {
+            toast.error(result.error ?? 'Could not unlink the task');
+            return false;
+          }
+          dropLinkedTask(threadId, taskId);
+          return true;
+        } catch (error) {
+          toast.error(error instanceof Error ? error.message : 'Could not unlink the task');
+          return false;
+        }
+      })();
+      linkedTaskUnlinksRef.current.set(key, unlink);
+      try {
+        return await unlink;
+      } finally {
+        if (linkedTaskUnlinksRef.current.get(key) === unlink) {
+          linkedTaskUnlinksRef.current.delete(key);
+        }
+      }
     },
-    [updateThread]
+    [dropLinkedTask]
   );
 
   const markLinkedTaskDone = useCallback(
-    (threadId: string) => {
-      pushLinkedTaskStatus(threadId, 'done');
+    (threadId: string, taskId: string) => {
+      pushLinkedTaskStatus(threadId, 'done', undefined, [taskId]);
       toast.success('Task moved to Done on your board');
     },
     [pushLinkedTaskStatus]
   );
 
-  const linkTaskToSelectedThread = useCallback(
+  // Picking a task in the popover links it; picking one that is already linked
+  // unlinks it, so the popover doubles as the multi-select list.
+  const toggleTaskOnSelectedThread = useCallback(
     async (task: OrionBoardTask) => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === state.selectedThreadId);
-      if (!thread || !window.orion?.linkBoardTask) return;
+      if (!thread) return;
+      const linkedTasks = thread.linkedTasks ?? [];
+      if (linkedTasks.some((linked) => linked.id === task.id)) {
+        await unlinkTaskFromThread(thread.id, task.id);
+        return;
+      }
+      if (!window.orion?.linkBoardTask) return;
       const project = state.projects.find((p) => p.id === thread.projectId);
-      // A fresh, untitled thread adopts the task's title.
-      const adoptTitle = thread.messages.length === 0 && isDefaultTitle(thread.title);
-      const previous = thread.linkedTask;
+      // A fresh, untitled thread adopts the first task's title.
+      const adoptTitle =
+        linkedTasks.length === 0 && thread.messages.length === 0 && isDefaultTitle(thread.title);
 
       const result = await window.orion.linkBoardTask({
         taskId: task.id,
@@ -2436,12 +2526,14 @@ const App: React.FC = () => {
         toast.error(result.error ?? 'Could not link the task');
         return;
       }
-      if (previous && previous.id !== task.id) {
-        void window.orion.unlinkBoardTask?.({ taskId: previous.id, threadId: thread.id }).catch(() => {});
-      }
       const linkedTask = linkedTaskFromBoardTask(result.task ?? task);
+      // Re-read: the link round-trip is async, so the list may have moved.
+      const current =
+        useOrionStore.getState().threads.find((t) => t.id === thread.id)?.linkedTasks ?? [];
       updateThread(thread.id, {
-        linkedTask,
+        linkedTasks: current.some((linked) => linked.id === linkedTask.id)
+          ? current
+          : [...current, linkedTask],
         ...(adoptTitle ? { title: task.title } : {}),
       });
       const unavailableCount = linkedTask.attachments?.filter((attachment) => !attachment.path).length ?? 0;
@@ -2450,9 +2542,8 @@ const App: React.FC = () => {
           `${unavailableCount} task attachment${unavailableCount === 1 ? '' : 's'} could not be downloaded.`
         );
       }
-      setTaskPickerOpen(false);
     },
-    [updateThread]
+    [unlinkTaskFromThread, updateThread]
   );
 
   // Refresh and locally download the linked-task snapshot (and detect web-side
@@ -2462,73 +2553,85 @@ const App: React.FC = () => {
     (threadId: string, linked: LinkedBoardTask): Promise<void> => {
       if (!window.orion?.getBoardTask) return Promise.resolve();
 
-      const existing = linkedTaskRefreshesRef.current.get(threadId);
-      if (existing?.taskId === linked.id) return existing.promise;
+      const key = `${threadId}:${linked.id}`;
+      const existing = linkedTaskRefreshesRef.current.get(key);
+      if (existing) return existing;
 
       const refresh = window.orion
         .getBoardTask(linked.id)
         .then((result) => {
           const current = useOrionStore
             .getState()
-            .threads.find((thread) => thread.id === threadId)?.linkedTask;
-          if (!current || current.id !== linked.id || current.injected) return;
+            .threads.find((thread) => thread.id === threadId)
+            ?.linkedTasks?.find((task) => task.id === linked.id);
+          if (!current || current.injected) return;
 
           if (!result.ok) {
-            if (result.stale) {
-              updateThread(threadId, { linkedTask: undefined });
-            }
+            if (result.stale) dropLinkedTask(threadId, linked.id);
             return;
           }
 
           const fresh = result.task;
           if (!fresh || fresh.linked?.threadId !== threadId) {
-            updateThread(threadId, { linkedTask: undefined });
+            dropLinkedTask(threadId, linked.id);
             return;
           }
-          updateThread(threadId, {
-            linkedTask: {
-              ...linkedTaskFromBoardTask(fresh),
-              lastStatus: current.lastStatus,
-            },
+          updateLinkedTask(threadId, linked.id, {
+            ...linkedTaskFromBoardTask(fresh),
+            lastStatus: current.lastStatus,
           });
         })
         .catch(() => {});
       const sharedRefresh = refresh.finally(() => {
-        if (linkedTaskRefreshesRef.current.get(threadId)?.promise === sharedRefresh) {
-          linkedTaskRefreshesRef.current.delete(threadId);
+        if (linkedTaskRefreshesRef.current.get(key) === sharedRefresh) {
+          linkedTaskRefreshesRef.current.delete(key);
         }
       });
-      linkedTaskRefreshesRef.current.set(threadId, {
-        taskId: linked.id,
-        promise: sharedRefresh,
-      });
+      linkedTaskRefreshesRef.current.set(key, sharedRefresh);
       return sharedRefresh;
     },
-    [updateThread]
+    [dropLinkedTask, updateLinkedTask]
   );
 
-  const refreshLinkedTaskBeforeDispatch = useCallback(
+  const refreshLinkedTasksBeforeDispatch = useCallback(
     async (threadId: string) => {
-      const linked = useOrionStore
-        .getState()
-        .threads.find((thread) => thread.id === threadId)?.linkedTask;
-      if (!linked || linked.injected) return;
-      await refreshLinkedTaskSnapshot(threadId, linked);
+      const pending = (
+        useOrionStore.getState().threads.find((thread) => thread.id === threadId)?.linkedTasks ?? []
+      ).filter((task) => !task.injected);
+      if (pending.length === 0) return;
+      await Promise.all(pending.map((task) => refreshLinkedTaskSnapshot(threadId, task)));
     },
     [refreshLinkedTaskSnapshot]
   );
 
+  // Cards linked but not yet sent to the agent: the ones the composer shows as
+  // removable chips and the next turn will inject.
+  const pendingLinkedTasks = useMemo(
+    () => (selectedThread?.linkedTasks ?? []).filter((task) => !task.injected),
+    [selectedThread?.linkedTasks]
+  );
+  const hasPendingLinkedTasks = pendingLinkedTasks.length > 0;
+  // Every card linked to the thread, injected or not — the picker's selection
+  // state and the composer's board button read from these.
+  const linkedTaskIds = useMemo(
+    () => (selectedThread?.linkedTasks ?? []).map((task) => task.id),
+    [selectedThread?.linkedTasks]
+  );
+  const linkedTasksLabel =
+    selectedThread?.linkedTasks?.length
+      ? `Linked ${selectedThread.linkedTasks.length === 1 ? 'task' : 'tasks'}: ${selectedThread.linkedTasks
+          .map((task) => task.title)
+          .join(', ')}`
+      : 'Link tasks from your Orion board';
+  // Signature of that set, so selecting a thread re-refreshes only when it
+  // actually changed (not on every status push).
+  const pendingLinkedTaskKey = pendingLinkedTasks.map((task) => task.id).join(':');
+
   useEffect(() => {
     const threadId = selectedThread?.id;
-    const linked = selectedThread?.linkedTask;
-    if (!threadId || !linked || linked.injected) return;
-    void refreshLinkedTaskSnapshot(threadId, linked);
-  }, [
-    selectedThread?.id,
-    selectedThread?.linkedTask?.id,
-    selectedThread?.linkedTask?.injected,
-    refreshLinkedTaskSnapshot,
-  ]);
+    if (!threadId || !pendingLinkedTaskKey) return;
+    void refreshLinkedTasksBeforeDispatch(threadId);
+  }, [selectedThread?.id, pendingLinkedTaskKey, refreshLinkedTasksBeforeDispatch]);
 
   const flushChunkBuffers = useCallback(() => {
     if (chunkFlushTimer.current !== null) {
@@ -4975,7 +5078,7 @@ const App: React.FC = () => {
       }
       pendingTurnStartsRef.current.add(threadId);
       try {
-        await refreshLinkedTaskBeforeDispatch(threadId);
+        await refreshLinkedTasksBeforeDispatch(threadId);
       } finally {
         pendingTurnStartsRef.current.delete(threadId);
       }
@@ -5106,25 +5209,29 @@ const App: React.FC = () => {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
 
-      // First turn with a linked board task: the task itself is the prompt,
-      // so an empty draft is fine — the card's title and description become
-      // the agent context (later turns resume the same session, so the agent
-      // already has it). The chip moves onto this turn's user message.
-      const taskToInject =
-        thread.linkedTask && !thread.linkedTask.injected ? thread.linkedTask : undefined;
-      if (!promptText && attachments.length === 0 && !taskToInject) {
+      // First turn carrying linked board tasks: the tasks themselves are the
+      // prompt, so an empty draft is fine — their titles and descriptions
+      // become the agent context (later turns resume the same session, so the
+      // agent already has them). The chips move onto this turn's user message.
+      const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
+      if (!promptText && attachments.length === 0 && tasksToInject.length === 0) {
         return { ok: false, error: 'Type a message first' };
       }
 
-      const taskMediaAttachments = taskToInject ? linkedTaskMediaAttachments(taskToInject) : [];
+      const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
       const turnAttachments = [...taskMediaAttachments, ...attachments];
       const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
       let agentPrompt = buildPromptWithAttachments(promptText, attachments);
-      if (taskToInject) {
+      if (tasksToInject.length > 0) {
         agentPrompt = agentPrompt
-          ? `${buildLinkedTaskContext(taskToInject, true)}\n\n${agentPrompt}`
-          : buildLinkedTaskContext(taskToInject, false);
-        updateThread(threadId, { linkedTask: { ...taskToInject, injected: true } });
+          ? `${buildLinkedTaskContext(tasksToInject, true)}\n\n${agentPrompt}`
+          : buildLinkedTaskContext(tasksToInject, false);
+        const injectedIds = new Set(tasksToInject.map((task) => task.id));
+        updateThread(threadId, {
+          linkedTasks: (thread.linkedTasks ?? []).map((task) =>
+            injectedIds.has(task.id) ? { ...task, injected: true } : task
+          ),
+        });
       }
       // @-model mentions in the user's original text: tell the agent which
       // models were referenced so it can delegate to them. Works on any
@@ -5148,7 +5255,7 @@ const App: React.FC = () => {
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
       if (thread.messages.length === 0 && isDefaultTitle(thread.title)) {
-        const titleSeed = userContent || taskToInject?.title || '';
+        const titleSeed = userContent || tasksToInject[0]?.title || '';
         const initialTitle = deriveTitle(titleSeed);
         if (isPlausibleTitle(initialTitle)) {
           updateThread(threadId, { title: initialTitle });
@@ -5171,13 +5278,13 @@ const App: React.FC = () => {
         role: 'user',
         content: userContent,
         attachments: turnAttachments,
-        ...(taskToInject
+        ...(tasksToInject.length > 0
           ? {
-              linkedTask: {
-                id: taskToInject.id,
-                title: taskToInject.title,
-                description: taskToInject.description,
-              },
+              linkedTasks: tasksToInject.map((task) => ({
+                id: task.id,
+                title: task.title,
+                description: task.description,
+              })),
             }
           : {}),
       });
@@ -5283,7 +5390,7 @@ const App: React.FC = () => {
       clearActiveRun,
       pushLinkedTaskStatus,
       trackRunStartup,
-      refreshLinkedTaskBeforeDispatch,
+      refreshLinkedTasksBeforeDispatch,
     ]
   );
 
@@ -6375,11 +6482,10 @@ const App: React.FC = () => {
       return;
     }
     const promptText = chatInput.trim();
-    // A freshly linked board task can be sent on its own — the card is the
-    // prompt. Mid-run it can't (queued follow-ups need their own text).
-    const canSendLinkedTaskAlone =
-      !isSending && Boolean(selectedThread.linkedTask && !selectedThread.linkedTask.injected);
-    if (!promptText && chatAttachments.length === 0 && !canSendLinkedTaskAlone) return;
+    // Freshly linked board tasks can be sent on their own — the cards are the
+    // prompt. Mid-run they can't (queued follow-ups need their own text).
+    const canSendLinkedTasksAlone = !isSending && hasPendingLinkedTasks;
+    if (!promptText && chatAttachments.length === 0 && !canSendLinkedTasksAlone) return;
 
     if (selectedThreadRiftUnavailable) {
       toast.error(
@@ -6405,11 +6511,11 @@ const App: React.FC = () => {
       setChatAttachments([]);
       pendingTurnStartsRef.current.add(selectedThreadId);
       try {
-        await refreshLinkedTaskBeforeDispatch(submittedThreadId);
+        await refreshLinkedTasksBeforeDispatch(submittedThreadId);
       } catch (error) {
         restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
         toast.error(
-          error instanceof Error ? error.message : 'The linked task could not be refreshed'
+          error instanceof Error ? error.message : 'The linked tasks could not be refreshed'
         );
         return;
       } finally {
@@ -6418,15 +6524,12 @@ const App: React.FC = () => {
       const currentThread = useOrionStore
         .getState()
         .threads.find((thread) => thread.id === submittedThreadId);
-      const taskToInject =
-        currentThread?.linkedTask && !currentThread.linkedTask.injected
-          ? currentThread.linkedTask
-          : undefined;
+      const tasksToInject = (currentThread?.linkedTasks ?? []).filter((task) => !task.injected);
       let text = buildPromptWithAttachments(promptText, submittedAttachments);
-      if (taskToInject) {
+      if (tasksToInject.length > 0) {
         text = text
-          ? `${buildLinkedTaskContext(taskToInject, true)}\n\n${text}`
-          : buildLinkedTaskContext(taskToInject, false);
+          ? `${buildLinkedTaskContext(tasksToInject, true)}\n\n${text}`
+          : buildLinkedTaskContext(tasksToInject, false);
       }
       if (!text) {
         restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
@@ -6456,15 +6559,24 @@ const App: React.FC = () => {
         toast.error(result?.error ?? 'The Claude Code terminal is not running.');
         return;
       }
-      if (taskToInject) {
-        const currentLinkedTask = useOrionStore
-          .getState()
-          .threads.find((thread) => thread.id === submittedThreadId)?.linkedTask;
-        if (currentLinkedTask?.id === taskToInject.id && !currentLinkedTask.injected) {
+      if (tasksToInject.length > 0) {
+        const injectedIds = new Set(tasksToInject.map((task) => task.id));
+        const currentLinkedTasks =
+          useOrionStore.getState().threads.find((thread) => thread.id === submittedThreadId)
+            ?.linkedTasks ?? [];
+        if (currentLinkedTasks.some((task) => injectedIds.has(task.id) && !task.injected)) {
           updateThread(submittedThreadId, {
-            linkedTask: { ...currentLinkedTask, injected: true },
+            linkedTasks: currentLinkedTasks.map((task) =>
+              injectedIds.has(task.id) ? { ...task, injected: true } : task
+            ),
           });
         }
+        pushLinkedTaskStatus(
+          submittedThreadId,
+          'running',
+          undefined,
+          tasksToInject.map((task) => task.id)
+        );
       }
       // Terminal threads have no transcript, so seed the sidebar title from
       // the first prompt sent through the composer.
@@ -10213,36 +10325,39 @@ const App: React.FC = () => {
                             ))}
                           </div>
                         )}
-                        {selectedThread.linkedTask && !selectedThread.linkedTask.injected && (
+                        {hasPendingLinkedTasks && (
                           <div className="composer-task-row">
-                            <div
-                              className={`composer-task-chip status-${selectedThread.linkedTask.lastStatus ?? 'linked'}`}
-                              title={selectedThread.linkedTask.description || selectedThread.linkedTask.title}
-                            >
-                              <SquareKanban size={13} />
-                              <span className="composer-task-title">{selectedThread.linkedTask.title}</span>
-                              <span className="composer-task-status">
-                                {linkedTaskStatusLabel(selectedThread.linkedTask.lastStatus)}
-                              </span>
-                              {selectedThread.linkedTask.lastStatus !== 'done' && !isSending && (
+                            {pendingLinkedTasks.map((linkedTask) => (
+                              <div
+                                key={linkedTask.id}
+                                className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
+                                title={linkedTask.description || linkedTask.title}
+                              >
+                                <SquareKanban size={13} />
+                                <span className="composer-task-title">{linkedTask.title}</span>
+                                <span className="composer-task-status">
+                                  {linkedTaskStatusLabel(linkedTask.lastStatus)}
+                                </span>
+                                {linkedTask.lastStatus !== 'done' && !isSending && (
+                                  <button
+                                    type="button"
+                                    className="composer-task-action done"
+                                    onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
+                                    title="Mark the task as done on the board"
+                                  >
+                                    <CircleCheck size={13} />
+                                  </button>
+                                )}
                                 <button
                                   type="button"
-                                  className="composer-task-action done"
-                                  onClick={() => markLinkedTaskDone(selectedThread.id)}
-                                  title="Mark the task as done on the board"
+                                  className="composer-task-action"
+                                  onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
+                                  title="Unlink task"
                                 >
-                                  <CircleCheck size={13} />
+                                  <X size={12} />
                                 </button>
-                              )}
-                              <button
-                                type="button"
-                                className="composer-task-action"
-                                onClick={() => unlinkTaskFromThread(selectedThread.id)}
-                                title="Unlink task"
-                              >
-                                <X size={12} />
-                              </button>
-                            </div>
+                              </div>
+                            ))}
                           </div>
                         )}
                         {!isTerminalThread && /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
@@ -10390,8 +10505,10 @@ const App: React.FC = () => {
                                 : 'Queue a follow-up — sends when the agent finishes (⏎)…'
                               : chatAttachments.length > 0
                                 ? `Ask something about the attached ${chatAttachments.some(isVideoAttachment) ? 'media' : 'image'}...`
-                                : selectedThread.linkedTask && !selectedThread.linkedTask.injected
-                                  ? 'Add details (optional) — send starts on the linked task...'
+                                : hasPendingLinkedTasks
+                                  ? `Add details (optional) — send starts on the linked ${
+                                      pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
+                                    }...`
                                   : 'Describe what you want the agent to do...'
                           }
                           value={chatInput}
@@ -10763,27 +10880,22 @@ const App: React.FC = () => {
                         {!isTerminalThread && (
                         <div className="task-picker-anchor" ref={taskPickerRef}>
                           <button
-                            className={`model-trigger task-link-trigger ${selectedThread.linkedTask ? 'linked' : ''}`}
+                            className={`model-trigger task-link-trigger ${linkedTaskIds.length > 0 ? 'linked' : ''}`}
                             onClick={() => setTaskPickerOpen((open) => !open)}
-                            title={
-                              selectedThread.linkedTask
-                                ? `Linked task: ${selectedThread.linkedTask.title}`
-                                : 'Link a task from your Orion board'
-                            }
-                            aria-label={
-                              selectedThread.linkedTask
-                                ? `Linked task: ${selectedThread.linkedTask.title}`
-                                : 'Link a task from your Orion board'
-                            }
+                            title={linkedTasksLabel}
+                            aria-label={linkedTasksLabel}
                           >
                             <SquareKanban size={15} />
+                            {linkedTaskIds.length > 1 && (
+                              <span className="task-link-count">{linkedTaskIds.length}</span>
+                            )}
                           </button>
                           {taskPickerOpen && (
                             <TaskPickerPopover
-                              linkedTaskId={selectedThread.linkedTask?.id}
+                              linkedTaskIds={linkedTaskIds}
                               authenticated={accountState.authenticated}
                               onSignIn={() => void handleStartAccountAuth()}
-                              onPick={linkTaskToSelectedThread}
+                              onPick={toggleTaskOnSelectedThread}
                             />
                           )}
                         </div>
@@ -10827,7 +10939,7 @@ const App: React.FC = () => {
                             disabled={
                               (!chatInput.trim() &&
                                 chatAttachments.length === 0 &&
-                                !(selectedThread.linkedTask && !selectedThread.linkedTask.injected)) ||
+                                !hasPendingLinkedTasks) ||
                               selectedAgentModel?.available === false
                             }
                             title="Send"

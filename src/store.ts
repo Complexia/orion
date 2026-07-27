@@ -239,8 +239,8 @@ export type Message = {
   changedFiles?: ChangedFileSummary[];
   /** Per-turn token usage, when the provider reports it (grok ACP). */
   stats?: TurnTokenStats;
-  /** Board-task chip shown on the user message whose turn sent the task to the agent. */
-  linkedTask?: Pick<LinkedBoardTask, 'id' | 'title' | 'description'>;
+  /** Board-task chips shown on the user message whose turn sent those tasks to the agent. */
+  linkedTasks?: Array<Pick<LinkedBoardTask, 'id' | 'title' | 'description'>>;
 };
 
 export type QueuedMessage = {
@@ -311,9 +311,10 @@ export type NativeSubagentInfo = {
   summary?: string;
 };
 
-// A kanban card from the Orion web board linked to this thread. Title and
-// description plus attachment paths are snapshotted at link time (refreshed
-// just before injection) and fed to the agent on the first linked turn.
+// A kanban card from the Orion web board linked to this thread — a thread can
+// carry any number of them. Title and description plus attachment paths are
+// snapshotted at link time (refreshed just before injection) and fed to the
+// agent on the first turn that carries them.
 export type LinkedBoardTaskAttachment = {
   id: string;
   name: string;
@@ -387,8 +388,8 @@ export type Thread = {
   queuedMessages?: QueuedMessage[];
   /** `/btw` asides answered by session forks; rendered alongside the transcript, never part of it. */
   btwExchanges?: BtwExchange[];
-  /** Kanban card on the Orion web board driving/driven by this thread. */
-  linkedTask?: LinkedBoardTask;
+  /** Kanban cards on the Orion web board driving/driven by this thread, in link order. */
+  linkedTasks?: LinkedBoardTask[];
   /** Codex goal (/goal) this thread is pursuing, if any. Null after /goal clear. */
   goal?: ThreadGoal | null;
   /** Sidebar epic this thread belongs to, if any. */
@@ -784,6 +785,41 @@ const orionStorage: StateStorage = {
       console.warn(`Failed to clear ${name}`);
     }
   },
+};
+
+// Threads and their user messages used to hold at most one board task in a
+// `linkedTask` field; both now hold a `linkedTasks` list. Rewrite the legacy
+// shape on hydration so old transcripts keep their chips and their board link.
+type LegacyLinkedTaskMessage = Message & {
+  linkedTask?: Pick<LinkedBoardTask, 'id' | 'title' | 'description'>;
+};
+type LegacyLinkedTaskThread = Omit<Thread, 'messages'> & {
+  linkedTask?: LinkedBoardTask;
+  messages: LegacyLinkedTaskMessage[];
+};
+
+const migrateLegacyLinkedTask = (thread: Thread): Thread => {
+  const legacy = thread as LegacyLinkedTaskThread;
+  const migratesThread = Boolean(legacy.linkedTask) && !legacy.linkedTasks;
+  const migratesMessages = legacy.messages.some(
+    (message) => message.linkedTask && !message.linkedTasks
+  );
+  if (!migratesThread && !migratesMessages) return thread;
+  const migrated: LegacyLinkedTaskThread = {
+    ...legacy,
+    ...(migratesThread ? { linkedTasks: [legacy.linkedTask!] } : {}),
+    ...(migratesMessages
+      ? {
+          messages: legacy.messages.map((message) => {
+            if (!message.linkedTask || message.linkedTasks) return message;
+            const { linkedTask, ...rest } = message;
+            return { ...rest, linkedTasks: [linkedTask] };
+          }),
+        }
+      : {}),
+  };
+  delete migrated.linkedTask;
+  return migrated;
 };
 
 export const useOrionStore = create<OrionState>()(
@@ -1594,6 +1630,8 @@ export const useOrionStore = create<OrionState>()(
         // history, and history must not be rebranded as a restart casualty.
         const waitingOnBackground = /^Waiting on \d+ background agents?…$/;
         merged.threads = merged.threads.map((thread) => {
+          // Threads used to carry a single board task; they now carry a list.
+          thread = migrateLegacyLinkedTask(thread);
           // The thread the app reopens visibly on counts as opened. Keep the
           // marker if the selected transcript is still hidden behind Code.
           if (
