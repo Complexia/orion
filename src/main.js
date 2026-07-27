@@ -2397,6 +2397,11 @@ ipcMain.handle('rift:status', () => ({
   readyRifts: [...unacknowledgedRifts.values()],
 }));
 
+// Every branch an epic's rift creates is namespaced here, so rift work is
+// recognizable at a glance next to hand-made `feat/`, `fix/` branches.
+const EPIC_BRANCH_NAMESPACE = 'orion/';
+const EPIC_BRANCH_NAMESPACE_REF = `refs/heads/${EPIC_BRANCH_NAMESPACE.slice(0, -1)}`;
+
 ipcMain.handle('epic:createRift', async (event, input) => {
   if (riftShutdownRequested) {
     return { ok: false, error: 'Rift creation was cancelled because Orion is quitting.' };
@@ -2495,6 +2500,27 @@ ipcMain.handle('epic:createRift', async (event, input) => {
           error: `The selected base branch ${requestedBaseBranch} no longer exists in the source repository.`,
         };
       }
+    }
+
+    // Git cannot store both `refs/heads/orion` and child refs such as
+    // `refs/heads/orion/<name>`. Check the source before copying it so this
+    // collision does not create an incomplete rift first.
+    const namespaceBranchExists = await commandSucceeds('git', [
+      '-C',
+      gitRoot,
+      'rev-parse',
+      '--verify',
+      '--quiet',
+      EPIC_BRANCH_NAMESPACE_REF,
+    ]);
+    if (namespaceBranchExists) {
+      return {
+        ok: false,
+        error:
+          'The source repository has a local branch named orion, which conflicts with ' +
+          "Orion's orion/... Rift branch namespace. Rename or delete the local orion branch " +
+          'before creating a rift.',
+      };
     }
 
     // Idempotent: registers the repo with Rift on first use.
@@ -2603,23 +2629,34 @@ ipcMain.handle('epic:createRift', async (event, input) => {
 
     // The rift starts on a detached HEAD with the source's working tree and
     // index reset above. Let the epic's message model pick the readable part
-    // of the branch name; fall back to a slug of the epic title.
+    // of the branch name; fall back to a slug of the epic title. Every epic
+    // branch lives under the `orion/` namespace.
     let branchBase = '';
     if (input?.modelId) {
       try {
         const prompt =
           `Choose a git branch name for work on the epic "${input?.epicName ?? ''}"` +
           (input?.epicDescription ? ` (${truncateForPrompt(String(input.epicDescription), 500)})` : '') +
-          '. Reply with ONLY the branch name: lowercase kebab-case, optionally namespaced with a ' +
-          'short prefix like "feat/" or "fix/", under 50 characters. No quotes, no commentary.';
+          '. Reply with ONLY the branch name: lowercase kebab-case, no namespace prefix ' +
+          '(no "feat/", no "fix/"), under 50 characters. No quotes, no commentary.';
         const raw = cleanGeneratedGitMessage(
           await runOneShotForModelId(input.modelId, prompt, riftWorkingDir, {
             signal: abortController.signal,
             reasoningEffort: input?.reasoningEffort,
           })
         );
-        const candidate = raw.split('\n')[0]?.trim().replace(/^["'`]+|["'`]+$/g, '').slice(0, 60);
-        if (candidate && (await validateNewBranchName(candidate))) branchBase = candidate;
+        const candidate = raw
+          .split('\n')[0]
+          ?.trim()
+          .replace(/^["'`]+|["'`]+$/g, '')
+          // The model still reaches for a `feat/` style prefix sometimes. Drop it
+          // and flatten anything else it namespaced so `orion/` stays the only one.
+          .replace(/^[^/]+\//, '')
+          .replace(/\//g, '-')
+          .slice(0, 60);
+        if (candidate && (await validateNewBranchName(`${EPIC_BRANCH_NAMESPACE}${candidate}`))) {
+          branchBase = candidate;
+        }
       } catch {
         // Fall back to the slug below.
       }
@@ -2627,9 +2664,9 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     if (abortController.signal.aborted || riftShutdownRequested) {
       throw new Error('Rift creation was cancelled because its Orion window closed.');
     }
-    if (!branchBase) branchBase = `epic/${slug}`;
-    branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || `epic/${slug}`;
-    const branch = `${branchBase}-${suffix}`;
+    if (!branchBase) branchBase = slug;
+    branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || slug;
+    const branch = `${EPIC_BRANCH_NAMESPACE}${branchBase}-${suffix}`;
     await execFileAsync('git', ['-C', createdRiftPath, 'checkout', '-b', branch]);
 
     // The initiating renderer can reload or close while the copy/model turn
