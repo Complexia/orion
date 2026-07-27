@@ -882,14 +882,30 @@ const App: React.FC = () => {
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const accessModeRef = useRef<HTMLDivElement>(null);
 
-  // The Agents pane unmounts while the Code tab is active, so the textarea must
-  // be re-measured when it remounts, not only when the text changes.
-  useLayoutEffect(() => {
-    const el = chatInputRef.current;
+  // Autosize the composer to its content. The height lives as an inline style
+  // on the textarea, so it is lost with the DOM node on every unmount.
+  const resizeChatInput = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
-  }, [chatInput, activeTab]);
+  }, []);
+
+  // The composer unmounts whenever the shell swaps views — Settings, the Code
+  // tab — and remounts with a fresh node that has no height style, collapsing a
+  // long draft back to one line. Measuring from the ref callback re-applies the
+  // height during the same commit that mounts the node, so the draft keeps the
+  // size its text earns no matter what caused the remount.
+  const setChatInputRef = useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      chatInputRef.current = el;
+      resizeChatInput(el);
+    },
+    [resizeChatInput]
+  );
+
+  useLayoutEffect(() => {
+    resizeChatInput(chatInputRef.current);
+  }, [chatInput, resizeChatInput]);
 
   // Selecting a thread no longer forces the transcript to the bottom — the
   // transcript restores that thread's own position (bottom for never-visited
@@ -9277,9 +9293,6 @@ const App: React.FC = () => {
                           className={`sidebar-section-chevron ${recentAgentsOpen ? 'open' : ''}`}
                         />
                         <span>Recent agents</span>
-                        {runningAgentCount > 0 && (
-                          <span className="sidebar-section-count">{runningAgentCount}</span>
-                        )}
                       </button>
                       {recentAgentsTargetProject && (
                         <button
@@ -9296,6 +9309,9 @@ const App: React.FC = () => {
                         >
                           <SquarePen size={13} />
                         </button>
+                      )}
+                      {runningAgentCount > 0 && (
+                        <span className="sidebar-section-count">{runningAgentCount}</span>
                       )}
                     </div>
                     {recentAgentsOpen && (
@@ -10370,7 +10386,7 @@ const App: React.FC = () => {
                           </ComposerPopover>
                         )}
                         <textarea
-                          ref={chatInputRef}
+                          ref={setChatInputRef}
                           className="chat-input min-h-[52px]"
                           disabled={isNativeSubagentThread || selectedThreadRiftUnavailable}
                           placeholder={
