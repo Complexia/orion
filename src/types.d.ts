@@ -262,7 +262,12 @@ type OrionComputerUsePermissions = {
           error?: string;
         };
       }>;
-      commitAndPush: (projectPath: string) => Promise<{
+      commitAndPush: (input: {
+        projectPath: string;
+        /** Text-generation model that writes the message; null falls back to a file summary. */
+        modelId?: string | null;
+        reasoningEffort?: string | null;
+      }) => Promise<{
         ok: boolean;
         branch?: string;
         message?: string;

@@ -3320,9 +3320,16 @@ const App: React.FC = () => {
 
     setGitBusy(true);
     try {
-      const result = await window.orion.commitAndPush(activeWorkingDir);
+      const result = await window.orion.commitAndPush({
+        projectPath: activeWorkingDir,
+        // Same message model the epic commit uses, so navbar commits get a
+        // written message instead of "Update 5 files".
+        ...resolveUtilityTurn(),
+      });
       if (result.ok) {
-        toast.success(`Committed and pushed ${result.branch ?? gitState?.currentBranch ?? 'branch'}`);
+        toast.success(`Committed and pushed ${result.branch ?? gitState?.currentBranch ?? 'branch'}`, {
+          description: result.message?.split('\n')[0],
+        });
         await refreshGitState();
       } else {
         toast.error(result.error ?? 'Commit and push failed');
