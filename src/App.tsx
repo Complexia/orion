@@ -242,6 +242,37 @@ type EpicPrLookupRequest = {
   startedAt: string;
 };
 
+// The git action an epic currently has in flight, with the checkout it acts
+// on. Tracked per epic so one epic's commit or PR never blocks another epic's.
+type EpicGitBusyKind = 'commit' | 'pr' | 'pr-branches' | 'settle';
+
+type EpicGitBusyEntry = {
+  kind: EpicGitBusyKind;
+  workspaceKey?: string;
+};
+
+const UNCLAIMED_EPIC_GIT_WORKSPACE_KEY = 'git:unclaimed';
+
+const epicGitWorkspacesOverlap = (left: string, right: string) =>
+  left === right ||
+  ((left === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY ||
+    right === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY) &&
+    !left.startsWith('rift:') &&
+    !right.startsWith('rift:'));
+
+// Whether an epic has to wait before starting a git action: either it already
+// has one in flight, or another epic is working in the same canonical checkout.
+const epicGitWorkspaceBusy = (
+  epicId: string,
+  workspaceKey: string | undefined,
+  entries: Record<string, EpicGitBusyEntry>
+) =>
+  Object.entries(entries).some(([busyEpicId, entry]) => {
+    if (busyEpicId === epicId) return true;
+    if (!workspaceKey || !entry.workspaceKey) return false;
+    return epicGitWorkspacesOverlap(workspaceKey, entry.workspaceKey);
+  });
+
 // Single source of truth for "what state is this epic's PR in", shared by the
 // sidebar icon colour and the epic view's badge. Successful selected-workspace
 // reads and URL-only batch reads both update the persisted epic, so rendering
@@ -707,11 +738,23 @@ const App: React.FC = () => {
   const [epicMenuOpenId, setEpicMenuOpenId] = useState<string | null>(null);
   const [epicRenameId, setEpicRenameId] = useState<string | null>(null);
   const [epicRepoPickerOpen, setEpicRepoPickerOpen] = useState(false);
-  // One epic git action (commit/PR/status) at a time; the epic view's buttons disable
-  // while it runs.
-  const [epicGitBusy, setEpicGitBusy] = useState<
-    'commit' | 'pr' | 'pr-branches' | 'settle' | null
-  >(null);
+  // One epic git action (commit/PR/status) at a time *per epic*, keyed by epic
+  // id: the epic view's buttons disable while that epic's action runs, and
+  // every other epic stays free to start its own. The ref mirrors the state so
+  // a click-time guard sees a just-started action before React re-renders.
+  const [epicGitBusy, setEpicGitBusy] = useState<Record<string, EpicGitBusyEntry>>({});
+  const epicGitBusyRef = useRef<Record<string, EpicGitBusyEntry>>({});
+  const markEpicGitBusy = useCallback(
+    (epicId: string, kind: EpicGitBusyKind | null, workspaceKey?: string) => {
+      const next = { ...epicGitBusyRef.current };
+      if (kind) next[epicId] = { kind, workspaceKey };
+      else delete next[epicId];
+      epicGitBusyRef.current = next;
+      setEpicGitBusy(next);
+    },
+    []
+  );
+  const anyEpicGitBusy = Object.keys(epicGitBusy).length > 0;
   // Message dialog shown before an epic's commit & push. An empty message
   // hands the write back to the epic message model.
   const [epicCommitDialog, setEpicCommitDialog] = useState<{
@@ -784,7 +827,9 @@ const App: React.FC = () => {
       }
     >
   >({});
-  const repositoryOperationBusy = gitBusy || cloudBusy || epicGitBusy !== null;
+  // Shell-wide guard: the workspace project/branch pickers and cloud actions
+  // stand down while any repository work is in flight, epic git included.
+  const repositoryOperationBusy = gitBusy || cloudBusy || anyEpicGitBusy;
   useEffect(() => {
     if (!repositoryOperationBusy) return;
     setProjectPickerOpen(false);
@@ -3991,6 +4036,37 @@ const App: React.FC = () => {
     };
   };
 
+  // Claimed non-rift epics lock by their canonical Git root rather than the
+  // selected project folder, because multiple folders can share one checkout
+  // and index. Before the first action returns that root, serialize unclaimed
+  // non-rift epics under one conservative wildcard key, which also waits for
+  // claimed shared-checkout work because the unknown root could be that same
+  // checkout. Rifts use their private roots, so unrelated rift-backed epics can
+  // still run concurrently.
+  const epicGitWorkspaceKey = (epic: Epic) => {
+    if (epic.riftPath && !epic.riftCleanupPending) {
+      return `rift:${normalizeRepositoryPath(epic.riftPath)}`;
+    }
+    if (epic.gitRoot) {
+      return `git:${normalizeRepositoryPath(epic.gitRoot)}`;
+    }
+    return resolveEpicGitTarget(epic).projectPath
+      ? UNCLAIMED_EPIC_GIT_WORKSPACE_KEY
+      : undefined;
+  };
+
+  // Click-time guard for one epic's git actions. Shell git/cloud work still
+  // blocks them — it can touch the same checkout — as does an epic sharing this
+  // one's workspace, but an unrelated epic's in-flight commit or PR does not.
+  const epicOperationBusy = (epic: Epic) =>
+    gitBusy ||
+    cloudBusy ||
+    epicGitWorkspaceBusy(
+      epic.id,
+      epicGitWorkspaceKey(epic),
+      epicGitBusyRef.current
+    );
+
   // A rift epic's gitRoot stays the source repository root (it associates the
   // epic with its project); the main process reports the rift itself as the
   // git root, which must not overwrite that binding.
@@ -4003,7 +4079,7 @@ const App: React.FC = () => {
   };
 
   // Keeps the selected epic's git-button status fresh: fetched on selection
-  // and after every epic git action (epicGitBusy returning to null re-runs the
+  // and after every epic git action (the epic's busy kind clearing re-runs the
   // effect), plus a light local-only poll while the view stays open so agent
   // work re-enables "Commit & push". The PR state lookup hits GitHub, so it
   // runs only on the initial fetch, not on every poll tick.
@@ -4074,11 +4150,26 @@ const App: React.FC = () => {
   const selectedEpicRemovalPending = selectedEpic
     ? Boolean(riftRemovalEpicIds[selectedEpic.id])
     : false;
+  // Only the selected epic's own git action pauses its status poll and names
+  // the in-progress label; work running in an unrelated epic leaves this view
+  // alone. The button guard also stands down for an epic sharing this one's
+  // checkout, matching the click-time guard.
+  const selectedEpicGitBusy = selectedEpic ? epicGitBusy[selectedEpic.id]?.kind ?? null : null;
+  const selectedEpicOperationBusy =
+    gitBusy ||
+    cloudBusy ||
+    (selectedEpic
+      ? epicGitWorkspaceBusy(
+          selectedEpic.id,
+          epicGitWorkspaceKey(selectedEpic),
+          epicGitBusy
+        )
+      : false);
 
   useEffect(() => {
     if (
       !selectedEpic ||
-      epicGitBusy ||
+      selectedEpicGitBusy ||
       activeRiftUnavailable ||
       selectedEpicRemovalPending
     ) {
@@ -4118,7 +4209,7 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     selectedEpicGitPollKey,
-    epicGitBusy,
+    selectedEpicGitBusy,
     activeRiftUnavailable,
     selectedEpicRemovalPending,
   ]);
@@ -4250,7 +4341,7 @@ const App: React.FC = () => {
   };
 
   const epicCommitBlocked = (epic: Epic) =>
-    repositoryOperationBusy ||
+    epicOperationBusy(epic) ||
     riftSetupEpicIdsRef.current[epic.id] ||
     riftRemovalEpicIdsRef.current.has(epic.id) ||
     epic.riftRequest ||
@@ -4288,7 +4379,8 @@ const App: React.FC = () => {
       return;
     }
 
-    setEpicGitBusy('commit');
+    let committed = false;
+    markEpicGitBusy(epic.id, 'commit', epicGitWorkspaceKey(epic));
     try {
       const trimmedMessage = message.trim();
       const result = await window.orion.epicCommitAndPush({
@@ -4304,6 +4396,7 @@ const App: React.FC = () => {
         claimEpicGitTarget(epic, result);
       }
       if (result.ok) {
+        committed = true;
         toast.success(`Committed and pushed ${result.branch ?? 'branch'}`, {
           description: result.message?.split('\n')[0],
         });
@@ -4318,12 +4411,31 @@ const App: React.FC = () => {
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Commit and push failed');
     } finally {
-      setEpicGitBusy(null);
+      markEpicGitBusy(epic.id, null);
     }
+
+    // The "then create PR" tick: a successful commit carries straight on into
+    // the pull request, so the user can start the commit and navigate away.
+    // Runs after the busy marker clears — the PR's own guards read it.
+    if (committed) await runEpicAutoPr(epic.id);
+  };
+
+  // Follow-up PR for an epic whose "then create PR" tick is on. Reads the epic
+  // back from the store: the commit just claimed its repository and branch,
+  // and the tick may have been toggled while the commit was in flight.
+  const runEpicAutoPr = async (epicId: string) => {
+    const epic = useOrionStore.getState().epics.find((candidate) => candidate.id === epicId);
+    if (!epic?.autoPrAfterCommit) return;
+    // Nothing to open: the push already updated this epic's existing pull
+    // request. A closed one still gets a replacement, matching the button.
+    if (epic.prUrl && epic.prState !== 'CLOSED') return;
+    // Unattended by design, so the base-branch dialog is skipped even when
+    // message prompts are on — the PR takes the promptless button's base.
+    await createEpicPrWithoutPrompt(epic);
   };
 
   const epicCreatePrBlocked = (epic: Epic) =>
-    repositoryOperationBusy ||
+    epicOperationBusy(epic) ||
     riftSetupEpicIdsRef.current[epic.id] ||
     riftRemovalEpicIdsRef.current.has(epic.id) ||
     epic.riftRequest ||
@@ -4392,7 +4504,7 @@ const App: React.FC = () => {
       return;
     }
 
-    setEpicGitBusy('pr-branches');
+    markEpicGitBusy(epic.id, 'pr-branches', epicGitWorkspaceKey(epic));
     try {
       const options = await resolveEpicPrBaseOptions(epic);
       if (!options) return;
@@ -4406,7 +4518,7 @@ const App: React.FC = () => {
         error instanceof Error ? error.message : 'Could not list the branches on origin'
       );
     } finally {
-      setEpicGitBusy(null);
+      markEpicGitBusy(epic.id, null);
     }
   };
 
@@ -4419,20 +4531,21 @@ const App: React.FC = () => {
       toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
       return;
     }
-    if (!resolveEpicGitTarget(epic).projectPath) {
+    const { projectPath } = resolveEpicGitTarget(epic);
+    if (!projectPath) {
       toast.error('Select a repository for this epic before opening a PR');
       return;
     }
 
     let baseBranch = '';
-    setEpicGitBusy('pr-branches');
+    markEpicGitBusy(epic.id, 'pr-branches', epicGitWorkspaceKey(epic));
     try {
       const options = await resolveEpicPrBaseOptions(epic);
       if (options && !('error' in options)) baseBranch = options.baseBranch;
     } catch {
       // Fall through to the remote default branch.
     } finally {
-      setEpicGitBusy(null);
+      markEpicGitBusy(epic.id, null);
     }
     await handleEpicCreatePr(epic, baseBranch);
   };
@@ -4451,7 +4564,7 @@ const App: React.FC = () => {
       return;
     }
 
-    setEpicGitBusy('pr');
+    markEpicGitBusy(epic.id, 'pr', epicGitWorkspaceKey(epic));
     try {
       const trimmedMessage = message.trim();
       const result = await window.orion.epicCreatePr({
@@ -4493,7 +4606,7 @@ const App: React.FC = () => {
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Could not open a pull request');
     } finally {
-      setEpicGitBusy(null);
+      markEpicGitBusy(epic.id, null);
     }
   };
 
@@ -4770,7 +4883,7 @@ const App: React.FC = () => {
   };
 
   const handleSettleEpic = async (epic: Epic) => {
-    if (epicGitBusy) return;
+    if (epicOperationBusy(epic)) return;
     if (epicHasRunningAgents(epic.id)) {
       toast.error('Agents are still running in this epic — wait for them to finish before settling it');
       return;
@@ -4787,12 +4900,12 @@ const App: React.FC = () => {
       epic.riftCleanupPending ||
       (!epic.riftPath && riftsSettings.enabled && riftStatus === null);
     if (!riftUnavailable) {
-      setEpicGitBusy('settle');
+      markEpicGitBusy(epic.id, 'settle', epicGitWorkspaceKey(epic));
       const prLookup = epic.prUrl ? beginEpicPrLookup(epic.id, epic.prUrl) : null;
       try {
         status = await refreshEpicGitStatus(epic, { includePr: true });
       } finally {
-        setEpicGitBusy(null);
+        markEpicGitBusy(epic.id, null);
       }
       if (status?.pr?.state && prLookup) {
         persistEpicPrLookup(epic.id, status.pr.state, prLookup);
@@ -9835,16 +9948,16 @@ const App: React.FC = () => {
                           id="epic-repository"
                           className="epic-view-repository-trigger"
                           disabled={
-                            repositoryOperationBusy ||
+                            selectedEpicOperationBusy ||
                             Boolean(selectedEpic.riftRequest) ||
                             projects.length === 0
                           }
                           onClick={() => {
-                            if (repositoryOperationBusy || selectedEpic.riftRequest) return;
+                            if (selectedEpicOperationBusy || selectedEpic.riftRequest) return;
                             setEpicRepoPickerOpen((open) => !open);
                           }}
                           aria-haspopup="menu"
-                          aria-expanded={epicRepoPickerOpen && !repositoryOperationBusy}
+                          aria-expanded={epicRepoPickerOpen && !selectedEpicOperationBusy}
                           aria-labelledby="epic-repository-label"
                           title={
                             selectedEpicRepositoryProject?.path ??
@@ -9876,7 +9989,7 @@ const App: React.FC = () => {
                           />
                         </button>
                         {epicRepoPickerOpen &&
-                          !repositoryOperationBusy &&
+                          !selectedEpicOperationBusy &&
                           !selectedEpic.riftRequest &&
                           projects.length > 0 && (
                           <div
@@ -9937,7 +10050,7 @@ const App: React.FC = () => {
                       type="button"
                       className="btn"
                       disabled={
-                        repositoryOperationBusy ||
+                        selectedEpicOperationBusy ||
                         activeRiftUnavailable ||
                         riftRemovalEpicIds[selectedEpic.id] ||
                         (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
@@ -9959,8 +10072,25 @@ const App: React.FC = () => {
                       }
                     >
                       <GitCommit size={14} />
-                      {epicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
+                      {selectedEpicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
                     </button>
+                    <label
+                      className="epic-view-auto-pr"
+                      title={
+                        selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
+                          ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
+                          : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
+                      }
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedEpic.autoPrAfterCommit)}
+                        onChange={(e) =>
+                          updateEpic(selectedEpic.id, { autoPrAfterCommit: e.target.checked })
+                        }
+                      />
+                      <span>Then create PR</span>
+                    </label>
                     {selectedEpicPrBadge && (
                       <button
                         type="button"
@@ -9989,7 +10119,7 @@ const App: React.FC = () => {
                         type="button"
                         className="btn"
                         disabled={
-                          repositoryOperationBusy ||
+                          selectedEpicOperationBusy ||
                           activeRiftUnavailable ||
                           riftRemovalEpicIds[selectedEpic.id] ||
                           (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
@@ -10010,9 +10140,9 @@ const App: React.FC = () => {
                         }
                       >
                         <GitPullRequest size={14} />
-                        {epicGitBusy === 'pr'
+                        {selectedEpicGitBusy === 'pr'
                           ? 'Opening PR…'
-                          : epicGitBusy === 'pr-branches'
+                          : selectedEpicGitBusy === 'pr-branches'
                             ? 'Loading branches…'
                             : selectedEpicPrBadge?.modifier === 'closed'
                               ? 'Create replacement PR'
@@ -10023,7 +10153,7 @@ const App: React.FC = () => {
                       type="button"
                       className="btn epic-view-settle"
                       disabled={
-                        !!epicGitBusy ||
+                        !!selectedEpicGitBusy ||
                         selectedEpicHasRunningAgents
                       }
                       onClick={() => void handleSettleEpic(selectedEpic)}
@@ -10038,7 +10168,7 @@ const App: React.FC = () => {
                     </button>
                   </div>
 
-                  {(epicGitBusy || riftSetupEpicIds[selectedEpic.id]) && (
+                  {(selectedEpicGitBusy || riftSetupEpicIds[selectedEpic.id]) && (
                     <div className="epic-view-status">
                       <span className="working-dots" aria-hidden="true">
                         <span />
@@ -10047,11 +10177,11 @@ const App: React.FC = () => {
                       </span>
                       {riftSetupEpicIds[selectedEpic.id]
                         ? 'Creating the epic’s rift workspace and branch…'
-                        : epicGitBusy === 'commit'
+                        : selectedEpicGitBusy === 'commit'
                           ? 'Staging all changes and writing a commit message, then pushing…'
-                          : epicGitBusy === 'pr-branches'
+                          : selectedEpicGitBusy === 'pr-branches'
                             ? 'Fetching the branches on origin…'
-                            : epicGitBusy === 'settle'
+                            : selectedEpicGitBusy === 'settle'
                               ? 'Checking the workspace and pull request state…'
                               : 'Writing the PR message and opening the pull request…'}
                     </div>
