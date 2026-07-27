@@ -2,12 +2,13 @@ import { useCallback, useEffect, useState } from 'react';
 import { Check, Link, LogIn, RefreshCw, Search, SquareKanban } from 'lucide-react';
 
 export const TaskPickerPopover = ({
-  linkedTaskId,
+  linkedTaskIds,
   authenticated,
   onSignIn,
   onPick,
 }: {
-  linkedTaskId?: string;
+  /** Ids of the tasks already linked to this thread — picking one again unlinks it. */
+  linkedTaskIds: string[];
   authenticated: boolean;
   onSignIn: () => void;
   onPick: (task: OrionBoardTask) => Promise<void> | void;
@@ -58,7 +59,11 @@ export const TaskPickerPopover = ({
     <div className="task-picker-popover">
       <div className="task-picker-header">
         <SquareKanban size={14} />
-        <span>Link a board task</span>
+        <span>
+          {linkedTaskIds.length > 0
+            ? `Link board tasks · ${linkedTaskIds.length} linked`
+            : 'Link board tasks'}
+        </span>
         <button className="task-picker-refresh" onClick={() => void load()} title="Refresh">
           <RefreshCw size={13} />
         </button>
@@ -101,7 +106,7 @@ export const TaskPickerPopover = ({
                   <div key={column.id} className="task-picker-group">
                     <div className="task-picker-column-label">{column.name}</div>
                     {columnTasks.map((task) => {
-                      const isCurrent = task.id === linkedTaskId;
+                      const isCurrent = linkedTaskIds.includes(task.id);
                       const linkedElsewhere = Boolean(task.linked) && !isCurrent;
                       return (
                         <button
@@ -116,7 +121,11 @@ export const TaskPickerPopover = ({
                               setLinkingId(null);
                             }
                           }}
-                          title={task.description || task.title}
+                          title={
+                            isCurrent
+                              ? 'Linked — click to unlink'
+                              : task.description || task.title
+                          }
                         >
                           <span className="task-picker-row-title">{task.title}</span>
                           {isCurrent && <Check size={14} />}
@@ -129,8 +138,9 @@ export const TaskPickerPopover = ({
               })}
           </div>
           <div className="task-picker-footer">
-            The task's title, description, and attachments are added to the agent's context, and
-            the card moves across the board as this thread runs.
+            Pick as many tasks as you like — each one's title, description, and attachments are
+            added to the agent's context, and its card moves across the board as this thread runs.
+            Click a linked task to unlink it.
           </div>
         </>
       )}

@@ -345,11 +345,11 @@ export type ChatMessageProps = {
   message: Message;
   /** Whether work owned by this turn is still live, including background agents. */
   runRunning?: boolean;
-  /** The thread's current linked task, for live status on the message's task chip. */
-  liveTask?: LinkedBoardTask;
+  /** The thread's currently linked tasks, for live status on the message's task chips. */
+  liveTasks?: LinkedBoardTask[];
   taskBusy?: boolean;
-  onMarkTaskDone?: () => void;
-  onUnlinkTask?: () => void;
+  onMarkTaskDone?: (taskId: string) => void;
+  onUnlinkTask?: (taskId: string) => void;
   btwExchanges?: BtwExchange[];
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
   onAuthenticateProvider?: (providerId: string) => void;
@@ -359,7 +359,7 @@ export type ChatMessageProps = {
 export const ChatMessage = React.memo(function ChatMessage({
   message,
   runRunning,
-  liveTask,
+  liveTasks,
   taskBusy,
   onMarkTaskDone,
   onUnlinkTask,
@@ -369,10 +369,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   authenticatingProviderId,
 }: ChatMessageProps) {
   const attachments = message.attachments ?? [];
-  const messageTask = message.linkedTask;
-  // Live status/actions only while the chip's task is still the thread's
-  // linked task; after an unlink or relink it renders as a static snapshot.
-  const liveMessageTask = messageTask && liveTask?.id === messageTask.id ? liveTask : undefined;
+  const messageTasks = message.linkedTasks ?? [];
   const isAgentRun = message.role === 'agent' && message.kind === 'agent-run';
   const isRunning = isAgentRun && message.status === 'running';
 
@@ -439,38 +436,44 @@ export const ChatMessage = React.memo(function ChatMessage({
         <MarkdownContent content={message.content} />
       ) : (
         <>
-          {messageTask && (
-            <div
-              className={`composer-task-chip message-task-chip status-${liveMessageTask?.lastStatus ?? 'linked'}`}
-              title={messageTask.description || messageTask.title}
-            >
-              <SquareKanban size={13} />
-              <span className="composer-task-title">{messageTask.title}</span>
-              <span className="composer-task-status">
-                {liveMessageTask ? linkedTaskStatusLabel(liveMessageTask.lastStatus) : 'Linked'}
-              </span>
-              {liveMessageTask && liveMessageTask.lastStatus !== 'done' && !taskBusy && onMarkTaskDone && (
-                <button
-                  type="button"
-                  className="composer-task-action done"
-                  onClick={onMarkTaskDone}
-                  title="Mark the task as done on the board"
-                >
-                  <CircleCheck size={13} />
-                </button>
-              )}
-              {liveMessageTask && onUnlinkTask && (
-                <button
-                  type="button"
-                  className="composer-task-action"
-                  onClick={onUnlinkTask}
-                  title="Unlink task"
-                >
-                  <X size={12} />
-                </button>
-              )}
-            </div>
-          )}
+          {messageTasks.map((messageTask) => {
+            // Live status/actions only while the chip's task is still linked to
+            // the thread; after an unlink it renders as a static snapshot.
+            const liveMessageTask = liveTasks?.find((task) => task.id === messageTask.id);
+            return (
+              <div
+                key={messageTask.id}
+                className={`composer-task-chip message-task-chip status-${liveMessageTask?.lastStatus ?? 'linked'}`}
+                title={messageTask.description || messageTask.title}
+              >
+                <SquareKanban size={13} />
+                <span className="composer-task-title">{messageTask.title}</span>
+                <span className="composer-task-status">
+                  {liveMessageTask ? linkedTaskStatusLabel(liveMessageTask.lastStatus) : 'Linked'}
+                </span>
+                {liveMessageTask && liveMessageTask.lastStatus !== 'done' && !taskBusy && onMarkTaskDone && (
+                  <button
+                    type="button"
+                    className="composer-task-action done"
+                    onClick={() => onMarkTaskDone(messageTask.id)}
+                    title="Mark the task as done on the board"
+                  >
+                    <CircleCheck size={13} />
+                  </button>
+                )}
+                {liveMessageTask && onUnlinkTask && (
+                  <button
+                    type="button"
+                    className="composer-task-action"
+                    onClick={() => onUnlinkTask(messageTask.id)}
+                    title="Unlink task"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
           {message.content && <div className="whitespace-pre-wrap break-words">{message.content}</div>}
           {attachments.length > 0 && (
             <div className="message-attachments">
@@ -625,8 +628,8 @@ export type ChatTranscriptProps = {
   onMoveTasksCard: (position: { x: number; y: number }) => void;
   onToggleTasksCard: () => void;
   onDismissTasksCard: (messageId: string) => void;
-  onMarkTaskDone: (threadId: string) => void;
-  onUnlinkTask: (threadId: string) => void;
+  onMarkTaskDone: (threadId: string, taskId: string) => void;
+  onUnlinkTask: (threadId: string, taskId: string) => void;
   onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
   onAuthenticateProvider: (providerId: string) => void;
   onSteerQueuedMessage: (queuedId: string) => void;
@@ -803,11 +806,11 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   ]);
 
   const handleMarkTaskDone = useCallback(
-    () => onMarkTaskDone(threadId),
+    (taskId: string) => onMarkTaskDone(threadId, taskId),
     [onMarkTaskDone, threadId]
   );
   const handleUnlinkTask = useCallback(
-    () => onUnlinkTask(threadId),
+    (taskId: string) => onUnlinkTask(threadId, taskId),
     [onUnlinkTask, threadId]
   );
   const handleDismissTasksCard = useCallback(() => {
@@ -901,7 +904,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                     message.status === 'running' ||
                     (message.id === latestAgentRun?.id && thread.status === 'running')
                   }
-                  liveTask={thread.linkedTask}
+                  liveTasks={thread.linkedTasks}
                   taskBusy={isSending}
                   onMarkTaskDone={handleMarkTaskDone}
                   onUnlinkTask={handleUnlinkTask}

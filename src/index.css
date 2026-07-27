@@ -5253,6 +5253,8 @@ body {
 
 .composer-task-row {
   display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   padding: 10px 10px 0;
 }
 
@@ -5345,7 +5347,9 @@ body {
   background: var(--bg-elevated);
 }
 
+/* Several cards can ride on one turn, so the chips need to space themselves. */
 .message.user .message-task-chip:not(:only-child) {
+  margin-right: 6px;
   margin-bottom: 8px;
 }
 
@@ -5355,16 +5359,35 @@ body {
 }
 
 .task-link-trigger {
+  position: relative;
   width: 34px;
   padding: 0;
   justify-content: center;
   flex-shrink: 0;
+  overflow: visible;
 }
 
 .task-link-trigger.linked {
   border-color: rgb(77 141 255 / 40%);
   color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* How many cards are linked, once there is more than one to count. */
+.task-link-count {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
 }
 
 .task-picker-popover {
