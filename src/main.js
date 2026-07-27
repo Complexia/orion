@@ -1682,6 +1682,24 @@ const readGitIndexTree = async (gitRoot) => {
   return stdout.trim();
 };
 
+// origin/HEAD as the clone recorded it. Purely local, so the PR base picker
+// can paint with it immediately; it can be stale, which is why
+// resolveRemoteDefaultBranch below asks the remote first.
+const readLocalDefaultBranch = async (gitRoot) => {
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '-C',
+      gitRoot,
+      'symbolic-ref',
+      '--short',
+      'refs/remotes/origin/HEAD',
+    ]);
+    return stdout.trim().replace(/^origin\//, '');
+  } catch {
+    return '';
+  }
+};
+
 const resolveRemoteDefaultBranch = async (gitRoot) => {
   // Ask the remote first: origin/HEAD is only locally recorded metadata and
   // can remain stale after the repository changes its default branch.
@@ -1701,19 +1719,9 @@ const resolveRemoteDefaultBranch = async (gitRoot) => {
     // An offline or inaccessible remote may still have usable local metadata.
   }
 
-  try {
-    const { stdout } = await execFileAsync('git', [
-      '-C',
-      gitRoot,
-      'symbolic-ref',
-      '--short',
-      'refs/remotes/origin/HEAD',
-    ]);
-    const branch = stdout.trim().replace(/^origin\//, '');
-    if (branch) return branch;
-  } catch {
-    // No origin/HEAD tracking reference; fall through to GitHub metadata.
-  }
+  // No usable answer from the remote; local metadata may still be right.
+  const localDefaultBranch = await readLocalDefaultBranch(gitRoot);
+  if (localDefaultBranch) return localDefaultBranch;
 
   try {
     const { stdout } = await execFileAsync(
@@ -1957,6 +1965,38 @@ const riftWorktreeChangesFailure = async (gitRoot, branch, input) => {
       'This epic’s rift still has uncommitted changes. Commit and push them before opening a pull request.',
   };
 };
+
+// Everything the PR base picker can resolve without touching the network, so
+// the dialog opens with a real base branch instead of waiting on origin. The
+// full branch list follows over epic:listRemoteBranches while it is open.
+ipcMain.handle('epic:localPrBase', async (_event, input) => {
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const currentBranch = (await getCurrentGitBranch(gitRoot)) ?? null;
+    let sourceBranch = null;
+    if (input?.sourceProjectPath) {
+      try {
+        sourceBranch =
+          (await getCurrentGitBranch(await getGitRoot(input.sourceProjectPath))) ?? null;
+      } catch {
+        // The source checkout may be gone; the picker just loses its default.
+      }
+    }
+    return {
+      ok: true,
+      gitRoot,
+      currentBranch,
+      sourceBranch,
+      defaultBranch: await readLocalDefaultBranch(gitRoot),
+    };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+});
 
 // Branches currently on origin, for the PR base picker. Asks the remote
 // directly (not local tracking refs) so a stale clone still offers every

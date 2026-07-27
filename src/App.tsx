@@ -39,6 +39,7 @@ import {
   Settings,
   Keyboard,
   Link,
+  LoaderCircle,
   Archive,
   Plug,
   Palette,
@@ -721,14 +722,20 @@ const App: React.FC = () => {
   // Base-branch and message picker shown before opening an epic's pull
   // request. Holds the origin branches fetched for the picker, the user's
   // current selection, and their optional hand-written title/description.
+  // The dialog opens before origin has answered, so the branch list starts
+  // empty and loading while the base branch comes from local git.
   const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<{
+    instanceId: number;
     epic: Epic;
     branches: string[];
+    branchesLoading: boolean;
+    branchesError: string;
     defaultBranch: string;
     sourceBranch: string;
     baseBranch: string;
     message: string;
   } | null>(null);
+  const epicPrBaseDialogInstanceRef = useRef(0);
   const [epicSettleDialog, setEpicSettleDialog] = useState<{
     epic: Epic;
     warnings: string[];
@@ -4355,9 +4362,80 @@ const App: React.FC = () => {
     };
   };
 
-  // "Create PR" with the message prompt on: resolve the base options, then let
-  // the user adjust the base and optionally write the title/description.
-  const openEpicPrBaseDialog = async (epic: Epic) => {
+  // Only touch the exact dialog invocation that started a load. The same epic
+  // can be closed and reopened while an earlier request is still in flight.
+  const patchEpicPrBaseDialog = (
+    instanceId: number,
+    patch: (
+      current: NonNullable<typeof epicPrBaseDialog>
+    ) => Partial<NonNullable<typeof epicPrBaseDialog>>
+  ) =>
+    setEpicPrBaseDialog((current) =>
+      current && current.instanceId === instanceId ? { ...current, ...patch(current) } : current
+    );
+
+  // The base branch as local git alone can answer it: no network, so it lands
+  // in the just-opened dialog within milliseconds. Origin's list corrects it
+  // moments later if it names a branch origin does not have.
+  const preloadEpicPrLocalBase = async (epic: Epic, instanceId: number) => {
+    if (!window.orion?.epicLocalPrBase) return;
+    const { projectPath } = resolveEpicGitTarget(epic);
+    if (!projectPath) return;
+    const sourceProjectPath = resolveEpicSourceProjectPath(epic);
+    try {
+      const result = await window.orion.epicLocalPrBase({
+        projectPath,
+        ...(sourceProjectPath ? { sourceProjectPath } : {}),
+      });
+      if (!result.ok) return;
+      // The PR's head branch cannot be its own base.
+      const usable = (name?: string | null) => (name && name !== result.currentBranch ? name : '');
+      const sourceBranch = usable(result.sourceBranch);
+      const defaultBranch = usable(result.defaultBranch);
+      patchEpicPrBaseDialog(instanceId, (current) =>
+        // Origin already answered — its list is the authoritative one.
+        current.branches.length > 0 || current.baseBranch
+          ? {}
+          : { sourceBranch, defaultBranch, baseBranch: sourceBranch || defaultBranch }
+      );
+    } catch {
+      // The picker still fills from origin.
+    }
+  };
+
+  // Origin's branch list, for the picker of an already-open dialog.
+  const loadEpicPrRemoteBranches = async (epic: Epic, instanceId: number) => {
+    try {
+      const options = await resolveEpicPrBaseOptions(epic);
+      if (!options) {
+        patchEpicPrBaseDialog(instanceId, () => ({ branchesLoading: false }));
+        return;
+      }
+      if ('error' in options) {
+        patchEpicPrBaseDialog(instanceId, () => ({
+          branchesLoading: false,
+          branchesError: options.error,
+        }));
+        return;
+      }
+      patchEpicPrBaseDialog(instanceId, () => ({
+        ...options,
+        branchesLoading: false,
+        branchesError: '',
+      }));
+    } catch (error) {
+      patchEpicPrBaseDialog(instanceId, () => ({
+        branchesLoading: false,
+        branchesError:
+          error instanceof Error ? error.message : 'Could not list the branches on origin',
+      }));
+    }
+  };
+
+  // "Create PR" with the message prompt on. Listing origin's branches is a
+  // network round trip, so the dialog opens first — with the base branch local
+  // git already knows — and the picker fills itself while the user reads it.
+  const openEpicPrBaseDialog = (epic: Epic) => {
     if (epicCreatePrBlocked(epic) || !window.orion?.epicListRemoteBranches) return;
     if (epicHasRunningAgents(epic.id)) {
       toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
@@ -4369,22 +4447,21 @@ const App: React.FC = () => {
       return;
     }
 
-    setEpicGitBusy('pr-branches');
-    try {
-      const options = await resolveEpicPrBaseOptions(epic);
-      if (!options) return;
-      if ('error' in options) {
-        toast.error(options.error);
-        return;
-      }
-      setEpicPrBaseDialog({ epic, ...options, message: '' });
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : 'Could not list the branches on origin'
-      );
-    } finally {
-      setEpicGitBusy(null);
-    }
+    setEpicPrBaseBranchPickerOpen(false);
+    const instanceId = ++epicPrBaseDialogInstanceRef.current;
+    setEpicPrBaseDialog({
+      instanceId,
+      epic,
+      branches: [],
+      branchesLoading: true,
+      branchesError: '',
+      defaultBranch: '',
+      sourceBranch: '',
+      baseBranch: '',
+      message: '',
+    });
+    void preloadEpicPrLocalBase(epic, instanceId);
+    void loadEpicPrRemoteBranches(epic, instanceId);
   };
 
   // "Create PR" with the message prompt off: no dialog, and the PR targets the
@@ -9973,7 +10050,7 @@ const App: React.FC = () => {
                           selectedEpicHasRunningAgents
                         }
                         onClick={() => {
-                          if (epicPromptGitMessages) void openEpicPrBaseDialog(selectedEpic);
+                          if (epicPromptGitMessages) openEpicPrBaseDialog(selectedEpic);
                           else void createEpicPrWithoutPrompt(selectedEpic);
                         }}
                         title={
@@ -11057,6 +11134,13 @@ const App: React.FC = () => {
               onSubmit={(e) => {
                 e.preventDefault();
                 const dialog = epicPrBaseDialog;
+                if (
+                  dialog.branchesLoading ||
+                  !dialog.baseBranch ||
+                  !dialog.branches.includes(dialog.baseBranch)
+                ) {
+                  return;
+                }
                 setEpicPrBaseDialog(null);
                 void handleEpicCreatePr(dialog.epic, dialog.baseBranch, dialog.message);
               }}
@@ -11072,11 +11156,15 @@ const App: React.FC = () => {
                     aria-expanded={epicPrBaseBranchPickerOpen}
                   >
                     <span className="truncate">
-                      {epicPrBaseDialog.baseBranch === epicPrBaseDialog.sourceBranch
-                        ? `${epicPrBaseDialog.baseBranch} (your current branch)`
-                        : epicPrBaseDialog.baseBranch === epicPrBaseDialog.defaultBranch
-                          ? `${epicPrBaseDialog.baseBranch} (default)`
-                          : epicPrBaseDialog.baseBranch}
+                      {!epicPrBaseDialog.baseBranch
+                        ? epicPrBaseDialog.branchesLoading
+                          ? 'Finding the base branch…'
+                          : 'No base branch found'
+                        : epicPrBaseDialog.baseBranch === epicPrBaseDialog.sourceBranch
+                          ? `${epicPrBaseDialog.baseBranch} (your current branch)`
+                          : epicPrBaseDialog.baseBranch === epicPrBaseDialog.defaultBranch
+                            ? `${epicPrBaseDialog.baseBranch} (default)`
+                            : epicPrBaseDialog.baseBranch}
                     </span>
                     <ChevronDown
                       size={14}
@@ -11091,6 +11179,20 @@ const App: React.FC = () => {
                       aria-label="Base branch"
                       className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
                     >
+                      {/* Origin is still being asked; the picker fills itself
+                          without the user having to close and reopen it. */}
+                      {epicPrBaseDialog.branchesLoading && (
+                        <div className="flex items-center gap-2 px-2.5 py-1.5 text-[13px] text-[var(--text-muted)]">
+                          <LoaderCircle size={13} className="spinning shrink-0" />
+                          Loading branches on origin…
+                        </div>
+                      )}
+                      {!epicPrBaseDialog.branchesLoading &&
+                        epicPrBaseDialog.branches.length === 0 && (
+                          <div className="px-2.5 py-1.5 text-[13px] text-[var(--text-muted)]">
+                            {epicPrBaseDialog.branchesError || 'No branches found on origin'}
+                          </div>
+                        )}
                       {epicPrBaseDialog.branches.map((name) => {
                         const selected = name === epicPrBaseDialog.baseBranch;
                         const label =
@@ -11125,6 +11227,13 @@ const App: React.FC = () => {
                     </div>
                   )}
                 </div>
+                {/* A provisional local base is never submitted. Origin must
+                    confirm the branch before the PR action is enabled. */}
+                {epicPrBaseDialog.branchesError && (
+                  <span className="text-[12px] text-[var(--text-muted)]">
+                    {epicPrBaseDialog.branchesError}
+                  </span>
+                )}
               </div>
               <label className="modal-field">
                 <span className="modal-field-label">
@@ -11156,7 +11265,15 @@ const App: React.FC = () => {
                 >
                   Cancel
                 </button>
-                <button type="submit" className="btn">
+                <button
+                  type="submit"
+                  className="btn"
+                  disabled={
+                    epicPrBaseDialog.branchesLoading ||
+                    !epicPrBaseDialog.baseBranch ||
+                    !epicPrBaseDialog.branches.includes(epicPrBaseDialog.baseBranch)
+                  }
+                >
                   <GitPullRequest size={14} />
                   Create PR
                 </button>

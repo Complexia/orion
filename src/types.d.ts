@@ -341,6 +341,20 @@ type OrionComputerUsePermissions = {
         alreadyExists?: boolean;
         error?: string;
       }>;
+      /** Local-git answer for the PR base picker's first paint — no network. */
+      epicLocalPrBase: (input: {
+        projectPath: string;
+        /** The epic's real repository checkout, when it works inside a rift. */
+        sourceProjectPath?: string;
+      }) => Promise<{
+        ok: boolean;
+        gitRoot?: string;
+        currentBranch?: string | null;
+        sourceBranch?: string | null;
+        /** origin/HEAD as recorded locally; may be stale. */
+        defaultBranch?: string;
+        error?: string;
+      }>;
       epicListRemoteBranches: (input: {
         projectPath: string;
         /** The epic's real repository checkout, when it works inside a rift. */
