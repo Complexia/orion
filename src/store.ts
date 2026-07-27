@@ -24,6 +24,14 @@ export type Epic = {
   /** URL of the PR opened from this epic, if any. */
   prUrl?: string;
   /**
+   * The tick beside "Commit & push": a successful commit carries straight on
+   * into "Create PR" without a second click, so the user can start the commit
+   * and navigate away. The unattended PR skips the base-branch dialog and
+   * takes the same base the promptless button would. Per epic, and persisted
+   * so it holds for that epic's later commits.
+   */
+  autoPrAfterCommit?: boolean;
+  /**
    * Last known lifecycle state of prUrl's pull request. Persisted so the
    * sidebar can colour every epic's icon on first paint instead of waiting on
    * a round of `gh pr view` calls.

@@ -12,9 +12,12 @@ almost no disk space.
    dialog pre-checks "Work in a rift"; uncheck it to opt out for that epic.
 3. Orion registers the project with rift (`rift init`, idempotent), creates a
    rift from a clean `HEAD` snapshot, and checks out a fresh branch inside the
-   rift — the readable part is chosen by the epic message model (fallback:
-   `epic/<slug>`) and Orion adds a globally unique suffix. Rift creation is
-   refused while the source has staged, unstaged, or untracked changes.
+   rift — the branch is always namespaced `orion/`, the readable part is chosen
+   by the epic message model (fallback: the epic's slug), and Orion adds a
+   globally unique suffix, giving `orion/<name>-<suffix>`. Rift creation is
+   refused while the source has staged, unstaged, or untracked changes, or if
+   the source already has a local `orion` branch that conflicts with the
+   namespace.
 4. Every thread grouped under the epic runs its agent processes inside the rift,
    and so do the repository controls for those threads: git state and the
    branch picker, Commit & push, Orion Cloud, the Code tab and Open With all

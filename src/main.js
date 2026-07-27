@@ -1560,8 +1560,12 @@ ipcMain.handle('git:checkoutBranch', async (_event, input) => {
   }
 });
 
-ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
+// The navbar action passes `{ projectPath, modelId, reasoningEffort }`; older
+// callers passed the path alone and keep the diffstat-style fallback message.
+ipcMain.handle('git:commitAndPush', async (_event, input) => {
   try {
+    const request = typeof input === 'string' ? { projectPath: input } : (input ?? {});
+    const { projectPath } = request;
     if (!projectPath) {
       return { ok: false, error: 'Missing project path.' };
     }
@@ -1583,7 +1587,30 @@ ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
       return { ok: false, error: 'No staged changes to commit.' };
     }
 
-    const message = commitMessageForEntries(entries);
+    // Freeze the index across the message turn, the same way the epic commit
+    // does: staging keeps moving while the model writes, and committing after
+    // that would ship changes the message never described.
+    const indexTree = await readGitIndexTree(gitRoot);
+    const stagedEntries = await readStagedGitEntries(gitRoot);
+    const message = await writeGitCommitMessage({
+      gitRoot,
+      entries: stagedEntries,
+      modelId: request.modelId,
+      reasoningEffort: request.reasoningEffort,
+    });
+    if ((await readGitIndexTree(gitRoot)) !== indexTree) {
+      return {
+        ok: false,
+        error: 'Staged changes changed while Orion was preparing the commit. Try again.',
+      };
+    }
+    if ((await getCurrentGitBranch(gitRoot)) !== state.currentBranch) {
+      return {
+        ok: false,
+        error: `The repository moved off ${state.currentBranch} while Orion was preparing the commit. Try again.`,
+      };
+    }
+
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
     await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', state.currentBranch]);
 
@@ -1682,6 +1709,46 @@ const readGitIndexTree = async (gitRoot) => {
   return stdout.trim();
 };
 
+// origin/HEAD as the clone recorded it. Purely local, so the PR base picker
+// can paint with it immediately; it can be stale, which is why
+// resolveRemoteDefaultBranch below asks the remote first.
+const readLocalDefaultBranch = async (gitRoot) => {
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '-C',
+      gitRoot,
+      'symbolic-ref',
+      '--short',
+      'refs/remotes/origin/HEAD',
+    ]);
+    return stdout.trim().replace(/^origin\//, '');
+  } catch {
+    return '';
+  }
+};
+
+// Ask the text-generation model for a commit message describing the staged
+// entries. Without a model — or when the turn comes back empty because the
+// model is unavailable or errored — this degrades to the mechanical
+// "Update N files" summary rather than blocking the commit.
+const writeGitCommitMessage = async ({ gitRoot, entries, epicName, modelId, reasoningEffort }) => {
+  if (modelId) {
+    const context = await readStagedGitChangesContext(gitRoot, entries);
+    const prompt =
+      'Write a git commit message for the changes below' +
+      (epicName ? `, which are part of the epic "${epicName}"` : '') +
+      '. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
+      'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
+      'message — no quotes, no code fences, no commentary.\n\n' +
+      context;
+    const generated = cleanGeneratedGitMessage(
+      await runOneShotForModelId(modelId, prompt, gitRoot, { reasoningEffort })
+    );
+    if (generated) return generated;
+  }
+  return commitMessageForEntries(entries);
+};
+
 const resolveRemoteDefaultBranch = async (gitRoot) => {
   // Ask the remote first: origin/HEAD is only locally recorded metadata and
   // can remain stale after the repository changes its default branch.
@@ -1701,19 +1768,9 @@ const resolveRemoteDefaultBranch = async (gitRoot) => {
     // An offline or inaccessible remote may still have usable local metadata.
   }
 
-  try {
-    const { stdout } = await execFileAsync('git', [
-      '-C',
-      gitRoot,
-      'symbolic-ref',
-      '--short',
-      'refs/remotes/origin/HEAD',
-    ]);
-    const branch = stdout.trim().replace(/^origin\//, '');
-    if (branch) return branch;
-  } catch {
-    // No origin/HEAD tracking reference; fall through to GitHub metadata.
-  }
+  // No usable answer from the remote; local metadata may still be right.
+  const localDefaultBranch = await readLocalDefaultBranch(gitRoot);
+  if (localDefaultBranch) return localDefaultBranch;
 
   try {
     const { stdout } = await execFileAsync(
@@ -1891,22 +1948,15 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     // A message typed in the commit dialog is used verbatim — no model turn,
     // and no cleanup pass (that one strips artifacts of generated text).
     let message = String(input?.message ?? '').trim();
-    if (!message && input?.modelId) {
-      const context = await readStagedGitChangesContext(gitRoot, entries);
-      const prompt =
-        'Write a git commit message for the changes below' +
-        (input?.epicName ? `, which are part of the epic "${input.epicName}"` : '') +
-        '. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
-        'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
-        'message — no quotes, no code fences, no commentary.\n\n' +
-        context;
-      message = cleanGeneratedGitMessage(
-        await runOneShotForModelId(input.modelId, prompt, gitRoot, {
-          reasoningEffort: input?.reasoningEffort,
-        })
-      );
+    if (!message) {
+      message = await writeGitCommitMessage({
+        gitRoot,
+        entries,
+        epicName: input?.epicName,
+        modelId: input?.modelId,
+        reasoningEffort: input?.reasoningEffort,
+      });
     }
-    if (!message) message = commitMessageForEntries(entries);
 
     // Re-verify what the commit will actually land, and where: `git commit`
     // uses the index and the current checkout, but the push below targets the
@@ -1957,6 +2007,38 @@ const riftWorktreeChangesFailure = async (gitRoot, branch, input) => {
       'This epic’s rift still has uncommitted changes. Commit and push them before opening a pull request.',
   };
 };
+
+// Everything the PR base picker can resolve without touching the network, so
+// the dialog opens with a real base branch instead of waiting on origin. The
+// full branch list follows over epic:listRemoteBranches while it is open.
+ipcMain.handle('epic:localPrBase', async (_event, input) => {
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) {
+      return { ok: false, error: 'Missing project path.' };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const currentBranch = (await getCurrentGitBranch(gitRoot)) ?? null;
+    let sourceBranch = null;
+    if (input?.sourceProjectPath) {
+      try {
+        sourceBranch =
+          (await getCurrentGitBranch(await getGitRoot(input.sourceProjectPath))) ?? null;
+      } catch {
+        // The source checkout may be gone; the picker just loses its default.
+      }
+    }
+    return {
+      ok: true,
+      gitRoot,
+      currentBranch,
+      sourceBranch,
+      defaultBranch: await readLocalDefaultBranch(gitRoot),
+    };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+});
 
 // Branches currently on origin, for the PR base picker. Asks the remote
 // directly (not local tracking refs) so a stale clone still offers every
@@ -2355,6 +2437,11 @@ ipcMain.handle('rift:status', () => ({
   readyRifts: [...unacknowledgedRifts.values()],
 }));
 
+// Every branch an epic's rift creates is namespaced here, so rift work is
+// recognizable at a glance next to hand-made `feat/`, `fix/` branches.
+const EPIC_BRANCH_NAMESPACE = 'orion/';
+const EPIC_BRANCH_NAMESPACE_REF = `refs/heads/${EPIC_BRANCH_NAMESPACE.slice(0, -1)}`;
+
 ipcMain.handle('epic:createRift', async (event, input) => {
   if (riftShutdownRequested) {
     return { ok: false, error: 'Rift creation was cancelled because Orion is quitting.' };
@@ -2453,6 +2540,27 @@ ipcMain.handle('epic:createRift', async (event, input) => {
           error: `The selected base branch ${requestedBaseBranch} no longer exists in the source repository.`,
         };
       }
+    }
+
+    // Git cannot store both `refs/heads/orion` and child refs such as
+    // `refs/heads/orion/<name>`. Check the source before copying it so this
+    // collision does not create an incomplete rift first.
+    const namespaceBranchExists = await commandSucceeds('git', [
+      '-C',
+      gitRoot,
+      'rev-parse',
+      '--verify',
+      '--quiet',
+      EPIC_BRANCH_NAMESPACE_REF,
+    ]);
+    if (namespaceBranchExists) {
+      return {
+        ok: false,
+        error:
+          'The source repository has a local branch named orion, which conflicts with ' +
+          "Orion's orion/... Rift branch namespace. Rename or delete the local orion branch " +
+          'before creating a rift.',
+      };
     }
 
     // Idempotent: registers the repo with Rift on first use.
@@ -2561,23 +2669,34 @@ ipcMain.handle('epic:createRift', async (event, input) => {
 
     // The rift starts on a detached HEAD with the source's working tree and
     // index reset above. Let the epic's message model pick the readable part
-    // of the branch name; fall back to a slug of the epic title.
+    // of the branch name; fall back to a slug of the epic title. Every epic
+    // branch lives under the `orion/` namespace.
     let branchBase = '';
     if (input?.modelId) {
       try {
         const prompt =
           `Choose a git branch name for work on the epic "${input?.epicName ?? ''}"` +
           (input?.epicDescription ? ` (${truncateForPrompt(String(input.epicDescription), 500)})` : '') +
-          '. Reply with ONLY the branch name: lowercase kebab-case, optionally namespaced with a ' +
-          'short prefix like "feat/" or "fix/", under 50 characters. No quotes, no commentary.';
+          '. Reply with ONLY the branch name: lowercase kebab-case, no namespace prefix ' +
+          '(no "feat/", no "fix/"), under 50 characters. No quotes, no commentary.';
         const raw = cleanGeneratedGitMessage(
           await runOneShotForModelId(input.modelId, prompt, riftWorkingDir, {
             signal: abortController.signal,
             reasoningEffort: input?.reasoningEffort,
           })
         );
-        const candidate = raw.split('\n')[0]?.trim().replace(/^["'`]+|["'`]+$/g, '').slice(0, 60);
-        if (candidate && (await validateNewBranchName(candidate))) branchBase = candidate;
+        const candidate = raw
+          .split('\n')[0]
+          ?.trim()
+          .replace(/^["'`]+|["'`]+$/g, '')
+          // The model still reaches for a `feat/` style prefix sometimes. Drop it
+          // and flatten anything else it namespaced so `orion/` stays the only one.
+          .replace(/^[^/]+\//, '')
+          .replace(/\//g, '-')
+          .slice(0, 60);
+        if (candidate && (await validateNewBranchName(`${EPIC_BRANCH_NAMESPACE}${candidate}`))) {
+          branchBase = candidate;
+        }
       } catch {
         // Fall back to the slug below.
       }
@@ -2585,9 +2704,9 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     if (abortController.signal.aborted || riftShutdownRequested) {
       throw new Error('Rift creation was cancelled because its Orion window closed.');
     }
-    if (!branchBase) branchBase = `epic/${slug}`;
-    branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || `epic/${slug}`;
-    const branch = `${branchBase}-${suffix}`;
+    if (!branchBase) branchBase = slug;
+    branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || slug;
+    const branch = `${EPIC_BRANCH_NAMESPACE}${branchBase}-${suffix}`;
     await execFileAsync('git', ['-C', createdRiftPath, 'checkout', '-b', branch]);
 
     // The initiating renderer can reload or close while the copy/model turn

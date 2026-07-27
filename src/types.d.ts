@@ -262,7 +262,12 @@ type OrionComputerUsePermissions = {
           error?: string;
         };
       }>;
-      commitAndPush: (projectPath: string) => Promise<{
+      commitAndPush: (input: {
+        projectPath: string;
+        /** Text-generation model that writes the message; null falls back to a file summary. */
+        modelId?: string | null;
+        reasoningEffort?: string | null;
+      }) => Promise<{
         ok: boolean;
         branch?: string;
         message?: string;
@@ -339,6 +344,20 @@ type OrionComputerUsePermissions = {
         branch?: string;
         baseBranch?: string;
         alreadyExists?: boolean;
+        error?: string;
+      }>;
+      /** Local-git answer for the PR base picker's first paint — no network. */
+      epicLocalPrBase: (input: {
+        projectPath: string;
+        /** The epic's real repository checkout, when it works inside a rift. */
+        sourceProjectPath?: string;
+      }) => Promise<{
+        ok: boolean;
+        gitRoot?: string;
+        currentBranch?: string | null;
+        sourceBranch?: string | null;
+        /** origin/HEAD as recorded locally; may be stale. */
+        defaultBranch?: string;
         error?: string;
       }>;
       epicListRemoteBranches: (input: {

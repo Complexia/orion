@@ -33,11 +33,12 @@ contextBridge.exposeInMainWorld('orion', {
   // Git
   getGitState: (projectPath) => ipcRenderer.invoke('git:getState', projectPath),
   checkoutGitBranch: (input) => ipcRenderer.invoke('git:checkoutBranch', input),
-  commitAndPush: (projectPath) => ipcRenderer.invoke('git:commitAndPush', projectPath),
+  commitAndPush: (input) => ipcRenderer.invoke('git:commitAndPush', input),
 
   // Epics (sidebar Epics section)
   epicCommitAndPush: (input) => ipcRenderer.invoke('epic:commitAndPush', input),
   epicCreatePr: (input) => ipcRenderer.invoke('epic:createPr', input),
+  epicLocalPrBase: (input) => ipcRenderer.invoke('epic:localPrBase', input),
   epicListRemoteBranches: (input) => ipcRenderer.invoke('epic:listRemoteBranches', input),
   epicGitStatus: (input) => ipcRenderer.invoke('epic:gitStatus', input),
   epicPrStates: (input) => ipcRenderer.invoke('epic:prStates', input),
