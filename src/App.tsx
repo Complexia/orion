@@ -230,10 +230,17 @@ type SettingsTab =
 
 const THREADS_VISIBLE_LIMIT = 5;
 
-// How often the sidebar refreshes non-merged PRs. This hits the network (one
-// `gh pr view` per epic), so keep it far slower than the 5s local-git poll
-// behind the selected epic's buttons. Focus refreshes share this same throttle.
-const EPIC_PR_STATE_REFRESH_MS = 5 * 60_000;
+// How often the sidebar refreshes non-merged PRs. One `gh api graphql` call
+// covers every epic at once (rate-limit cost 1 of 5000/hour), so this is a
+// fixed cost per tick rather than per PR, and stays well under the 5s local-git
+// poll behind the selected epic's buttons. A merge can land any time — minutes
+// or a day after the PR opens, and possibly by someone else — so this periodic
+// refresh, not any user-driven event, is what has to catch it.
+const EPIC_PR_STATE_REFRESH_MS = 60_000;
+
+// Returning to Orion right after merging in the browser is the moment the icon
+// is most likely stale, so focus gets its own much shorter throttle.
+const EPIC_PR_STATE_FOCUS_REFRESH_MS = 15_000;
 
 type EpicPrStatus = 'open' | 'merged' | 'closed';
 
@@ -242,6 +249,10 @@ type EpicPrLookupRequest = {
   order: number;
   startedAt: string;
 };
+
+// What prompted a batch PR-state refresh, which decides how long it must wait
+// since the last one: the background interval or a window focus.
+type EpicPrRefreshReason = 'tick' | 'focus';
 
 // The git action an epic currently has in flight, with the checkout it acts
 // on. Tracked per epic so one epic's commit or PR never blocks another epic's.
@@ -4214,6 +4225,17 @@ const App: React.FC = () => {
   // response completes first.
   const epicPrLookupOrderRef = useRef(0);
   const latestEpicPrLookupOrderRef = useRef<Map<string, number>>(new Map());
+
+  // Opening a PR on GitHub is the one moment Orion knows the user is looking at
+  // it, so the next focus refreshes without waiting on any throttle. Only a
+  // hint: a teammate can merge, or the user can merge from elsewhere entirely,
+  // which is why the background interval remains what actually catches merges.
+  // Lives outside the poll effect so it survives that effect restarting.
+  const epicPrRefreshArmedRef = useRef(false);
+  const openEpicPrUrl = (prUrl: string) => {
+    epicPrRefreshArmedRef.current = true;
+    void window.orion?.openExternalUrl?.(prUrl);
+  };
   const beginEpicPrLookup = (
     epicId: string,
     expectedPrUrl: string
@@ -4242,6 +4264,13 @@ const App: React.FC = () => {
     ) {
       return;
     }
+    // A tick that only confirms the state we already hold must not touch the
+    // store: updateEpic allocates a new epics array, which re-renders all of
+    // App and re-serializes the persisted blob. Steady-state polling is then
+    // free, so the refresh interval can stay short. This makes prStateCheckedAt
+    // mean "when this state became known" rather than "when we last polled" —
+    // nothing reads it, and the former is the more useful of the two.
+    if (currentEpic.prState === state) return;
     updateEpic(epicId, {
       prState: state,
       // Record the accepted request's start time rather than its completion
@@ -4351,23 +4380,47 @@ const App: React.FC = () => {
     if (!hasEpicPrTargets || !window.orion?.epicPrStates) return;
     let cancelled = false;
     let inFlight = false;
+    let pendingFocus = false;
     let timer: number | undefined;
     let lastLookupAt = 0;
 
-    const run = async () => {
-      if (cancelled || inFlight) return;
+    const run = async (reason: EpicPrRefreshReason = 'tick') => {
+      if (cancelled) return;
+      if (inFlight) {
+        // A focus can be the return from a just-merged PR. Keep it pending so
+        // the current batch cannot swallow the armed, immediate refresh.
+        if (reason === 'focus') pendingFocus = true;
+        return;
+      }
       if (timer !== undefined) {
         window.clearTimeout(timer);
         timer = undefined;
       }
-      // Do not wake up periodically while hidden. Focus catches up using the
-      // same elapsed-time throttle as the visible timer.
+      // Do not wake up periodically while hidden. Focus catches up using its
+      // own shorter throttle below.
       if (document.hidden) return;
+      // Focus is the highest-signal moment — the user may have just merged in
+      // the browser — and having opened this PR from Orion first is stronger
+      // still, so that skips the throttle entirely.
+      const armed = reason === 'focus' && epicPrRefreshArmedRef.current;
+      const minElapsed = armed
+        ? 0
+        : reason === 'focus'
+          ? EPIC_PR_STATE_FOCUS_REFRESH_MS
+          : EPIC_PR_STATE_REFRESH_MS;
       const elapsed = Date.now() - lastLookupAt;
-      if (lastLookupAt > 0 && elapsed < EPIC_PR_STATE_REFRESH_MS) {
-        timer = window.setTimeout(() => void run(), EPIC_PR_STATE_REFRESH_MS - elapsed);
+      if (lastLookupAt > 0 && elapsed < minElapsed) {
+        // Reschedule at the background cadence, never at the focus one: a focus
+        // arriving just after a tick must not convert the loop into a 15s poll.
+        timer = window.setTimeout(
+          () => void run(),
+          Math.max(0, EPIC_PR_STATE_REFRESH_MS - elapsed)
+        );
         return;
       }
+      // Spend the arm only now that this refresh is definitely going ahead: a
+      // focus that returned early above must leave it for the next one.
+      if (armed) epicPrRefreshArmedRef.current = false;
       inFlight = true;
       lastLookupAt = Date.now();
       try {
@@ -4394,6 +4447,11 @@ const App: React.FC = () => {
         inFlight = false;
       }
       if (cancelled) return;
+      if (pendingFocus) {
+        pendingFocus = false;
+        void run('focus');
+        return;
+      }
       // Always reschedule off the latest run so a focus-triggered refresh
       // replaces the pending tick instead of stacking a second chain.
       if (timer !== undefined) window.clearTimeout(timer);
@@ -4401,7 +4459,7 @@ const App: React.FC = () => {
     };
 
     void run();
-    const onFocus = () => void run();
+    const onFocus = () => void run('focus');
     window.addEventListener('focus', onFocus);
     return () => {
       cancelled = true;
@@ -4778,7 +4836,7 @@ const App: React.FC = () => {
             ? {
                 action: {
                   label: 'Open',
-                  onClick: () => void window.orion?.openExternalUrl?.(url),
+                  onClick: () => openEpicPrUrl(url),
                 },
               }
             : undefined
@@ -8427,9 +8485,7 @@ const App: React.FC = () => {
                                     type="button"
                                     className="archived-epic-action"
                                     title="Open the pull request"
-                                    onClick={() =>
-                                      void window.orion?.openExternalUrl?.(epic.prUrl as string)
-                                    }
+                                    onClick={() => openEpicPrUrl(epic.prUrl as string)}
                                   >
                                     <GitPullRequest size={13} />
                                   </button>
@@ -10298,9 +10354,7 @@ const App: React.FC = () => {
                       <button
                         type="button"
                         className={`btn epic-view-pr-state epic-view-pr-state--${selectedEpicPrBadge.modifier}`}
-                        onClick={() =>
-                          void window.orion?.openExternalUrl?.(selectedEpic.prUrl as string)
-                        }
+                        onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
                         title={
                           selectedEpicPrBadge.modifier === 'merged'
                             ? 'The pull request is merged — settle the epic to archive it'
@@ -10414,9 +10468,7 @@ const App: React.FC = () => {
                     <button
                       type="button"
                       className="epic-view-pr-link"
-                      onClick={() =>
-                        void window.orion?.openExternalUrl?.(selectedEpic.prUrl as string)
-                      }
+                      onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
                       title="Open the pull request in your browser"
                     >
                       <GitPullRequest size={13} />
