@@ -343,6 +343,8 @@ export const ProviderAuthPrompt: React.FC<{
 
 export type ChatMessageProps = {
   message: Message;
+  /** Whether work owned by this turn is still live, including background agents. */
+  runRunning?: boolean;
   /** The thread's current linked task, for live status on the message's task chip. */
   liveTask?: LinkedBoardTask;
   taskBusy?: boolean;
@@ -356,6 +358,7 @@ export type ChatMessageProps = {
 
 export const ChatMessage = React.memo(function ChatMessage({
   message,
+  runRunning,
   liveTask,
   taskBusy,
   onMarkTaskDone,
@@ -400,6 +403,7 @@ export const ChatMessage = React.memo(function ChatMessage({
               key={segment.activities[0].id}
               activities={segment.activities}
               runStatus={message.status}
+              runRunning={runRunning}
             />
           ) : segment.kind === 'btw' ? (
             <React.Fragment key={`btw-${segment.exchange.id}`}>
@@ -668,18 +672,25 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       removeQueuedThreadMessage: state.removeQueuedThreadMessage,
     }))
   );
-  const floatingPlan = useMemo(() => {
+  const latestAgentRun = useMemo(() => {
     const messages = thread?.messages;
     if (!messages) return null;
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
-      if (message.role !== 'agent' || message.kind !== 'agent-run') continue;
-      const activity = message.activities?.find((entry) => entry.type === 'plan');
-      if (!activity || (activity.plan?.length ?? 0) === 0) return null;
-      return { messageId: message.id, activity, running: message.status === 'running' };
+      if (message.role === 'agent' && message.kind === 'agent-run') return message;
     }
     return null;
   }, [thread?.messages]);
+  const floatingPlan = useMemo(() => {
+    if (!latestAgentRun) return null;
+    const activity = latestAgentRun.activities?.find((entry) => entry.type === 'plan');
+    if (!activity || (activity.plan?.length ?? 0) === 0) return null;
+    return {
+      messageId: latestAgentRun.id,
+      activity,
+      runStatus: latestAgentRun.status,
+    };
+  }, [latestAgentRun]);
 
   const runningAgentMessage = useMemo(() => {
     const messages = thread?.messages;
@@ -886,6 +897,10 @@ export const ChatTranscript = React.memo(function ChatTranscript({
               <React.Fragment key={message.id}>
                 <ChatMessage
                   message={message}
+                  runRunning={
+                    message.status === 'running' ||
+                    (message.id === latestAgentRun?.id && thread.status === 'running')
+                  }
                   liveTask={thread.linkedTask}
                   taskBusy={isSending}
                   onMarkTaskDone={handleMarkTaskDone}
@@ -966,7 +981,10 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       {floatingPlan && tasksCardDismissedFor !== floatingPlan.messageId && (
         <FloatingTasksCard
           activity={floatingPlan.activity}
-          running={floatingPlan.running}
+          runStatus={floatingPlan.runStatus}
+          runRunning={
+            floatingPlan.runStatus === 'running' || thread.status === 'running'
+          }
           position={tasksCardPosition}
           onMove={onMoveTasksCard}
           collapsed={tasksCardCollapsed}

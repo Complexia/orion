@@ -3324,6 +3324,20 @@ body {
   color: var(--text-primary);
 }
 
+/* The task the agent was on when the run ended: still highlighted so it marks
+   how far things got, but visibly parked rather than in flight. */
+.agent-plan-entry.halted .agent-plan-content {
+  color: var(--text-secondary);
+}
+
+.agent-plan-halted-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
 .agent-plan-marker {
   display: inline-flex;
   align-items: center;
@@ -3348,6 +3362,15 @@ body {
   border: 1.5px solid var(--accent);
   border-top-color: transparent;
   animation: plan-spin 0.9s linear infinite;
+}
+
+/* Same ring as the spinner, frozen: the task is where the run stopped. */
+.agent-plan-halted {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  border: 1.5px solid var(--text-muted);
+  border-top-color: transparent;
 }
 
 @keyframes plan-spin {
@@ -3638,6 +3661,22 @@ body {
   color: var(--success);
 }
 
+/* Run is over with tasks unfinished — "Stopped"/"Failed"/"Ended". */
+.tasks-float-state.ended {
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.tasks-float-card.failed .tasks-float-state.ended {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  color: var(--danger);
+}
+
 .tasks-float-actions {
   display: inline-flex;
   align-items: center;
@@ -3695,14 +3734,48 @@ body {
   gap: 5px;
 }
 
+/* The card header already says the run stopped, so the per-row tag would only
+   repeat it — and steal width from the task text. The frozen marker stays. */
+.tasks-float-body .agent-plan-halted-tag {
+  display: none;
+}
+
 .tasks-float-current {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   padding: 7px 12px 9px;
   font-size: 12px;
   line-height: 1.4;
   color: var(--text-primary);
+}
+
+.tasks-float-current-text {
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.tasks-float-current.ended .tasks-float-current-text {
+  color: var(--text-secondary);
+}
+
+.tasks-float-current-label {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.tasks-float-card.ended .tasks-float-meter-fill {
+  background: var(--text-muted);
+}
+
+.tasks-float-card.failed .tasks-float-meter-fill {
+  background: var(--danger);
 }
 
 .agent-response-stats {
