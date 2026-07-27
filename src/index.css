@@ -1820,6 +1820,13 @@ body {
   margin: 0;
 }
 
+/* Count sits after the new-thread control; drop the toggle's margin-left:auto
+   so the two stay adjacent on the right of the row. */
+.recent-agents-header-row .sidebar-section-count {
+  margin-left: 0;
+  flex-shrink: 0;
+}
+
 .sidebar-section-toggle {
   display: flex;
   align-items: center;
