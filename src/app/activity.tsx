@@ -100,25 +100,43 @@ export const goalSummaryLine = (goal: ThreadGoal) => {
   return `${goalStatusLabels[goal.status] ?? goal.status}: ${goal.objective}${usage ? ` · ${usage}` : ''}`;
 };
 
-// Live task checklist streamed by the agent (grok ACP plan updates).
-export const AgentPlanChecklist: React.FC<{ activity: AgentActivity }> = ({ activity }) => (
+// Live task checklist streamed by the agent (grok ACP plan updates). Once the
+// run ends the in-progress task keeps its place in the list but stops
+// spinning — it marks where the agent got to, not work still happening.
+export const AgentPlanChecklist: React.FC<{ activity: AgentActivity; running: boolean }> = ({
+  activity,
+  running,
+}) => (
   <div className="agent-plan-list">
-    {(activity.plan ?? []).map((entry, index) => (
-      <div key={index} className={`agent-plan-entry ${entry.status}`}>
-        <span className="agent-plan-marker">
-          {entry.status === 'completed' ? (
-            <Check size={12} />
-          ) : entry.status === 'in_progress' ? (
-            <span className="agent-plan-spinner" aria-hidden="true" />
-          ) : (
-            <span className="agent-plan-dot" aria-hidden="true" />
-          )}
-        </span>
-        <span className="agent-plan-content">{entry.content}</span>
-      </div>
-    ))}
+    {(activity.plan ?? []).map((entry, index) => {
+      const halted = entry.status === 'in_progress' && !running;
+      return (
+        <div key={index} className={`agent-plan-entry ${entry.status}${halted ? ' halted' : ''}`}>
+          <span className="agent-plan-marker">
+            {entry.status === 'completed' ? (
+              <Check size={12} />
+            ) : halted ? (
+              <span className="agent-plan-halted" aria-hidden="true" />
+            ) : entry.status === 'in_progress' ? (
+              <span className="agent-plan-spinner" aria-hidden="true" />
+            ) : (
+              <span className="agent-plan-dot" aria-hidden="true" />
+            )}
+          </span>
+          <span className="agent-plan-content">{entry.content}</span>
+          {halted && <span className="agent-plan-halted-tag">stopped here</span>}
+        </div>
+      );
+    })}
   </div>
 );
+
+// How the Tasks card describes a plan whose run is no longer live.
+const endedRunLabel = (status?: Message['status']) => {
+  if (status === 'error') return 'Failed';
+  if (status === 'stopped') return 'Stopped';
+  return 'Ended';
+};
 
 // Floating, movable "Tasks" card pinned over the chat area. Only rendered
 // when the current agent turn streamed a plan (grok ACP task list) — simple
@@ -126,13 +144,23 @@ export const AgentPlanChecklist: React.FC<{ activity: AgentActivity }> = ({ acti
 // that lives inside the Agent steps card, so it needs no extra plumbing.
 export const FloatingTasksCard: React.FC<{
   activity: AgentActivity;
-  running: boolean;
+  runStatus?: Message['status'];
+  runRunning: boolean;
   position: { x: number; y: number } | null;
   onMove: (position: { x: number; y: number }) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
   onDismiss: () => void;
-}> = ({ activity, running, position, onMove, collapsed, onToggleCollapsed, onDismiss }) => {
+}> = ({
+  activity,
+  runStatus,
+  runRunning,
+  position,
+  onMove,
+  collapsed,
+  onToggleCollapsed,
+  onDismiss,
+}) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
 
@@ -140,6 +168,9 @@ export const FloatingTasksCard: React.FC<{
   const completed = entries.filter((entry) => entry.status === 'completed').length;
   const allDone = entries.length > 0 && completed === entries.length;
   const activeEntry = entries.find((entry) => entry.status === 'in_progress');
+  // A finished-but-incomplete plan is the interesting case: say the run ended
+  // and keep pointing at the task it never got past.
+  const endedLabel = !runRunning && !allDone ? endedRunLabel(runStatus) : null;
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -175,7 +206,9 @@ export const FloatingTasksCard: React.FC<{
   return (
     <div
       ref={cardRef}
-      className={`tasks-float-card${collapsed ? ' collapsed' : ''}${dragging ? ' dragging' : ''}`}
+      className={`tasks-float-card${collapsed ? ' collapsed' : ''}${dragging ? ' dragging' : ''}${
+        endedLabel ? ' ended' : ''
+      }${runStatus === 'error' ? ' failed' : ''}`}
       style={position ? { left: position.x, top: position.y, right: 'auto' } : undefined}
     >
       <div
@@ -194,9 +227,11 @@ export const FloatingTasksCard: React.FC<{
             <span className="tasks-float-state done">
               <Check size={12} />
             </span>
-          ) : running ? (
+          ) : runRunning ? (
             <span className="agent-plan-spinner" aria-hidden="true" />
-          ) : null}
+          ) : (
+            <span className="tasks-float-state ended">{endedLabel}</span>
+          )}
         </span>
         <span className="tasks-float-actions">
           <button
@@ -218,10 +253,15 @@ export const FloatingTasksCard: React.FC<{
         />
       </div>
       {collapsed ? (
-        activeEntry && <div className="tasks-float-current">{activeEntry.content}</div>
+        activeEntry && (
+          <div className={`tasks-float-current${endedLabel ? ' ended' : ''}`}>
+            {endedLabel && <span className="tasks-float-current-label">{endedLabel} at</span>}
+            <span className="tasks-float-current-text">{activeEntry.content}</span>
+          </div>
+        )
       ) : (
         <div className="tasks-float-body">
-          <AgentPlanChecklist activity={activity} />
+          <AgentPlanChecklist activity={activity} running={runRunning} />
         </div>
       )}
     </div>
@@ -241,7 +281,8 @@ export const collapsedDetailPreview = (activity: AgentActivity) => {
 export const AgentActivityCard: React.FC<{
   activities: AgentActivity[];
   runStatus?: Message['status'];
-}> = ({ activities, runStatus }) => {
+  runRunning?: boolean;
+}> = ({ activities, runStatus, runRunning = runStatus === 'running' }) => {
   const [expanded, setExpanded] = useState(false);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(() => new Set());
   // Collapsed view tracks the newest steps so the card shows what the agent
@@ -275,9 +316,9 @@ export const AgentActivityCard: React.FC<{
       </button>
       <div className="agent-tools-list">
         {visibleActivities.map((activity) => {
-          const rowRunning = runStatus === 'running' && activity.status === 'running';
+          const rowRunning = runRunning && activity.status === 'running';
           const status =
-            runStatus !== 'running' &&
+            !runRunning &&
             (activity.status === 'running' || activity.status === 'waiting')
               ? 'done'
               : activity.status ?? 'done';
@@ -304,7 +345,7 @@ export const AgentActivityCard: React.FC<{
                 </span>
                 <span className="agent-tool-text">
                   <span className="agent-tool-title">{activity.title}</span>
-                  <AgentPlanChecklist activity={activity} />
+                  <AgentPlanChecklist activity={activity} running={runRunning} />
                 </span>
               </div>
             );
@@ -351,7 +392,7 @@ export const AgentActivityCard: React.FC<{
                   {typeof activity.exitCode === 'number' && activity.exitCode !== 0 && (
                     <span className="agent-tool-chip exit">exit {activity.exitCode}</span>
                   )}
-                  {activity.status === 'waiting' && runStatus === 'running' && (
+                  {activity.status === 'waiting' && runRunning && (
                     <span className="agent-tool-chip waiting">needs approval</span>
                   )}
                 </span>
