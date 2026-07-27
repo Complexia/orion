@@ -6106,29 +6106,13 @@ body {
 .epic-view-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-start;
   gap: 8px;
 }
 
 .epic-view-actions .btn:disabled {
   opacity: 0.55;
   cursor: default;
-}
-
-/* Tick beside "Commit & push": the commit carries straight on into the PR, so
-   the user can start it and navigate away. */
-.epic-view-auto-pr {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  user-select: none;
-}
-
-.epic-view-auto-pr input[type='checkbox'] {
-  flex-shrink: 0;
-  cursor: pointer;
 }
 
 /* Shows an existing PR's lifecycle state and opens it on GitHub. A closed PR

@@ -4524,13 +4524,13 @@ const App: React.FC = () => {
       markEpicGitBusy(epic.id, null);
     }
 
-    // The "then create PR" tick: a successful commit carries straight on into
+    // "Auto create PR on commit": a successful commit carries straight on into
     // the pull request, so the user can start the commit and navigate away.
     // Runs after the busy marker clears — the PR's own guards read it.
     if (committed) await runEpicAutoPr(epic.id);
   };
 
-  // Follow-up PR for an epic whose "then create PR" tick is on. Reads the epic
+  // Follow-up PR for an epic whose auto-create-PR tick is on. Reads the epic
   // back from the store: the commit just claimed its repository and branch,
   // and the tick may have been toggled while the commit was in flight.
   const runEpicAutoPr = async (epicId: string) => {
@@ -10238,51 +10238,62 @@ const App: React.FC = () => {
                   </div>
 
                   <div className="epic-view-actions">
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={
-                        selectedEpicOperationBusy ||
-                        activeRiftUnavailable ||
-                        riftRemovalEpicIds[selectedEpic.id] ||
-                        (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
-                        !selectedEpicHasWorkToPush ||
-                        selectedEpicHasRunningAgents
-                      }
-                      onClick={() => {
-                        if (epicPromptGitMessages) openEpicCommitDialog(selectedEpic);
-                        else void handleEpicCommitAndPush(selectedEpic);
-                      }}
-                      title={
-                        selectedEpicHasRunningAgents
-                          ? 'Agents are still running in this epic — wait for them to finish before committing'
-                          : !selectedEpicHasWorkToPush
-                            ? 'Nothing to commit — the workspace is clean and fully pushed'
-                            : epicPromptGitMessages
-                              ? 'Stage all changes, write or generate a commit message, then commit and push'
-                              : 'Stage all changes, generate a commit message, then commit and push'
-                      }
-                    >
-                      <GitCommit size={14} />
-                      {selectedEpicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
-                    </button>
-                    <label
-                      className="epic-view-auto-pr"
-                      title={
-                        selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
-                          ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
-                          : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
-                      }
-                    >
-                      <input
-                        type="checkbox"
-                        checked={Boolean(selectedEpic.autoPrAfterCommit)}
-                        onChange={(e) =>
-                          updateEpic(selectedEpic.id, { autoPrAfterCommit: e.target.checked })
+                    <div className="flex flex-col items-start gap-1.5">
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={
+                          selectedEpicOperationBusy ||
+                          activeRiftUnavailable ||
+                          riftRemovalEpicIds[selectedEpic.id] ||
+                          (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
+                          !selectedEpicHasWorkToPush ||
+                          selectedEpicHasRunningAgents
                         }
-                      />
-                      <span>Then create PR</span>
-                    </label>
+                        onClick={() => {
+                          if (epicPromptGitMessages) openEpicCommitDialog(selectedEpic);
+                          else void handleEpicCommitAndPush(selectedEpic);
+                        }}
+                        title={
+                          selectedEpicHasRunningAgents
+                            ? 'Agents are still running in this epic — wait for them to finish before committing'
+                            : !selectedEpicHasWorkToPush
+                              ? 'Nothing to commit — the workspace is clean and fully pushed'
+                              : epicPromptGitMessages
+                                ? 'Stage all changes, write or generate a commit message, then commit and push'
+                                : 'Stage all changes, generate a commit message, then commit and push'
+                        }
+                      >
+                        <GitCommit size={14} />
+                        {selectedEpicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
+                      </button>
+                      <label
+                        className="inline-flex items-center gap-1.5 cursor-pointer select-none group"
+                        title={
+                          selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
+                            ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
+                            : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
+                        }
+                      >
+                        <input
+                          type="checkbox"
+                          className="peer sr-only"
+                          checked={Boolean(selectedEpic.autoPrAfterCommit)}
+                          onChange={(e) =>
+                            updateEpic(selectedEpic.id, { autoPrAfterCommit: e.target.checked })
+                          }
+                        />
+                        <span
+                          className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
+                          aria-hidden
+                        >
+                          <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
+                        </span>
+                        <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
+                          Auto create PR on commit
+                        </span>
+                      </label>
+                    </div>
                     {selectedEpicPrBadge && (
                       <button
                         type="button"
