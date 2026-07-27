@@ -1560,8 +1560,12 @@ ipcMain.handle('git:checkoutBranch', async (_event, input) => {
   }
 });
 
-ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
+// The navbar action passes `{ projectPath, modelId, reasoningEffort }`; older
+// callers passed the path alone and keep the diffstat-style fallback message.
+ipcMain.handle('git:commitAndPush', async (_event, input) => {
   try {
+    const request = typeof input === 'string' ? { projectPath: input } : (input ?? {});
+    const { projectPath } = request;
     if (!projectPath) {
       return { ok: false, error: 'Missing project path.' };
     }
@@ -1583,7 +1587,30 @@ ipcMain.handle('git:commitAndPush', async (_event, projectPath) => {
       return { ok: false, error: 'No staged changes to commit.' };
     }
 
-    const message = commitMessageForEntries(entries);
+    // Freeze the index across the message turn, the same way the epic commit
+    // does: staging keeps moving while the model writes, and committing after
+    // that would ship changes the message never described.
+    const indexTree = await readGitIndexTree(gitRoot);
+    const stagedEntries = await readStagedGitEntries(gitRoot);
+    const message = await writeGitCommitMessage({
+      gitRoot,
+      entries: stagedEntries,
+      modelId: request.modelId,
+      reasoningEffort: request.reasoningEffort,
+    });
+    if ((await readGitIndexTree(gitRoot)) !== indexTree) {
+      return {
+        ok: false,
+        error: 'Staged changes changed while Orion was preparing the commit. Try again.',
+      };
+    }
+    if ((await getCurrentGitBranch(gitRoot)) !== state.currentBranch) {
+      return {
+        ok: false,
+        error: `The repository moved off ${state.currentBranch} while Orion was preparing the commit. Try again.`,
+      };
+    }
+
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
     await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', state.currentBranch]);
 
@@ -1680,6 +1707,28 @@ const readStagedGitEntries = async (gitRoot) => {
 const readGitIndexTree = async (gitRoot) => {
   const { stdout } = await execFileAsync('git', ['-C', gitRoot, 'write-tree']);
   return stdout.trim();
+};
+
+// Ask the text-generation model for a commit message describing the staged
+// entries. Without a model — or when the turn comes back empty because the
+// model is unavailable or errored — this degrades to the mechanical
+// "Update N files" summary rather than blocking the commit.
+const writeGitCommitMessage = async ({ gitRoot, entries, epicName, modelId, reasoningEffort }) => {
+  if (modelId) {
+    const context = await readStagedGitChangesContext(gitRoot, entries);
+    const prompt =
+      'Write a git commit message for the changes below' +
+      (epicName ? `, which are part of the epic "${epicName}"` : '') +
+      '. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
+      'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
+      'message — no quotes, no code fences, no commentary.\n\n' +
+      context;
+    const generated = cleanGeneratedGitMessage(
+      await runOneShotForModelId(modelId, prompt, gitRoot, { reasoningEffort })
+    );
+    if (generated) return generated;
+  }
+  return commitMessageForEntries(entries);
 };
 
 const resolveRemoteDefaultBranch = async (gitRoot) => {
@@ -1891,22 +1940,15 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     // A message typed in the commit dialog is used verbatim — no model turn,
     // and no cleanup pass (that one strips artifacts of generated text).
     let message = String(input?.message ?? '').trim();
-    if (!message && input?.modelId) {
-      const context = await readStagedGitChangesContext(gitRoot, entries);
-      const prompt =
-        'Write a git commit message for the changes below' +
-        (input?.epicName ? `, which are part of the epic "${input.epicName}"` : '') +
-        '. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
-        'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
-        'message — no quotes, no code fences, no commentary.\n\n' +
-        context;
-      message = cleanGeneratedGitMessage(
-        await runOneShotForModelId(input.modelId, prompt, gitRoot, {
-          reasoningEffort: input?.reasoningEffort,
-        })
-      );
+    if (!message) {
+      message = await writeGitCommitMessage({
+        gitRoot,
+        entries,
+        epicName: input?.epicName,
+        modelId: input?.modelId,
+        reasoningEffort: input?.reasoningEffort,
+      });
     }
-    if (!message) message = commitMessageForEntries(entries);
 
     // Re-verify what the commit will actually land, and where: `git commit`
     // uses the index and the current checkout, but the push below targets the
