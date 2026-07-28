@@ -2383,6 +2383,41 @@ ipcMain.handle('epic:gitStatus', async (_event, input) => {
   }
 });
 
+// https://<host>/<owner>/<repo>/pull/<number>, allowing the trailing path or
+// query GitHub adds for files/commits views on a copied URL.
+const PR_URL_PATTERN = /^https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#]|$)/;
+
+const parsePrUrl = (prUrl) => {
+  const match = PR_URL_PATTERN.exec(String(prUrl));
+  if (!match) return null;
+  const number = Number(match[4]);
+  if (!Number.isSafeInteger(number) || number <= 0) return null;
+  return { host: match[1], owner: match[2], repo: match[3], number };
+};
+
+// GraphQL string literal. Owner/repo come from a URL, so they cannot contain a
+// quote in practice, but the query is assembled by hand — escape anyway.
+const graphqlString = (value) =>
+  `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
+// One aliased query per host collapses every epic's PR into a single request
+// (rate-limit cost 1, regardless of how many PRs are in it). Aliases must be
+// synthetic: GraphQL names are /^[_A-Za-z][_0-9A-Za-z]*$/, and repo names
+// routinely contain `-` and `.`.
+const buildPrStateQuery = (repoGroups) => {
+  const repoFields = repoGroups.map(
+    (group, repoIndex) =>
+      `  r${repoIndex}: repository(owner: ${graphqlString(group.owner)}, name: ${graphqlString(
+        group.repo
+      )}) {\n` +
+      group.pulls
+        .map((pull, pullIndex) => `    p${pullIndex}: pullRequest(number: ${pull.number}) { state }`)
+        .join('\n') +
+      '\n  }'
+  );
+  return `query {\n${repoFields.join('\n')}\n}`;
+};
+
 // Batch PR-state lookup behind the sidebar's epic icon colours. Deliberately
 // not a loop over epic:gitStatus: that also runs `git status` and `rev-list`
 // against each epic's workspace, which is wasted work here and throws for
@@ -2397,34 +2432,118 @@ ipcMain.handle('epic:prStates', async (_event, input) => {
   }
 
   const states = [];
-  const queue = [...targets];
-  const lookup = async () => {
-    for (;;) {
-      const target = queue.shift();
-      if (!target) return;
-      // prUrl is a full URL, so gh resolves the repo from it; cwd only decides
-      // which credentials apply. Fall back to the app cwd when the epic's
-      // workspace is gone rather than failing the lookup outright.
-      let cwd;
-      try {
-        cwd = target.projectPath ? await getGitRoot(target.projectPath) : undefined;
-      } catch {
-        cwd = undefined;
-      }
+
+  // Several epics can point at one PR, so every pull carries the list of epics
+  // waiting on it rather than a single id.
+  const byHost = new Map();
+  const unparsed = [];
+  for (const target of targets) {
+    const parsed = parsePrUrl(target.prUrl);
+    if (!parsed) {
+      unparsed.push(target);
+      continue;
+    }
+    const repoKey = `${parsed.owner}/${parsed.repo}`;
+    if (!byHost.has(parsed.host)) byHost.set(parsed.host, new Map());
+    const repos = byHost.get(parsed.host);
+    if (!repos.has(repoKey)) {
+      repos.set(repoKey, { owner: parsed.owner, repo: parsed.repo, pulls: new Map() });
+    }
+    const group = repos.get(repoKey);
+    if (!group.pulls.has(parsed.number)) {
+      group.pulls.set(parsed.number, { number: parsed.number, epicIds: [] });
+    }
+    group.pulls.get(parsed.number).epicIds.push(target.epicId);
+  }
+
+  // Everything GraphQL could not resolve falls back to the per-PR `gh pr view`
+  // path below, so an unfamiliar URL shape or a host without GraphQL access
+  // degrades to the old behaviour instead of losing the epic entirely.
+  const fallbackTargets = [...unparsed];
+
+  await Promise.all(
+    [...byHost.entries()].map(async ([host, repos]) => {
+      const repoGroups = [...repos.values()].map((group) => ({
+        owner: group.owner,
+        repo: group.repo,
+        pulls: [...group.pulls.values()],
+      }));
+      const hostTargets = repoGroups.flatMap((group) =>
+        group.pulls.flatMap((pull) =>
+          pull.epicIds.map((epicId) => ({
+            epicId,
+            prUrl: `https://${host}/${group.owner}/${group.repo}/pull/${pull.number}`,
+          }))
+        )
+      );
+      let payload;
       try {
         const { stdout } = await execFileAsync(
           'gh',
-          ['pr', 'view', String(target.prUrl), '--json', 'state'],
-          { ...(cwd ? { cwd } : {}), timeout: 15_000 }
+          ['api', 'graphql', '--hostname', host, '-f', `query=${buildPrStateQuery(repoGroups)}`],
+          { timeout: 15_000 }
         );
-        const parsed = JSON.parse(stdout);
-        if (parsed?.state) states.push({ epicId: target.epicId, state: parsed.state });
-      } catch {
-        // Offline, gh unauthenticated, or the PR is gone.
+        payload = JSON.parse(stdout);
+      } catch (error) {
+        // `gh api graphql` exits non-zero when the response carries `errors`,
+        // but still prints a body that can hold partial `data` — one bad PR in
+        // the batch must not discard the rest.
+        try {
+          payload = JSON.parse(error?.stdout?.toString() ?? '');
+        } catch {
+          payload = null;
+        }
       }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(4, targets.length) }, lookup));
+      if (!payload?.data) {
+        fallbackTargets.push(...hostTargets);
+        return;
+      }
+      for (const [repoIndex, group] of repoGroups.entries()) {
+        const repoData = payload.data[`r${repoIndex}`];
+        for (const [pullIndex, pull] of group.pulls.entries()) {
+          // A null repository or pullRequest means deleted or no access; leave
+          // those epics on the state they already have.
+          const state = repoData?.[`p${pullIndex}`]?.state;
+          if (!state) continue;
+          for (const epicId of pull.epicIds) states.push({ epicId, state });
+        }
+      }
+    })
+  );
+
+  if (fallbackTargets.length > 0) {
+    const queue = [...fallbackTargets];
+    const byEpicId = new Map(targets.map((target) => [target.epicId, target]));
+    const lookup = async () => {
+      for (;;) {
+        const target = queue.shift();
+        if (!target) return;
+        // prUrl is a full URL, so gh resolves the repo from it; cwd only
+        // decides which credentials apply. Fall back to the app cwd when the
+        // epic's workspace is gone rather than failing the lookup outright.
+        const projectPath = byEpicId.get(target.epicId)?.projectPath;
+        let cwd;
+        try {
+          cwd = projectPath ? await getGitRoot(projectPath) : undefined;
+        } catch {
+          cwd = undefined;
+        }
+        try {
+          const { stdout } = await execFileAsync(
+            'gh',
+            ['pr', 'view', String(target.prUrl), '--json', 'state'],
+            { ...(cwd ? { cwd } : {}), timeout: 15_000 }
+          );
+          const parsed = JSON.parse(stdout);
+          if (parsed?.state) states.push({ epicId: target.epicId, state: parsed.state });
+        } catch {
+          // Offline, gh unauthenticated, or the PR is gone.
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, queue.length) }, lookup));
+  }
+
   return { ok: true, states };
 });
 
