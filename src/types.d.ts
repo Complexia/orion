@@ -22,6 +22,67 @@ type AppUpdateState = {
   error?: string | null;
 };
 
+/**
+ * One rift directory found under a `.rifts/<repo>` root.
+ *
+ * `bytes` comes from block accounting (`du -sk`), so on copy-on-write
+ * filesystems it is an upper bound: a rift still sharing blocks with its
+ * source repository reports its full size but frees far less than that.
+ */
+export type RiftStorageEntry = {
+  riftPath: string;
+  riftRoot: string;
+  name: string;
+  repoName: string;
+  bytes: number | null;
+  /** `orphan` means no epic in the persisted store claims this directory. */
+  status: 'active' | 'settled' | 'orphan' | 'cleanupPending';
+  hasMarker: boolean;
+  epicId: string | null;
+  epicName: string | null;
+  settledAt: string | null;
+  gitBranch: string | null;
+  prUrl: string | null;
+  prState: 'OPEN' | 'CLOSED' | 'MERGED' | null;
+  hasUncommittedChanges: boolean;
+  hasUnpushedCommits: boolean;
+};
+
+export type RiftStorageState = {
+  scanning: boolean;
+  scannedAt: string | null;
+  entries: RiftStorageEntry[];
+  /** Total size of Rift's own trash directories, reclaimable only by `rift gc`. */
+  trashBytes: number | null;
+  error: string | null;
+  /**
+   * Rifts removed by manual or retention cleanup whose owning epic/thread
+   * metadata has not yet been durably cleared by a renderer.
+   */
+  pendingReleases?: Array<{ riftPath: string; epicId: string }>;
+  pendingReleasesRetentionDays?: number | null;
+};
+
+export type RiftStorageReleaseResult = {
+  riftPath: string;
+  ok: boolean;
+  /** Path was already gone; the epic pointer should still be cleared. */
+  skipped?: boolean;
+  reason?:
+    | 'unsafe-path'
+    | 'missing-marker'
+    | 'epic-active'
+    | 'epic-busy'
+    | 'unpushed-work'
+    | 'restore-ref-failed'
+    | 'runtime-dispose-failed'
+    | 'journal-failed'
+    | 'ownership-changed'
+    | 'remove-failed';
+  error?: string;
+  epicId?: string | null;
+};
+
 // A running orchestrator agent asked main to spawn a subagent; the renderer
 // resolves the model fuzzily (id, slug, or label), creates a child thread,
 // runs it, and reports back via reportSubagentResult.
@@ -395,6 +456,8 @@ type OrionComputerUsePermissions = {
         available: boolean;
         version?: string | null;
         pendingEpicIds?: string[];
+        /** Epics protected by an active or unacknowledged Rift release. */
+        pendingRemovalEpicIds?: string[];
         readyRifts?: Array<{
           epicId: string;
           projectId?: string;
@@ -415,6 +478,11 @@ type OrionComputerUsePermissions = {
         reasoningEffort?: string | null;
         /** Local branch the feature branch starts from; checked out inside the rift only. */
         baseBranch?: string;
+        /**
+         * Recreate a freed epic's workspace on the branch it already owns
+         * instead of naming a new one. Takes precedence over baseBranch.
+         */
+        existingBranch?: string;
       }) => Promise<{
         ok: boolean;
         riftPath?: string;
@@ -428,9 +496,45 @@ type OrionComputerUsePermissions = {
         skipped?: boolean;
         error?: string;
       }>;
-      epicRemoveRift: (input: { riftPath: string }) => Promise<{
+      epicRemoveRift: (input: {
+        epicId: string;
+        riftPath: string;
+        runtimeThreadIds?: string[];
+        gitRoot?: string;
+        projectPath?: string;
+      }) => Promise<{
         ok: boolean;
         skipped?: boolean;
+        error?: string;
+        warning?: string;
+      }>;
+      epicDeleteRiftRestoreRef: (input: {
+        epicId: string;
+        gitRoot?: string;
+        projectPath?: string;
+      }) => Promise<{ ok: boolean; skipped?: boolean; error?: string; warning?: string }>;
+      getRiftStorageState: () => Promise<RiftStorageState>;
+      acknowledgeRiftStorageReleases?: (input: {
+        riftPaths: string[];
+      }) => Promise<{ ok: boolean; error?: string }>;
+      scanRiftStorage: (input?: { remeasure?: boolean }) => Promise<RiftStorageState>;
+      releaseRiftStorage: (input: {
+        riftPaths: string[];
+        /** Paths the user explicitly chose to free despite uncommitted or unpushed work. */
+        forcePaths?: string[];
+        /** Epics with live agent runs or terminals, which the persisted store cannot show. */
+        busyEpicIds?: string[];
+        /** Every thread whose runtime is rooted in the owning epic's Rift. */
+        runtimeThreadIdsByEpic?: Record<string, string[]>;
+        /** Empty Rift's trash afterwards. Machine-wide and permanent. */
+        runGc?: boolean;
+      }) => Promise<{
+        ok: boolean;
+        results: RiftStorageReleaseResult[];
+        /** Free-space delta measured across the sweep; null when unavailable. */
+        reclaimedBytes: number | null;
+        gcError?: string | null;
+        releasedEpicIds: string[];
         error?: string;
       }>;
       getPathForFile?: (file: File) => string;
@@ -782,6 +886,7 @@ type OrionComputerUsePermissions = {
       codexGoalCommand: (input: {
         sessionId: string;
         threadId: string;
+        epicId?: string;
         projectPath: string;
         action: 'pause' | 'clear' | 'get';
       }) => Promise<{ ok: boolean; goal?: import('./store').ThreadGoal | null; error?: string }>;
@@ -791,6 +896,14 @@ type OrionComputerUsePermissions = {
       onSubagentStopRequest(callback: (request: SubagentStopRequest) => void): () => void;
       onFileChange?: (cb: (data: any) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
+      onRiftStorageState?: (cb: (state: RiftStorageState) => void) => () => void;
+      /** The startup retention sweep freed rifts; the renderer clears their epic pointers. */
+      onRiftStorageReleased?: (
+        cb: (payload: {
+          released: Array<{ riftPath: string; epicId: string }>;
+          retentionDays: number;
+        }) => void
+      ) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;
     };
   }

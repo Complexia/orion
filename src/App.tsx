@@ -63,15 +63,18 @@ import {
   BookOpen,
   Workflow,
   FlaskConical,
+  HardDrive,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   useOrionStore,
   flushOrionStoreSave,
+  flushOrionThreadsSave,
   defaultProviderSettings,
   defaultOrchestrationSettings,
   defaultNotificationSettings,
   defaultEpicsSettings,
+  defaultRiftsSettings,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -87,6 +90,7 @@ import {
   type TurnTokenStats,
   type Epic,
 } from './store';
+import type { RiftStorageEntry, RiftStorageState } from './types';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
@@ -225,8 +229,41 @@ type SettingsTab =
   | 'providers'
   | 'orchestration'
   | 'computer-use'
+  | 'storage'
   | 'cosmetics'
   | 'experimental';
+
+/**
+ * Sizes come from block accounting, which counts a copy-on-write clone's
+ * shared blocks in full — so these read as an upper bound on what freeing a
+ * rift reclaims, not a promise. The real figure is measured from free space
+ * after a sweep.
+ */
+const formatBytes = (bytes: number | null | undefined) => {
+  if (bytes == null || !Number.isFinite(bytes)) return '—';
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 100 || unitIndex === 0 ? Math.round(value) : value.toFixed(1)} ${units[unitIndex]}`;
+};
+
+const RIFT_RELEASE_REASON_LABELS: Record<string, string> = {
+  'unsafe-path': 'not a recognizable rift directory',
+  'missing-marker': 'missing its rift marker',
+  'epic-active': 'its epic is still active',
+  'epic-busy': 'its epic is busy',
+  'unpushed-work': 'has uncommitted or unpushed work',
+  'restore-ref-failed': 'its restorable branch state could not be preserved',
+  'runtime-dispose-failed': 'its agent runtimes could not be stopped safely',
+  'journal-failed': 'its release could not be recorded safely',
+  'ownership-changed': 'its epic ownership changed while cleanup was running',
+  'remove-failed': 'could not be removed',
+};
 
 const THREADS_VISIBLE_LIMIT = 5;
 
@@ -317,9 +354,11 @@ const threadWorkingDir = (
   project: Project
 ) => {
   const epic = thread?.epicId ? epics.find((candidate) => candidate.id === thread.epicId) : undefined;
-  return epic?.riftPath && !epic.riftCleanupPending
-    ? epic.riftWorkingDir ?? epic.riftPath
-    : project.path;
+  // A thread that belongs to a Rift epic must never silently fall back to the
+  // source checkout while that workspace is absent. Callers treat null as a
+  // hard launch guard.
+  if (epic?.riftReleased || epic?.riftRequest || epic?.riftCleanupPending) return null;
+  return epic?.riftPath ? epic.riftWorkingDir ?? epic.riftPath : project.path;
 };
 
 // Provider-native ids are not necessarily globally unique (Kimi uses values
@@ -442,6 +481,27 @@ const EpicDescriptionEditor: React.FC<{
   );
 };
 
+const runtimeThreadsForEpic = (threads: Thread[], epicId: string) => {
+  const threadIds = new Set(
+    threads.filter((thread) => thread.epicId === epicId).map((thread) => thread.id)
+  );
+  let foundChild = true;
+  while (foundChild) {
+    foundChild = false;
+    for (const thread of threads) {
+      if (
+        thread.parentThreadId &&
+        threadIds.has(thread.parentThreadId) &&
+        !threadIds.has(thread.id)
+      ) {
+        threadIds.add(thread.id);
+        foundChild = true;
+      }
+    }
+  }
+  return threads.filter((thread) => threadIds.has(thread.id));
+};
+
 const App: React.FC = () => {
   const {
     activeTab,
@@ -463,6 +523,7 @@ const App: React.FC = () => {
     deleteEpic,
     settleEpic,
     unsettleEpic,
+    releaseEpicRift,
     selectEpic,
     setEpicsSettings,
     createThread,
@@ -520,6 +581,7 @@ const App: React.FC = () => {
       deleteEpic: state.deleteEpic,
       settleEpic: state.settleEpic,
       unsettleEpic: state.unsettleEpic,
+      releaseEpicRift: state.releaseEpicRift,
       selectEpic: state.selectEpic,
       setEpicsSettings: state.setEpicsSettings,
       createThread: state.createThread,
@@ -691,6 +753,7 @@ const App: React.FC = () => {
     available: boolean;
     version?: string | null;
     pendingEpicIds?: string[];
+    pendingRemovalEpicIds?: string[];
     readyRifts?: Array<{
       epicId: string;
       projectId?: string;
@@ -714,6 +777,8 @@ const App: React.FC = () => {
   // selected Claude terminal while teardown is in flight.
   const [riftRemovalEpicIds, setRiftRemovalEpicIds] = useState<Record<string, boolean>>({});
   const riftRemovalEpicIdsRef = useRef<Set<string>>(new Set());
+  const [riftRemovalThreadIds, setRiftRemovalThreadIds] = useState<Record<string, boolean>>({});
+  const riftRemovalThreadIdsRef = useRef<Set<string>>(new Set());
   const markRiftRemoval = useCallback((epicId: string, pending: boolean) => {
     if (pending) riftRemovalEpicIdsRef.current.add(epicId);
     else riftRemovalEpicIdsRef.current.delete(epicId);
@@ -721,6 +786,21 @@ const App: React.FC = () => {
       const next = { ...current };
       if (pending) next[epicId] = true;
       else delete next[epicId];
+      return next;
+    });
+  }, []);
+  const markRiftRemovalThreads = useCallback((threadIds: Iterable<string>, pending: boolean) => {
+    const ids = [...threadIds];
+    for (const threadId of ids) {
+      if (pending) riftRemovalThreadIdsRef.current.add(threadId);
+      else riftRemovalThreadIdsRef.current.delete(threadId);
+    }
+    setRiftRemovalThreadIds((current) => {
+      const next = { ...current };
+      for (const threadId of ids) {
+        if (pending) next[threadId] = true;
+        else delete next[threadId];
+      }
       return next;
     });
   }, []);
@@ -782,13 +862,69 @@ const App: React.FC = () => {
   const [epicSettleDialog, setEpicSettleDialog] = useState<{
     epic: Epic;
     warnings: string[];
+    /** Whether freeing the rift is offered at all — false unless Orion could
+     *  verify the workspace has nothing uncommitted or unpushed left in it. */
+    canReleaseRift: boolean;
+    /** Free the rift as part of settling; seeded from riftsSettings.releaseOnSettle. */
+    releaseRift: boolean;
   } | null>(null);
+  const [riftStorageState, setRiftStorageState] = useState<RiftStorageState | null>(null);
+  const [riftStorageBusy, setRiftStorageBusy] = useState(false);
+  const riftStorageQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const riftStorageQueueDepthRef = useRef(0);
+  // Rifts the user chose to free despite uncommitted or unpushed work.
+  const [riftStorageForced, setRiftStorageForced] = useState<Record<string, boolean>>({});
+  const [riftSweepDialog, setRiftSweepDialog] = useState<{
+    entries: RiftStorageEntry[];
+    /** Also run `rift gc`, which permanently empties Rift's trash machine-wide. */
+    runGc: boolean;
+  } | null>(null);
+  const dismissRiftSweepDialog = useCallback(() => {
+    setRiftSweepDialog(null);
+    // "Free anyway" is approval for one confirmation flow, not a durable
+    // property of the path. Dismissing that flow revokes it.
+    setRiftStorageForced({});
+  }, []);
+
+  const riftStorageEntries = riftStorageState?.entries ?? [];
+  const riftStorageSummary = useMemo(() => {
+    const entries = riftStorageState?.entries ?? [];
+    const sumBytes = (matches: (entry: RiftStorageEntry) => boolean) =>
+      entries.reduce((total, entry) => (matches(entry) ? total + (entry.bytes ?? 0) : total), 0);
+    return {
+      total: sumBytes(() => true) + (riftStorageState?.trashBytes ?? 0),
+      active: sumBytes((entry) => entry.status === 'active'),
+      settled: sumBytes((entry) => entry.status === 'settled'),
+      orphan: sumBytes((entry) => entry.status === 'orphan' || entry.status === 'cleanupPending'),
+      trash: riftStorageState?.trashBytes ?? 0,
+    };
+  }, [riftStorageState]);
+
+  // Anything not backing a live epic. Rifts holding uncommitted or unpushed
+  // work stay in the list but are excluded until the user forces them, since
+  // settling only warns about that work and never publishes it.
+  const riftSweepCandidates = useMemo(() => {
+    const entries = riftStorageState?.entries ?? [];
+    return entries.filter((entry) => entry.status !== 'active' && entry.hasMarker);
+  }, [riftStorageState]);
+
+  const riftSweepSelection = useMemo(
+    () =>
+      riftSweepCandidates.filter(
+        (entry) =>
+          riftStorageForced[entry.riftPath] ||
+          (!entry.hasUncommittedChanges && !entry.hasUnpushedCommits)
+      ),
+    [riftSweepCandidates, riftStorageForced]
+  );
   const [epicPrBaseBranchPickerOpen, setEpicPrBaseBranchPickerOpen] = useState(false);
   const epicPrBaseBranchPickerRef = useRef<HTMLDivElement>(null);
   // Escape dismisses any epic-action dialog, matching the create-epic modal.
   // An open base-branch dropdown closes first before the dialog itself.
   useEffect(() => {
-    if (!epicCommitDialog && !epicPrBaseDialog && !epicSettleDialog) return undefined;
+    if (!epicCommitDialog && !epicPrBaseDialog && !epicSettleDialog && !riftSweepDialog) {
+      return undefined;
+    }
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       e.preventDefault();
@@ -799,10 +935,18 @@ const App: React.FC = () => {
       setEpicCommitDialog(null);
       setEpicPrBaseDialog(null);
       setEpicSettleDialog(null);
+      dismissRiftSweepDialog();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [epicCommitDialog, epicPrBaseDialog, epicPrBaseBranchPickerOpen, epicSettleDialog]);
+  }, [
+    epicCommitDialog,
+    epicPrBaseDialog,
+    epicPrBaseBranchPickerOpen,
+    epicSettleDialog,
+    dismissRiftSweepDialog,
+    riftSweepDialog,
+  ]);
 
   // Click-outside for the Create PR base-branch Tailwind dropdown.
   useEffect(() => {
@@ -989,13 +1133,19 @@ const App: React.FC = () => {
     selectedThread?.epicId && riftSetupEpicIds[selectedThread.epicId]
   );
   const selectedThreadRiftRemoving = Boolean(
-    selectedThread?.epicId && riftRemovalEpicIds[selectedThread.epicId]
+    selectedThread &&
+      (riftRemovalThreadIds[selectedThread.id] ||
+        (selectedThread.epicId && riftRemovalEpicIds[selectedThread.epicId]))
   );
   const selectedThreadRiftUnavailable =
     selectedThreadRiftPending ||
     selectedThreadRiftRemoving ||
     Boolean(selectedThreadEpic?.riftRequest) ||
     Boolean(selectedThreadEpic?.riftCleanupPending) ||
+    // Released epic threads remain grouped in Recent agents, but their
+    // isolated workspace no longer exists. Never fall through to the source
+    // project while the epic is waiting for its Rift to be recreated.
+    Boolean(selectedThreadEpic?.riftReleased) ||
     Boolean(
       selectedThreadEpic &&
         !selectedThreadEpic.riftPath &&
@@ -1595,12 +1745,14 @@ const App: React.FC = () => {
       ? activeRift.riftWorkingDir ?? activeRift.riftPath
       : null;
   const activeRiftUnavailable = Boolean(
-    activeRift &&
-      (riftSetupEpicIds[activeRift.id] ||
-        riftRemovalEpicIds[activeRift.id] ||
-        activeRift.riftRequest ||
-        activeRift.riftCleanupPending ||
-        (!activeRift.riftPath && riftsSettings.enabled && riftStatus === null))
+    selectedThreadRiftUnavailable ||
+      (activeRift &&
+        (riftSetupEpicIds[activeRift.id] ||
+          riftRemovalEpicIds[activeRift.id] ||
+          activeRift.riftRequest ||
+          activeRift.riftCleanupPending ||
+          activeRift.riftReleased ||
+          (!activeRift.riftPath && riftsSettings.enabled && riftStatus === null)))
   );
   const activeWorkingDir = activeRiftUnavailable
     ? null
@@ -1895,6 +2047,171 @@ const App: React.FC = () => {
       unsubscribe?.();
     };
   }, []);
+
+  const finalizeReleasedRifts = useCallback(
+    async (
+      released: Array<{ riftPath: string; epicId: string }>,
+      { disposeRuntimes = true }: { disposeRuntimes?: boolean } = {}
+    ) => {
+      if (released.length === 0) return true;
+      const state = useOrionStore.getState();
+      const epicMatchesRelease = (
+        epic: Epic,
+        { epicId, riftPath }: { epicId: string; riftPath: string }
+      ) =>
+        epic.id === epicId &&
+        (epic.riftPath === riftPath || (!epic.riftPath && epic.riftReleased === true));
+      // Startup state and the live release event can deliver the same journal
+      // result more than once. A restored epic may already own a replacement
+      // Rift by then, so stale payloads must not touch its new runtimes/state.
+      // An unbound riftReleased epic is a partial-persistence retry: its store
+      // save landed, but its stale thread sessions may still need saving.
+      const matchingReleases = released.filter((release) =>
+        state.epics.some((epic) => epicMatchesRelease(epic, release))
+      );
+      const runtimeThreadsByEpic = new Map(
+        matchingReleases.map(({ epicId }) => [
+          epicId,
+          runtimeThreadsForEpic(state.threads, epicId),
+        ])
+      );
+      const runtimeThreads = [
+        ...new Map(
+          [...runtimeThreadsByEpic.values()]
+            .flat()
+            .map((thread) => [thread.id, thread])
+        ).values(),
+      ];
+
+      let runtimesDisposed = true;
+      if (disposeRuntimes && window.orion?.disposeAgentThread) {
+        try {
+          await Promise.all(
+            runtimeThreads.map((thread) => window.orion!.disposeAgentThread(thread.id))
+          );
+        } catch (error) {
+          runtimesDisposed = false;
+          console.error('Could not dispose every runtime for released Rifts', error);
+        }
+      }
+
+      // These resumable ids were created with the removed workspace as cwd.
+      // Clear them even when disposal failed so no later turn tries to resume
+      // into that path; the durable release journal remains for another reap.
+      const latestState = useOrionStore.getState();
+      const releasesToFinalize = matchingReleases.filter((release) =>
+        latestState.epics.some((epic) => epicMatchesRelease(epic, release))
+      );
+      const threadsToFinalize = [
+        ...new Map(
+          releasesToFinalize
+            .flatMap(({ epicId }) => runtimeThreadsByEpic.get(epicId) ?? [])
+            .map((thread) => [thread.id, thread])
+        ).values(),
+      ];
+      for (const thread of threadsToFinalize) {
+        updateThread(thread.id, {
+          agentSessionIds: undefined,
+          pendingForkProviders: undefined,
+          ...(thread.status === 'running' ? { status: 'idle' as const } : {}),
+          ...((thread.queuedMessages?.length ?? 0) > 0 ? { queuedMessages: [] } : {}),
+        });
+      }
+      for (const { epicId, riftPath } of releasesToFinalize) {
+        releaseEpicRift(epicId, riftPath);
+      }
+
+      const [storeSaved, threadsSaved] =
+        releasesToFinalize.length > 0
+          ? await Promise.all([flushOrionStoreSave(), flushOrionThreadsSave()])
+          : [true, true];
+      if (!runtimesDisposed || !storeSaved || !threadsSaved) return false;
+      const acknowledgement = await window.orion?.acknowledgeRiftStorageReleases?.({
+        riftPaths: released.map((entry) => entry.riftPath),
+      });
+      return acknowledgement?.ok === true;
+    },
+    [releaseEpicRift, updateThread]
+  );
+
+  // Rift storage. Main owns the scan; the renderer only mirrors its state and
+  // asks for a rescan when the Storage tab is opened.
+  //
+  // The startup retention sweep runs before this window exists, so its result
+  // cannot arrive as a push — main parks it and this mount drains it. The live
+  // subscription only covers a sweep that happens while a window is already up.
+  useEffect(() => {
+    let mounted = true;
+
+    const applyReleases = async (
+      released: Array<{ riftPath: string; epicId: string }>,
+      retentionDays: number | null
+    ) => {
+      if (released.length === 0) return;
+      // The startup journal can be ready before Zustand's async storage has
+      // hydrated. Releasing against the initial empty store would persist that
+      // snapshot over the real epics before hydration gets a chance to merge.
+      if (!useOrionStore.persist.hasHydrated()) {
+        await new Promise<void>((resolve) => {
+          let finished = false;
+          let unsubscribe = () => {};
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            unsubscribe();
+            resolve();
+          };
+          unsubscribe = useOrionStore.persist.onFinishHydration(finish);
+          // Close the check/subscription race if hydration completed between
+          // the first hasHydrated() call and listener registration.
+          if (useOrionStore.persist.hasHydrated()) finish();
+        });
+      }
+      if (!mounted) return;
+      if (await finalizeReleasedRifts(released)) {
+        toast.info(
+          `Freed ${released.length} rift${released.length === 1 ? '' : 's'}` +
+            (retentionDays ? ` settled over ${retentionDays} days ago` : '')
+        );
+      } else {
+        toast.error('Rifts were freed, but Orion could not durably finish their cleanup');
+      }
+    };
+
+    void window.orion?.getRiftStorageState?.().then(async (state) => {
+      if (!mounted) return;
+      setRiftStorageState(state);
+      if (!state.pendingReleases?.length) return;
+      await applyReleases(state.pendingReleases, state.pendingReleasesRetentionDays ?? null);
+    });
+
+    const unsubscribeState = window.orion?.onRiftStorageState?.((state) => {
+      setRiftStorageState(state);
+    });
+    const unsubscribeReleased = window.orion?.onRiftStorageReleased?.(
+      ({ released, retentionDays }) => void applyReleases(released, retentionDays)
+    );
+
+    return () => {
+      mounted = false;
+      unsubscribeState?.();
+      unsubscribeReleased?.();
+    };
+  }, [finalizeReleasedRifts]);
+
+  // Sizing walks multi-gigabyte trees, so it only runs when the tab is opened,
+  // reusing cached sizes unless the user asks for a fresh measurement.
+  useEffect(() => {
+    if (!settingsOpen || settingsTab !== 'storage') return;
+    let cancelled = false;
+    void flushOrionStoreSave().then((saved) => {
+      if (cancelled || !saved) return;
+      void window.orion?.scanRiftStorage?.({ remeasure: false });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [settingsOpen, settingsTab]);
 
   useEffect(() => {
     let mounted = true;
@@ -3663,6 +3980,8 @@ const App: React.FC = () => {
         riftPath: ownership.riftPath,
         riftWorkingDir: ownership.riftWorkingDir,
         riftRequest: undefined,
+        // The epic has a workspace again, so it is no longer a freed one.
+        riftReleased: undefined,
         ...(ownership.gitRoot ? { gitRoot: ownership.gitRoot } : {}),
         ...(ownership.branch ? { gitBranch: ownership.branch } : {}),
         repositoryProjectId: project.id,
@@ -3694,9 +4013,12 @@ const App: React.FC = () => {
     let disposed = false;
     let refreshTimer: number | null = null;
     let recoveryRetryCount = 0;
+    let releaseRecoveryRetryCount = 0;
+    let pendingRemovalObserved = false;
     const recoveringEpicIds = new Set<string>();
     const refresh = async () => {
       let shouldRetryReadyRift = false;
+      let shouldRetryReleasedRifts = false;
       try {
         const status = await getRiftStatus();
         if (disposed) return;
@@ -3742,27 +4064,67 @@ const App: React.FC = () => {
           recoveryRetryCount = 0;
         }
         const hasMainPendingSetup = (status.pendingEpicIds?.length ?? 0) > 0;
+        const hasMainPendingRemoval = (status.pendingRemovalEpicIds?.length ?? 0) > 0;
+        pendingRemovalObserved = hasMainPendingRemoval;
+        if (hasMainPendingRemoval && window.orion?.getRiftStorageState) {
+          try {
+            const storageState = await window.orion.getRiftStorageState();
+            if (disposed) return;
+            setRiftStorageState(storageState);
+            if ((storageState.pendingReleases?.length ?? 0) > 0) {
+              shouldRetryReleasedRifts = !(
+                await finalizeReleasedRifts(storageState.pendingReleases ?? [])
+              );
+            }
+          } catch (error) {
+            shouldRetryReleasedRifts = true;
+            console.error('Could not reconcile released Rifts', error);
+          }
+        }
+        if (shouldRetryReleasedRifts) {
+          releaseRecoveryRetryCount += 1;
+        } else if (hasMainPendingRemoval) {
+          releaseRecoveryRetryCount = 0;
+        }
         if (
           hasMainPendingSetup ||
+          hasMainPendingRemoval ||
           locallyStartedRiftEpicIdsRef.current.size > 0 ||
           shouldRetryReadyRift
         ) {
-          // Main-owned setup remains on the existing fast cadence. A ready
-          // Rift whose save/acknowledgement failed backs off so a persistent
-          // storage failure cannot create a hot IPC/save loop.
-          const retryDelay = hasMainPendingSetup
-            ? 500
-            : Math.min(500 * 2 ** Math.min(recoveryRetryCount, 4), 5000);
+          // Main-owned setup remains on the existing fast cadence. Failed
+          // setup or release persistence backs off so a persistent storage
+          // failure cannot create a hot IPC/save loop.
+          const retryDelay = shouldRetryReleasedRifts
+            ? Math.min(500 * 2 ** Math.min(releaseRecoveryRetryCount, 4), 5000)
+            : hasMainPendingSetup
+              ? 500
+              : hasMainPendingRemoval
+                ? 500
+                : Math.min(500 * 2 ** Math.min(recoveryRetryCount, 4), 5000);
           refreshTimer = window.setTimeout(() => void refresh(), retryDelay);
         }
       } catch {
         if (
           !disposed &&
-          (locallyStartedRiftEpicIdsRef.current.size > 0 || shouldRetryReadyRift)
+          (locallyStartedRiftEpicIdsRef.current.size > 0 ||
+            shouldRetryReadyRift ||
+            pendingRemovalObserved)
         ) {
-          recoveryRetryCount += 1;
+          if (pendingRemovalObserved) {
+            releaseRecoveryRetryCount += 1;
+          } else {
+            recoveryRetryCount += 1;
+          }
           const retryDelay = Math.min(
-            500 * 2 ** Math.min(recoveryRetryCount, 4),
+            500 *
+              2 **
+                Math.min(
+                  pendingRemovalObserved
+                    ? releaseRecoveryRetryCount
+                    : recoveryRetryCount,
+                  4
+                ),
             5000
           );
           refreshTimer = window.setTimeout(() => void refresh(), retryDelay);
@@ -3774,7 +4136,7 @@ const App: React.FC = () => {
       disposed = true;
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
     };
-  }, [persistAndAcknowledgeRift, riftRecoveryRefreshNonce]);
+  }, [finalizeReleasedRifts, persistAndAcknowledgeRift, riftRecoveryRefreshNonce]);
 
   const openCreateEpicModal = useCallback(() => {
     setNewEpicName('');
@@ -3885,6 +4247,9 @@ const App: React.FC = () => {
         toast.error('Could not save the Rift request');
         return;
       }
+      // A freed epic already owns a branch; recreating its workspace must land
+      // back on that branch rather than opening a second one for the same work.
+      const restoringBranch = epic.riftReleased && epic.gitBranch ? epic.gitBranch : null;
       const result = await window.orion.epicCreateRift({
         epicId,
         projectId: project.id,
@@ -3892,7 +4257,11 @@ const App: React.FC = () => {
         epicName: epic.name,
         epicDescription: epic.description,
         ...resolveUtilityTurn(),
-        ...(request.baseBranch ? { baseBranch: request.baseBranch } : {}),
+        ...(restoringBranch
+          ? { existingBranch: restoringBranch }
+          : request.baseBranch
+            ? { baseBranch: request.baseBranch }
+            : {}),
       });
       if (result.ok && result.riftPath) {
         // Keep the local launch lock if persistence throws as well as when it
@@ -4871,9 +5240,48 @@ const App: React.FC = () => {
     }
   };
 
-  // Confirms and deletes an epic. Its threads survive (deleteEpic only clears
-  // their epicId), so a rift-backed epic needs a fuller warning: the workspace
-  // those threads were editing goes away with it.
+  // Confirms and deletes an epic. Its threads survive and normally lose their
+  // epicId, so a rift-backed epic needs a fuller warning: the workspace those
+  // threads were editing goes away with it.
+  const deleteEpicRestoreRef = async (epic: Epic) => {
+    // Ordinary Git-backed epics never create this ref. Do not make deleting
+    // them depend on a repository that may since have moved or disappeared.
+    if (!epic.riftPath && !epic.riftReleased) return true;
+    const cleanup = window.orion?.epicDeleteRiftRestoreRef;
+    if (!cleanup) {
+      toast.warning('Could not clean up the epic’s saved Rift restore data');
+      return true;
+    }
+    try {
+      const projectPath = epic.repositoryProjectId
+        ? useOrionStore
+            .getState()
+            .projects.find((project) => project.id === epic.repositoryProjectId)?.path
+        : undefined;
+      const result = await cleanup({
+        epicId: epic.id,
+        ...(epic.gitRoot ? { gitRoot: epic.gitRoot } : {}),
+        ...(projectPath ? { projectPath } : {}),
+      });
+      if (result.ok) {
+        if (result.warning) {
+          toast.warning('The epic’s saved Rift restore data could not be cleaned up', {
+            description: result.warning,
+          });
+        }
+        return true;
+      }
+      toast.warning('Could not clean up the epic’s saved Rift restore data', {
+        description: result.error,
+      });
+    } catch (error) {
+      toast.warning('Could not clean up the epic’s saved Rift restore data', {
+        description: error instanceof Error ? error.message : undefined,
+      });
+    }
+    return true;
+  };
+
   const handleDeleteEpic = async (epic: Epic) => {
     if (repositoryOperationBusy) {
       toast.error('Wait for the current repository operation to finish before deleting this epic');
@@ -4891,6 +5299,45 @@ const App: React.FC = () => {
     const currentEpic = state.epics.find((candidate) => candidate.id === epic.id);
     if (!currentEpic) return;
     const epicThreads = state.threads.filter((thread) => thread.epicId === currentEpic.id);
+    const originalEpicIndex = state.epics.findIndex(
+      (candidate) => candidate.id === currentEpic.id
+    );
+    const directThreadIds = new Set(epicThreads.map((thread) => thread.id));
+    const restoreDeletedEpic = async () => {
+      // Preserve unrelated state changes that may land during deletion while
+      // restoring only this Epic, its direct thread memberships, and prior
+      // selection. Main keeps the Rift/ref intact whenever rollback is used.
+      useOrionStore.setState((latest) => {
+        const nextEpics = latest.epics.some((candidate) => candidate.id === currentEpic.id)
+          ? latest.epics
+          : (() => {
+              const restored = [...latest.epics];
+              restored.splice(
+                Math.min(Math.max(originalEpicIndex, 0), restored.length),
+                0,
+                currentEpic
+              );
+              return restored;
+            })();
+        return {
+          epics: nextEpics,
+          threads: latest.threads.map((thread) =>
+            directThreadIds.has(thread.id) && !thread.epicId
+              ? { ...thread, epicId: currentEpic.id }
+              : thread
+          ),
+          selectedEpicId:
+            latest.selectedEpicId === null && state.selectedEpicId === currentEpic.id
+              ? currentEpic.id
+              : latest.selectedEpicId,
+        };
+      });
+      const [storeSaved, threadsSaved] = await Promise.all([
+        flushOrionStoreSave(),
+        flushOrionThreadsSave(),
+      ]);
+      return storeSaved && threadsSaved;
+    };
     if (!currentEpic.riftPath) {
       if (
         !confirm(
@@ -4899,7 +5346,28 @@ const App: React.FC = () => {
       ) {
         return;
       }
-      deleteEpic(currentEpic.id);
+      if (!currentEpic.riftReleased) {
+        deleteEpic(currentEpic.id);
+        return;
+      }
+      // Reserve deletion before persistence/ref cleanup, which can touch slow
+      // or unavailable storage. Repeated clicks and new launches stay blocked
+      // for the whole asynchronous operation.
+      markRiftRemoval(currentEpic.id, true);
+      try {
+        // The restore ref can be the only surviving copy of a force-freed,
+        // never-pushed branch. First make the epic deletion durable so a crash
+        // can only leak the ref, never resurrect an epic whose ref is gone.
+        deleteEpic(currentEpic.id);
+        if (!(await flushOrionStoreSave())) {
+          await restoreDeletedEpic();
+          toast.error('Could not save the epic deletion; its Rift restore data was kept');
+          return;
+        }
+        if (!(await deleteEpicRestoreRef(currentEpic))) return;
+      } finally {
+        markRiftRemoval(currentEpic.id, false);
+      }
       return;
     }
 
@@ -4922,14 +5390,16 @@ const App: React.FC = () => {
       return;
     }
 
-    const disposeAgentThread = window.orion?.disposeAgentThread;
     const removeRift = window.orion?.epicRemoveRift;
-    if (!disposeAgentThread || !removeRift) {
+    if (!removeRift) {
       toast.error('This Orion build cannot safely remove a live epic rift');
       return;
     }
 
+    // Take the synchronous renderer lock before any asynchronous cleanup or
+    // teardown so repeated confirmed deletes cannot enter this flow together.
     markRiftRemoval(currentEpic.id, true);
+    let removalThreadIds: string[] = [];
     try {
       // Include descendants as well as directly grouped threads. This safely
       // covers children created before epic inheritance was added.
@@ -4949,6 +5419,27 @@ const App: React.FC = () => {
         }
       }
       const runtimeThreads = state.threads.filter((thread) => runtimeThreadIds.has(thread.id));
+      removalThreadIds = [...runtimeThreadIds];
+      // Some descendants predate epic inheritance and have no epicId of their
+      // own. Guard the complete runtime set explicitly so those threads cannot
+      // launch in the source checkout while their inherited Rift is removed.
+      markRiftRemovalThreads(removalThreadIds, true);
+
+      // The restore ref can be the only surviving copy of a force-freed,
+      // never-pushed branch. Persist the Epic deletion before main is allowed
+      // to drop that ref or move the Rift. A crash can now only leave an
+      // orphaned, recoverable Rift/ref behind; it cannot resurrect an Epic
+      // whose last commit copy has already been removed.
+      // Keep the surviving threads attached while removal is pending. Every
+      // renderer and main-process workspace guard keys off this epicId; clearing
+      // it before the store flush/removal finishes would let a selected thread
+      // remount in the source checkout with its old Rift session.
+      deleteEpic(currentEpic.id, { retainThreadMembership: true });
+      if (!(await flushOrionStoreSave())) {
+        await restoreDeletedEpic();
+        toast.error('Could not save the epic deletion; its Rift and restore data were kept');
+        return;
+      }
 
       // The ref can lag a just-started run until the next render, while the
       // output map is updated synchronously. Merge both views so every tracked
@@ -4995,26 +5486,6 @@ const App: React.FC = () => {
       }
       flushChunkBuffers();
 
-      // stopAgentTurn handles tracked foreground/background run handles.
-      // disposeAgentThread is the authoritative teardown for every thread: it
-      // also kills untracked agents, persistent Claude background sessions,
-      // Claude terminal PTYs, and pending terminal starts.
-      if (window.orion?.stopAgentTurn) {
-        await Promise.allSettled(
-          runsToStop.map(({ runId }) =>
-            window.orion!.stopAgentTurn(runId, { terminateBackground: true })
-          )
-        );
-      }
-      try {
-        await Promise.all(runtimeThreads.map((thread) => disposeAgentThread(thread.id)));
-      } catch (error) {
-        toast.error('Could not safely stop every runtime in the epic rift', {
-          description: error instanceof Error ? error.message : undefined,
-        });
-        return;
-      }
-
       const pendingSpawnIds: string[] = [];
       for (const thread of runtimeThreads) {
         const updates: Partial<Thread> = {};
@@ -5034,33 +5505,79 @@ const App: React.FC = () => {
         });
       }
 
+      const finalizeDeletedEpicThreads = async () => {
+        for (const thread of runtimeThreads) {
+          const latestThread = useOrionStore
+            .getState()
+            .threads.find((candidate) => candidate.id === thread.id);
+          updateThread(thread.id, {
+            ...(latestThread?.epicId === currentEpic.id ? { epicId: undefined } : {}),
+            agentSessionIds: undefined,
+            pendingForkProviders: undefined,
+          });
+        }
+        return flushOrionThreadsSave();
+      };
+
       let removalResult;
       try {
-        removalResult = await removeRift({ riftPath: currentEpic.riftPath });
+        const projectPath = currentEpic.repositoryProjectId
+          ? state.projects.find((project) => project.id === currentEpic.repositoryProjectId)?.path
+          : undefined;
+        removalResult = await removeRift({
+          epicId: currentEpic.id,
+          riftPath: currentEpic.riftPath,
+          runtimeThreadIds: runtimeThreads.map((thread) => thread.id),
+          ...(currentEpic.gitRoot ? { gitRoot: currentEpic.gitRoot } : {}),
+          ...(projectPath ? { projectPath } : {}),
+        });
       } catch (error) {
-        toast.error('Could not remove the epic rift', {
-          description: error instanceof Error ? error.message : undefined,
+        // An IPC failure is ambiguous: main may have completed the move before
+        // the response was lost. Keep the durable Epic deletion rather than
+        // resurrecting metadata that could point at an absent Rift/ref. Since
+        // the threads now leave the deleted Epic, also drop every session tied
+        // to its old Rift before releasing the workspace guard.
+        const threadsSaved = await finalizeDeletedEpicThreads();
+        toast.error('The epic was deleted, but Orion could not confirm Rift cleanup', {
+          description: [
+            error instanceof Error ? error.message : undefined,
+            !threadsSaved ? 'Thread cleanup is still being retried.' : undefined,
+          ]
+            .filter(Boolean)
+            .join(' '),
         });
         return;
       }
       if (!removalResult?.ok) {
+        const rollbackSaved = await restoreDeletedEpic();
         toast.error('Could not remove the epic rift', {
-          description: removalResult?.error,
+          description: [
+            removalResult?.error,
+            !rollbackSaved ? 'The Epic could not be durably restored for retry.' : undefined,
+          ]
+            .filter(Boolean)
+            .join(' '),
         });
         return;
       }
-
-      // These sessions were recorded with the removed rift as their working
-      // directory. Clear them only after removal succeeds; on failure the epic
-      // and riftPath remain intact and deletion can be retried.
-      for (const thread of runtimeThreads) {
-        updateThread(thread.id, {
-          agentSessionIds: undefined,
-          pendingForkProviders: undefined,
+      if (removalResult.warning) {
+        toast.warning('The epic’s saved Rift restore data could not be cleaned up', {
+          description: removalResult.warning,
         });
       }
-      deleteEpic(currentEpic.id);
+
+      // These sessions were recorded with the removed rift as their working
+      // directory. Detach and clear them only after removal succeeds; on failure
+      // the epic and riftPath remain intact and deletion can be retried. Flush
+      // before releasing the guard so a restart cannot revive an old Rift
+      // session in the shared source checkout.
+      if (!(await finalizeDeletedEpicThreads())) {
+        toast.error('The Rift was removed, but thread cleanup is still being retried', {
+          description: 'Orion will keep retrying the thread save in the background.',
+        });
+      }
     } finally {
+      markRiftRemovalThreads(removalThreadIds, false);
       markRiftRemoval(currentEpic.id, false);
     }
   };
@@ -5139,21 +5656,195 @@ const App: React.FC = () => {
       return;
     }
 
+    // Freeing the rift is only ever offered when Orion positively verified the
+    // workspace has nothing left in it — settling warns about uncommitted and
+    // unpushed work but never publishes it, so an unverified workspace must
+    // not be swept. A missing status means the inspection itself failed.
+    const canReleaseRift = Boolean(
+      epic.riftPath && status && !status.hasChangesToCommit && !status.hasUnpushedCommits
+    );
+    const releaseRift =
+      canReleaseRift && (riftsSettings.releaseOnSettle ?? defaultRiftsSettings.releaseOnSettle);
+
     const confirmSettle = epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle;
     if (confirmSettle || warnings.length > 0) {
-      setEpicSettleDialog({ epic, warnings });
+      setEpicSettleDialog({ epic, warnings, canReleaseRift, releaseRift });
       return;
     }
     settleEpic(epic.id);
     toast.success(`Settled ${epic.name}`);
+    if (releaseRift && epic.riftPath) {
+      void releaseRiftStorage([{ riftPath: epic.riftPath }], { queueIfBusy: true });
+    }
   };
 
-  const confirmEpicSettlement = (epic: Epic) => {
+  // Restoring an epic whose rift was freed rebuilds the workspace on the
+  // branch it already owns. Keep it archived until recreation can actually
+  // start so its threads cannot become active without an isolated workspace.
+  const handleRestoreEpic = (epic: Epic) => {
+    if (
+      riftRemovalEpicIdsRef.current.has(epic.id) ||
+      riftStatus?.pendingRemovalEpicIds?.includes(epic.id)
+    ) {
+      toast.info(`Wait for ${epic.name}’s rift cleanup to finish before restoring it`);
+      return;
+    }
+    if (!epic.riftReleased) {
+      unsettleEpic(epic.id);
+      return;
+    }
+    if (!epic.gitBranch) {
+      toast.error(`Could not restore ${epic.name} because its Rift branch is missing`);
+      return;
+    }
+    if (!riftsActive) {
+      toast.info(`Enable Rifts before restoring ${epic.name}`);
+      return;
+    }
+    const project = epic.gitRoot
+      ? projectForGitRoot(epic.gitRoot, epic.repositoryProjectId)
+      : projects.find((candidate) => candidate.id === epic.repositoryProjectId);
+    if (!project) {
+      toast.error(`Could not restore ${epic.name} because its project is unavailable`);
+      return;
+    }
+    updateEpic(epic.id, {
+      riftRequest: { projectId: project.id, projectPath: project.path },
+    });
+    unsettleEpic(epic.id);
+    toast.info(`Recreating the rift for ${epic.name} on ${epic.gitBranch}`);
+    void setupRiftForEpic(epic.id);
+  };
+
+  // Frees rift directories and clears the pointers of whichever epics owned
+  // them. Main re-checks every guard; the renderer only contributes the live
+  // run information the persisted store cannot show.
+  const releaseRiftStorage = (
+    entries: Array<{ riftPath: string }>,
+    {
+      runGc = false,
+      forcePaths = [],
+      queueIfBusy = false,
+    }: { runGc?: boolean; forcePaths?: string[]; queueIfBusy?: boolean } = {}
+  ) => {
+    if (!runGc && entries.length === 0) return Promise.resolve();
+    // Storage controls are disabled during a sweep, but automatic cleanup can
+    // be requested by settling another epic at any time. Preserve that intent
+    // and run it after the active operation instead of silently dropping it.
+    if (riftStorageQueueDepthRef.current > 0 && !queueIfBusy) return Promise.resolve();
+    riftStorageQueueDepthRef.current += 1;
+    setRiftStorageBusy(true);
+    const request = riftStorageQueueRef.current
+      .catch(() => {})
+      .then(async () => {
+        const markedEpicIds = new Set<string>();
+        try {
+          const state = useOrionStore.getState();
+          const requestedPaths = new Set(entries.map((entry) => entry.riftPath));
+          const requestedEpics = state.epics.filter(
+            (epic) => epic.riftPath && requestedPaths.has(epic.riftPath)
+          );
+          // Register the renderer guard before the first await. Restore and
+          // launch actions can otherwise cross the store flush while main is
+          // about to act on the still-settled snapshot.
+          for (const epic of requestedEpics) {
+            markedEpicIds.add(epic.id);
+            markRiftRemoval(epic.id, true);
+          }
+          // Main reads epic ownership and settled state from the persisted store,
+          // so the store has to be on disk before it looks.
+          if (!(await flushOrionStoreSave())) {
+            toast.error('Rift cleanup could not start because Orion storage is unavailable');
+            return;
+          }
+          const busyEpicIds = state.epics
+            .filter((epic) => epicHasRunningAgents(epic.id))
+            .map((epic) => epic.id);
+          const runtimeThreadIdsByEpic = Object.fromEntries(
+            requestedEpics.map((epic) => [
+              epic.id,
+              runtimeThreadsForEpic(state.threads, epic.id).map((thread) => thread.id),
+            ])
+          );
+          const result = await window.orion?.releaseRiftStorage?.({
+            riftPaths: entries.map((entry) => entry.riftPath),
+            // Force approval belongs only to the manual confirmation that supplied
+            // this list. Automatic release-on-settle calls omit it and must pass
+            // main's fresh unpublished-work guard.
+            forcePaths,
+            busyEpicIds,
+            runtimeThreadIdsByEpic,
+            runGc,
+          });
+          if (!result) {
+            toast.error('Rift storage cleanup is unavailable in this build');
+            return;
+          }
+          setRiftStorageForced({});
+
+          const freed = (result.results ?? []).filter((entry) => entry.ok);
+          const skipped = (result.results ?? []).filter((entry) => !entry.ok);
+          const ownedReleases = freed.flatMap((entry) =>
+            typeof entry.epicId === 'string' && entry.epicId.length > 0
+              ? [{ riftPath: entry.riftPath, epicId: entry.epicId }]
+              : []
+          );
+          const releasePersisted = await finalizeReleasedRifts(ownedReleases, {
+            disposeRuntimes: false,
+          });
+          if (freed.length > 0) {
+            if (releasePersisted) {
+              // The per-rift sizes count blocks a clone still shares with its source,
+              // so report what free space actually moved rather than that estimate.
+              const reclaimed =
+                result.reclaimedBytes != null
+                  ? ` — reclaimed ${formatBytes(result.reclaimedBytes)}`
+                  : '';
+              toast.success(
+                `Freed ${freed.length} rift${freed.length === 1 ? '' : 's'}${reclaimed}`
+              );
+            } else {
+              // Main retains the durable release journal and launch guard
+              // until acknowledgement. The status poll may be idle after a
+              // manual/release-on-settle sweep, so wake its backoff retry now.
+              setRiftRecoveryRefreshNonce((current) => current + 1);
+              toast.error('Rifts were freed, but Orion could not durably finish their cleanup');
+            }
+          } else if (runGc && !result.gcError) {
+            const reclaimed =
+              result.reclaimedBytes != null
+                ? ` — reclaimed ${formatBytes(result.reclaimedBytes)}`
+                : '';
+            toast.success(`Emptied Rift trash${reclaimed}`);
+          }
+          for (const entry of skipped) {
+            const label =
+              RIFT_RELEASE_REASON_LABELS[entry.reason ?? ''] ?? entry.error ?? 'was skipped';
+            toast.warning(`${entry.riftPath.split('/').pop()}: ${label}`);
+          }
+          if (result.gcError) toast.error(`Could not empty the rift trash: ${result.gcError}`);
+        } catch (error) {
+          toast.error(`Rift cleanup failed: ${(error as Error)?.message ?? String(error)}`);
+        } finally {
+          for (const epicId of markedEpicIds) markRiftRemoval(epicId, false);
+        }
+      })
+      .finally(() => {
+        riftStorageQueueDepthRef.current = Math.max(0, riftStorageQueueDepthRef.current - 1);
+        if (riftStorageQueueDepthRef.current === 0) setRiftStorageBusy(false);
+      });
+    riftStorageQueueRef.current = request;
+    return request;
+  };
+
+  const confirmEpicSettlement = (epic: Epic, releaseRift = false) => {
     setEpicSettleDialog(null);
     // The dialog can stay open while a new run starts, so the sole settlement
     // blocker gets one final click-time check.
     if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
+      toast.error(
+        'Agents are still running in this epic — wait for them to finish before settling it'
+      );
       return;
     }
     const currentEpic = useOrionStore
@@ -5162,6 +5853,12 @@ const App: React.FC = () => {
     if (!currentEpic || currentEpic.settledAt) return;
     settleEpic(epic.id);
     toast.success(`Settled ${currentEpic.name}`);
+    // Main only frees a rift whose epic is already settled, and
+    // releaseRiftStorage flushes the store first, so this ordering is what
+    // makes the guard pass.
+    if (releaseRift && currentEpic.riftPath) {
+      void releaseRiftStorage([{ riftPath: currentEpic.riftPath }], { queueIfBusy: true });
+    }
   };
 
   const attachMediaFiles = useCallback(
@@ -5335,10 +6032,20 @@ const App: React.FC = () => {
           error: 'This epic has an incomplete rift that must be removed before work can continue',
         };
       }
-      if (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId)) {
+      if (
+        riftRemovalThreadIdsRef.current.has(thread.id) ||
+        (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
+      ) {
         return {
           ok: false,
           error: 'This epic’s rift workspace is being removed',
+        };
+      }
+      const workingDir = threadWorkingDir(state.epics, thread, project);
+      if (!workingDir) {
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is not available',
         };
       }
       let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
@@ -5483,7 +6190,7 @@ const App: React.FC = () => {
           threadId,
           titleSeed,
           resolveUtilityTurn(),
-          threadWorkingDir(state.epics, thread, project),
+          workingDir,
           updateThread,
           thread.epicId
         );
@@ -5526,7 +6233,7 @@ const App: React.FC = () => {
           runId,
           threadId,
           epicId: thread.epicId,
-          projectPath: threadWorkingDir(state.epics, thread, project),
+          projectPath: workingDir,
           prompt: agentPrompt,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -5630,26 +6337,26 @@ const App: React.FC = () => {
         report(false, 'Driver thread not found');
         return;
       }
+      const driverEpic = driverThread.epicId
+        ? state.epics.find((epic) => epic.id === driverThread.epicId)
+        : undefined;
       if (
-        driverThread.epicId &&
-        (riftSetupEpicIdsRef.current[driverThread.epicId] ||
-          riftRemovalEpicIdsRef.current.has(driverThread.epicId))
+        riftRemovalThreadIdsRef.current.has(driverThread.id) ||
+        (driverThread.epicId &&
+          (riftSetupEpicIdsRef.current[driverThread.epicId] ||
+            riftRemovalEpicIdsRef.current.has(driverThread.epicId)))
       ) {
         report(false, 'The driver epic’s rift workspace is not available');
         return;
       }
       if (
-        driverThread.epicId &&
-        state.epics.find((epic) => epic.id === driverThread.epicId)?.riftRequest
+        driverEpic?.riftRequest
       ) {
         report(false, 'The driver epic’s rift setup must finish before spawning subagents');
         return;
       }
-      if (
-        driverThread.epicId &&
-        state.epics.find((epic) => epic.id === driverThread.epicId)?.riftCleanupPending
-      ) {
-        report(false, 'The driver epic has an incomplete rift pending cleanup');
+      if (driverEpic?.riftCleanupPending || driverEpic?.riftReleased) {
+        report(false, 'The driver epic’s rift workspace is not available');
         return;
       }
       const projectId = driverThread.projectId;
@@ -5989,8 +6696,14 @@ const App: React.FC = () => {
         (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) ||
         threadEpic?.riftRequest ||
         threadEpic?.riftCleanupPending ||
+        threadEpic?.riftReleased ||
+        riftRemovalThreadIdsRef.current.has(thread.id) ||
         (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
       ) {
+        return { ok: false, error: 'This epic’s rift workspace is not available' };
+      }
+      const workingDir = threadWorkingDir(state.epics, thread, project);
+      if (!workingDir) {
         return { ok: false, error: 'This epic’s rift workspace is not available' };
       }
       let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
@@ -6046,7 +6759,7 @@ const App: React.FC = () => {
           runId,
           threadId,
           epicId: thread.epicId,
-          projectPath: threadWorkingDir(state.epics, thread, project),
+          projectPath: workingDir,
           prompt,
           modelId: model.id,
           // Plan mode: the aside can read the repo but never mutate it.
@@ -6100,6 +6813,9 @@ const App: React.FC = () => {
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      const threadEpic = thread.epicId
+        ? state.epics.find((epic) => epic.id === thread.epicId)
+        : undefined;
       // Wait for the epic's rift: see startTurnForThread.
       if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
         return {
@@ -6107,26 +6823,30 @@ const App: React.FC = () => {
           error: 'This epic’s rift workspace is still being created — try again in a moment',
         };
       }
-      if (
-        thread.epicId &&
-        state.epics.find((epic) => epic.id === thread.epicId)?.riftRequest
-      ) {
+      if (threadEpic?.riftRequest) {
         return {
           ok: false,
           error: 'This epic’s rift setup needs to finish before work can continue',
         };
       }
-      if (
-        thread.epicId &&
-        state.epics.find((epic) => epic.id === thread.epicId)?.riftCleanupPending
-      ) {
+      if (threadEpic?.riftCleanupPending) {
         return {
           ok: false,
           error: 'This epic has an incomplete rift that must be removed before work can continue',
         };
       }
-      if (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId)) {
+      if (
+        riftRemovalThreadIdsRef.current.has(thread.id) ||
+        (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
+      ) {
         return { ok: false, error: 'This epic’s rift workspace is being removed' };
+      }
+      if (threadEpic?.riftReleased) {
+        return { ok: false, error: 'This epic’s rift workspace is not available' };
+      }
+      const workingDir = threadWorkingDir(state.epics, thread, project);
+      if (!workingDir) {
+        return { ok: false, error: 'This epic’s rift workspace is not available' };
       }
       const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
@@ -6164,7 +6884,7 @@ const App: React.FC = () => {
           runId,
           threadId,
           epicId: thread.epicId,
-          projectPath: threadWorkingDir(state.epics, thread, project),
+          projectPath: workingDir,
           prompt: goalAction.objective || 'Resume the goal.',
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -6229,6 +6949,9 @@ const App: React.FC = () => {
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
+      const threadEpic = thread.epicId
+        ? state.epics.find((epic) => epic.id === thread.epicId)
+        : undefined;
       // Wait for the epic's rift: see startTurnForThread.
       if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
         return {
@@ -6236,26 +6959,30 @@ const App: React.FC = () => {
           error: 'This epic’s rift workspace is still being created — try again in a moment',
         };
       }
-      if (
-        thread.epicId &&
-        state.epics.find((epic) => epic.id === thread.epicId)?.riftRequest
-      ) {
+      if (threadEpic?.riftRequest) {
         return {
           ok: false,
           error: 'This epic’s rift setup needs to finish before work can continue',
         };
       }
-      if (
-        thread.epicId &&
-        state.epics.find((epic) => epic.id === thread.epicId)?.riftCleanupPending
-      ) {
+      if (threadEpic?.riftCleanupPending) {
         return {
           ok: false,
           error: 'This epic has an incomplete rift that must be removed before work can continue',
         };
       }
-      if (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId)) {
+      if (
+        riftRemovalThreadIdsRef.current.has(thread.id) ||
+        (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
+      ) {
         return { ok: false, error: 'This epic’s rift workspace is being removed' };
+      }
+      if (threadEpic?.riftReleased) {
+        return { ok: false, error: 'This epic’s rift workspace is not available' };
+      }
+      const workingDir = threadWorkingDir(state.epics, thread, project);
+      if (!workingDir) {
+        return { ok: false, error: 'This epic’s rift workspace is not available' };
       }
       const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
@@ -6309,7 +7036,7 @@ const App: React.FC = () => {
           runId,
           threadId,
           epicId: thread.epicId,
-          projectPath: threadWorkingDir(state.epics, thread, project),
+          projectPath: workingDir,
           prompt: review.instructions || reviewLabel,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -6447,6 +7174,7 @@ const App: React.FC = () => {
     const goal = selectedThread.goal;
     const sessionId = selectedThread.agentSessionIds?.codex;
     const project = state.projects.find((p) => p.id === selectedThread.projectId);
+    const workingDir = project ? threadWorkingDir(state.epics, selectedThread, project) : null;
     const finishInput = () => {
       setChatInput('');
       setChatMention(null);
@@ -6458,12 +7186,13 @@ const App: React.FC = () => {
         toast.error('No goal on this thread yet — set one with “/goal <objective>”.');
         return;
       }
-      if (sessionId && project && window.orion?.codexGoalCommand) {
+      if (sessionId && workingDir && window.orion?.codexGoalCommand) {
         void window.orion
           .codexGoalCommand({
             sessionId,
             threadId: selectedThreadId,
-            projectPath: threadWorkingDir(state.epics, selectedThread, project),
+            epicId: selectedThread.epicId,
+            projectPath: workingDir,
             action: 'get',
           })
           .then((result) => {
@@ -6505,12 +7234,13 @@ const App: React.FC = () => {
           }
           toast.success('Goal paused.');
         });
-      } else if (sessionId && project && window.orion?.codexGoalCommand) {
+      } else if (sessionId && workingDir && window.orion?.codexGoalCommand) {
         void window.orion
           .codexGoalCommand({
             sessionId,
             threadId: selectedThreadId,
-            projectPath: threadWorkingDir(state.epics, selectedThread, project),
+            epicId: selectedThread.epicId,
+            projectPath: workingDir,
             action: 'pause',
           })
           .then((result) => {
@@ -6532,12 +7262,13 @@ const App: React.FC = () => {
         return;
       }
       const clearGoal = () => {
-        if (sessionId && project && window.orion?.codexGoalCommand) {
+        if (sessionId && workingDir && window.orion?.codexGoalCommand) {
           void window.orion
             .codexGoalCommand({
               sessionId,
               threadId: selectedThreadId,
-              projectPath: threadWorkingDir(state.epics, selectedThread, project),
+              epicId: selectedThread.epicId,
+              projectPath: workingDir,
               action: 'clear',
             })
             .then((result) => {
@@ -6740,6 +7471,16 @@ const App: React.FC = () => {
       const currentThread = useOrionStore
         .getState()
         .threads.find((thread) => thread.id === submittedThreadId);
+      if (
+        currentThread &&
+        (riftRemovalThreadIdsRef.current.has(currentThread.id) ||
+          (currentThread.epicId &&
+            riftRemovalEpicIdsRef.current.has(currentThread.epicId)))
+      ) {
+        restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
+        toast.error('This epic’s rift workspace is being removed');
+        return;
+      }
       const tasksToInject = (currentThread?.linkedTasks ?? []).filter((task) => !task.injected);
       let text = buildPromptWithAttachments(promptText, submittedAttachments);
       if (tasksToInject.length > 0) {
@@ -7998,6 +8739,7 @@ const App: React.FC = () => {
                 { id: 'providers', label: 'Providers', Icon: Plug },
                 { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
                 { id: 'computer-use', label: 'Computer Use', Icon: MousePointerClick },
+                { id: 'storage', label: 'Storage', Icon: HardDrive },
                 { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
                 { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
               ].map(({ id, label, Icon }) => (
@@ -8030,12 +8772,13 @@ const App: React.FC = () => {
               {settingsTab === 'providers' && 'PROVIDERS'}
               {settingsTab === 'orchestration' && 'ORCHESTRATION'}
               {settingsTab === 'computer-use' && 'COMPUTER USE'}
+              {settingsTab === 'storage' && 'STORAGE'}
               {settingsTab === 'cosmetics' && 'COSMETICS'}
               {settingsTab === 'experimental' && 'EXPERIMENTAL'}
             </div>
 
             <div
-              className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' ? ' settings-panel-grouped' : ''}`}
+              className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' ? ' settings-panel-grouped' : ''}`}
             >
               {settingsTab === 'account' && (
                 <>
@@ -8422,6 +9165,14 @@ const App: React.FC = () => {
                                   Settled{' '}
                                   {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
                                 </span>
+                                {epic.riftReleased && (
+                                  <span
+                                    className="provider-status-chip"
+                                    title="Its rift was freed to reclaim disk. Restoring recreates it on the same branch."
+                                  >
+                                    Rift freed
+                                  </span>
+                                )}
                                 {epic.prUrl && (
                                   <button
                                     type="button"
@@ -8437,8 +9188,12 @@ const App: React.FC = () => {
                                 <button
                                   type="button"
                                   className="archived-epic-action"
-                                  title="Restore to the sidebar"
-                                  onClick={() => unsettleEpic(epic.id)}
+                                  title={
+                                    epic.riftReleased
+                                      ? 'Restore to the sidebar and recreate its rift'
+                                      : 'Restore to the sidebar'
+                                  }
+                                  onClick={() => handleRestoreEpic(epic)}
                                 >
                                   <RefreshCw size={13} />
                                 </button>
@@ -8959,6 +9714,226 @@ const App: React.FC = () => {
                     </div>
                   </>
                 )
+              )}
+
+              {settingsTab === 'storage' && (
+                <>
+                  <div className="settings-group-label">Rift workspaces</div>
+                  <div className="settings-group">
+                    <div className="storage-summary">
+                      <div className="storage-summary-main">
+                        <div className="storage-summary-total">
+                          {formatBytes(riftStorageSummary.total)}
+                        </div>
+                        <div className="storage-summary-caption">
+                          Across {riftStorageEntries.length} rift
+                          {riftStorageEntries.length === 1 ? '' : 's'}. Rifts share unchanged files
+                          with their source repository, so freeing them usually reclaims less than
+                          this.
+                        </div>
+                      </div>
+                      <div className="storage-summary-actions">
+                        <button
+                          type="button"
+                          className="btn secondary small"
+                          disabled={riftStorageState?.scanning || riftStorageBusy}
+                          onClick={() => void window.orion?.scanRiftStorage?.({ remeasure: true })}
+                        >
+                          <RefreshCw size={13} />
+                          {riftStorageState?.scanning ? 'Measuring...' : 'Rescan'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn danger small"
+                          disabled={
+                            riftStorageBusy ||
+                            riftStorageState?.scanning ||
+                            (riftSweepSelection.length === 0 && riftStorageSummary.trash <= 0)
+                          }
+                          onClick={() =>
+                            setRiftSweepDialog({ entries: riftSweepSelection, runGc: true })
+                          }
+                        >
+                          <Trash2 size={13} />
+                          {riftStorageBusy
+                            ? 'Freeing...'
+                            : riftSweepSelection.length === 0
+                              ? `Empty ${formatBytes(riftStorageSummary.trash)} trash`
+                              : `Free up ${formatBytes(
+                                  riftSweepSelection.reduce(
+                                    (total, entry) => total + (entry.bytes ?? 0),
+                                    0
+                                  )
+                                )}`}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="storage-breakdown">
+                      {[
+                        { label: 'Active epics', bytes: riftStorageSummary.active },
+                        { label: 'Settled epics', bytes: riftStorageSummary.settled },
+                        { label: 'No epic', bytes: riftStorageSummary.orphan },
+                        { label: 'Rift trash', bytes: riftStorageSummary.trash },
+                      ].map(({ label, bytes }) => (
+                        <div key={label} className="storage-breakdown-item">
+                          <span className="storage-breakdown-label">{label}</span>
+                          <span className="storage-breakdown-value">{formatBytes(bytes)}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {riftStorageState?.error && (
+                      <div className="setting-row">
+                        <div className="setting-label">
+                          <div className="setting-label-desc">{riftStorageState.error}</div>
+                        </div>
+                      </div>
+                    )}
+
+                    {riftStorageEntries.length === 0 && !riftStorageState?.scanning && (
+                      <div className="setting-row">
+                        <div className="setting-label">
+                          <div className="setting-label-desc">
+                            No rift workspaces found. Rifts appear here once epics start creating
+                            them.
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {riftStorageEntries.length > 0 && (
+                      <div className="setting-row setting-row-stacked">
+                        <div className="storage-rift-list">
+                          {riftStorageEntries.map((entry) => {
+                            const blocked =
+                              entry.hasUncommittedChanges || entry.hasUnpushedCommits;
+                            const forced = Boolean(riftStorageForced[entry.riftPath]);
+                            return (
+                              <div key={entry.riftPath} className="storage-rift-row">
+                                <div className="storage-rift-main">
+                                  <span
+                                    className="storage-rift-name truncate"
+                                    title={entry.riftPath}
+                                  >
+                                    {entry.epicName || entry.name}
+                                  </span>
+                                  <span className="storage-rift-meta truncate">
+                                    {entry.repoName}
+                                    {entry.gitBranch ? ` · ${entry.gitBranch}` : ''}
+                                    {entry.settledAt
+                                      ? ` · settled ${formatShortTime(new Date(entry.settledAt))}`
+                                      : ''}
+                                  </span>
+                                </div>
+                                {entry.status === 'active' && (
+                                  <span className="provider-status-chip">Active</span>
+                                )}
+                                {entry.status === 'orphan' && (
+                                  <span className="provider-status-chip">No epic</span>
+                                )}
+                                {entry.status === 'cleanupPending' && (
+                                  <span className="provider-status-chip">Incomplete</span>
+                                )}
+                                {blocked && (
+                                  <button
+                                    type="button"
+                                    className={`storage-rift-flag${forced ? ' active' : ''}`}
+                                    title={
+                                      forced
+                                        ? 'This rift will be freed even though it has unpushed work'
+                                        : 'Has uncommitted or unpushed work — click to free it anyway'
+                                    }
+                                    onClick={() =>
+                                      setRiftStorageForced((current) => ({
+                                        ...current,
+                                        [entry.riftPath]: !current[entry.riftPath],
+                                      }))
+                                    }
+                                  >
+                                    {forced ? 'Freeing anyway' : 'Unpushed work'}
+                                  </button>
+                                )}
+                                <span className="storage-rift-size">
+                                  {formatBytes(entry.bytes)}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="archived-epic-action danger"
+                                  title="Free this rift"
+                                  disabled={
+                                    riftStorageBusy ||
+                                    entry.status === 'active' ||
+                                    !entry.hasMarker ||
+                                    (blocked && !forced)
+                                  }
+                                  onClick={() =>
+                                    setRiftSweepDialog({ entries: [entry], runGc: true })
+                                  }
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="settings-group-label">Automatic cleanup</div>
+                  <div className="settings-group settings-group-overflowing">
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Free the rift when settling</div>
+                        <div className="setting-label-desc">
+                          Settling an epic also frees its rift workspace. The epic keeps its branch
+                          and pull request, and restoring it recreates the rift. Rifts with
+                          uncommitted or unpushed work are never freed automatically.
+                        </div>
+                      </div>
+                      <label className="provider-toggle" title="Free the rift when settling">
+                        <input
+                          type="checkbox"
+                          checked={
+                            riftsSettings.releaseOnSettle ?? defaultRiftsSettings.releaseOnSettle
+                          }
+                          onChange={(e) =>
+                            setRiftsSettings({ releaseOnSettle: e.target.checked })
+                          }
+                        />
+                        <span />
+                      </label>
+                    </div>
+
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Free settled rifts after</div>
+                        <div className="setting-label-desc">
+                          Checked once at startup. Freed rifts stay recoverable in Rift's trash
+                          until you empty it from this page.
+                        </div>
+                      </div>
+                      <SelectMenu
+                        label="Free settled rifts after"
+                        value={String(
+                          riftsSettings.retentionDays ?? defaultRiftsSettings.retentionDays ?? '',
+                        )}
+                        options={[
+                          { value: '', label: 'Never' },
+                          { value: '7', label: '7 days' },
+                          { value: '14', label: '14 days' },
+                          { value: '30', label: '30 days' },
+                        ]}
+                        onChange={(value) =>
+                          setRiftsSettings({
+                            retentionDays: value ? Number(value) : null,
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+                </>
               )}
 
               {settingsTab === 'cosmetics' && (
@@ -11588,6 +12563,23 @@ const App: React.FC = () => {
                 ))}
               </div>
             )}
+            {epicSettleDialog.canReleaseRift && (
+              <label className="storage-sweep-option">
+                <input
+                  type="checkbox"
+                  checked={epicSettleDialog.releaseRift}
+                  onChange={(e) =>
+                    setEpicSettleDialog((current) =>
+                      current ? { ...current, releaseRift: e.target.checked } : current
+                    )
+                  }
+                />
+                <span>
+                  Also free its rift workspace to reclaim disk. The branch and pull request are
+                  kept, and restoring the epic recreates the rift.
+                </span>
+              </label>
+            )}
             <div className="modal-actions">
               <button
                 type="button"
@@ -11599,10 +12591,112 @@ const App: React.FC = () => {
               <button
                 type="button"
                 className="btn"
-                onClick={() => confirmEpicSettlement(epicSettleDialog.epic)}
+                onClick={() =>
+                  confirmEpicSettlement(epicSettleDialog.epic, epicSettleDialog.releaseRift)
+                }
               >
                 <Archive size={14} />
                 Settle epic
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {riftSweepDialog && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={dismissRiftSweepDialog}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="rift-sweep-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="rift-sweep-title" className="modal-title">
+              {riftSweepDialog.entries.length === 0
+                ? "Empty Rift's trash?"
+                : riftSweepDialog.entries.length === 1
+                  ? `Free “${riftSweepDialog.entries[0].epicName || riftSweepDialog.entries[0].name}”?`
+                  : `Free ${riftSweepDialog.entries.length} rift workspaces?`}
+            </h2>
+            <p className="modal-subtitle">
+              {riftSweepDialog.entries.length === 0
+                ? "This permanently empties Rift's trash across every repository on this machine."
+                : 'Their epics keep their branches, commits, and pull requests. Restoring an epic recreates its rift from the source repository.'}
+            </p>
+            {riftSweepDialog.entries.length > 0 && (
+              <div className="storage-sweep-list">
+                {riftSweepDialog.entries.map((entry) => (
+                  <div key={entry.riftPath} className="storage-sweep-item">
+                    <span className="truncate" title={entry.riftPath}>
+                      {entry.epicName || entry.name}
+                    </span>
+                    <span className="storage-rift-size">{formatBytes(entry.bytes)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {riftSweepDialog.entries.some(
+              (entry) => entry.hasUncommittedChanges || entry.hasUnpushedCommits
+            ) && (
+              <div className="epic-settle-warnings">
+                <p>
+                  Some of these have uncommitted or unpushed work that exists nowhere else. You
+                  chose to free them anyway.
+                </p>
+              </div>
+            )}
+            {riftSweepDialog.entries.length > 0 && (
+              <label className="storage-sweep-option">
+                <input
+                  type="checkbox"
+                  checked={riftSweepDialog.runGc}
+                  onChange={(e) =>
+                    setRiftSweepDialog((current) =>
+                      current ? { ...current, runGc: e.target.checked } : current
+                    )
+                  }
+                />
+                <span>
+                  Empty Rift's trash afterwards. Without this the space is not actually reclaimed —
+                  but emptying it is permanent and covers every repository on this machine, not just
+                  Orion's.
+                </span>
+              </label>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={dismissRiftSweepDialog}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn danger"
+                onClick={() => {
+                  const { entries, runGc } = riftSweepDialog;
+                  const forcePaths = entries
+                    .filter(
+                      (entry) =>
+                        (entry.hasUncommittedChanges || entry.hasUnpushedCommits) &&
+                        riftStorageForced[entry.riftPath]
+                    )
+                    .map((entry) => entry.riftPath);
+                  setRiftSweepDialog(null);
+                  setRiftStorageForced({});
+                  void releaseRiftStorage(entries, { runGc, forcePaths });
+                }}
+              >
+                <Trash2 size={14} />
+                {riftSweepDialog.entries.length === 0
+                  ? 'Empty trash'
+                  : `Free ${riftSweepDialog.entries.length === 1 ? 'rift' : 'rifts'}`}
               </button>
             </div>
           </div>

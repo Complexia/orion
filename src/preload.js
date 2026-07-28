@@ -48,6 +48,25 @@ contextBridge.exposeInMainWorld('orion', {
   epicCreateRift: (input) => ipcRenderer.invoke('epic:createRift', input),
   epicAcknowledgeRift: (input) => ipcRenderer.invoke('epic:acknowledgeRift', input),
   epicRemoveRift: (input) => ipcRenderer.invoke('epic:removeRift', input),
+  epicDeleteRiftRestoreRef: (input) =>
+    ipcRenderer.invoke('epic:deleteRiftRestoreRef', input),
+
+  // Rift storage (Settings > Storage)
+  getRiftStorageState: () => ipcRenderer.invoke('riftStorage:getState'),
+  scanRiftStorage: (input) => ipcRenderer.invoke('riftStorage:scan', input),
+  releaseRiftStorage: (input) => ipcRenderer.invoke('riftStorage:release', input),
+  acknowledgeRiftStorageReleases: (input) =>
+    ipcRenderer.invoke('riftStorage:acknowledgeReleases', input),
+  onRiftStorageState: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('riftStorage:state', listener);
+    return () => ipcRenderer.removeListener('riftStorage:state', listener);
+  },
+  onRiftStorageReleased: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('riftStorage:released', listener);
+    return () => ipcRenderer.removeListener('riftStorage:released', listener);
+  },
 
   // Agent runtime
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),

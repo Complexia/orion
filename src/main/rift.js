@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 
 // Rift (github.com/anomalyco/rift) ships prebuilt CLI binaries inside the
@@ -142,6 +143,46 @@ export const riftCreate = async (workspacePath, { name, into, signal } = {}) => 
 // through this path — rift itself refuses that without -f.
 export const riftRemove = async (riftPath) => {
   await runRift(['remove', riftPath]);
+};
+
+// Permanently deletes everything Rift has in its trash. `rift gc` takes no
+// path argument, so this is machine-wide: it also drops trashed rifts from
+// repositories Orion has never touched. Only ever call it from an explicit,
+// confirmed user action — never from a background sweep.
+export const riftGc = async ({ signal } = {}) => {
+  await runRift(['gc'], { timeout: 600_000, signal });
+};
+
+// `rift gc` is machine-wide, so Orion's own project list is not enough to
+// identify every volume whose free space may change. Rift's registry is the
+// authoritative list of pending trash, including repositories Orion has never
+// opened. Read it without creating or mutating the database.
+const riftDatabasePath = () => {
+  if (process.platform === 'linux') {
+    const dataRoot =
+      process.env.XDG_DATA_HOME || path.join(app.getPath('home'), '.local', 'share');
+    return path.join(dataRoot, 'rift', 'rift.sqlite');
+  }
+  return path.join(app.getPath('appData'), 'rift', 'rift.sqlite');
+};
+
+export const listRiftTrashPaths = () => {
+  const databasePath = riftDatabasePath();
+  if (!existsSync(databasePath)) return [];
+  let database;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true, timeout: 2_000 });
+    return database
+      .prepare('SELECT path FROM trash')
+      .all()
+      .flatMap((row) => (typeof row?.path === 'string' && row.path ? [row.path] : []));
+  } catch {
+    return [];
+  } finally {
+    try {
+      database?.close();
+    } catch {}
+  }
 };
 
 export const riftSlug = (name) => {
