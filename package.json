@@ -11,6 +11,7 @@
     "make": "electron-forge make",
     "deploy": "node scripts/deploy.mjs",
     "update-rifts": "node scripts/update-rifts.mjs",
+    "test:rift-storage": "node scripts/test-rift-storage.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",

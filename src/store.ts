@@ -75,6 +75,13 @@ export type Epic = {
    * git actions must not use the incomplete workspace.
    */
   riftCleanupPending?: boolean;
+  /**
+   * The epic's rift was freed to reclaim disk (Settings > Storage, the settle
+   * sweep, or retention). riftPath is cleared, but gitRoot/gitBranch/prUrl
+   * survive so the archived epic still shows its branch and PR — and so
+   * restoring it can recreate the rift on the same branch.
+   */
+  riftReleased?: boolean;
 };
 
 export type EpicsSettings = {
@@ -131,11 +138,25 @@ export type RiftsSettings = {
   enabled: boolean;
   /** Create a rift (and branch) automatically for every new epic. */
   autoCreateForEpics: boolean;
+  /**
+   * Free an epic's rift as part of settling it. A rift is a whole repository
+   * copy, so keeping one per settled epic adds up fast — but settling is
+   * otherwise a cheap, reversible timestamp, so this stays opt-in.
+   */
+  releaseOnSettle: boolean;
+  /**
+   * Free rifts belonging to epics settled more than this many days ago, swept
+   * at startup. `null` disables retention entirely. The sweep never touches a
+   * rift with uncommitted or unpushed work, and never empties Rift's trash.
+   */
+  retentionDays: number | null;
 };
 
 export const defaultRiftsSettings: RiftsSettings = {
   enabled: false,
   autoCreateForEpics: true,
+  releaseOnSettle: false,
+  retentionDays: null,
 };
 
 const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -538,10 +559,12 @@ interface OrionState {
   ) => string; // returns new epic id
   renameEpic: (id: string, name: string) => void;
   updateEpic: (id: string, updates: Partial<Epic>) => void;
-  /** Deletes the epic; its threads survive and just lose the grouping. */
-  deleteEpic: (id: string) => void;
+  /** Deletes the epic; its threads survive and normally just lose the grouping. */
+  deleteEpic: (id: string, options?: { retainThreadMembership?: boolean }) => void;
   settleEpic: (id: string) => void;
   unsettleEpic: (id: string) => void;
+  /** Clear an epic's rift pointers only if it still owns the freed path. */
+  releaseEpicRift: (id: string, riftPath: string) => void;
   selectEpic: (id: string | null) => void;
   setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
   setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
@@ -663,6 +686,7 @@ if (typeof window !== 'undefined') {
 // live in their own file on a slower save cadence — see the saver below the
 // store definition. State shared with it:
 let threadsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let threadsSaveFlush: Promise<boolean> | null = null;
 let lastPersistedThreads: Thread[] | null = null;
 // The threads reference at clearStorage time: zustand clears storage without
 // clearing in-memory state, so the savers must not write this exact snapshot
@@ -1064,14 +1088,18 @@ export const useOrionStore = create<OrionState>()(
           };
         }),
 
-      deleteEpic: (id) =>
+      deleteEpic: (id, options) =>
         set((state) => ({
           epics: state.epics.filter((epic) => epic.id !== id),
           // Threads survive their epic — they stay in Recent agents and their
-          // project list; only the grouping is gone.
-          threads: state.threads.map((t) =>
-            t.epicId === id ? { ...t, epicId: undefined } : t
-          ),
+          // project list; only the grouping is gone. Rift-backed deletion can
+          // retain membership until workspace removal succeeds so the epic's
+          // launch guards keep covering those threads during cleanup.
+          threads: options?.retainThreadMembership
+            ? state.threads
+            : state.threads.map((t) =>
+                t.epicId === id ? { ...t, epicId: undefined } : t
+              ),
           selectedEpicId: state.selectedEpicId === id ? null : state.selectedEpicId,
         })),
 
@@ -1087,6 +1115,24 @@ export const useOrionStore = create<OrionState>()(
         set((state) => ({
           epics: state.epics.map((epic) =>
             epic.id === id ? { ...epic, settledAt: undefined } : epic
+          ),
+        })),
+
+      // The epic's rift directory is gone from disk. Drop the pointers that
+      // would now resolve to nothing, and keep everything that still describes
+      // the work — the branch is what lets a restore recreate the rift.
+      releaseEpicRift: (id, riftPath) =>
+        set((state) => ({
+          epics: state.epics.map((epic) =>
+            epic.id === id && epic.riftPath === riftPath
+              ? {
+                  ...epic,
+                  riftPath: undefined,
+                  riftWorkingDir: undefined,
+                  riftCleanupPending: undefined,
+                  riftReleased: true,
+                }
+              : epic
           ),
         })),
 
@@ -1714,18 +1760,25 @@ const scheduleThreadsSave = () => {
   }, THREADS_SAVE_MS);
 };
 
-const flushThreadsSave = () => {
+export const flushOrionThreadsSave = async (): Promise<boolean> => {
   cancelQueuedThreadsSave();
-  if (typeof window === 'undefined' || !window.orion?.saveThreads) return;
-  if (threadsPersistenceBlocked) return;
+  if (typeof window === 'undefined' || !window.orion?.saveThreads) return false;
+  if (threadsPersistenceBlocked) return false;
   // Before hydration the store still holds the initial threads: [] — saving
   // now would replace the on-disk transcripts with an empty snapshot, which
   // outranks the legacy embedded threads on the next launch. (Safe on the
   // post-hydration flush: zustand flips hasHydrated before its
   // finish-hydration listeners run.)
-  if (!useOrionStore.persist.hasHydrated()) return;
+  if (!useOrionStore.persist.hasHydrated()) return false;
+  if (threadsSaveFlush !== null) {
+    if (!(await threadsSaveFlush)) return false;
+    // The in-flight write may have saved an older snapshot. Re-enter after it
+    // settles so callers only receive true once the current threads reached
+    // disk, not merely because an optimistic marker matched temporarily.
+    return flushOrionThreadsSave();
+  }
   const threads = useOrionStore.getState().threads;
-  if (threads === lastPersistedThreads) return;
+  if (threads === lastPersistedThreads) return true;
   // Claim the marker optimistically so overlapping flushes don't double-save,
   // but surrender it if the write fails: a snapshot only counts as persisted
   // on a successful acknowledgement, otherwise nothing would ever retry and
@@ -1741,12 +1794,26 @@ const flushThreadsSave = () => {
       scheduleThreadsSave();
     }
   };
-  void window.orion
-    .saveThreads(JSON.stringify({ version: 1, threads }))
-    .then((saved) => {
+  const save = (async () => {
+    try {
+      const saved = await window.orion.saveThreads(JSON.stringify({ version: 1, threads }));
       if (!saved) failed();
-    })
-    .catch(failed);
+      return saved;
+    } catch {
+      failed();
+      return false;
+    }
+  })();
+  threadsSaveFlush = save;
+  try {
+    return await save;
+  } finally {
+    if (threadsSaveFlush === save) threadsSaveFlush = null;
+  }
+};
+
+const flushThreadsSave = () => {
+  void flushOrionThreadsSave();
 };
 
 useOrionStore.subscribe((state) => {
