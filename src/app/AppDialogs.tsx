@@ -47,8 +47,6 @@ export type AppDialogsModel = {
   epicSettleDialog: EpicSettleDialogState | null;
   setEpicSettleDialog: React.Dispatch<React.SetStateAction<EpicSettleDialogState | null>>;
   confirmEpicSettlement: (epic: Epic, releaseRift?: boolean) => void;
-  riftStorageForced: Record<string, boolean>;
-  setRiftStorageForced: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   riftSweepDialog: RiftSweepDialogState | null;
   setRiftSweepDialog: React.Dispatch<React.SetStateAction<RiftSweepDialogState | null>>;
   dismissRiftSweepDialog: () => void;
@@ -100,8 +98,6 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
     epicSettleDialog,
     setEpicSettleDialog,
     confirmEpicSettlement,
-    riftStorageForced,
-    setRiftStorageForced,
     riftSweepDialog,
     setRiftSweepDialog,
     dismissRiftSweepDialog,
@@ -400,7 +396,7 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
             <p className="modal-subtitle">
               {riftSweepDialog.entries.length === 0
                 ? "This permanently empties Rift's trash across every repository on this machine."
-                : 'Their epics keep their branches, commits, and pull requests. Restoring an epic recreates its rift from the source repository.'}
+                : 'This removes the workspace. Epics keep their branches, commits, and pull requests, and restoring an epic recreates its rift from the source repository.'}
             </p>
             {riftSweepDialog.entries.length > 0 && (
               <div className="storage-sweep-list">
@@ -417,8 +413,9 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
             {riftSweepDialog.entries.some((entry) => entry.hasUncommittedChanges || entry.hasUnpushedCommits) && (
               <div className="epic-settle-warnings">
                 <p>
-                  Some of these have uncommitted or unpushed work that exists nowhere else. You chose to free them
-                  anyway.
+                  {riftSweepDialog.entries.length === 1
+                    ? 'This rift contains uncommitted or unpushed work. Confirming will delete that unpublished work without creating a commit or pull request.'
+                    : 'Some of these rifts contain uncommitted or unpushed work. Confirming will delete that unpublished work without creating commits or pull requests.'}
                 </p>
               </div>
             )}
@@ -445,15 +442,8 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 type="button"
                 className="btn danger"
                 onClick={() => {
-                  const { entries, runGc } = riftSweepDialog;
-                  const forcePaths = entries
-                    .filter(
-                      (entry) =>
-                        (entry.hasUncommittedChanges || entry.hasUnpushedCommits) && riftStorageForced[entry.riftPath]
-                    )
-                    .map((entry) => entry.riftPath);
-                  setRiftSweepDialog(null);
-                  setRiftStorageForced({});
+                  const { entries, runGc, forcePaths } = riftSweepDialog;
+                  dismissRiftSweepDialog();
                   void releaseRiftStorage(entries, { runGc, forcePaths });
                 }}
               >

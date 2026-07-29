@@ -142,7 +142,13 @@ import {
   parseModelMentions,
 } from './app/promptContext';
 import { formatShortTime, getThreadActivityTime } from './app/time';
-import { deriveTitle, isDefaultTitle, isPlausibleTitle, tryGenerateBetterTitle } from './app/titles';
+import {
+  deriveTitle,
+  getGoalTitleSeed,
+  isDefaultTitle,
+  isPlausibleTitle,
+  tryGenerateBetterTitle,
+} from './app/titles';
 import type { SidebarFooterProps } from './app/SidebarFooter';
 import type { SettingsPageProps } from './app/SettingsPage';
 import type {
@@ -309,6 +315,9 @@ const threadWorkingDir = (epics: Epic[], thread: { epicId?: string } | undefined
   if (epic?.riftReleased || epic?.riftRequest || epic?.riftCleanupPending) return null;
   return epic?.riftPath ? (epic.riftWorkingDir ?? epic.riftPath) : project.path;
 };
+
+const getStoredThreadTitle = (threadId: string) =>
+  useOrionStore.getState().threads.find((thread) => thread.id === threadId)?.title;
 
 // Provider-native ids are not necessarily globally unique (Kimi uses values
 // such as agent-0 per session). Reload recovery may search nested descendants,
@@ -929,6 +938,7 @@ const App: React.FC = () => {
     setEpicRepoPickerOpen(false);
   }, [repositoryOperationBusy]);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
+  const [providerUpdatesChecking, setProviderUpdatesChecking] = useState(false);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
@@ -1952,10 +1962,13 @@ const App: React.FC = () => {
 
   const refreshProviderUpdates = useCallback(async () => {
     if (!window.orion?.checkProviderUpdates) return;
+    setProviderUpdatesChecking(true);
     try {
       setProviderUpdateState(await window.orion.checkProviderUpdates({ enabledProviderIds }));
     } catch {
       setProviderUpdateState(null);
+    } finally {
+      setProviderUpdatesChecking(false);
     }
   }, [enabledProviderIds]);
 
@@ -5849,13 +5862,23 @@ const App: React.FC = () => {
       if (thread.messages.length === 0 && isDefaultTitle(thread.title)) {
         const titleSeed = userContent || tasksToInject[0]?.title || '';
         const initialTitle = deriveTitle(titleSeed);
+        const expectedTitle = isPlausibleTitle(initialTitle) ? initialTitle : thread.title;
         if (isPlausibleTitle(initialTitle)) {
           updateThread(threadId, { title: initialTitle });
         }
         // Kick off async LLM refinement for a nicer title. The thread's own
         // model may be a slow reasoning one (or Orion, which can't run a
         // one-shot), so this goes through the text-generation model instead.
-        void tryGenerateBetterTitle(threadId, titleSeed, resolveUtilityTurn(), workingDir, updateThread, thread.epicId);
+        void tryGenerateBetterTitle(
+          threadId,
+          titleSeed,
+          resolveUtilityTurn(),
+          workingDir,
+          updateThread,
+          expectedTitle,
+          getStoredThreadTitle,
+          thread.epicId
+        );
       }
 
       pinThreadToBottom(threadId);
@@ -6524,6 +6547,28 @@ const App: React.FC = () => {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
 
+      // Goal commands bypass the normal send flow, so seed the title here
+      // from the objective before the first transcript messages are added.
+      // Resuming a goal must preserve the thread's existing title.
+      const titleSeed = getGoalTitleSeed(thread, goalAction);
+      if (titleSeed) {
+        const initialTitle = deriveTitle(titleSeed);
+        const expectedTitle = isPlausibleTitle(initialTitle) ? initialTitle : thread.title;
+        if (isPlausibleTitle(initialTitle)) {
+          updateThread(threadId, { title: initialTitle });
+        }
+        void tryGenerateBetterTitle(
+          threadId,
+          titleSeed,
+          resolveUtilityTurn(),
+          workingDir,
+          updateThread,
+          expectedTitle,
+          getStoredThreadTitle,
+          thread.epicId
+        );
+      }
+
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
@@ -6592,6 +6637,7 @@ const App: React.FC = () => {
       updateThread,
       updateThreadMessage,
       clearActiveRun,
+      resolveUtilityTurn,
     ]
   );
 
@@ -7205,6 +7251,7 @@ const App: React.FC = () => {
       // the first prompt sent through the composer.
       if (currentThread && isDefaultTitle(currentThread.title) && promptText) {
         const initialTitle = deriveTitle(promptText);
+        const expectedTitle = isPlausibleTitle(initialTitle) ? initialTitle : currentThread.title;
         if (isPlausibleTitle(initialTitle)) {
           updateThread(submittedThreadId, { title: initialTitle });
         }
@@ -7214,6 +7261,8 @@ const App: React.FC = () => {
           resolveUtilityTurn(),
           selectedThreadProjectPath ?? '',
           updateThread,
+          expectedTitle,
+          getStoredThreadTitle,
           currentThread.epicId
         );
       }
@@ -7837,8 +7886,10 @@ const App: React.FC = () => {
     riftStorageSummary,
     riftSweepSelection,
     providerUpdateState,
+    providerUpdatesChecking,
     providerUpdatesRunning,
     appUpdateState,
+    appUpdateBusy,
     setSettingsOpen,
     settingsTab,
     setSettingsTab,
@@ -7874,6 +7925,7 @@ const App: React.FC = () => {
     utilityReasoningOptions,
     resolvedUtilityReasoningEffort,
     refreshProviderUpdates,
+    handleAppUpdateClick,
     handleRequestComputerUsePermission,
     handleOpenChromeDebugSetup,
     handleStartAccountAuth,
@@ -7922,8 +7974,6 @@ const App: React.FC = () => {
     epicSettleDialog,
     setEpicSettleDialog,
     confirmEpicSettlement,
-    riftStorageForced,
-    setRiftStorageForced,
     riftSweepDialog,
     setRiftSweepDialog,
     dismissRiftSweepDialog,
