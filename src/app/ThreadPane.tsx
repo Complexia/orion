@@ -22,8 +22,8 @@ export type ThreadPaneProps = {
 
 /**
  * One thread in the split view: chrome around a transcript (or terminal) plus
- * the composer, which only the focused pane renders. Focus follows any pointer
- * press inside the pane, so replying to a background agent is one click.
+ * the composer, which only the focused pane renders. Focus follows pointer and
+ * keyboard focus into the pane, so replying to a background agent is one step.
  */
 export const ThreadPane: React.FC<ThreadPaneProps> = ({
   thread,
@@ -42,6 +42,17 @@ export const ThreadPane: React.FC<ThreadPaneProps> = ({
     // is the exception: focusing a pane immediately before removing it changes
     // closeThreadPane's fallback selection.
     onPointerDownCapture={
+      focused
+        ? undefined
+        : (event) => {
+            const target = event.target;
+            if (target instanceof Element && target.closest('.thread-pane-close')) return;
+            onFocus();
+          }
+    }
+    // Keyboard focus entering a background pane must claim it too, or its
+    // composer never renders. Keep close equivalent to the pointer path.
+    onFocusCapture={
       focused
         ? undefined
         : (event) => {

@@ -100,6 +100,20 @@ export const ModelPickerPopover = ({
     const anchor = popover?.parentElement;
     if (!popover || !anchor) return undefined;
 
+    // Overflow policy is stable for one open session. Cache it so scroll and
+    // resize corrections only re-read geometry, not every ancestor's styles.
+    const clippingAncestors: Array<{
+      node: HTMLElement;
+      clipsX: boolean;
+      clipsY: boolean;
+    }> = [];
+    for (let node: HTMLElement | null = anchor; node; node = node.parentElement) {
+      const style = window.getComputedStyle(node);
+      const clipsX = style.overflowX !== 'visible';
+      const clipsY = style.overflowY !== 'visible';
+      if (clipsX || clipsY) clippingAncestors.push({ node, clipsX, clipsY });
+    }
+
     const fit = () => {
       // Always measure the CSS placement, never a corrected one: a window
       // resized back to roomy then drops the correction instead of drifting.
@@ -127,14 +141,13 @@ export const ModelPickerPopover = ({
       let clipRight = window.innerWidth;
       let clipTop = 0;
       let clipBottom = window.innerHeight;
-      for (let node = anchor; node; node = node.parentElement) {
-        const style = window.getComputedStyle(node);
+      for (const { node, clipsX, clipsY } of clippingAncestors) {
         const rect = node.getBoundingClientRect();
-        if (style.overflowX !== 'visible') {
+        if (clipsX) {
           clipLeft = Math.max(clipLeft, rect.left);
           clipRight = Math.min(clipRight, rect.right);
         }
-        if (style.overflowY !== 'visible') {
+        if (clipsY) {
           clipTop = Math.max(clipTop, rect.top);
           clipBottom = Math.min(clipBottom, rect.bottom);
         }
@@ -173,32 +186,56 @@ export const ModelPickerPopover = ({
       if (cappedHeight < height) popover.style.height = `${cappedHeight}px`;
     };
 
-    // Straight off the resize event, not a rAF: frames are throttled while the
-    // window is occluded, and a picker left open across that would sit at a
-    // stale offset. Resize fires per step of a drag, so each pass re-measures
-    // from the CSS placement and the last one wins.
+    // Coalesce resize, scroll, observer, and mutation bursts into one pass.
+    // Deferring observer-triggered writes also keeps them outside the current
+    // ResizeObserver delivery and avoids loop churn.
+    let fitFrame: number | null = null;
+    const scheduleFit = () => {
+      if (fitFrame !== null) return;
+      fitFrame = window.requestAnimationFrame(() => {
+        fitFrame = null;
+        fit();
+      });
+    };
+    const handleScroll = (event: Event) => {
+      const target = event.target;
+      // Ignore scrolling inside the picker itself. Only a scrolling ancestor
+      // of the anchor can move its natural placement.
+      if (
+        target === window ||
+        target === document ||
+        (target instanceof Element && target.contains(anchor))
+      ) {
+        scheduleFit();
+      }
+    };
+
+    // The first pass is synchronous so the picker is corrected before paint.
     fit();
-    window.addEventListener('resize', fit);
+    window.addEventListener('resize', scheduleFit);
     // Scroll events do not bubble, so capture them at the window to follow
     // anchors inside Settings and any other scrolling pane.
-    window.addEventListener('scroll', fit, true);
+    window.addEventListener('scroll', handleScroll, true);
     // Split-grid changes move the trigger by resizing one of its ancestors.
-    // Watching that chain keeps a fixed picker attached even when no window
-    // resize or scroll event fires.
-    const resizeObserver = new ResizeObserver(fit);
-    for (let node: HTMLElement | null = anchor; node; node = node.parentElement) {
-      resizeObserver.observe(node);
-    }
+    // The anchor and clipping boxes are the geometry that can affect fitting.
+    const resizeObserver = new ResizeObserver(scheduleFit);
+    const observedNodes = new Set<HTMLElement>([
+      anchor,
+      ...clippingAncestors.map(({ node }) => node),
+    ]);
     const splitGrid = anchor.closest('.thread-panes');
-    const mutationObserver = splitGrid ? new MutationObserver(fit) : null;
+    if (splitGrid instanceof HTMLElement) observedNodes.add(splitGrid);
+    for (const node of observedNodes) resizeObserver.observe(node);
+    const mutationObserver = splitGrid ? new MutationObserver(scheduleFit) : null;
     if (splitGrid && mutationObserver) {
       mutationObserver.observe(splitGrid, { attributes: true, childList: true });
     }
     return () => {
-      window.removeEventListener('resize', fit);
-      window.removeEventListener('scroll', fit, true);
+      window.removeEventListener('resize', scheduleFit);
+      window.removeEventListener('scroll', handleScroll, true);
       resizeObserver.disconnect();
       mutationObserver?.disconnect();
+      if (fitFrame !== null) window.cancelAnimationFrame(fitFrame);
     };
   }, [flipped, placement]);
 

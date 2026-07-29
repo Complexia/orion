@@ -2846,7 +2846,9 @@ body {
 }
 
 .saved-view-remove {
-  display: none;
+  display: flex;
+  opacity: 0;
+  pointer-events: none;
   align-items: center;
   justify-content: center;
   position: absolute;
@@ -2859,12 +2861,16 @@ body {
   background: var(--bg-elevated, rgb(32 32 38));
   color: var(--text-muted);
   cursor: pointer;
-  transition: color var(--transition-fast), background var(--transition-fast);
+  transition:
+    opacity var(--transition-fast),
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 
 .saved-view-item:hover .saved-view-remove,
 .saved-view-remove:focus-visible {
-  display: flex;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .saved-view-remove:hover {
@@ -5231,7 +5237,8 @@ body {
 /* Composer overflow menu. Below the width the chips need, everything except
    the model picker folds in here, so a narrow pane gets one icon instead of a
    row of half-squashed dropdowns. The full-width composer never sees this. */
-.composer-controls.compact {
+.composer-controls.compact,
+.thread-pane.split .composer-controls.compact {
   flex-wrap: nowrap;
 }
 

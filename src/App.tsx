@@ -7570,14 +7570,16 @@ const App: React.FC = () => {
   const steerQueuedMessageRef = useRef<(threadId: string, queuedId: string) => Promise<void>>(
     async () => {}
   );
-  steerQueuedMessageRef.current = async (threadId: string, queuedId: string) => {
-    if (!steerTargetForThread(threadId)) return;
-    const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
-    const queued = thread?.queuedMessages?.find((q) => q.id === queuedId);
-    if (!queued) return;
-    removeQueuedThreadMessage(threadId, queuedId);
-    await steerWithContent(threadId, queued.text, queued.attachments ?? []);
-  };
+  useLayoutEffect(() => {
+    steerQueuedMessageRef.current = async (threadId: string, queuedId: string) => {
+      if (!steerTargetForThread(threadId)) return;
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const queued = thread?.queuedMessages?.find((q) => q.id === queuedId);
+      if (!queued) return;
+      removeQueuedThreadMessage(threadId, queuedId);
+      await steerWithContent(threadId, queued.text, queued.attachments ?? []);
+    };
+  });
   const steerQueuedMessage = useCallback((threadId: string, queuedId: string) => {
     void steerQueuedMessageRef.current(threadId, queuedId);
   }, []);

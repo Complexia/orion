@@ -1660,7 +1660,13 @@ export const useOrionStore = create<OrionState>()(
             .filter((threadId) => state.threads.some((thread) => thread.id === threadId))
             .slice(0, MAX_THREAD_PANES);
           if (paneThreadIds.length === 0) {
-            return { savedViews: state.savedViews.filter((candidate) => candidate.id !== id) };
+            return {
+              ...(state.splitViewSettings.autoSave
+                ? { savedViews: state.savedViews.filter((candidate) => candidate.id !== id) }
+                : {}),
+              activeSavedViewId:
+                state.activeSavedViewId === id ? null : state.activeSavedViewId,
+            };
           }
           const focusedId = paneThreadIds[0];
           const focused = state.threads.find((thread) => thread.id === focusedId);
@@ -1673,11 +1679,15 @@ export const useOrionStore = create<OrionState>()(
             selectedProjectId: focused?.projectId ?? state.selectedProjectId,
             selectedEpicId: focused?.epicId ?? null,
             threads: threadsWithOpenedSeen(state, paneThreadIds),
-            savedViews: collapsed
-              ? state.savedViews.filter((candidate) => candidate.id !== id)
-              : state.savedViews.map((candidate) =>
-                  candidate.id === id ? { ...candidate, threadIds: paneThreadIds } : candidate
-                ),
+            ...(state.splitViewSettings.autoSave
+              ? {
+                  savedViews: collapsed
+                    ? state.savedViews.filter((candidate) => candidate.id !== id)
+                    : state.savedViews.map((candidate) =>
+                        candidate.id === id ? { ...candidate, threadIds: paneThreadIds } : candidate
+                      ),
+                }
+              : {}),
             // With auto-save off the view is opened read-only: editing the
             // split on screen must not rewrite an entry the user is keeping.
             activeSavedViewId:
