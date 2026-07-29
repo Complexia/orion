@@ -106,8 +106,10 @@ export type SettingsPageProps = {
   };
   riftSweepSelection: RiftStorageEntry[];
   providerUpdateState: ProviderUpdateState | null;
+  providerUpdatesChecking: boolean;
   providerUpdatesRunning: boolean;
   appUpdateState: AppUpdateState | null;
+  appUpdateBusy: boolean;
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>;
   settingsTab: SettingsTab;
   setSettingsTab: React.Dispatch<React.SetStateAction<SettingsTab>>;
@@ -143,6 +145,7 @@ export type SettingsPageProps = {
   utilityReasoningOptions: Array<{ value: string; label: string }>;
   resolvedUtilityReasoningEffort: string | null;
   refreshProviderUpdates: () => Promise<void>;
+  handleAppUpdateClick: () => Promise<void>;
   handleRequestComputerUsePermission: (kind: OrionComputerUsePermissionKind) => Promise<void>;
   handleOpenChromeDebugSetup: () => Promise<void>;
   handleStartAccountAuth: () => Promise<void>;
@@ -186,8 +189,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     riftStorageSummary,
     riftSweepSelection,
     providerUpdateState,
+    providerUpdatesChecking,
     providerUpdatesRunning,
     appUpdateState,
+    appUpdateBusy,
     setSettingsOpen,
     settingsTab,
     setSettingsTab,
@@ -223,6 +228,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     utilityReasoningOptions,
     resolvedUtilityReasoningEffort,
     refreshProviderUpdates,
+    handleAppUpdateClick,
     handleRequestComputerUsePermission,
     handleOpenChromeDebugSetup,
     handleStartAccountAuth,
@@ -235,6 +241,47 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     formatBytes,
     epicPrStatus,
   } = props;
+  const appUpdatePercent = Math.max(0, Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0)));
+  const appUpdateStatus =
+    appUpdateState?.status === 'checking'
+      ? 'Checking for updates...'
+      : appUpdateState?.status === 'available'
+        ? `Orion v${appUpdateState.availableVersion ?? 'next'} is available.`
+        : appUpdateState?.status === 'downloading'
+          ? `Downloading Orion v${appUpdateState.availableVersion ?? 'next'} — ${appUpdatePercent}%`
+          : appUpdateState?.status === 'downloaded'
+            ? `Orion v${appUpdateState.availableVersion ?? 'next'} is ready to install.`
+            : appUpdateState?.status === 'restarting'
+              ? 'Restarting Orion to install the update...'
+              : appUpdateState?.status === 'not-available'
+                ? `Orion is up to date.${
+                    appUpdateState.checkedAt ? ` Checked ${formatCheckedTime(appUpdateState.checkedAt)}.` : ''
+                  }`
+                : appUpdateState?.status === 'error'
+                  ? (appUpdateState.error ?? 'Could not check for updates.')
+                  : 'Check for a newer version of Orion.';
+  const appUpdateActionLabel =
+    appUpdateState?.status === 'checking'
+      ? 'Checking...'
+      : appUpdateState?.status === 'available'
+        ? appUpdateState.availableVersion
+          ? `Update to v${appUpdateState.availableVersion}`
+          : 'Update Orion'
+        : appUpdateState?.status === 'downloading'
+          ? `Downloading ${appUpdatePercent}%`
+          : appUpdateState?.status === 'downloaded'
+            ? 'Restart to update'
+            : appUpdateState?.status === 'restarting'
+              ? 'Restarting...'
+              : appUpdateState?.status === 'error'
+                ? 'Try again'
+                : 'Check for updates';
+  const appUpdateActionDisabled =
+    !appUpdateState ||
+    appUpdateBusy ||
+    appUpdateState.status === 'checking' ||
+    appUpdateState.status === 'downloading' ||
+    appUpdateState.status === 'restarting';
 
   return (
     <div className="settings-page">
@@ -730,12 +777,39 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               <div className="settings-group">
                 <div className="setting-row">
                   <div className="setting-label">
-                    <div className="setting-label-title">About</div>
-                    <div className="setting-label-desc">The Orion version currently installed.</div>
+                    <div className="setting-label-title">Orion v{appUpdateState?.currentVersion ?? '—'}</div>
+                    <div
+                      className={`setting-label-desc${
+                        appUpdateState?.status === 'error' ? ' setting-update-error' : ''
+                      }`}
+                      role={appUpdateState?.status === 'error' ? 'alert' : 'status'}
+                    >
+                      {appUpdateStatus}
+                    </div>
                   </div>
-                  <span className="setting-version">
-                    {appUpdateState?.currentVersion ? `v${appUpdateState.currentVersion}` : '—'}
-                  </span>
+                  <button
+                    type="button"
+                    className="provider-auth-button settings-update-button"
+                    onClick={() => {
+                      void handleAppUpdateClick();
+                    }}
+                    disabled={appUpdateActionDisabled}
+                    aria-busy={
+                      appUpdateState?.status === 'checking' ||
+                      appUpdateState?.status === 'downloading' ||
+                      appUpdateState?.status === 'restarting'
+                    }
+                  >
+                    <RefreshCw
+                      size={13}
+                      className={
+                        appUpdateState?.status === 'checking' || appUpdateState?.status === 'restarting'
+                          ? 'spinning'
+                          : ''
+                      }
+                    />
+                    {appUpdateActionLabel}
+                  </button>
                 </div>
               </div>
             </>
@@ -753,13 +827,15 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   <button
                     type="button"
                     className="providers-action-btn"
-                    title="Refresh"
+                    title="Check installed provider CLIs for updates"
                     onClick={() => {
                       void refreshProviderUpdates();
                     }}
-                    disabled={providerUpdatesRunning}
+                    disabled={providerUpdatesChecking || providerUpdatesRunning}
+                    aria-busy={providerUpdatesChecking}
                   >
-                    <RefreshCw size={13} className={providerUpdatesRunning ? 'spinning' : ''} />
+                    <RefreshCw size={13} className={providerUpdatesChecking ? 'spinning' : ''} />
+                    <span>{providerUpdatesChecking ? 'Checking...' : 'Check for updates'}</span>
                   </button>
                 </div>
               </div>
