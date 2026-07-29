@@ -425,6 +425,12 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
               <>
                 {activeEpics.map((epic) => {
                   const epicThreads = threadsByEpic.get(epic.id) ?? [];
+                  const epicThreadListKey = `epic:${epic.id}`;
+                  const epicVisibleLimit = threadListLimits[epicThreadListKey] ?? THREADS_VISIBLE_LIMIT;
+                  const visibleEpicThreads = epicThreads.slice(0, epicVisibleLimit);
+                  const hasMoreEpicThreads = epicThreads.length > epicVisibleLimit;
+                  const isEpicListExpanded =
+                    epicVisibleLimit > THREADS_VISIBLE_LIMIT && epicThreads.length > THREADS_VISIBLE_LIMIT;
                   // The project label sits on the epic row instead of
                   // repeating on every thread under it — but only while
                   // those threads agree on one project, so a mixed epic
@@ -457,12 +463,20 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                           className="project-collapse-toggle"
                           title={isEpicCollapsed ? 'Expand threads' : 'Collapse threads'}
                           aria-expanded={!isEpicCollapsed}
-                          onClick={() =>
+                          onClick={() => {
+                            // Collapsing resets the list back to the default 5 on next expand.
+                            if (!isEpicCollapsed) {
+                              setThreadListLimits((prev) => {
+                                if (!(epicThreadListKey in prev)) return prev;
+                                const { [epicThreadListKey]: _removed, ...rest } = prev;
+                                return rest;
+                              });
+                            }
                             setCollapsedEpics((prev) => ({
                               ...prev,
                               [epic.id]: !isEpicCollapsed,
-                            }))
-                          }
+                            }));
+                          }}
                         >
                           <ChevronRight
                             size={12}
@@ -573,8 +587,9 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                       </div>
 
                       {!isEpicCollapsed && (
-                        <div className="threads-list">
-                          {epicThreads.length === 0 ? (
+                        <>
+                          <div className="threads-list">
+                            {epicThreads.length === 0 ? (
                             <button
                               type="button"
                               className="thread-item thread-item-empty"
@@ -583,7 +598,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                               <span className="thread-title">New thread</span>
                             </button>
                           ) : (
-                            epicThreads.map((thread) => (
+                            visibleEpicThreads.map((thread) => (
                               <div
                                 key={thread.id}
                                 className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
@@ -690,8 +705,30 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                                 </div>
                               </div>
                             ))
+                            )}
+                          </div>
+
+                          {(hasMoreEpicThreads || isEpicListExpanded) && (
+                            <button
+                              type="button"
+                              className="threads-show-more"
+                              onClick={() =>
+                                setThreadListLimits((prev) => {
+                                  if (hasMoreEpicThreads) {
+                                    return {
+                                      ...prev,
+                                      [epicThreadListKey]: epicThreads.length,
+                                    };
+                                  }
+                                  const { [epicThreadListKey]: _removed, ...rest } = prev;
+                                  return rest;
+                                })
+                              }
+                            >
+                              {hasMoreEpicThreads ? 'Show more' : 'Show less'}
+                            </button>
                           )}
-                        </div>
+                        </>
                       )}
                     </div>
                   );
