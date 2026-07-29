@@ -2299,6 +2299,29 @@ body {
   background: rgb(255 255 255 / 7%);
 }
 
+/* Open as a pane in the split view — the accent bar distinguishes "on screen
+   somewhere" from the focused thread's fill. */
+.thread-item.in-split::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: rgb(77 141 255 / 55%);
+}
+
+.thread-item.in-split.selected::before {
+  background: var(--accent);
+}
+
+/* Threads are drag sources for the split view; the grab cursor is the only
+   hint they can be pulled into the main view. */
+.thread-item:active {
+  cursor: grabbing;
+}
+
 .thread-item-empty .thread-title {
   color: var(--text-muted);
 }
@@ -2566,10 +2589,299 @@ body {
 }
 
 .agents-panel {
+  position: relative; /* anchors the drag-a-thread-here hint */
   background:
     radial-gradient(ellipse 80% 50% at 50% -20%, rgb(77 141 255 / 7%), transparent 60%),
     radial-gradient(ellipse 60% 40% at 100% 100%, rgb(139 124 246 / 5%), transparent 50%),
     var(--bg-base);
+}
+
+/* Split view: up to six thread panes share the main view. One pane is the
+   plain thread view of old — no chrome, no grid gutters — so the unsplit case
+   looks untouched. */
+.thread-panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-auto-rows: 1fr;
+}
+
+.thread-panes:not(.count-1) {
+  gap: 8px;
+  padding: 8px;
+}
+
+.thread-panes.count-1 {
+  grid-template-columns: 1fr;
+}
+
+.thread-panes.count-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.thread-panes.count-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.thread-panes.count-4 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.thread-panes.count-6 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+/* Five panes fill a 3-over-2 layout instead of leaving a hole in the second
+   row: a six-column base lets the top row take two columns each and the
+   bottom row three. */
+.thread-panes.count-5 {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.thread-panes.count-5 > .thread-pane:nth-child(-n + 3) {
+  grid-column: span 2;
+}
+
+.thread-panes.count-5 > .thread-pane:nth-child(n + 4) {
+  grid-column: span 3;
+}
+
+.thread-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.thread-pane.split {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: rgb(20 20 22 / 55%);
+  transition: border-color var(--transition-base), box-shadow var(--transition-base);
+}
+
+/* The focused pane owns the composer and the keyboard; the ring says which
+   thread a keystroke will reach. */
+.thread-pane.split.focused {
+  border-color: rgb(77 141 255 / 45%);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.thread-pane-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 6px 0 10px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgb(26 26 30 / 60%);
+}
+
+.thread-pane-header > .thread-working-dot,
+.thread-pane-header > .thread-finished-dot {
+  position: static;
+  flex-shrink: 0;
+  margin: 0;
+}
+
+.thread-pane-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.thread-pane.focused .thread-pane-title {
+  color: var(--text-primary);
+}
+
+.thread-pane-project {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 40%;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.thread-pane-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm, 6px);
+  color: var(--text-muted);
+  transition: color var(--transition-base), background var(--transition-base);
+}
+
+.thread-pane-close:hover {
+  color: var(--text-primary);
+  background: rgb(255 255 255 / 8%);
+}
+
+/* A pane is a fraction of the width the thread view was designed for, so the
+   chrome that assumes room has to give. None of this touches the unsplit view. */
+.thread-pane.split .chat-scroll {
+  /* Long tool paths and the run pill would otherwise put a horizontal
+     scrollbar under every pane; the elements below shrink instead. Code blocks
+     keep their own overflow. */
+  overflow-x: hidden;
+}
+
+.thread-pane.split .chat-container {
+  padding: 16px 12px 10px;
+  gap: 12px;
+}
+
+.thread-pane.split .message {
+  max-width: 92%;
+}
+
+.thread-pane.split .agent-response-divider {
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.thread-pane.split .agent-response-divider span {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.thread-pane.split .chat-input-area {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 1;
+  min-height: 0;
+  max-height: min(66%, calc(100% - 56px));
+  padding: 8px 12px 12px;
+}
+
+.thread-pane.split .agent-switcher-wrap {
+  flex-shrink: 0;
+}
+
+.thread-pane.split .composer-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.thread-pane.split .chat-input {
+  flex: 1 1 auto;
+  max-height: none;
+}
+
+.thread-pane.split .composer-controls {
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+/* Dragging a sidebar thread over the main view. */
+.agents-panel.thread-drop-active::after {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border: 1.5px dashed rgb(77 141 255 / 45%);
+  border-radius: var(--radius-lg);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.thread-drop-hint {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid rgb(77 141 255 / 40%);
+  border-radius: var(--radius-lg);
+  background: rgb(26 26 30 / 94%);
+  box-shadow: var(--shadow-md);
+  color: var(--text-primary);
+  font-size: 12px;
+  pointer-events: none;
+  z-index: 6;
+}
+
+.thread-drop-hint.full {
+  border-color: var(--border-default);
+  color: var(--text-muted);
+}
+
+/* Saved views: splits the user can return to. Rows reuse .thread-item so the
+   section sits in the sidebar's existing rhythm. */
+.saved-views-list {
+  margin-top: 2px;
+}
+
+.saved-view-item {
+  cursor: pointer;
+}
+
+/* Not drag sources — a saved view is a destination, not a pane. */
+.saved-view-item:active {
+  cursor: pointer;
+}
+
+.saved-view-icon {
+  flex-shrink: 0;
+  color: rgb(77 141 255 / 70%);
+}
+
+.saved-view-item.selected .saved-view-icon {
+  color: var(--accent);
+}
+
+.saved-view-item .sidebar-section-count {
+  flex-shrink: 0;
+}
+
+.saved-view-remove {
+  display: flex;
+  opacity: 0;
+  pointer-events: none;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  right: 6px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: var(--bg-elevated, rgb(32 32 38));
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    opacity var(--transition-fast),
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+
+.saved-view-item:hover .saved-view-remove,
+.saved-view-remove:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.saved-view-remove:hover {
+  color: var(--danger);
+  background: rgb(248 113 113 / 10%);
 }
 
 .panel-header {
@@ -3660,6 +3972,8 @@ body {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
 }
 
@@ -3671,6 +3985,7 @@ body {
 
 .tasks-float-header {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -3757,6 +4072,7 @@ body {
 }
 
 .tasks-float-meter {
+  flex-shrink: 0;
   height: 2px;
   background: var(--border-subtle);
 }
@@ -3770,6 +4086,8 @@ body {
 }
 
 .tasks-float-body {
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 8px 12px 10px;
   max-height: 38vh;
   overflow-y: auto;
@@ -3788,6 +4106,7 @@ body {
 
 .tasks-float-current {
   display: flex;
+  flex-shrink: 0;
   align-items: baseline;
   gap: 6px;
   padding: 7px 12px 9px;
@@ -4919,6 +5238,171 @@ body {
   box-shadow: var(--shadow-lg);
   z-index: 110;
   animation: popover-in 220ms var(--ease-out) both;
+}
+
+/* Composer overflow menu. Below the width the chips need, everything except
+   the model picker folds in here, so a narrow pane gets one icon instead of a
+   row of half-squashed dropdowns. The full-width composer never sees this. */
+.composer-controls.compact,
+.thread-pane.split .composer-controls.compact {
+  flex-wrap: nowrap;
+}
+
+/* The model name is what gives when the row is tight — the trigger ellipsises
+   it. The anchor keeps its overflow visible: it is the popover's containing
+   block, and clipping there would cut the panel off at the trigger's width. */
+.composer-controls.compact .model-picker-anchor {
+  flex: 0 1 auto;
+}
+
+.composer-controls.compact .model-trigger {
+  max-width: 100%;
+}
+
+.composer-menu-anchor {
+  position: relative;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.composer-menu-trigger {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  overflow: visible;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.composer-menu-trigger:hover,
+.composer-menu-trigger.open {
+  background: var(--bg-elevated);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.composer-menu {
+  position: fixed;
+  width: min(300px, calc(100vw - 24px));
+  max-height: min(520px, calc(100vh - 24px));
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-lg);
+  z-index: 110;
+  animation: popover-in 220ms var(--ease-out) both;
+}
+
+.composer-menu-group + .composer-menu-group {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.composer-menu-row {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.composer-menu-row:hover:not(:disabled) {
+  background: var(--bg-elevated);
+}
+
+.composer-menu-row:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.composer-menu-row > svg:first-child {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.composer-menu-row-label {
+  flex-shrink: 0;
+}
+
+.composer-menu-row-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+/* Each group's options open inside the sheet: a pane this narrow has nowhere
+   to put a second floating layer. */
+.composer-menu-panel {
+  padding: 2px 8px 12px;
+}
+
+.composer-menu-panel .codex-settings-heading {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* A lone section repeats the row that opened it (Grok has reasoning only). */
+.composer-menu-panel .codex-settings-section:only-child .codex-settings-heading {
+  display: none;
+}
+
+.composer-menu-panel .codex-settings-row {
+  min-height: 30px;
+  grid-template-columns: 22px minmax(0, 1fr);
+  font-size: 13px;
+}
+
+.composer-menu-panel .settings-check {
+  width: 18px;
+}
+
+.composer-menu-panel .settings-check svg {
+  width: 14px;
+  height: 14px;
+}
+
+.composer-menu-panel .codex-settings-divider {
+  margin: 10px 0 12px;
+}
+
+/* The task picker floats everywhere else; in here it is just another panel. */
+.composer-menu-panel.embedded-picker {
+  padding: 0 0 4px;
+}
+
+.composer-menu-panel .task-picker-popover {
+  position: static;
+  width: auto;
+  max-height: 320px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  animation: none;
 }
 
 .send-button {

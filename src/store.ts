@@ -506,15 +506,69 @@ export const defaultNotificationSettings: NotificationSettings = {
   sound: true,
 };
 
+/** Hard ceiling on the split view: past six the panes are too small to read. */
+export const MAX_THREAD_PANES = 6;
+
+/**
+ * A split the user can get back to from the sidebar. It holds thread ids only —
+ * nothing about a thread is copied, so opening a saved view is navigation, and
+ * deleting one never touches a transcript.
+ */
+export type SavedView = {
+  id: string;
+  /** Derived from the pane titles; refreshed whenever the split changes. */
+  name: string;
+  /** Panes in display order. Always at least two: one pane isn't a split. */
+  threadIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SplitViewSettings = {
+  /**
+   * Record every split into the sidebar's Saved views section as it is formed.
+   * Off means splits are never written down: closing one loses it, which is the
+   * point — some users don't want a growing list of views they didn't ask for.
+   */
+  autoSave: boolean;
+};
+
+export const defaultSplitViewSettings: SplitViewSettings = {
+  autoSave: true,
+};
+
+export const isAgentsPanelVisible = (state: {
+  activeTab: 'agents' | 'code';
+  settingsOpen: boolean;
+}) => state.activeTab === 'agents' && !state.settingsOpen;
+
 interface OrionState {
   // Tabs
   activeTab: 'agents' | 'code';
+  /** Settings replaces the main content, so panes remain mounted in state but are not visible. */
+  settingsOpen: boolean;
 
   // Projects & Threads
   projects: Project[];
   threads: Thread[];
   selectedProjectId: string | null;
   selectedThreadId: string | null;
+  /**
+   * Threads currently shown in the main view, left-to-right / top-to-bottom.
+   * The split view renders one pane per entry and `selectedThreadId` is the
+   * focused one — it is always a member of this list, or null when it's empty.
+   */
+  paneThreadIds: string[];
+
+  // Saved views (splits the user can return to)
+  savedViews: SavedView[];
+  /**
+   * The saved view the on-screen split is currently mirroring, if any. Set by
+   * forming or opening a split while auto-save is on; cleared by navigating
+   * away, so a view stops following panes the user has moved on from.
+   */
+  activeSavedViewId: string | null;
+  splitViewSettings: SplitViewSettings;
 
   // Epics
   epics: Epic[];
@@ -537,6 +591,7 @@ interface OrionState {
 
   // Actions
   setActiveTab: (tab: 'agents' | 'code') => void;
+  setSettingsOpen: (open: boolean) => void;
   setProviderEnabled: (id: ProviderId, enabled: boolean) => void;
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
@@ -588,6 +643,15 @@ interface OrionState {
   branchThread: (sourceThreadId: string) => string | null; // returns new thread id
   selectProject: (id: string | null) => void;
   selectThread: (id: string | null) => void;
+  /** Add a thread as an extra pane beside the ones already open, and focus it. */
+  openThreadInSplit: (id: string) => void;
+  /** Remove a pane from the split; the thread itself is untouched. */
+  closeThreadPane: (id: string) => void;
+  /** Restore a saved split into the main view. Copies nothing. */
+  openSavedView: (id: string) => void;
+  /** Forget a saved view. Its threads are untouched. */
+  deleteSavedView: (id: string) => void;
+  setSplitViewSettings: (updates: Partial<SplitViewSettings>) => void;
   updateThread: (id: string, updates: Partial<Thread>) => void;
   deleteThread: (id: string) => void;
   addMessageToThread: (threadId: string, message: Omit<Message, 'id' | 'ts'>) => string;
@@ -854,14 +918,201 @@ const migrateLegacyLinkedTask = (thread: Thread): Thread => {
   return migrated;
 };
 
+// Opening a thread already on screen just moves focus to its pane. Opening any
+// other thread leaves the split behind and shows that thread alone: clicking a
+// thread means "show me this thread", and a split the user can neither grow by
+// browsing nor step out of would be a trap. The split isn't lost — its Saved
+// views entry puts it back in one click. Extra panes only arrive by drag
+// (openThreadInSplit).
+const panesForSelection = (
+  state: Pick<OrionState, 'selectedThreadId' | 'paneThreadIds'>,
+  id: string | null
+): { selectedThreadId: string | null; paneThreadIds: string[] } => {
+  if (!id) return { selectedThreadId: null, paneThreadIds: [] };
+  if (state.paneThreadIds.includes(id)) {
+    return { selectedThreadId: id, paneThreadIds: state.paneThreadIds };
+  }
+  return { selectedThreadId: id, paneThreadIds: [id] };
+};
+
+// Dropping a thread out of the split (closed, deleted, its project removed)
+// hands focus to the pane that slid into its place, so the main view is never
+// left blank while other panes are still open.
+const panesAfterRemoval = (
+  state: Pick<OrionState, 'selectedThreadId' | 'paneThreadIds'>,
+  removed: (id: string) => boolean
+): { selectedThreadId: string | null; paneThreadIds: string[] } => {
+  const paneThreadIds = state.paneThreadIds.filter((id) => !removed(id));
+  if (state.selectedThreadId && paneThreadIds.includes(state.selectedThreadId)) {
+    return { selectedThreadId: state.selectedThreadId, paneThreadIds };
+  }
+  const previousIndex = state.selectedThreadId
+    ? state.paneThreadIds.indexOf(state.selectedThreadId)
+    : 0;
+  const fallback = paneThreadIds[Math.min(Math.max(previousIndex, 0), paneThreadIds.length - 1)];
+  return { selectedThreadId: fallback ?? null, paneThreadIds };
+};
+
+// A saved view is labelled by what's in it, so the sidebar reads as the panes
+// do rather than as "Split view 3".
+const savedViewName = (threads: Thread[], threadIds: string[]): string => {
+  const titles = threadIds.map(
+    (id) => threads.find((thread) => thread.id === id)?.title ?? 'Untitled'
+  );
+  if (titles.length <= 2) return titles.join(' + ');
+  return `${titles[0]} +${titles.length - 1}`;
+};
+
+const sameIds = (a: string[], b: string[]) =>
+  a.length === b.length && a.every((id, index) => id === b[index]);
+
+type PaneSelection = { selectedThreadId: string | null; paneThreadIds: string[] };
+type PaneUpdate = PaneSelection & Partial<Pick<OrionState, 'savedViews' | 'activeSavedViewId'>>;
+
+/**
+ * Mirror the on-screen split into its sidebar entry.
+ *
+ * `ejectOnCollapse` marks a change the user made by closing panes: falling back
+ * to a single thread then throws the entry away, because a "view" that restores
+ * one pane is just that thread. Every other route to one pane — picking an
+ * epic, opening a thread elsewhere — only stops tracking, so the saved view
+ * survives to be reopened.
+ */
+const syncSavedView = (
+  state: OrionState,
+  panes: PaneSelection,
+  options?: {
+    ejectOnCollapse?: boolean;
+    /** Save an already-open split, such as when auto-save is enabled. */
+    createIfUntracked?: boolean;
+    /** Thread list to name panes from, when the caller is adding one. */
+    threads?: Thread[];
+  }
+): PaneUpdate => {
+  const tracked = state.activeSavedViewId
+    ? state.savedViews.find((view) => view.id === state.activeSavedViewId)
+    : undefined;
+
+  if (panes.paneThreadIds.length < 2) {
+    if (!tracked) return panes;
+    return {
+      ...panes,
+      activeSavedViewId: null,
+      savedViews: options?.ejectOnCollapse
+        ? state.savedViews.filter((view) => view.id !== tracked.id)
+        : state.savedViews,
+    };
+  }
+
+  if (!state.splitViewSettings.autoSave) return panes;
+  // An untracked split that did not change is intentionally left alone. This
+  // is how deleting the active saved view remains a deletion even though its
+  // panes stay on screen; growing or otherwise changing the split saves it
+  // again as a new view.
+  if (
+    !tracked &&
+    !options?.createIfUntracked &&
+    sameIds(state.paneThreadIds, panes.paneThreadIds)
+  ) {
+    return panes;
+  }
+  const now = new Date().toISOString();
+  const threads = options?.threads ?? state.threads;
+  const threadIds = panes.paneThreadIds;
+
+  // The same set of panes must never occupy two sidebar rows, so a split that
+  // already has an entry adopts it instead of adding a second one.
+  const duplicate = state.savedViews.find(
+    (view) => view.id !== tracked?.id && sameIds(view.threadIds, threadIds)
+  );
+
+  if (tracked) {
+    if (sameIds(tracked.threadIds, threadIds)) {
+      const name = savedViewName(threads, threadIds);
+      if (tracked.name === name) return panes;
+      return {
+        ...panes,
+        savedViews: state.savedViews.map((view) =>
+          view.id === tracked.id ? { ...view, name, updatedAt: now } : view
+        ),
+      };
+    }
+    if (duplicate) {
+      // The split has become one that's already saved; the entry it was
+      // tracking would otherwise linger as a stale copy of this one.
+      return {
+        ...panes,
+        savedViews: state.savedViews.filter((view) => view.id !== tracked.id),
+        activeSavedViewId: duplicate.id,
+      };
+    }
+    return {
+      ...panes,
+      savedViews: state.savedViews.map((view) =>
+        view.id === tracked.id
+          ? { ...view, threadIds, name: savedViewName(threads, threadIds), updatedAt: now }
+          : view
+      ),
+    };
+  }
+
+  if (duplicate) return { ...panes, activeSavedViewId: duplicate.id };
+
+  const created: SavedView = {
+    id: crypto.randomUUID(),
+    name: savedViewName(threads, threadIds),
+    threadIds,
+    createdAt: now,
+    updatedAt: now,
+  };
+  return {
+    ...panes,
+    savedViews: [created, ...state.savedViews],
+    activeSavedViewId: created.id,
+  };
+};
+
+// Threads that no longer exist drop out of every saved view, and a view left
+// with fewer than two of them stops being a split and goes with them.
+const pruneSavedViews = (savedViews: SavedView[], threads: Thread[]) => {
+  const liveThreadIds = new Set(threads.map((thread) => thread.id));
+  return savedViews.flatMap((view) => {
+    const threadIds = view.threadIds.filter((id) => liveThreadIds.has(id));
+    if (threadIds.length < 2) return [];
+    const name = savedViewName(threads, threadIds);
+    return [
+      sameIds(threadIds, view.threadIds) && name === view.name
+        ? view
+        : { ...view, threadIds, name },
+    ];
+  });
+};
+
+// Every thread visible in an opened pane clears its "finished while you were
+// away" mark, including background panes in a saved/restored split.
+const threadsWithOpenedSeen = (state: OrionState, ids: string | string[]) => {
+  const openedIds = new Set(Array.isArray(ids) ? ids : [ids]);
+  if (!state.threads.some((thread) => openedIds.has(thread.id) && thread.finishedUnseenAt)) {
+    return state.threads;
+  }
+  return state.threads.map((thread) =>
+    openedIds.has(thread.id) ? { ...thread, finishedUnseenAt: undefined } : thread
+  );
+};
+
 export const useOrionStore = create<OrionState>()(
   persist(
     (set, get) => ({
       activeTab: 'agents',
+      settingsOpen: false,
       projects: [],
       threads: [],
       selectedProjectId: null,
       selectedThreadId: null,
+      paneThreadIds: [],
+      savedViews: [],
+      activeSavedViewId: null,
+      splitViewSettings: defaultSplitViewSettings,
       epics: [],
       selectedEpicId: null,
       epicsSettings: defaultEpicsSettings,
@@ -877,24 +1128,26 @@ export const useOrionStore = create<OrionState>()(
 
       setActiveTab: (tab) =>
         set((state) => {
-          const selectedThread =
-            tab === 'agents'
-              ? state.threads.find((thread) => thread.id === state.selectedThreadId)
-              : undefined;
-
           return {
             activeTab: tab,
-            // Returning from Code reveals the selected transcript without
-            // selecting its row again, so that also counts as opening it.
-            threads: selectedThread?.finishedUnseenAt
-              ? state.threads.map((thread) =>
-                  thread.id === selectedThread.id
-                    ? { ...thread, finishedUnseenAt: undefined }
-                    : thread
-                )
-              : state.threads,
+            // Returning from Code reveals every pane without selecting its row
+            // again, so each visible transcript counts as opened.
+            threads:
+              tab === 'agents' && !state.settingsOpen
+                ? threadsWithOpenedSeen(state, state.paneThreadIds)
+                : state.threads,
           };
         }),
+      setSettingsOpen: (open) =>
+        set((state) => ({
+          settingsOpen: open,
+          // Leaving Settings reveals the panes again. Any completion markers
+          // collected while it covered the agents panel have now been seen.
+          threads:
+            !open && state.activeTab === 'agents'
+              ? threadsWithOpenedSeen(state, state.paneThreadIds)
+              : state.threads,
+        })),
       setProviderEnabled: (id, enabled) =>
         set((state) => ({
           providerSettings: {
@@ -1002,6 +1255,16 @@ export const useOrionStore = create<OrionState>()(
           const selectedEpic = state.epics.find((epic) => epic.id === state.selectedEpicId);
           const selectedEpicRepository = projectForEpicRepository(state.projects, selectedEpic);
           const removedSelectedEpicRepository = selectedEpicRepository?.id === id;
+          // Saved views lose the threads that went with the project.
+          const threads = state.threads.filter((thread) => thread.projectId !== id);
+          const savedViews = pruneSavedViews(state.savedViews, threads);
+          const panes = panesAfterRemoval(
+            state,
+            (paneId) => state.threads.find((thread) => thread.id === paneId)?.projectId === id
+          );
+          const focusedPaneThread = panes.selectedThreadId
+            ? threads.find((thread) => thread.id === panes.selectedThreadId)
+            : undefined;
 
           return {
             projects: remainingProjects,
@@ -1010,17 +1273,25 @@ export const useOrionStore = create<OrionState>()(
                 ? { ...epic, repositoryProjectId: undefined }
                 : epic
             ),
-            threads: state.threads.filter((t) => t.projectId !== id),
+            threads,
             selectedProjectId:
-              state.selectedProjectId === id ? fallbackProject?.id ?? null : state.selectedProjectId,
-            selectedThreadId:
-              state.threads.find((t) => t.id === state.selectedThreadId)?.projectId === id
+              focusedPaneThread?.projectId ??
+              (state.selectedProjectId === id ? fallbackProject?.id ?? null : state.selectedProjectId),
+            // Panes showing threads from the removed project close; any others
+            // stay open.
+            ...panes,
+            savedViews,
+            activeSavedViewId: savedViews.some((view) => view.id === state.activeSavedViewId)
+              ? state.activeSavedViewId
+              : null,
+            // A surviving focused pane owns the shell's epic context. With no
+            // pane left, dismiss an epic whose repository was removed; its
+            // durable gitRoot/branch claim remains if that repository returns.
+            selectedEpicId: focusedPaneThread
+              ? focusedPaneThread.epicId ?? null
+              : removedSelectedEpicRepository
                 ? null
-                : state.selectedThreadId,
-            // Dismiss an epic whose repository was removed before moving the
-            // shell to a fallback project. Its durable gitRoot/branch claim is
-            // retained for safety if that repository is added again.
-            selectedEpicId: removedSelectedEpicRepository ? null : state.selectedEpicId,
+                : state.selectedEpicId,
             expandedProjects: state.expandedProjects.filter((pid) => pid !== id),
             workspacePath: wasWorkspaceProject ? fallbackProject?.path ?? null : state.workspacePath,
             openFiles: wasWorkspaceProject ? [] : state.openFiles,
@@ -1052,6 +1323,10 @@ export const useOrionStore = create<OrionState>()(
             epics: [newEpic, ...state.epics],
             selectedEpicId: newEpic.id,
             selectedThreadId: null,
+            paneThreadIds: [],
+            // The split is put away, not thrown away: its saved view stays in
+            // the sidebar to come back to.
+            activeSavedViewId: null,
             // The shell repository follows the epic's binding: the project
             // picked in the create modal, or none — header git controls must
             // not keep targeting the previously selected project while the
@@ -1148,9 +1423,13 @@ export const useOrionStore = create<OrionState>()(
           const repositoryProject = projectForEpicRepository(state.projects, epic);
           return {
             selectedEpicId: id,
-            // The epic view replaces the thread view; a selected thread would
-            // shadow it.
+            // The epic view replaces the thread view; open panes would shadow
+            // it.
             selectedThreadId: null,
+            paneThreadIds: [],
+            // Leaving the split for an epic keeps its saved view in the
+            // sidebar; only closing panes retires one.
+            activeSavedViewId: null,
             // An unbound epic must not inherit the previous shell repository.
             selectedProjectId: repositoryProject?.id ?? null,
           };
@@ -1164,6 +1443,29 @@ export const useOrionStore = create<OrionState>()(
             ...updates,
           },
         })),
+
+      setSplitViewSettings: (updates) =>
+        set((state) => {
+          const splitViewSettings = {
+            ...defaultSplitViewSettings,
+            ...state.splitViewSettings,
+            ...updates,
+          };
+          // Turning auto-save off stops the open split writing to the entry it
+          // came from. Views already saved stay until the user trashes them.
+          if (!splitViewSettings.autoSave) return { splitViewSettings, activeSavedViewId: null };
+          // Turning it on records the split already on screen, so the setting
+          // applies to what the user is looking at rather than to the next
+          // split they happen to touch.
+          return {
+            splitViewSettings,
+            ...syncSavedView(
+              { ...state, splitViewSettings },
+              { selectedThreadId: state.selectedThreadId, paneThreadIds: state.paneThreadIds },
+              { createIfUntracked: true }
+            ),
+          };
+        }),
 
       setRiftsSettings: (updates) =>
         set((state) => ({
@@ -1224,7 +1526,9 @@ export const useOrionStore = create<OrionState>()(
             ? {}
             : {
                 selectedProjectId: projectId,
-                selectedThreadId: newThread.id,
+                ...syncSavedView(state, panesForSelection(state, newThread.id), {
+                  threads: [newThread, ...state.threads],
+                }),
                 selectedEpicId: options?.epicId ?? null,
               }),
         }));
@@ -1267,7 +1571,9 @@ export const useOrionStore = create<OrionState>()(
         set((state) => ({
           threads: [newThread, ...state.threads],
           selectedProjectId: source.projectId,
-          selectedThreadId: newThread.id,
+          ...syncSavedView(state, panesForSelection(state, newThread.id), {
+            threads: [newThread, ...state.threads],
+          }),
           selectedEpicId: source.epicId ?? null,
         }));
         return newThread.id;
@@ -1277,10 +1583,18 @@ export const useOrionStore = create<OrionState>()(
         set((state) => {
           const selectedThread = state.threads.find((t) => t.id === state.selectedThreadId);
 
+          // Moving the shell to another project drops the thread view, split
+          // and all — the same rule as before panes existed, keyed off the
+          // focused one.
+          const leavesThread = Boolean(selectedThread && selectedThread.projectId !== id);
+
           return {
             selectedProjectId: id,
-            selectedThreadId:
-              selectedThread && selectedThread.projectId !== id ? null : state.selectedThreadId,
+            selectedThreadId: leavesThread ? null : state.selectedThreadId,
+            paneThreadIds: leavesThread ? [] : state.paneThreadIds,
+            // The split's saved view stays in the sidebar; it just stops
+            // following the panes once they're gone.
+            activeSavedViewId: leavesThread ? null : state.activeSavedViewId,
             // Picking a project moves focus off the epic view.
             selectedEpicId: null,
           };
@@ -1291,24 +1605,105 @@ export const useOrionStore = create<OrionState>()(
           const thread = state.threads.find((t) => t.id === id);
 
           return {
-            selectedThreadId: id,
+            ...syncSavedView(state, panesForSelection(state, id)),
             selectedProjectId: thread?.projectId ?? state.selectedProjectId,
             // Preserve epic context only for a thread that actually belongs to
             // that epic. Selecting an unrelated (or missing) thread must not
             // leave a stale epic view waiting behind it.
             selectedEpicId: thread?.epicId ?? null,
-            // Opening a thread clears its "finished while you were away" mark.
-            threads: thread?.finishedUnseenAt
-              ? state.threads.map((t) =>
-                  t.id === id ? { ...t, finishedUnseenAt: undefined } : t
-                )
-              : state.threads,
+            threads: id ? threadsWithOpenedSeen(state, id) : state.threads,
           };
         }),
 
-      updateThread: (id, updates) =>
+      openThreadInSplit: (id) =>
+        set((state) => {
+          const thread = state.threads.find((t) => t.id === id);
+          if (!thread) return {};
+          // Already on screen: focus it rather than opening a second copy —
+          // two panes on one thread would fight over the same transcript.
+          const paneThreadIds = state.paneThreadIds.includes(id)
+            ? state.paneThreadIds
+            : state.paneThreadIds.length >= MAX_THREAD_PANES
+              ? null
+              : [...state.paneThreadIds, id];
+          if (!paneThreadIds) return {};
+          return {
+            ...syncSavedView(state, { selectedThreadId: id, paneThreadIds }),
+            selectedProjectId: thread.projectId,
+            selectedEpicId: thread.epicId ?? null,
+            threads: threadsWithOpenedSeen(state, id),
+          };
+        }),
+
+      closeThreadPane: (id) =>
+        set((state) => {
+          if (!state.paneThreadIds.includes(id)) return {};
+          const next = panesAfterRemoval(state, (paneId) => paneId === id);
+          const focused = next.selectedThreadId
+            ? state.threads.find((t) => t.id === next.selectedThreadId)
+            : undefined;
+          return {
+            // Closing panes back down to a single thread retires the saved
+            // view: the user has taken the split apart by hand.
+            ...syncSavedView(state, next, { ejectOnCollapse: true }),
+            selectedProjectId: focused?.projectId ?? state.selectedProjectId,
+            selectedEpicId: focused?.epicId ?? null,
+          };
+        }),
+
+      openSavedView: (id) =>
+        set((state) => {
+          const view = state.savedViews.find((candidate) => candidate.id === id);
+          if (!view) return {};
+          // Threads deleted since the view was saved are simply left out.
+          const paneThreadIds = view.threadIds
+            .filter((threadId) => state.threads.some((thread) => thread.id === threadId))
+            .slice(0, MAX_THREAD_PANES);
+          if (paneThreadIds.length === 0) {
+            return {
+              ...(state.splitViewSettings.autoSave
+                ? { savedViews: state.savedViews.filter((candidate) => candidate.id !== id) }
+                : {}),
+              activeSavedViewId:
+                state.activeSavedViewId === id ? null : state.activeSavedViewId,
+            };
+          }
+          const focusedId = paneThreadIds[0];
+          const focused = state.threads.find((thread) => thread.id === focusedId);
+          // Down to one surviving thread it is no longer a split: open that
+          // thread and drop the entry, matching what closing panes does.
+          const collapsed = paneThreadIds.length < 2;
+          return {
+            paneThreadIds,
+            selectedThreadId: focusedId,
+            selectedProjectId: focused?.projectId ?? state.selectedProjectId,
+            selectedEpicId: focused?.epicId ?? null,
+            threads: threadsWithOpenedSeen(state, paneThreadIds),
+            ...(state.splitViewSettings.autoSave
+              ? {
+                  savedViews: collapsed
+                    ? state.savedViews.filter((candidate) => candidate.id !== id)
+                    : state.savedViews.map((candidate) =>
+                        candidate.id === id ? { ...candidate, threadIds: paneThreadIds } : candidate
+                      ),
+                }
+              : {}),
+            // With auto-save off the view is opened read-only: editing the
+            // split on screen must not rewrite an entry the user is keeping.
+            activeSavedViewId:
+              collapsed || !state.splitViewSettings.autoSave ? null : id,
+          };
+        }),
+
+      deleteSavedView: (id) =>
         set((state) => ({
-          threads: state.threads.map((t) => {
+          savedViews: state.savedViews.filter((view) => view.id !== id),
+          activeSavedViewId: state.activeSavedViewId === id ? null : state.activeSavedViewId,
+        })),
+
+      updateThread: (id, updates) =>
+        set((state) => {
+          const threads = state.threads.map((t) => {
             if (t.id !== id) return t;
             const next = { ...t, ...updates };
             // A run that ends while the user is elsewhere leaves a dot in the
@@ -1320,19 +1715,49 @@ export const useOrionStore = create<OrionState>()(
               next.finishedUnseenAt =
                 t.status === 'running' &&
                 (updates.status === 'done' || updates.status === 'error') &&
-                (state.activeTab !== 'agents' || state.selectedThreadId !== id)
+                (!isAgentsPanelVisible(state) || !state.paneThreadIds.includes(id))
                   ? new Date().toISOString()
                   : undefined;
             }
             return next;
-          }),
-        })),
+          });
+          return {
+            threads,
+            // Saved-view labels are derived from their current thread titles,
+            // including automatic titles assigned after a view was created.
+            ...(updates.title !== undefined
+              ? {
+                  savedViews: state.savedViews.map((view) => {
+                    if (!view.threadIds.includes(id)) return view;
+                    const name = savedViewName(threads, view.threadIds);
+                    return view.name === name ? view : { ...view, name };
+                  }),
+                }
+              : {}),
+          };
+        }),
 
       deleteThread: (id) =>
-        set((state) => ({
-          threads: state.threads.filter((t) => t.id !== id),
-          selectedThreadId: state.selectedThreadId === id ? null : state.selectedThreadId,
-        })),
+        set((state) => {
+          // A deleted thread leaves every saved view it appeared in; a view
+          // left with one thread goes with it.
+          const threads = state.threads.filter((thread) => thread.id !== id);
+          const savedViews = pruneSavedViews(state.savedViews, threads);
+          const panes = panesAfterRemoval(state, (paneId) => paneId === id);
+          const focusedPaneThread = panes.selectedThreadId
+            ? threads.find((thread) => thread.id === panes.selectedThreadId)
+            : undefined;
+          return {
+            threads,
+            ...panes,
+            selectedProjectId: focusedPaneThread?.projectId ?? state.selectedProjectId,
+            selectedEpicId: focusedPaneThread?.epicId ?? null,
+            savedViews,
+            activeSavedViewId: savedViews.some((view) => view.id === state.activeSavedViewId)
+              ? state.activeSavedViewId
+              : null,
+          };
+        }),
 
       addMessageToThread: (threadId, message) => {
         const msg: Message = {
@@ -1618,6 +2043,13 @@ export const useOrionStore = create<OrionState>()(
         projects: state.projects,
         selectedProjectId: state.selectedProjectId,
         selectedThreadId: state.selectedThreadId,
+        paneThreadIds: state.paneThreadIds,
+        savedViews: state.savedViews,
+        activeSavedViewId: state.activeSavedViewId,
+        splitViewSettings: {
+          ...defaultSplitViewSettings,
+          ...state.splitViewSettings,
+        },
         epics: state.epics,
         selectedEpicId: state.selectedEpicId,
         epicsSettings: {
@@ -1686,15 +2118,6 @@ export const useOrionStore = create<OrionState>()(
         merged.threads = merged.threads.map((thread) => {
           // Threads used to carry a single board task; they now carry a list.
           thread = migrateLegacyLinkedTask(thread);
-          // The thread the app reopens visibly on counts as opened. Keep the
-          // marker if the selected transcript is still hidden behind Code.
-          if (
-            merged.activeTab === 'agents' &&
-            thread.id === merged.selectedThreadId &&
-            thread.finishedUnseenAt
-          ) {
-            thread = { ...thread, finishedUnseenAt: undefined };
-          }
           const waitUnresolved = thread.status === 'running';
           const stale =
             waitUnresolved || thread.messages.some((message) => message.status === 'running');
@@ -1740,6 +2163,55 @@ export const useOrionStore = create<OrionState>()(
             }),
           };
         });
+        // Panes must reference threads that survived to this launch, and stores
+        // written before the split view shipped carry no pane list at all —
+        // rebuild it from the selected thread so those users reopen on the
+        // single view they left.
+        const liveThreadIds = new Set(merged.threads.map((thread) => thread.id));
+        const restoredPanes = (
+          Array.isArray(merged.paneThreadIds) ? merged.paneThreadIds : []
+        ).filter(
+          (id, index, ids) => liveThreadIds.has(id) && ids.indexOf(id) === index
+        );
+        merged.paneThreadIds = restoredPanes.slice(0, MAX_THREAD_PANES);
+        if (merged.selectedThreadId && !liveThreadIds.has(merged.selectedThreadId)) {
+          merged.selectedThreadId = null;
+        }
+        if (merged.selectedThreadId && !merged.paneThreadIds.includes(merged.selectedThreadId)) {
+          merged.paneThreadIds =
+            merged.paneThreadIds.length >= MAX_THREAD_PANES
+              ? [merged.selectedThreadId, ...merged.paneThreadIds.slice(1)]
+              : [...merged.paneThreadIds, merged.selectedThreadId];
+        }
+        // A split whose focused thread is gone reopens on its leftmost pane
+        // rather than throwing the rest away.
+        if (!merged.selectedThreadId) merged.selectedThreadId = merged.paneThreadIds[0] ?? null;
+        // Saved views outlive their threads on disk, so they get the same
+        // treatment: drop dead ids, and drop any view that is no longer a
+        // split. Stores written before saved views existed have none.
+        merged.savedViews = pruneSavedViews(
+          Array.isArray(merged.savedViews) ? merged.savedViews : [],
+          merged.threads
+        );
+        merged.splitViewSettings = {
+          ...defaultSplitViewSettings,
+          ...merged.splitViewSettings,
+        };
+        // Tracking only resumes for the view actually back on screen.
+        const restoredView = merged.savedViews.find(
+          (view) => view.id === merged.activeSavedViewId
+        );
+        merged.activeSavedViewId =
+          restoredView &&
+          merged.splitViewSettings.autoSave &&
+          sameIds(restoredView.threadIds, merged.paneThreadIds)
+            ? restoredView.id
+            : null;
+        // Restored panes count as opened only when their transcripts are
+        // actually visible. Code keeps every completion marker intact.
+        if (isAgentsPanelVisible(merged)) {
+          merged.threads = threadsWithOpenedSeen(merged, merged.paneThreadIds);
+        }
         return merged;
       },
     }

@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   ChevronDown,
+  Columns2,
   FlaskConical,
   GitPullRequest,
   HardDrive,
@@ -21,6 +22,8 @@ import {
 import {
   defaultEpicsSettings,
   defaultRiftsSettings,
+  defaultSplitViewSettings,
+  MAX_THREAD_PANES,
   type Epic,
   type EpicsSettings,
   type NotificationSettings,
@@ -30,6 +33,8 @@ import {
   type ProviderRuntimeOptions,
   type ProviderSettings,
   type RiftsSettings,
+  type SavedView,
+  type SplitViewSettings,
   type TextGenerationSettings,
 } from '../store';
 import {
@@ -63,6 +68,10 @@ export type SettingsPageProps = {
   setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
   setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
   epicsSettings: EpicsSettings;
+  splitViewSettings: SplitViewSettings;
+  setSplitViewSettings: (updates: Partial<SplitViewSettings>) => void;
+  savedViews: SavedView[];
+  deleteSavedView: (id: string) => void;
   providerSettings: ProviderSettings;
   setProviderEnabled: (id: ProviderId, enabled: boolean) => void;
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
@@ -166,6 +175,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setTextGenerationSettings,
     setEpicsSettings,
     epicsSettings,
+    splitViewSettings,
+    setSplitViewSettings,
+    savedViews,
+    deleteSavedView,
     providerSettings,
     setProviderEnabled,
     setProviderOptions,
@@ -296,6 +309,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             { id: 'general', label: 'General', Icon: Settings },
             { id: 'providers', label: 'Providers', Icon: Plug },
             { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
+            { id: 'split-view', label: 'Split View', Icon: Columns2 },
             {
               id: 'computer-use',
               label: 'Computer Use',
@@ -329,6 +343,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'general' && 'GENERAL'}
           {settingsTab === 'providers' && 'PROVIDERS'}
           {settingsTab === 'orchestration' && 'ORCHESTRATION'}
+          {settingsTab === 'split-view' && 'SPLIT VIEW'}
           {settingsTab === 'computer-use' && 'COMPUTER USE'}
           {settingsTab === 'storage' && 'STORAGE'}
           {settingsTab === 'cosmetics' && 'COSMETICS'}
@@ -1070,6 +1085,68 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   placeholder="e.g. Always run the test suite before reporting a task as done."
                 />
               </div>
+            </>
+          )}
+
+          {settingsTab === 'split-view' && (
+            <>
+              <div className="setting-row">
+                <div className="setting-label">
+                  <div className="settings-panel-title">Split view</div>
+                  <div className="settings-muted">
+                    Drag a thread from the sidebar into the main view to open it beside the one already
+                    there — up to {MAX_THREAD_PANES} at once. Panes are windows onto the threads
+                    themselves; nothing is ever copied.
+                  </div>
+                </div>
+              </div>
+
+              <div className="setting-row">
+                <div className="setting-label">
+                  <div className="setting-label-title">Auto-save split views</div>
+                  <div className="setting-label-desc">
+                    Keep every split you open in the sidebar's Saved views section, so you can come back
+                    to it in one click. Off means splits are never recorded — close one and it's gone.
+                  </div>
+                </div>
+                <label className="provider-toggle" title="Auto-save split views">
+                  <input
+                    type="checkbox"
+                    checked={splitViewSettings?.autoSave ?? defaultSplitViewSettings.autoSave}
+                    onChange={(e) => setSplitViewSettings({ autoSave: e.target.checked })}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              {savedViews.length > 0 && (
+                <div className="setting-row setting-row-stacked">
+                  <div className="setting-label">
+                    <div className="setting-label-title">Saved views</div>
+                    <div className="setting-label-desc">
+                      Delete one here or from the sidebar. Its threads are untouched either way.
+                    </div>
+                  </div>
+                  <div className="archived-epics-list">
+                    {savedViews.map((view) => (
+                      <div key={view.id} className="archived-epic-row">
+                        <Columns2 size={13} />
+                        <span className="archived-epic-name truncate" title={view.name}>
+                          {view.name}
+                        </span>
+                        <span className="archived-epic-date">{view.threadIds.length} threads</span>
+                        <button
+                          type="button"
+                          className="archived-epic-action"
+                          onClick={() => deleteSavedView(view.id)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </>
           )}
 

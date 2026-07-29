@@ -2,6 +2,7 @@ import React from 'react';
 import {
   Archive,
   ChevronRight,
+  Columns2,
   Ellipsis,
   EyeOff,
   FolderOpen,
@@ -14,8 +15,9 @@ import {
   SquareKanban,
   SquarePen,
   Trash2,
+  X,
 } from 'lucide-react';
-import type { Epic, Project, Thread } from '../store';
+import type { Epic, Project, SavedView, Thread } from '../store';
 import { ProjectIcon } from './ProjectIcon';
 import { InlineRenameInput } from './fileTree';
 import { ThreadSearchResults } from './threadSearch';
@@ -30,6 +32,17 @@ export type AgentsSidebarModel = {
   selectThread: (id: string | null) => void;
   setActiveTab: (tab: 'agents' | 'code') => void;
   selectedThreadId: string | null;
+  /** Threads open as panes in the main view; marked in every thread list. */
+  paneThreadIds: string[];
+  /** Splits the user can return to. The section is hidden while this is empty. */
+  savedViews: SavedView[];
+  activeSavedViewId: string | null;
+  /** Titles for the threads a saved view points at, for its hover list. */
+  threadTitlesById: Map<string, string>;
+  openSavedView: (id: string) => void;
+  deleteSavedView: (id: string) => void;
+  savedViewsSectionOpen: boolean;
+  setSavedViewsSectionOpen: React.Dispatch<React.SetStateAction<boolean>>;
   updateThread: (id: string, updates: Partial<Thread>) => void;
   branchThread: (sourceThreadId: string) => string | null;
   selectedEpicId: string | null;
@@ -106,6 +119,25 @@ export type AgentsSidebarModel = {
   epicPrStatus: (epic: Pick<Epic, 'prUrl' | 'prState'> | null | undefined) => EpicPrStatus | null;
 };
 
+// Dragging a sidebar thread onto the main view opens it as an extra pane. The
+// payload rides on a private MIME type so the shell's image-drop handling —
+// which only looks for 'Files' — stays out of the way, and so a thread dropped
+// on anything else (the composer, another app) is simply ignored.
+export const THREAD_DRAG_MIME = 'application/x-orion-thread';
+
+const threadDragProps = (threadId: string, renaming: boolean) => ({
+  // A draggable ancestor swallows text selection in the rename input, so the
+  // row stops being a drag source while it is being renamed.
+  draggable: !renaming,
+  onDragStart: (event: React.DragEvent<HTMLDivElement>) => {
+    event.dataTransfer.setData(THREAD_DRAG_MIME, threadId);
+    // Plain text keeps the drag legible to the OS drag image and to any
+    // external drop target the user wanders over.
+    event.dataTransfer.setData('text/plain', threadId);
+    event.dataTransfer.effectAllowed = 'copy';
+  },
+});
+
 const ThreadItemSelect = ({
   isRenaming,
   onActivate,
@@ -130,6 +162,14 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     selectThread,
     setActiveTab,
     selectedThreadId,
+    paneThreadIds,
+    savedViews,
+    activeSavedViewId,
+    threadTitlesById,
+    openSavedView,
+    deleteSavedView,
+    savedViewsSectionOpen,
+    setSavedViewsSectionOpen,
     updateThread,
     branchThread,
     selectedEpicId,
@@ -203,6 +243,13 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     epicPrStatus,
   } = props;
 
+  // A thread can appear in several sidebar sections at once (pinned, recent,
+  // its project, its epic); every copy shows the same open/focused state.
+  const threadItemClassName = (threadId: string) =>
+    `thread-item${selectedThreadId === threadId ? ' selected' : ''}${
+      paneThreadIds.includes(threadId) ? ' in-split' : ''
+    }`;
+
   return (
     <div className="sidebar agents-sidebar">
       <div className="sidebar-content agents-sidebar-content">
@@ -263,6 +310,74 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
           </div>
         )}
 
+        {/*
+          Saved views only exist while there are splits to return to — an empty
+          section would be a permanent reminder of a feature the user isn't
+          using, so it isn't rendered at all.
+        */}
+        {savedViews.length > 0 && (
+          <div className="recent-agents-section saved-views-section">
+            <button
+              type="button"
+              className="sidebar-section-toggle"
+              onClick={() => setSavedViewsSectionOpen((open) => !open)}
+              aria-expanded={savedViewsSectionOpen}
+            >
+              <ChevronRight
+                size={12}
+                className={`sidebar-section-chevron ${savedViewsSectionOpen ? 'open' : ''}`}
+              />
+              <span>Saved views</span>
+            </button>
+            {savedViewsSectionOpen && (
+              <div className="threads-list saved-views-list">
+                {savedViews.map((view) => {
+                  const paneTitles = view.threadIds.map(
+                    (threadId) => threadTitlesById.get(threadId) ?? 'Untitled'
+                  );
+                  return (
+                    <div
+                      key={view.id}
+                      className={`thread-item saved-view-item${
+                        activeSavedViewId === view.id ? ' selected' : ''
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        className="thread-item-select"
+                        onClick={() => {
+                          openSavedView(view.id);
+                          setActiveTab('agents');
+                        }}
+                        title={paneTitles.join('\n')}
+                      >
+                        <Columns2 size={13} className="saved-view-icon" />
+                        <span className="thread-title">
+                          <span className="thread-title-text">{view.name}</span>
+                        </span>
+                        {/* thread-meta: fades out on hover so the delete
+                            button has the row's right edge to itself. */}
+                        <span className="sidebar-section-count thread-meta">
+                          {view.threadIds.length}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        className="saved-view-remove"
+                        title="Delete this saved view — its threads stay"
+                        aria-label={`Delete saved view ${view.name}`}
+                        onClick={() => deleteSavedView(view.id)}
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {pinnedThreads.length > 0 && (
           <div className="recent-agents-section">
             <button
@@ -287,7 +402,8 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                     (thread) => (
                       <div
                         key={thread.id}
-                        className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                        className={threadItemClassName(thread.id)}
+                        {...threadDragProps(thread.id, threadRenameKey === `pinned:${thread.id}`)}
                       >
                         <ThreadItemSelect
                           isRenaming={threadRenameKey === `pinned:${thread.id}`}
@@ -601,7 +717,8 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                             visibleEpicThreads.map((thread) => (
                               <div
                                 key={thread.id}
-                                className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                                className={threadItemClassName(thread.id)}
+                                {...threadDragProps(thread.id, threadRenameKey === `epic:${thread.id}`)}
                               >
                                 <ThreadItemSelect
                                   isRenaming={threadRenameKey === `epic:${thread.id}`}
@@ -784,7 +901,8 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                       (thread) => (
                         <div
                           key={thread.id}
-                          className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                          className={threadItemClassName(thread.id)}
+                          {...threadDragProps(thread.id, threadRenameKey === `recent:${thread.id}`)}
                         >
                           <ThreadItemSelect
                             isRenaming={threadRenameKey === `recent:${thread.id}`}
@@ -1057,7 +1175,8 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                       visibleThreads.map((thread) => (
                         <div
                           key={thread.id}
-                          className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
+                          className={threadItemClassName(thread.id)}
+                          {...threadDragProps(thread.id, threadRenameKey === `project:${thread.id}`)}
                         >
                           <ThreadItemSelect
                             isRenaming={threadRenameKey === `project:${thread.id}`}
