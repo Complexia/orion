@@ -882,6 +882,7 @@ const App: React.FC = () => {
     setEpicRepoPickerOpen(false);
   }, [repositoryOperationBusy]);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
+  const [providerUpdatesChecking, setProviderUpdatesChecking] = useState(false);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
@@ -1793,10 +1794,13 @@ const App: React.FC = () => {
 
   const refreshProviderUpdates = useCallback(async () => {
     if (!window.orion?.checkProviderUpdates) return;
+    setProviderUpdatesChecking(true);
     try {
       setProviderUpdateState(await window.orion.checkProviderUpdates({ enabledProviderIds }));
     } catch {
       setProviderUpdateState(null);
+    } finally {
+      setProviderUpdatesChecking(false);
     }
   }, [enabledProviderIds]);
 
@@ -7645,8 +7649,10 @@ const App: React.FC = () => {
     riftStorageSummary,
     riftSweepSelection,
     providerUpdateState,
+    providerUpdatesChecking,
     providerUpdatesRunning,
     appUpdateState,
+    appUpdateBusy,
     setSettingsOpen,
     settingsTab,
     setSettingsTab,
@@ -7682,6 +7688,7 @@ const App: React.FC = () => {
     utilityReasoningOptions,
     resolvedUtilityReasoningEffort,
     refreshProviderUpdates,
+    handleAppUpdateClick,
     handleRequestComputerUsePermission,
     handleOpenChromeDebugSetup,
     handleStartAccountAuth,
