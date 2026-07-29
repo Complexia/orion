@@ -1,8 +1,67 @@
 import React from 'react';
 import { Archive, Check, ChevronDown, GitCommit, GitPullRequest, LoaderCircle, Trash2 } from 'lucide-react';
+import type { Epic, Project } from '../store';
+import type { RiftStorageEntry } from '../types';
+import type {
+  EpicCommitDialogState,
+  EpicPrBaseDialogState,
+  EpicSettleDialogState,
+  NewEpicRiftBranches,
+  RiftSweepDialogState,
+} from './appTypes';
 import { ProjectIcon } from './ProjectIcon';
 
-export type AppDialogsModel = Record<string, any>;
+export type AppDialogsModel = {
+  projects: Project[];
+  createEpicOpen: boolean;
+  newEpicName: string;
+  setNewEpicName: React.Dispatch<React.SetStateAction<string>>;
+  newEpicDescription: string;
+  setNewEpicDescription: React.Dispatch<React.SetStateAction<string>>;
+  newEpicProjectId: string | null;
+  setNewEpicProjectId: React.Dispatch<React.SetStateAction<string | null>>;
+  setCreateEpicProjectPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  createEpicProjectPickerOpen: boolean;
+  setCreateEpicRiftBranchPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  createEpicRiftBranchPickerOpen: boolean;
+  newEpicCreateRift: boolean;
+  setNewEpicCreateRift: React.Dispatch<React.SetStateAction<boolean>>;
+  newEpicRiftBaseBranch: string | null;
+  setNewEpicRiftBaseBranch: React.Dispatch<React.SetStateAction<string | null>>;
+  newEpicRiftBranches: NewEpicRiftBranches | null;
+  createEpicTitleRef: React.RefObject<HTMLInputElement | null>;
+  createEpicProjectPickerRef: React.RefObject<HTMLDivElement | null>;
+  createEpicRiftBranchPickerRef: React.RefObject<HTMLDivElement | null>;
+  riftsActive: boolean;
+  closeCreateEpicModal: () => void;
+  handleCreateEpic: () => void;
+  epicCommitDialog: EpicCommitDialogState | null;
+  setEpicCommitDialog: React.Dispatch<React.SetStateAction<EpicCommitDialogState | null>>;
+  handleEpicCommitAndPush: (epic: Epic, message?: string) => Promise<void>;
+  epicPrBaseDialog: EpicPrBaseDialogState | null;
+  setEpicPrBaseDialog: React.Dispatch<React.SetStateAction<EpicPrBaseDialogState | null>>;
+  setEpicPrBaseBranchPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  epicPrBaseBranchPickerOpen: boolean;
+  epicPrBaseBranchPickerRef: React.RefObject<HTMLDivElement | null>;
+  handleEpicCreatePr: (epic: Epic, baseBranch: string, message?: string) => Promise<void>;
+  epicSettleDialog: EpicSettleDialogState | null;
+  setEpicSettleDialog: React.Dispatch<React.SetStateAction<EpicSettleDialogState | null>>;
+  confirmEpicSettlement: (epic: Epic, releaseRift?: boolean) => void;
+  riftStorageForced: Record<string, boolean>;
+  setRiftStorageForced: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  riftSweepDialog: RiftSweepDialogState | null;
+  setRiftSweepDialog: React.Dispatch<React.SetStateAction<RiftSweepDialogState | null>>;
+  dismissRiftSweepDialog: () => void;
+  releaseRiftStorage: (
+    entries: Array<Pick<RiftStorageEntry, 'riftPath'>>,
+    options?: {
+      runGc?: boolean;
+      forcePaths?: string[];
+      queueIfBusy?: boolean;
+    }
+  ) => Promise<void>;
+  formatBytes: (bytes: number | null | undefined) => string;
+};
 
 const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogsModel }) {
   const {

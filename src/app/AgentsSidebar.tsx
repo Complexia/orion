@@ -15,15 +15,114 @@ import {
   SquarePen,
   Trash2,
 } from 'lucide-react';
+import type { Epic, Project, Thread } from '../store';
 import { ProjectIcon } from './ProjectIcon';
 import { InlineRenameInput } from './fileTree';
 import { ThreadSearchResults } from './threadSearch';
 import { formatShortTime, getThreadActivityTime } from './time';
-import { SidebarFooter } from './SidebarFooter';
+import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
+import type { EpicPrStatus } from './appTypes';
 
 const THREADS_VISIBLE_LIMIT = 5;
 
-export type AgentsSidebarModel = Record<string, any>;
+export type AgentsSidebarModel = {
+  projects: Project[];
+  selectThread: (id: string | null) => void;
+  setActiveTab: (tab: 'agents' | 'code') => void;
+  selectedThreadId: string | null;
+  updateThread: (id: string, updates: Partial<Thread>) => void;
+  branchThread: (sourceThreadId: string) => string | null;
+  selectedEpicId: string | null;
+  renameEpic: (id: string, name: string) => void;
+  selectEpic: (id: string | null) => void;
+  renameProject: (id: string, name: string) => void;
+  selectProject: (id: string | null) => void;
+  threadSearchOpen: boolean;
+  setThreadSearchOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  threadSearchQuery: string;
+  setThreadSearchQuery: React.Dispatch<React.SetStateAction<string>>;
+  projectMenuOpenId: string | null;
+  setProjectMenuOpenId: React.Dispatch<React.SetStateAction<string | null>>;
+  threadItemMenuKey: string | null;
+  setThreadItemMenuKey: React.Dispatch<React.SetStateAction<string | null>>;
+  threadRenameKey: string | null;
+  setThreadRenameKey: React.Dispatch<React.SetStateAction<string | null>>;
+  projectRenameId: string | null;
+  setProjectRenameId: React.Dispatch<React.SetStateAction<string | null>>;
+  threadListLimits: Record<string, number>;
+  setThreadListLimits: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+  collapsedProjects: Record<string, boolean>;
+  setCollapsedProjects: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  setRecentAgentsOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  recentAgentsOpen: boolean;
+  setRecentAgentsShowAll: React.Dispatch<React.SetStateAction<boolean>>;
+  recentAgentsShowAll: boolean;
+  setPinnedAgentsOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  pinnedAgentsOpen: boolean;
+  setPinnedAgentsShowAll: React.Dispatch<React.SetStateAction<boolean>>;
+  pinnedAgentsShowAll: boolean;
+  setEpicsSectionOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  epicsSectionOpen: boolean;
+  collapsedEpics: Record<string, boolean>;
+  setCollapsedEpics: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  epicMenuOpenId: string | null;
+  setEpicMenuOpenId: React.Dispatch<React.SetStateAction<string | null>>;
+  epicRenameId: string | null;
+  setEpicRenameId: React.Dispatch<React.SetStateAction<string | null>>;
+  threadSearchRef: React.RefObject<HTMLDivElement | null>;
+  projectMenuRef: React.RefObject<HTMLDivElement | null>;
+  threadItemMenuRef: React.RefObject<HTMLDivElement | null>;
+  epicMenuRef: React.RefObject<HTMLDivElement | null>;
+  selectedProject: Project | null;
+  sortedProjects: Project[];
+  recentAgentsTargetProject: Project;
+  pinnedThreads: Thread[];
+  recentThreads: Thread[];
+  pinThread: (threadId: string) => void;
+  unpinThread: (threadId: string) => void;
+  runningAgentCount: number;
+  projectThreadsByProject: Map<string, Thread[]>;
+  epicsEnabled: boolean;
+  activeEpics: Epic[];
+  threadsByEpic: Map<string, Thread[]>;
+  runningAgentEpicIds: Set<string>;
+  projectForGitRoot: (gitRoot: string | undefined, preferredProjectId?: string) => Project | null;
+  deleteThreadWithRuntime: (threadId: string) => Promise<void>;
+  removeProjectWithRuntimes: (projectId: string) => Promise<void>;
+  handleAddProject: (options?: {
+    createInitialThread?: boolean;
+    expectedGitRoot?: string;
+  }) => Promise<string | undefined>;
+  handleNewAgent: () => void;
+  handleCreateThread: (projectId: string) => string;
+  openCreateEpicModal: () => void;
+  handleCreateThreadForEpic: (epic: Epic) => Promise<string | undefined>;
+  handleRemoveThreadFromEpic: (threadId: string) => Promise<void>;
+  handleDeleteEpic: (epic: Epic) => Promise<void>;
+  handleSettleEpic: (epic: Epic) => Promise<void>;
+  renderThreadCliBadge: (thread: Thread) => React.JSX.Element | null;
+  renderThreadStatusDot: (thread: Thread) => React.JSX.Element | null;
+  sidebarFooterProps: SidebarFooterProps;
+  epicPrStatus: (epic: Pick<Epic, 'prUrl' | 'prState'> | null | undefined) => EpicPrStatus | null;
+};
+
+const ThreadItemSelect = ({
+  isRenaming,
+  onActivate,
+  children,
+}: {
+  isRenaming: boolean;
+  onActivate: () => void;
+  children: React.ReactNode;
+}) => {
+  const className = `thread-item-select ${isRenaming ? 'renaming' : ''}`;
+  if (isRenaming) return <div className={className}>{children}</div>;
+  return (
+    <button type="button" className={className} onClick={onActivate}>
+      {children}
+    </button>
+  );
+};
 
 export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSidebarModel) {
   const {
@@ -189,37 +288,38 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                       <div
                         key={thread.id}
                         className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                        onClick={() => {
-                          if (threadRenameKey !== `pinned:${thread.id}`) selectThread(thread.id);
-                        }}
                       >
-                        {renderThreadStatusDot(thread)}
-                        {threadRenameKey === `pinned:${thread.id}` ? (
-                          <InlineRenameInput
-                            className="thread-rename-input"
-                            initialValue={thread.title}
-                            onSubmit={(title) => {
-                              updateThread(thread.id, { title });
-                              setThreadRenameKey(null);
-                            }}
-                            onCancel={() => setThreadRenameKey(null)}
-                          />
-                        ) : (
-                          <span className="thread-title">
-                            {renderThreadCliBadge(thread)}
-                            <span className="thread-title-text">{thread.title}</span>
+                        <ThreadItemSelect
+                          isRenaming={threadRenameKey === `pinned:${thread.id}`}
+                          onActivate={() => selectThread(thread.id)}
+                        >
+                          {renderThreadStatusDot(thread)}
+                          {threadRenameKey === `pinned:${thread.id}` ? (
+                            <InlineRenameInput
+                              className="thread-rename-input"
+                              initialValue={thread.title}
+                              onSubmit={(title) => {
+                                updateThread(thread.id, { title });
+                                setThreadRenameKey(null);
+                              }}
+                              onCancel={() => setThreadRenameKey(null)}
+                            />
+                          ) : (
+                            <span className="thread-title">
+                              {renderThreadCliBadge(thread)}
+                              <span className="thread-title-text">{thread.title}</span>
+                            </span>
+                          )}
+                          <span className="thread-project-tag thread-meta">
+                            {projects.find((p) => p.id === thread.projectId)?.name}
                           </span>
-                        )}
-                        <span className="thread-project-tag thread-meta">
-                          {projects.find((p) => p.id === thread.projectId)?.name}
-                        </span>
-                        <span className="thread-time thread-meta">
-                          {formatShortTime(getThreadActivityTime(thread))}
-                        </span>
+                          <span className="thread-time thread-meta">
+                            {formatShortTime(getThreadActivityTime(thread))}
+                          </span>
+                        </ThreadItemSelect>
                         <div
                           className="thread-menu-wrap"
                           ref={threadItemMenuKey === `pinned:${thread.id}` ? threadItemMenuRef : undefined}
-                          onClick={(e) => e.stopPropagation()}
                         >
                           <button
                             type="button"
@@ -487,41 +587,40 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                               <div
                                 key={thread.id}
                                 className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                                onClick={() => {
-                                  if (threadRenameKey !== `epic:${thread.id}`) {
-                                    selectThread(thread.id);
-                                  }
-                                }}
                               >
-                                {renderThreadStatusDot(thread)}
-                                {threadRenameKey === `epic:${thread.id}` ? (
-                                  <InlineRenameInput
-                                    className="thread-rename-input"
-                                    initialValue={thread.title}
-                                    onSubmit={(title) => {
-                                      updateThread(thread.id, { title });
-                                      setThreadRenameKey(null);
-                                    }}
-                                    onCancel={() => setThreadRenameKey(null)}
-                                  />
-                                ) : (
-                                  <span className="thread-title">
-                                    {renderThreadCliBadge(thread)}
-                                    <span className="thread-title-text">{thread.title}</span>
+                                <ThreadItemSelect
+                                  isRenaming={threadRenameKey === `epic:${thread.id}`}
+                                  onActivate={() => selectThread(thread.id)}
+                                >
+                                  {renderThreadStatusDot(thread)}
+                                  {threadRenameKey === `epic:${thread.id}` ? (
+                                    <InlineRenameInput
+                                      className="thread-rename-input"
+                                      initialValue={thread.title}
+                                      onSubmit={(title) => {
+                                        updateThread(thread.id, { title });
+                                        setThreadRenameKey(null);
+                                      }}
+                                      onCancel={() => setThreadRenameKey(null)}
+                                    />
+                                  ) : (
+                                    <span className="thread-title">
+                                      {renderThreadCliBadge(thread)}
+                                      <span className="thread-title-text">{thread.title}</span>
+                                    </span>
+                                  )}
+                                  {!epicProjectName && (
+                                    <span className="thread-project-tag thread-meta">
+                                      {projects.find((p) => p.id === thread.projectId)?.name}
+                                    </span>
+                                  )}
+                                  <span className="thread-time thread-meta">
+                                    {formatShortTime(getThreadActivityTime(thread))}
                                   </span>
-                                )}
-                                {!epicProjectName && (
-                                  <span className="thread-project-tag thread-meta">
-                                    {projects.find((p) => p.id === thread.projectId)?.name}
-                                  </span>
-                                )}
-                                <span className="thread-time thread-meta">
-                                  {formatShortTime(getThreadActivityTime(thread))}
-                                </span>
+                                </ThreadItemSelect>
                                 <div
                                   className="thread-menu-wrap"
                                   ref={threadItemMenuKey === `epic:${thread.id}` ? threadItemMenuRef : undefined}
-                                  onClick={(e) => e.stopPropagation()}
                                 >
                                   <button
                                     type="button"
@@ -649,37 +748,38 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                         <div
                           key={thread.id}
                           className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                          onClick={() => {
-                            if (threadRenameKey !== `recent:${thread.id}`) selectThread(thread.id);
-                          }}
                         >
-                          {renderThreadStatusDot(thread)}
-                          {threadRenameKey === `recent:${thread.id}` ? (
-                            <InlineRenameInput
-                              className="thread-rename-input"
-                              initialValue={thread.title}
-                              onSubmit={(title) => {
-                                updateThread(thread.id, { title });
-                                setThreadRenameKey(null);
-                              }}
-                              onCancel={() => setThreadRenameKey(null)}
-                            />
-                          ) : (
-                            <span className="thread-title">
-                              {renderThreadCliBadge(thread)}
-                              <span className="thread-title-text">{thread.title}</span>
+                          <ThreadItemSelect
+                            isRenaming={threadRenameKey === `recent:${thread.id}`}
+                            onActivate={() => selectThread(thread.id)}
+                          >
+                            {renderThreadStatusDot(thread)}
+                            {threadRenameKey === `recent:${thread.id}` ? (
+                              <InlineRenameInput
+                                className="thread-rename-input"
+                                initialValue={thread.title}
+                                onSubmit={(title) => {
+                                  updateThread(thread.id, { title });
+                                  setThreadRenameKey(null);
+                                }}
+                                onCancel={() => setThreadRenameKey(null)}
+                              />
+                            ) : (
+                              <span className="thread-title">
+                                {renderThreadCliBadge(thread)}
+                                <span className="thread-title-text">{thread.title}</span>
+                              </span>
+                            )}
+                            <span className="thread-project-tag thread-meta">
+                              {projects.find((p) => p.id === thread.projectId)?.name}
                             </span>
-                          )}
-                          <span className="thread-project-tag thread-meta">
-                            {projects.find((p) => p.id === thread.projectId)?.name}
-                          </span>
-                          <span className="thread-time thread-meta">
-                            {formatShortTime(getThreadActivityTime(thread))}
-                          </span>
+                            <span className="thread-time thread-meta">
+                              {formatShortTime(getThreadActivityTime(thread))}
+                            </span>
+                          </ThreadItemSelect>
                           <div
                             className="thread-menu-wrap"
                             ref={threadItemMenuKey === `recent:${thread.id}` ? threadItemMenuRef : undefined}
-                            onClick={(e) => e.stopPropagation()}
                           >
                             <button
                               type="button"
@@ -921,34 +1021,35 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                         <div
                           key={thread.id}
                           className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                          onClick={() => {
-                            if (threadRenameKey !== `project:${thread.id}`) selectThread(thread.id);
-                          }}
                         >
-                          {renderThreadStatusDot(thread)}
-                          {threadRenameKey === `project:${thread.id}` ? (
-                            <InlineRenameInput
-                              className="thread-rename-input"
-                              initialValue={thread.title}
-                              onSubmit={(title) => {
-                                updateThread(thread.id, { title });
-                                setThreadRenameKey(null);
-                              }}
-                              onCancel={() => setThreadRenameKey(null)}
-                            />
-                          ) : (
-                            <span className="thread-title">
-                              {renderThreadCliBadge(thread)}
-                              <span className="thread-title-text">{thread.title}</span>
+                          <ThreadItemSelect
+                            isRenaming={threadRenameKey === `project:${thread.id}`}
+                            onActivate={() => selectThread(thread.id)}
+                          >
+                            {renderThreadStatusDot(thread)}
+                            {threadRenameKey === `project:${thread.id}` ? (
+                              <InlineRenameInput
+                                className="thread-rename-input"
+                                initialValue={thread.title}
+                                onSubmit={(title) => {
+                                  updateThread(thread.id, { title });
+                                  setThreadRenameKey(null);
+                                }}
+                                onCancel={() => setThreadRenameKey(null)}
+                              />
+                            ) : (
+                              <span className="thread-title">
+                                {renderThreadCliBadge(thread)}
+                                <span className="thread-title-text">{thread.title}</span>
+                              </span>
+                            )}
+                            <span className="thread-time thread-meta">
+                              {formatShortTime(getThreadActivityTime(thread))}
                             </span>
-                          )}
-                          <span className="thread-time thread-meta">
-                            {formatShortTime(getThreadActivityTime(thread))}
-                          </span>
+                          </ThreadItemSelect>
                           <div
                             className="thread-menu-wrap"
                             ref={threadItemMenuKey === `project:${thread.id}` ? threadItemMenuRef : undefined}
-                            onClick={(e) => e.stopPropagation()}
                           >
                             <button
                               type="button"

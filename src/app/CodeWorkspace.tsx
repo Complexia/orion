@@ -3,7 +3,7 @@ import { Folder, FolderOpen, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useShallow } from 'zustand/react/shallow';
 import { useOrionStore } from '../store';
-import { CodeEditorPane } from './CodeEditorPane';
+import { CodeEditorPane, type CodeEditorPaneHandle } from './CodeEditorPane';
 import { type FileTreeItem, FileTreeNode } from './fileTree';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 
@@ -35,6 +35,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
     openFile,
     closeFile,
     setActiveFile,
+    updateOpenFileContent,
     closeAllFiles,
   } = useOrionStore(
     useShallow((state) => ({
@@ -46,6 +47,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
       openFile: state.openFile,
       closeFile: state.closeFile,
       setActiveFile: state.setActiveFile,
+      updateOpenFileContent: state.updateOpenFileContent,
       closeAllFiles: state.closeAllFiles,
     }))
   );
@@ -63,6 +65,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
   const previousRunningAgentCountRef = useRef(runningAgentCount);
   const previousTurnRefreshTickRef = useRef(turnRefreshTick);
   const treeRefreshTimerRef = useRef<number | null>(null);
+  const codeEditorPaneRef = useRef<CodeEditorPaneHandle>(null);
 
   useEffect(() => {
     treeRootRef.current = workspacePath;
@@ -148,16 +151,39 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
   );
 
   const handleTreeItemRenamed = useCallback(
-    async (oldPath: string, newPath: string, isDirectory: boolean) => {
+    async (oldPath: string, newPath: string, _isDirectory: boolean) => {
+      codeEditorPaneRef.current?.flushBuffers();
       const currentOpenFiles = useOrionStore.getState().openFiles;
-      const wasOpen = currentOpenFiles.some((file) => file.path === oldPath);
-      for (const file of currentOpenFiles) {
-        if (isPathWithin(file.path, oldPath)) closeFile(file.path);
+      const activePathBeforeRename = useOrionStore.getState().activeFilePath;
+      const renamedOpenFiles = currentOpenFiles
+        .filter((file) => isPathWithin(file.path, oldPath))
+        .map((file) => ({
+          file,
+          newPath: `${newPath}${file.path.slice(oldPath.length)}`,
+        }));
+
+      for (const { file } of renamedOpenFiles) {
+        closeFile(file.path);
       }
-      if (!isDirectory && wasOpen) await handleOpenFile(newPath);
+      for (const { file, newPath: renamedPath } of renamedOpenFiles) {
+        if (file.isDirty) {
+          openFile(renamedPath, file.content);
+          updateOpenFileContent(renamedPath, file.content);
+        } else {
+          await handleOpenFile(renamedPath);
+        }
+      }
+
+      if (activePathBeforeRename) {
+        const renamedActivePath =
+          renamedOpenFiles.find(({ file }) => file.path === activePathBeforeRename)?.newPath ?? activePathBeforeRename;
+        if (useOrionStore.getState().openFiles.some((file) => file.path === renamedActivePath)) {
+          setActiveFile(renamedActivePath);
+        }
+      }
       refreshTree();
     },
-    [closeFile, handleOpenFile, refreshTree]
+    [closeFile, handleOpenFile, openFile, refreshTree, setActiveFile, updateOpenFileContent]
   );
 
   const handleOpenFolderForCode = useCallback(async () => {
@@ -195,7 +221,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
             </button>
             <button
               onClick={() => {
-                if (workspacePath) void loadRoot(workspacePath);
+                refreshTree();
               }}
               className="btn secondary small"
               title="Refresh"
@@ -242,7 +268,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
 
       <div className="panel">
         {openFiles.length > 0 && (
-          <div className="editor-tabs">
+          <div className="editor-tabs" role="tablist" aria-label="Open files">
             {openFiles.map((file) => {
               const fileName = file.path.split(/[\\/]/).pop() || file.path;
               const isActive = file.path === activeFilePath;
@@ -250,27 +276,37 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
                 <div
                   key={file.path}
                   className={`editor-tab ${isActive ? 'active' : ''}`}
-                  onClick={() => setActiveFile(file.path)}
-                  title={file.path}
                 >
-                  <span className="truncate">{fileName}</span>
-                  {file.isDirty && <span className="text-[#f4a261]">●</span>}
-                  <span
+                  <button
+                    type="button"
+                    className="editor-tab-select"
+                    role="tab"
+                    tabIndex={0}
+                    aria-selected={isActive}
+                    title={file.path}
+                    onClick={() => setActiveFile(file.path)}
+                  >
+                    <span className="truncate">{fileName}</span>
+                    {file.isDirty && <span className="text-[#f4a261]">●</span>}
+                  </button>
+                  <button
+                    type="button"
                     className="close"
+                    aria-label={`Close ${fileName}`}
                     onClick={(event) => {
                       event.stopPropagation();
                       closeFile(file.path);
                     }}
                   >
                     <X size={13} />
-                  </span>
+                  </button>
                 </div>
               );
             })}
           </div>
         )}
 
-        <CodeEditorPane />
+        <CodeEditorPane ref={codeEditorPaneRef} />
       </div>
     </>
   );

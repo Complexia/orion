@@ -92,7 +92,8 @@ import {
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
-import { AgentsSidebar } from './app/AgentsSidebar';
+import { AgentsSidebar, type AgentsSidebarModel } from './app/AgentsSidebar';
+import type { AppDialogsModel } from './app/AppDialogs';
 import { ProjectIcon } from './app/ProjectIcon';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
@@ -130,7 +131,20 @@ import {
 import { formatShortTime, getThreadActivityTime } from './app/time';
 import { deriveTitle, isDefaultTitle, isPlausibleTitle, tryGenerateBetterTitle } from './app/titles';
 import type { SidebarFooterProps } from './app/SidebarFooter';
-import type { AppUpdateState, GitRepoState, OrionAccountState, ProviderUpdateState, SettingsTab } from './app/appTypes';
+import type { SettingsPageProps } from './app/SettingsPage';
+import type {
+  AppUpdateState,
+  EpicCommitDialogState,
+  EpicPrBaseDialogState,
+  EpicPrStatus,
+  EpicSettleDialogState,
+  GitRepoState,
+  NewEpicRiftBranches,
+  OrionAccountState,
+  ProviderUpdateState,
+  RiftSweepDialogState,
+  SettingsTab,
+} from './app/appTypes';
 
 // Lazy-loaded so xterm (and the TerminalView code) is split into its own
 // chunk and only fetched/parsed when a Claude Code CLI thread is actually
@@ -187,8 +201,6 @@ const EPIC_PR_STATE_REFRESH_MS = 60_000;
 // Returning to Orion right after merging in the browser is the moment the icon
 // is most likely stale, so focus gets its own much shorter throttle.
 const EPIC_PR_STATE_FOCUS_REFRESH_MS = 15_000;
-
-type EpicPrStatus = 'open' | 'merged' | 'closed';
 
 type EpicPrLookupRequest = {
   expectedPrUrl: string;
@@ -659,11 +671,7 @@ const App: React.FC = () => {
   const [newEpicRiftBaseBranch, setNewEpicRiftBaseBranch] = useState<string | null>(null);
   // Local branches of the modal's selected project, for the base picker.
   // Tagged with the project id so a stale list can't feed another project.
-  const [newEpicRiftBranches, setNewEpicRiftBranches] = useState<{
-    projectId: string;
-    currentBranch: string | null;
-    branches: string[];
-  } | null>(null);
+  const [newEpicRiftBranches, setNewEpicRiftBranches] = useState<NewEpicRiftBranches | null>(null);
   // Rift binary availability, fetched once (null while unknown).
   const [riftStatus, setRiftStatus] = useState<{
     available: boolean;
@@ -751,47 +759,22 @@ const App: React.FC = () => {
   const anyEpicGitBusy = Object.keys(epicGitBusy).length > 0;
   // Message dialog shown before an epic's commit & push. An empty message
   // hands the write back to the epic message model.
-  const [epicCommitDialog, setEpicCommitDialog] = useState<{
-    epic: Epic;
-    message: string;
-  } | null>(null);
+  const [epicCommitDialog, setEpicCommitDialog] = useState<EpicCommitDialogState | null>(null);
   // Base-branch and message picker shown before opening an epic's pull
   // request. Holds the origin branches fetched for the picker, the user's
   // current selection, and their optional hand-written title/description.
   // The dialog opens before origin has answered, so the branch list starts
   // empty and loading while the base branch comes from local git.
-  const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<{
-    instanceId: number;
-    epic: Epic;
-    branches: string[];
-    branchesLoading: boolean;
-    branchesError: string;
-    defaultBranch: string;
-    sourceBranch: string;
-    baseBranch: string;
-    message: string;
-  } | null>(null);
+  const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<EpicPrBaseDialogState | null>(null);
   const epicPrBaseDialogInstanceRef = useRef(0);
-  const [epicSettleDialog, setEpicSettleDialog] = useState<{
-    epic: Epic;
-    warnings: string[];
-    /** Whether freeing the rift is offered at all — false unless Orion could
-     *  verify the workspace has nothing uncommitted or unpushed left in it. */
-    canReleaseRift: boolean;
-    /** Free the rift as part of settling; seeded from riftsSettings.releaseOnSettle. */
-    releaseRift: boolean;
-  } | null>(null);
+  const [epicSettleDialog, setEpicSettleDialog] = useState<EpicSettleDialogState | null>(null);
   const [riftStorageState, setRiftStorageState] = useState<RiftStorageState | null>(null);
   const [riftStorageBusy, setRiftStorageBusy] = useState(false);
   const riftStorageQueueRef = useRef<Promise<void>>(Promise.resolve());
   const riftStorageQueueDepthRef = useRef(0);
   // Rifts the user chose to free despite uncommitted or unpushed work.
   const [riftStorageForced, setRiftStorageForced] = useState<Record<string, boolean>>({});
-  const [riftSweepDialog, setRiftSweepDialog] = useState<{
-    entries: RiftStorageEntry[];
-    /** Also run `rift gc`, which permanently empties Rift's trash machine-wide. */
-    runGc: boolean;
-  } | null>(null);
+  const [riftSweepDialog, setRiftSweepDialog] = useState<RiftSweepDialogState | null>(null);
   const dismissRiftSweepDialog = useCallback(() => {
     setRiftSweepDialog(null);
     // "Free anyway" is approval for one confirmation flow, not a durable
@@ -7633,7 +7616,7 @@ const App: React.FC = () => {
     []
   );
 
-  const settingsPageModel = {
+  const settingsPageModel: SettingsPageProps = {
     notificationSettings,
     setNotificationSettings,
     setTextGenerationSettings,
@@ -7711,7 +7694,7 @@ const App: React.FC = () => {
     epicPrStatus,
   };
 
-  const appDialogsModel = {
+  const appDialogsModel: AppDialogsModel = {
     projects,
     createEpicOpen,
     newEpicName,
@@ -7798,7 +7781,7 @@ const App: React.FC = () => {
     []
   );
 
-  const agentsSidebarModel = {
+  const agentsSidebarModel: AgentsSidebarModel = {
     projects,
     selectThread,
     setActiveTab,
@@ -9076,12 +9059,11 @@ const App: React.FC = () => {
                               <button
                                 className="model-trigger"
                                 onClick={() => {
-                                  setModelPickerOpen((open) => {
-                                    if (!open) {
-                                      setActiveProviderTab(selectedAgentModel.providerId);
-                                    }
-                                    return !open;
-                                  });
+                                  if (!modelPickerOpen) {
+                                    const providerId = selectedAgentModel?.providerId;
+                                    if (providerId) setActiveProviderTab(providerId);
+                                  }
+                                  setModelPickerOpen(!modelPickerOpen);
                                 }}
                                 disabled={isSending}
                               >

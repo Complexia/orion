@@ -9,12 +9,17 @@ import { getLanguageFromPath } from './language';
 // MonacoEditor configures the bundled Electron-safe loader when the Code
 // editor is first rendered.
 export const MonacoEditor = React.lazy(() => import('../MonacoEditor'));
+
+export type CodeEditorPaneHandle = {
+  flushBuffers: () => void;
+};
+
 /**
  * Keeps Monaco's per-keystroke updates inside the code pane. The shell only
  * observes tab metadata (path/dirty state), so editing no longer re-renders
  * the sidebar, transcript, settings, or composer.
  */
-export const CodeEditorPane = React.memo(function CodeEditorPane() {
+const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function CodeEditorPane(_props, ref) {
   const { activeFilePath, activeFile, closeFile, updateOpenFileContent, markFileSaved } =
     useOrionStore(
       useShallow((state) => ({
@@ -54,6 +59,16 @@ export const CodeEditorPane = React.memo(function CodeEditorPane() {
       updateOpenFileContent(path, content);
     },
     [updateOpenFileContent]
+  );
+
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      flushBuffers: () => {
+        for (const path of dirtyPathsRef.current) flushFileBuffer(path);
+      },
+    }),
+    [flushFileBuffer]
   );
 
   useEffect(() => {
@@ -204,3 +219,5 @@ export const CodeEditorPane = React.memo(function CodeEditorPane() {
     </div>
   );
 });
+
+export const CodeEditorPane = React.memo(CodeEditorPaneWithRef);

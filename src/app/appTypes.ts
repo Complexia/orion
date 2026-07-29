@@ -1,3 +1,43 @@
+import type { Epic } from '../store';
+import type { RiftStorageEntry } from '../types';
+
+export type EpicPrStatus = 'open' | 'merged' | 'closed';
+
+export type NewEpicRiftBranches = {
+  projectId: string;
+  currentBranch: string | null;
+  branches: string[];
+};
+
+export type EpicCommitDialogState = {
+  epic: Epic;
+  message: string;
+};
+
+export type EpicPrBaseDialogState = {
+  instanceId: number;
+  epic: Epic;
+  branches: string[];
+  branchesLoading: boolean;
+  branchesError: string;
+  defaultBranch: string;
+  sourceBranch: string;
+  baseBranch: string;
+  message: string;
+};
+
+export type EpicSettleDialogState = {
+  epic: Epic;
+  warnings: string[];
+  canReleaseRift: boolean;
+  releaseRift: boolean;
+};
+
+export type RiftSweepDialogState = {
+  entries: RiftStorageEntry[];
+  runGc: boolean;
+};
+
 export type GitBranchInfo = {
   name: string;
   current: boolean;

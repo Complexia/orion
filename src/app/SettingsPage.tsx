@@ -18,20 +18,145 @@ import {
   UserRound,
   Workflow,
 } from 'lucide-react';
-import { defaultEpicsSettings, defaultRiftsSettings, type ProviderId, type ProviderRuntimeOptions } from '../store';
-import { agentProviders, providerOptionDefs } from '../agentCatalog';
+import {
+  defaultEpicsSettings,
+  defaultRiftsSettings,
+  type Epic,
+  type EpicsSettings,
+  type NotificationSettings,
+  type OrchestrationRoleId,
+  type OrchestrationSettings,
+  type ProviderId,
+  type ProviderRuntimeOptions,
+  type ProviderSettings,
+  type RiftsSettings,
+  type TextGenerationSettings,
+} from '../store';
+import {
+  agentProviders,
+  providerOptionDefs,
+  type AgentModel,
+  type AgentProvider,
+  type AgentProviderId,
+} from '../agentCatalog';
+import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
 import { orchestrationRoleMeta } from './promptContext';
 import { formatShortTime } from './time';
-import type { SettingsTab } from './appTypes';
+import type {
+  AppUpdateState,
+  EpicPrStatus,
+  OrionAccountState,
+  ProviderUpdateItem,
+  ProviderUpdateState,
+  RiftSweepDialogState,
+  SettingsTab,
+} from './appTypes';
 
 // Settings remains controlled by App because its asynchronous account, update,
 // and Rift operations are shared with the shell. Keeping that integration in a
 // single view model avoids creating a second set of store subscriptions here.
-export type SettingsPageModel = Record<string, any>;
+export type SettingsPageProps = {
+  notificationSettings: NotificationSettings;
+  setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
+  setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
+  setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
+  epicsSettings: EpicsSettings;
+  providerSettings: ProviderSettings;
+  setProviderEnabled: (id: ProviderId, enabled: boolean) => void;
+  setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
+  setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
+  setOrchestrationGeneralInstructions: (text: string) => void;
+  riftsSettings: RiftsSettings;
+  setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
+  setUtilityModelPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  utilityModelPickerOpen: boolean;
+  setUtilityModelSearch: React.Dispatch<React.SetStateAction<string>>;
+  utilityModelSearch: string;
+  setUtilityModelTab: React.Dispatch<React.SetStateAction<AgentProviderId>>;
+  utilityModelTab: AgentProviderId;
+  riftStatus: {
+    available: boolean;
+    version?: string | null;
+    pendingEpicIds?: string[];
+    pendingRemovalEpicIds?: string[];
+    readyRifts?: Array<{
+      epicId: string;
+      projectId?: string;
+      projectPath: string;
+      riftPath: string;
+      riftWorkingDir: string;
+      gitRoot?: string;
+      branch?: string;
+    }>;
+  } | null;
+  riftStorageState: RiftStorageState | null;
+  riftStorageBusy: boolean;
+  riftStorageForced: Record<string, boolean>;
+  setRiftStorageForced: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  setRiftSweepDialog: React.Dispatch<React.SetStateAction<RiftSweepDialogState | null>>;
+  riftStorageEntries: RiftStorageEntry[];
+  riftStorageSummary: {
+    total: number;
+    active: number;
+    settled: number;
+    orphan: number;
+    trash: number;
+  };
+  riftSweepSelection: RiftStorageEntry[];
+  providerUpdateState: ProviderUpdateState | null;
+  providerUpdatesRunning: boolean;
+  appUpdateState: AppUpdateState | null;
+  setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  settingsTab: SettingsTab;
+  setSettingsTab: React.Dispatch<React.SetStateAction<SettingsTab>>;
+  authenticatingProviderId: string | null;
+  accountState: OrionAccountState;
+  accountLoading: boolean;
+  accountBusy: boolean;
+  computerUsePerms: OrionComputerUsePermissions | null;
+  computerUseBusyKind: OrionComputerUsePermissionKind | null;
+  revealedProviderEmails: Record<string, boolean>;
+  setRevealedProviderEmails: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  setRevealedAccountIdentity: React.Dispatch<React.SetStateAction<string | null>>;
+  expandedProviderOptions: Record<string, boolean>;
+  setExpandedProviderOptions: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  utilityModelPickerRef: React.RefObject<HTMLDivElement | null>;
+  normalizedProviderSettings: ProviderSettings;
+  normalizedOrchestrationSettings: OrchestrationSettings;
+  orchestrationModelGroups: Array<{ provider: AgentProvider; models: AgentModel[] }>;
+  providerStatusById: Map<string, ProviderUpdateItem>;
+  accountName: string;
+  accountEmail: string | null;
+  accountIdentity: string | null;
+  accountEmailRevealed: boolean;
+  accountInitials: string;
+  epicsEnabled: boolean;
+  epicPromptGitMessages: boolean;
+  archivedEpics: Epic[];
+  utilityCandidateModels: AgentModel[];
+  utilityProviders: AgentProvider[];
+  resolvedUtilityModelId: string | null;
+  resolvedUtilityModel: AgentModel | null;
+  utilityModelProviderId: AgentProviderId | null;
+  utilityReasoningOptions: Array<{ value: string; label: string }>;
+  resolvedUtilityReasoningEffort: string | null;
+  refreshProviderUpdates: () => Promise<void>;
+  handleRequestComputerUsePermission: (kind: OrionComputerUsePermissionKind) => Promise<void>;
+  handleOpenChromeDebugSetup: () => Promise<void>;
+  handleStartAccountAuth: () => Promise<void>;
+  handleSignOutAccount: () => Promise<void>;
+  handleAuthenticateProvider: (providerId: string) => Promise<void>;
+  openEpicPrUrl: (prUrl: string) => void;
+  handleDeleteEpic: (epic: Epic) => Promise<void>;
+  handleRestoreEpic: (epic: Epic) => void;
+  formatCheckedTime: (iso: string) => string;
+  formatBytes: (bytes: number | null | undefined) => string;
+  epicPrStatus: (epic: Pick<Epic, 'prUrl' | 'prState'> | null | undefined) => EpicPrStatus | null;
+};
 
-const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) {
+const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) {
   const {
     notificationSettings,
     setNotificationSettings,
@@ -259,9 +384,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                 <div className="setting-row">
                   <div className="setting-label">
                     <div className="setting-label-title">Theme</div>
-                    <div className="setting-label-desc">Choose how Orion looks across the app.</div>
+                    <div className="setting-label-desc">Choose how Orion looks across the app. Coming soon.</div>
                   </div>
-                  <select className="setting-select" defaultValue="system">
+                  <select className="setting-select" defaultValue="system" disabled>
                     <option value="system">System</option>
                     <option value="dark">Dark</option>
                     <option value="light">Light</option>
@@ -272,10 +397,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                   <div className="setting-label">
                     <div className="setting-label-title">Time format</div>
                     <div className="setting-label-desc">
-                      System default follows your browser or OS clock preference.
+                      System default follows your browser or OS clock preference. Coming soon.
                     </div>
                   </div>
-                  <select className="setting-select" defaultValue="system">
+                  <select className="setting-select" defaultValue="system" disabled>
                     <option value="system">System default</option>
                     <option value="12h">12-hour</option>
                     <option value="24h">24-hour</option>
@@ -289,11 +414,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                   <div className="setting-label">
                     <div className="setting-label-title">Word wrap</div>
                     <div className="setting-label-desc">
-                      Wrap long lines in code blocks, tables, diffs, and file previews by default.
+                      Wrap long lines in code blocks, tables, diffs, and file previews by default. Coming soon.
                     </div>
                   </div>
                   <label className="provider-toggle" title="Word wrap">
-                    <input type="checkbox" defaultChecked />
+                    <input type="checkbox" defaultChecked disabled />
                     <span />
                   </label>
                 </div>
@@ -302,11 +427,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                   <div className="setting-label">
                     <div className="setting-label-title">Hide whitespace changes</div>
                     <div className="setting-label-desc">
-                      Set whether the diff panel ignores whitespace-only edits by default.
+                      Set whether the diff panel ignores whitespace-only edits by default. Coming soon.
                     </div>
                   </div>
                   <label className="provider-toggle" title="Hide whitespace">
-                    <input type="checkbox" defaultChecked />
+                    <input type="checkbox" defaultChecked disabled />
                     <span />
                   </label>
                 </div>
@@ -315,11 +440,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                   <div className="setting-label">
                     <div className="setting-label-title">Assistant output</div>
                     <div className="setting-label-desc">
-                      Show token-by-token output while a response is in progress.
+                      Show token-by-token output while a response is in progress. Coming soon.
                     </div>
                   </div>
                   <label className="provider-toggle" title="Assistant output">
-                    <input type="checkbox" />
+                    <input type="checkbox" disabled />
                     <span />
                   </label>
                 </div>
@@ -367,10 +492,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                   <div className="setting-label">
                     <div className="setting-label-title">New threads</div>
                     <div className="setting-label-desc">
-                      Pick the default workspace mode for newly created draft threads.
+                      Pick the default workspace mode for newly created draft threads. Coming soon.
                     </div>
                   </div>
-                  <select className="setting-select" defaultValue="local">
+                  <select className="setting-select" defaultValue="local" disabled>
                     <option value="local">Local</option>
                     <option value="remote">Remote</option>
                   </select>
@@ -380,11 +505,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                   <div className="setting-label">
                     <div className="setting-label-title">Archive confirmation</div>
                     <div className="setting-label-desc">
-                      Require a second click on the inline archive action before a thread is archived.
+                      Require a second click on the inline archive action before a thread is archived. Coming soon.
                     </div>
                   </div>
                   <label className="provider-toggle" title="Archive confirmation">
-                    <input type="checkbox" />
+                    <input type="checkbox" disabled />
                     <span />
                   </label>
                 </div>
@@ -392,10 +517,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                 <div className="setting-row">
                   <div className="setting-label">
                     <div className="setting-label-title">Delete confirmation</div>
-                    <div className="setting-label-desc">Ask before deleting a thread and its chat history.</div>
+                    <div className="setting-label-desc">
+                      Ask before deleting a thread and its chat history. Coming soon.
+                    </div>
                   </div>
                   <label className="provider-toggle" title="Delete confirmation">
-                    <input type="checkbox" defaultChecked />
+                    <input type="checkbox" defaultChecked disabled />
                     <span />
                   </label>
                 </div>
@@ -407,11 +534,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                   <div className="setting-label">
                     <div className="setting-label-title">Provider update checks</div>
                     <div className="setting-label-desc">
-                      Check installed provider CLIs for newer available versions.
+                      Check installed provider CLIs for newer available versions. Coming soon.
                     </div>
                   </div>
                   <label className="provider-toggle" title="Provider update checks">
-                    <input type="checkbox" defaultChecked />
+                    <input type="checkbox" defaultChecked disabled />
                     <span />
                   </label>
                 </div>
@@ -969,7 +1096,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageModel) 
                     type="button"
                     className="provider-auth-button"
                     onClick={() => {
-                      void window.orion.relaunchApp();
+                      void window.orion?.relaunchApp?.();
                     }}
                   >
                     <RefreshCw size={13} />
