@@ -647,12 +647,19 @@ type OrionComputerUsePermissions = {
           }>;
         };
       }>;
-      authenticateProvider: (providerId: string) => Promise<{
+      authenticateProvider: (providerId: string, attemptId: string) => Promise<{
         ok: boolean;
         error?: string;
       }>;
       onProviderAuthenticated: (
         callback: (event: { providerId: string }) => void
+      ) => () => void;
+      onProviderAuthenticationCompleted: (
+        callback: (event: {
+          providerId: string;
+          attemptId: string;
+          authenticated: boolean;
+        }) => void
       ) => () => void;
       getAccountSession: () => Promise<OrionAccountState>;
       startAccountAuth: () => Promise<{

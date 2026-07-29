@@ -484,6 +484,67 @@ export const updateProviderTool = async (config, expectedLatestVersion = null) =
   }
 };
 
+export const PROVIDER_AUTH_ATTEMPT_TIMEOUT_MS = 5 * 60 * 1000;
+export const PROVIDER_AUTH_TERMINATE_GRACE_MS = 5000;
+
+const signalProviderAuthenticationProcess = (child, signal) => {
+  if (!child) return;
+
+  // The detached shell can exit after SIGTERM while a login descendant keeps
+  // the process group alive. Always attempt the POSIX group signal, especially
+  // the delayed SIGKILL, even when the group leader has already terminated.
+  if (process.platform !== 'win32' && Number.isInteger(child.pid)) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {}
+  }
+
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    child.kill(signal);
+  } catch {}
+};
+
+export const createProviderAuthenticationCompletion = (
+  child,
+  timeoutMs = PROVIDER_AUTH_ATTEMPT_TIMEOUT_MS
+) =>
+  new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
+    const timeout = setTimeout(() => {
+      signalProviderAuthenticationProcess(child, 'SIGTERM');
+      const forceKill = setTimeout(() => {
+        signalProviderAuthenticationProcess(child, 'SIGKILL');
+      }, PROVIDER_AUTH_TERMINATE_GRACE_MS);
+      forceKill.unref?.();
+      finish({
+        ok: false,
+        timedOut: true,
+        error: 'Authentication attempt timed out.',
+      });
+    }, Math.max(1, timeoutMs));
+    timeout.unref?.();
+
+    child.once('error', (error) => {
+      finish({ ok: false, error: getProcessErrorMessage(error) });
+    });
+    child.once('exit', (code, signal) => {
+      finish({
+        ok: code === 0,
+        code,
+        signal,
+        ...(code === 0 ? {} : { error: `Authentication exited with code ${code ?? signal}.` }),
+      });
+    });
+  });
+
 export const authenticateProviderTool = async (providerId) => {
   const config = providerUpdaterConfigs.find((provider) => provider.id === providerId);
   if (!config) {
@@ -513,19 +574,7 @@ export const authenticateProviderTool = async (providerId) => {
           NO_COLOR: '1',
         },
       });
-      const completion = new Promise((resolve) => {
-        child.once('error', (error) => {
-          resolve({ ok: false, error: getProcessErrorMessage(error) });
-        });
-        child.once('exit', (code, signal) => {
-          resolve({
-            ok: code === 0,
-            code,
-            signal,
-            ...(code === 0 ? {} : { error: `Authentication exited with code ${code ?? signal}.` }),
-          });
-        });
-      });
+      const completion = createProviderAuthenticationCompletion(child);
       child.unref();
       return { result: { ok: true }, completion };
     } catch (error) {

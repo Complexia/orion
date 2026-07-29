@@ -321,13 +321,18 @@ export const ProviderAuthPrompt: React.FC<{
   providerId: string;
   onAuthenticate: (providerId: string) => void;
   busy?: boolean;
-}> = ({ providerId, onAuthenticate, busy }) => {
+  /** Persisted turn failures resume after login; asides and legacy failures do not. */
+  autoResumes?: boolean;
+}> = ({ providerId, onAuthenticate, busy, autoResumes }) => {
   const label =
     agentProviders.find((provider) => provider.id === providerId)?.label ?? providerId;
   return (
     <div className="agent-error agent-auth-error">
       <span>
-        {label} is logged out. Authenticate, then send your message again.
+        {label} is logged out.{' '}
+        {autoResumes
+          ? 'Authenticate and the thread picks up where it left off.'
+          : 'Authenticate, then send your message again.'}
       </span>
       <button
         type="button"
@@ -352,7 +357,7 @@ export type ChatMessageProps = {
   onUnlinkTask?: (taskId: string) => void;
   btwExchanges?: BtwExchange[];
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
-  onAuthenticateProvider?: (providerId: string) => void;
+  onAuthenticateProvider?: (providerId: string, messageId?: string) => void;
   authenticatingProviderId?: string | null;
 };
 
@@ -420,8 +425,11 @@ export const ChatMessage = React.memo(function ChatMessage({
           (message.authProviderId && onAuthenticateProvider ? (
             <ProviderAuthPrompt
               providerId={message.authProviderId}
-              onAuthenticate={onAuthenticateProvider}
+              onAuthenticate={(providerId) =>
+                onAuthenticateProvider(providerId, message.authRetryPayload ? message.id : undefined)
+              }
               busy={authenticatingProviderId === message.authProviderId}
+              autoResumes={Boolean(message.authRetryPayload)}
             />
           ) : (
             <div className="agent-error">{message.error}</div>
@@ -631,7 +639,10 @@ export type ChatTranscriptProps = {
   onMarkTaskDone: (threadId: string, taskId: string) => void;
   onUnlinkTask: (threadId: string, taskId: string) => void;
   onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
-  onAuthenticateProvider: (providerId: string) => void;
+  onAuthenticateProvider: (
+    providerId: string,
+    retryTarget?: { threadId: string; messageId: string }
+  ) => void;
   onSteerQueuedMessage: (queuedId: string) => void;
 };
 
@@ -816,6 +827,13 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   const handleDismissTasksCard = useCallback(() => {
     if (floatingPlan) onDismissTasksCard(floatingPlan.messageId);
   }, [floatingPlan, onDismissTasksCard]);
+  // Turn-level auth prompts carry the exact failed message id; btw asides and
+  // legacy errors without a persisted payload authenticate without a resume.
+  const handleAuthenticateFromTurn = useCallback(
+    (providerId: string, messageId?: string) =>
+      onAuthenticateProvider(providerId, messageId ? { threadId, messageId } : undefined),
+    [onAuthenticateProvider, threadId]
+  );
   const renderBtwAside = useCallback(
     (exchange: BtwExchange) => (
       <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
@@ -914,7 +932,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                       : undefined
                   }
                   renderBtwAside={renderBtwAside}
-                  onAuthenticateProvider={onAuthenticateProvider}
+                  onAuthenticateProvider={handleAuthenticateFromTurn}
                   authenticatingProviderId={authenticatingProviderId}
                 />
                 {message.kind !== 'agent-run' &&

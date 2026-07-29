@@ -49,14 +49,17 @@ import {
   defaultEpicsSettings,
   defaultRiftsSettings,
   type AgentActivity,
+  type AuthRetryPayload,
   type BtwExchange,
   type ChangedFileSummary,
+  type GoalRunAction,
   type ImageAttachment,
   type LinkedBoardTask,
   type Message,
   type OrchestrationRoleId,
   type Project,
   type ProviderId,
+  type ReviewRunPayload,
   type Thread,
   type ThreadGoal,
   type TurnTokenStats,
@@ -109,6 +112,20 @@ import {
   isVideoFile,
 } from './app/attachments';
 import { AgentFamilySwitcher, type ChatScrollPosition, ChatTranscript, isProviderAuthErrorText } from './app/chat';
+import {
+  authRetryThreadIdsForWorkingDir,
+  consumeAuthRetryAttempt,
+  dispatchAuthRetryPayload,
+  findExactAuthRetryModel,
+  findRetryableAuthMessage,
+  linkedTasksForTurnDispatch,
+  recoverAuthRetryAttempt,
+  resolveAuthRetryTargets,
+  retireAuthRetryTargets,
+  type AuthRetryResult,
+  type AuthRetryTarget,
+  type PendingAuthRetryAttempt,
+} from './app/authRetry';
 import { InlineRenameInput } from './app/fileTree';
 import {
   claudeOneMillionOnlyModelSlugs,
@@ -451,6 +468,30 @@ const renderThreadStatusDot = (thread: Thread) => {
       title={failed ? 'Failed — not opened yet' : 'Finished — not opened yet'}
     />
   );
+};
+
+type TurnAuthRetryPayload = Extract<AuthRetryPayload, { kind: 'turn' }>;
+type GoalAuthRetryPayload = Extract<AuthRetryPayload, { kind: 'goal' }>;
+type ReviewAuthRetryPayload = Extract<AuthRetryPayload, { kind: 'review' }>;
+type StartTurnOptions = {
+  resend?: TurnAuthRetryPayload;
+  isRetryStillCurrent?: () => boolean;
+};
+
+const waitForOrionStoreHydration = async (): Promise<void> => {
+  if (useOrionStore.persist.hasHydrated()) return;
+  await new Promise<void>((resolve) => {
+    let finished = false;
+    let unsubscribe = () => {};
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      unsubscribe();
+      resolve();
+    };
+    unsubscribe = useOrionStore.persist.onFinishHydration(finish);
+    if (useOrionStore.persist.hasHydrated()) finish();
+  });
 };
 
 const App: React.FC = () => {
@@ -888,6 +929,7 @@ const App: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
   const [authenticatingProviderId, setAuthenticatingProviderId] = useState<string | null>(null);
+  const [authRetryQueueVersion, setAuthRetryQueueVersion] = useState(0);
   const [accountState, setAccountState] = useState<OrionAccountState>({
     authenticated: false,
     user: null,
@@ -943,10 +985,138 @@ const App: React.FC = () => {
     | ((
         threadId: string,
         promptText: string,
-        attachments: ImageAttachment[]
-      ) => Promise<{ ok: boolean; error?: string }>)
+        attachments: ImageAttachment[],
+        options?: StartTurnOptions
+      ) => Promise<AuthRetryResult>)
     | null
   >(null);
+  // Exact failed transcript messages whose Authenticate button launched a
+  // provider login, keyed by the renderer-generated authentication attempt.
+  const pendingAuthRetriesRef = useRef(new Map<string, PendingAuthRetryAttempt>());
+  // Auth can complete for several historical failures at once, but a thread
+  // can only execute one replay at a time. Queues remain until each preceding
+  // replay has actually terminated; different threads still drain in parallel.
+  const authRetryQueuesRef = useRef(
+    new Map<string, Array<{ providerId: string; target: AuthRetryTarget }>>()
+  );
+  const authRetryDispatchingThreadsRef = useRef(new Set<string>());
+  // Incremented whenever a thread's checkout identity is changing or its
+  // retries are retired. A dequeued turn checks this after linked-task refresh
+  // so it cannot cross an async workspace transition.
+  const authRetryDispatchGenerationsRef = useRef(new Map<string, number>());
+  const authRetrySuspendedThreadIdsRef = useRef(new Set<string>());
+  const retryAuthFailureRef = useRef<
+    ((providerId: string, target: AuthRetryTarget, generation: number) => Promise<AuthRetryResult>) | null
+  >(null);
+  const clearAuthRetryAttemptAssociations = useCallback(
+    (attemptId: string, targets?: Iterable<AuthRetryTarget>) => {
+      const targetKeys = targets
+        ? new Set(
+            [...targets].map((target) => `${target.threadId}\u0000${target.messageId}`)
+          )
+        : null;
+      for (const thread of useOrionStore.getState().threads) {
+        for (const message of thread.messages) {
+          if (message.authRetryAttemptId !== attemptId) continue;
+          if (targetKeys && !targetKeys.has(`${thread.id}\u0000${message.id}`)) continue;
+          updateThreadMessage(thread.id, message.id, {
+            authRetryAttemptId: undefined,
+          });
+        }
+      }
+    },
+    [updateThreadMessage]
+  );
+  const advanceAuthRetryDispatchGenerations = useCallback((threadIds: Iterable<string>) => {
+    for (const threadId of threadIds) {
+      authRetryDispatchGenerationsRef.current.set(
+        threadId,
+        (authRetryDispatchGenerationsRef.current.get(threadId) ?? 0) + 1
+      );
+    }
+  }, []);
+  const retireAuthRetriesForThreads = useCallback(
+    (threadIds: Iterable<string>, retireTranscriptPayloads = false) => {
+      const retiredThreadIds = new Set(threadIds);
+      advanceAuthRetryDispatchGenerations(retiredThreadIds);
+      const retiredCount = retireAuthRetryTargets(
+        pendingAuthRetriesRef.current,
+        authRetryQueuesRef.current,
+        retiredThreadIds
+      );
+
+      if (retireTranscriptPayloads) {
+        for (const thread of useOrionStore.getState().threads) {
+          if (!retiredThreadIds.has(thread.id)) continue;
+          for (const message of thread.messages) {
+            if (!message.authRetryPayload && !message.authRetryAttemptId) continue;
+            updateThreadMessage(thread.id, message.id, {
+              authRetryAttemptId: undefined,
+              ...(message.authRetryPayload
+                ? {
+                    authProviderId: undefined,
+                    authRetryPayload: undefined,
+                  }
+                : {}),
+            });
+          }
+        }
+      } else {
+        for (const thread of useOrionStore.getState().threads) {
+          if (!retiredThreadIds.has(thread.id)) continue;
+          for (const message of thread.messages) {
+            if (!message.authRetryAttemptId) continue;
+            updateThreadMessage(thread.id, message.id, {
+              authRetryAttemptId: undefined,
+            });
+          }
+        }
+      }
+
+      if (retiredCount > 0) {
+        setAuthRetryQueueVersion((version) => version + 1);
+      }
+    },
+    [advanceAuthRetryDispatchGenerations, updateThreadMessage]
+  );
+  const authRetryThreadIdsInWorkingDir = useCallback(
+    (workingDir: string) => {
+      const state = useOrionStore.getState();
+      const projectsById = new Map(state.projects.map((project) => [project.id, project]));
+      return authRetryThreadIdsForWorkingDir(state.threads, workingDir, (thread) => {
+        const project = projectsById.get(thread.projectId);
+        return project ? threadWorkingDir(state.epics, thread, project) : null;
+      });
+    },
+    []
+  );
+  const retireAuthRetriesForWorkingDir = useCallback(
+    (workingDir: string) => {
+      const threadIds = authRetryThreadIdsInWorkingDir(workingDir);
+      // A branch change invalidates both automatic targets and persisted
+      // Authenticate actions, since either would replay against a new checkout.
+      retireAuthRetriesForThreads(threadIds, true);
+    },
+    [authRetryThreadIdsInWorkingDir, retireAuthRetriesForThreads]
+  );
+  const suspendAuthRetriesForWorkingDir = useCallback(
+    (workingDir: string) => {
+      const threadIds = authRetryThreadIdsInWorkingDir(workingDir);
+      for (const threadId of threadIds) {
+        authRetrySuspendedThreadIdsRef.current.add(threadId);
+      }
+      advanceAuthRetryDispatchGenerations(threadIds);
+      setAuthRetryQueueVersion((version) => version + 1);
+      return threadIds;
+    },
+    [advanceAuthRetryDispatchGenerations, authRetryThreadIdsInWorkingDir]
+  );
+  const resumeAuthRetriesForThreads = useCallback((threadIds: Iterable<string>) => {
+    for (const threadId of threadIds) {
+      authRetrySuspendedThreadIdsRef.current.delete(threadId);
+    }
+    setAuthRetryQueueVersion((version) => version + 1);
+  }, []);
   // In-flight snapshot refreshes, keyed by `${threadId} ${taskId}`.
   const linkedTaskRefreshesRef = useRef(new Map<string, Promise<void>>());
   // Shared unlink requests prevent the picker and composer chip from issuing
@@ -1725,6 +1895,10 @@ const App: React.FC = () => {
         }
       }
 
+      // Retire the complete subtree before reading active runs or awaiting
+      // disposal. Authentication completion must not launch a replay between
+      // the run snapshot and deletion.
+      retireAuthRetriesForThreads(threadIds, true);
       const removedThreads = state.threads.filter((thread) => threadIds.has(thread.id));
       const runIds: string[] = [];
       const spawnIds: string[] = [];
@@ -1751,12 +1925,19 @@ const App: React.FC = () => {
       // thread while the persisted store updates.
       for (const thread of removedThreads.reverse()) deleteThread(thread.id);
     },
-    [activeRunsByThread, clearActiveRun, deleteThread, disposeThreadRuntime]
+    [activeRunsByThread, clearActiveRun, deleteThread, disposeThreadRuntime, retireAuthRetriesForThreads]
   );
 
   const removeProjectWithRuntimes = useCallback(
     async (projectId: string) => {
       const projectThreads = useOrionStore.getState().threads.filter((thread) => thread.projectId === projectId);
+      // Project removal owns every thread in the project. Close their retry
+      // lifecycle before capturing runs so login completion cannot create a
+      // new runtime while removal is awaiting IPC.
+      retireAuthRetriesForThreads(
+        projectThreads.map((thread) => thread.id),
+        true
+      );
       const runIds = projectThreads
         .map((thread) => activeRunsByThread[thread.id])
         .filter((runId): runId is string => Boolean(runId));
@@ -1776,18 +1957,21 @@ const App: React.FC = () => {
       }
       removeProject(projectId);
     },
-    [activeRunsByThread, clearActiveRun, disposeThreadRuntime, removeProject]
+    [activeRunsByThread, clearActiveRun, disposeThreadRuntime, removeProject, retireAuthRetriesForThreads]
   );
 
-  const refreshAgentModels = useCallback(async (force = false) => {
-    if (!window.orion?.listAgentModels) return;
+  const refreshAgentModels = useCallback(async (force = false): Promise<AgentModel[] | null> => {
+    if (!window.orion?.listAgentModels) return null;
     try {
       const models = await window.orion.listAgentModels({ force });
       if (models.length > 0) {
         setAgentModels(models);
+        return models;
       }
+      return null;
     } catch {
       // The fallback catalog remains usable when the bridge is unavailable.
+      return null;
     }
   }, []);
 
@@ -1800,18 +1984,112 @@ const App: React.FC = () => {
     }
   }, [enabledProviderIds]);
 
+  const queueAuthenticatedRetries = useCallback(
+    async (attemptId: string, providerId: string): Promise<boolean> => {
+      const refreshedModels = await refreshAgentModels(true);
+      const pending = pendingAuthRetriesRef.current.get(attemptId);
+      if (!pending || pending.providerId !== providerId || !pending.authenticationCompleted) {
+        return true;
+      }
+      // A missing catalog is transient and keeps the attempt available for the
+      // delayed/manual refresh. A nonempty fallback catalog is also
+      // inconclusive for provider-discovered Cursor/Kimi models: queue exact
+      // matches now, but retain missing dynamic targets for the retry window.
+      if (refreshedModels == null) return false;
+      const state = useOrionStore.getState();
+      const { usableTargets, undiscoveredTargets } = resolveAuthRetryTargets(
+        pending.targets,
+        state.threads,
+        providerId,
+        refreshedModels,
+        true
+      );
+      const undiscoveredTargetKeys = new Set(
+        undiscoveredTargets.map((target) => `${target.threadId}\u0000${target.messageId}`)
+      );
+      const settledTargets = pending.targets.filter(
+        (target) => !undiscoveredTargetKeys.has(`${target.threadId}\u0000${target.messageId}`)
+      );
+      clearAuthRetryAttemptAssociations(attemptId, settledTargets);
+      pending.targets = undiscoveredTargets;
+      if (undiscoveredTargets.length === 0) {
+        consumeAuthRetryAttempt(
+          pendingAuthRetriesRef.current,
+          attemptId,
+          providerId
+        );
+      }
+      for (const target of usableTargets) {
+        const queue = authRetryQueuesRef.current.get(target.threadId) ?? [];
+        queue.push({ providerId, target });
+        authRetryQueuesRef.current.set(target.threadId, queue);
+      }
+      setAuthRetryQueueVersion((version) => version + 1);
+      return undiscoveredTargets.length === 0;
+    },
+    [clearAuthRetryAttemptAssociations, refreshAgentModels]
+  );
+
   useEffect(() => {
     void refreshAgentModels();
     void refreshProviderUpdates();
   }, [refreshAgentModels, refreshProviderUpdates]);
 
   useEffect(() => {
-    if (!window.orion?.onProviderAuthenticated) return undefined;
-    return window.orion.onProviderAuthenticated(() => {
-      void refreshAgentModels(true);
-      void refreshProviderUpdates();
+    if (!window.orion?.onProviderAuthenticationCompleted) return undefined;
+    let disposed = false;
+    const unsubscribe = window.orion.onProviderAuthenticationCompleted((event) => {
+      void (async () => {
+        // A completion can arrive in a newly loaded renderer before the async
+        // transcript store has hydrated. Wait so the persisted attempt marker
+        // can safely reconstruct the exact clicked targets.
+        await waitForOrionStoreHydration();
+        if (disposed) return;
+        if (!event.authenticated) {
+          consumeAuthRetryAttempt(
+            pendingAuthRetriesRef.current,
+            event.attemptId,
+            event.providerId
+          );
+          clearAuthRetryAttemptAssociations(event.attemptId);
+          return;
+        }
+        void refreshProviderUpdates();
+        // Dynamic provider catalogs can be unavailable until login completes.
+        // Only consume the attempt after forced discovery returns every exact
+        // model needed by its persisted retry payloads. If discovery is
+        // transiently unavailable, keep both targets and transcript payloads
+        // intact and make one delayed retry before asking the user to retry.
+        let pending = pendingAuthRetriesRef.current.get(event.attemptId);
+        if (!pending) {
+          pending = recoverAuthRetryAttempt(
+            useOrionStore.getState().threads,
+            event.attemptId,
+            event.providerId
+          );
+          if (pending) {
+            pendingAuthRetriesRef.current.set(event.attemptId, pending);
+          }
+        }
+        if (!pending || pending.providerId !== event.providerId) return;
+        pending.authenticationCompleted = true;
+        if (await queueAuthenticatedRetries(event.attemptId, event.providerId)) return;
+        await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+        if (await queueAuthenticatedRetries(event.attemptId, event.providerId)) return;
+        if (pending.targets.length > 0) {
+          toast.error('Authenticated, but Orion could not refresh the original model. Try Authenticate again.');
+        }
+      })();
     });
-  }, [refreshAgentModels, refreshProviderUpdates]);
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [
+    clearAuthRetryAttemptAssociations,
+    queueAuthenticatedRetries,
+    refreshProviderUpdates,
+  ]);
 
   // Claude Code CLI terminal threads: main discovers the live CLI session id
   // from claude's on-disk session store (the interactive TUI ignores
@@ -1895,6 +2173,13 @@ const App: React.FC = () => {
             .map((thread) => [thread.id, thread])
         ).values(),
       ];
+      // These threads will resolve against a replacement checkout if the Epic
+      // is restored. Retire queued, in-flight, and persisted auth retries before
+      // clearing their old Rift sessions.
+      retireAuthRetriesForThreads(
+        threadsToFinalize.map((thread) => thread.id),
+        true
+      );
       for (const thread of threadsToFinalize) {
         updateThread(thread.id, {
           agentSessionIds: undefined,
@@ -1917,7 +2202,7 @@ const App: React.FC = () => {
       });
       return acknowledgement?.ok === true;
     },
-    [releaseEpicRift, updateThread]
+    [releaseEpicRift, retireAuthRetriesForThreads, updateThread]
   );
 
   // Rift storage. Main owns the scan; the renderer only mirrors its state and
@@ -2346,24 +2631,87 @@ const App: React.FC = () => {
   }, [accountBusy]);
 
   const handleAuthenticateProvider = useCallback(
-    async (providerId: string) => {
+    async (providerId: string, retryTarget?: AuthRetryTarget) => {
       if (!window.orion?.authenticateProvider || authenticatingProviderId) return;
 
+      const existingAttempt = [...pendingAuthRetriesRef.current.entries()].find(
+        ([, pending]) => pending.providerId === providerId
+      );
+      if (existingAttempt) {
+        const [attemptId, pending] = existingAttempt;
+        if (retryTarget) {
+          if (
+            !pending.targets.some(
+              (target) =>
+                target.threadId === retryTarget.threadId &&
+                target.messageId === retryTarget.messageId
+            )
+          ) {
+            pending.targets.push(retryTarget);
+          }
+          updateThreadMessage(retryTarget.threadId, retryTarget.messageId, {
+            authRetryAttemptId: attemptId,
+          });
+        }
+        if (pending.authenticationCompleted) {
+          toast.info('Refreshing the authenticated model before resuming');
+          if (!(await queueAuthenticatedRetries(attemptId, providerId))) {
+            toast.error('Orion still could not refresh the original model. Try again in a moment.');
+          }
+        } else if (retryTarget) {
+          toast.info('Authentication is already in progress — this thread will resume when it finishes');
+        } else {
+          toast.info('Authentication is already in progress');
+        }
+        return;
+      }
+
+      const attemptId = crypto.randomUUID();
+      // Register before IPC so an already-fast completion event cannot beat
+      // the renderer's authenticateProvider promise continuation. Targetless
+      // settings logins are tracked too, so retry clicks can join them.
+      pendingAuthRetriesRef.current.set(attemptId, {
+        providerId,
+        targets: retryTarget ? [retryTarget] : [],
+      });
+      if (retryTarget) {
+        updateThreadMessage(retryTarget.threadId, retryTarget.messageId, {
+          authRetryAttemptId: attemptId,
+        });
+      }
+      const discardRetryTarget = () => {
+        pendingAuthRetriesRef.current.delete(attemptId);
+        clearAuthRetryAttemptAssociations(
+          attemptId,
+          retryTarget ? [retryTarget] : undefined
+        );
+      };
       setAuthenticatingProviderId(providerId);
       try {
-        const result = await window.orion.authenticateProvider(providerId);
+        const result = await window.orion.authenticateProvider(providerId, attemptId);
         if (result.ok) {
-          toast.info('Authentication started');
+          if (retryTarget) {
+            toast.info('Authentication started — the thread resumes once you finish signing in');
+          } else {
+            toast.info('Authentication started');
+          }
         } else {
+          discardRetryTarget();
           toast.error(result.error ?? 'Could not start authentication');
         }
       } catch (error) {
+        discardRetryTarget();
         toast.error(error instanceof Error ? error.message : 'Could not start authentication');
       } finally {
         setAuthenticatingProviderId(null);
       }
     },
-    [authenticatingProviderId]
+    [
+      authenticatingProviderId,
+      clearAuthRetryAttemptAssociations,
+      queueAuthenticatedRetries,
+      updateThreadMessage,
+    ]
   );
 
   useEffect(() => {
@@ -3149,6 +3497,7 @@ const App: React.FC = () => {
             : 'Finished.',
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
+          authRetryPayload: undefined,
         });
         if (waiting) {
           updateThread(tracked.threadId, { status: 'running' });
@@ -3185,8 +3534,8 @@ const App: React.FC = () => {
         // where stderr lands — and mark the message so the transcript offers
         // an Authenticate button instead of a dead-end error.
         const errorThread = useOrionStore.getState().threads.find((thread) => thread.id === tracked.threadId);
-        const contentTail =
-          errorThread?.messages.find((message) => message.id === tracked.messageId)?.content.slice(-1200) ?? '';
+        const failedMessage = errorThread?.messages.find((message) => message.id === tracked.messageId);
+        const contentTail = failedMessage?.content.slice(-1200) ?? '';
         const looksLoggedOut = isProviderAuthErrorText(event.error) || isProviderAuthErrorText(contentTail);
         const rawAuthProviderId = looksLoggedOut ? (event.providerId ?? errorThread?.modelId.split(':')[0]) : undefined;
         // The Orion pseudo-provider has no CLI of its own to authenticate.
@@ -3197,6 +3546,7 @@ const App: React.FC = () => {
           statusText: authProviderId ? 'The agent is logged out.' : 'The agent stopped with an error.',
           error: event.error,
           authProviderId,
+          authRetryPayload: authProviderId ? failedMessage?.authRetryPayload : undefined,
           changedFiles: event.changedFiles ?? [],
         });
         updateThread(tracked.threadId, { status: 'error' });
@@ -3376,6 +3726,10 @@ const App: React.FC = () => {
       return;
     }
 
+    // Authentication completion can arrive while checkout is in flight.
+    // Suspend this workspace's retries now, but only retire them once Git
+    // confirms that the checkout identity actually changed.
+    const suspendedAuthRetryThreadIds = suspendAuthRetriesForWorkingDir(activeWorkingDir);
     setGitBusy(true);
     try {
       const result = await window.orion.checkoutGitBranch({
@@ -3383,13 +3737,17 @@ const App: React.FC = () => {
         branchName,
       });
       if (result.ok) {
+        retireAuthRetriesForWorkingDir(activeWorkingDir);
         toast.success(`Checked out ${branchName}`);
         setBranchPickerOpen(false);
         await refreshGitState();
       } else {
         toast.error(result.error ?? `Could not check out ${branchName}`);
       }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : `Could not check out ${branchName}`);
     } finally {
+      resumeAuthRetriesForThreads(suspendedAuthRetryThreadIds);
       setGitBusy(false);
     }
   };
@@ -3400,6 +3758,7 @@ const App: React.FC = () => {
     const normalized = branchName.trim();
     if (!normalized) return;
 
+    const suspendedAuthRetryThreadIds = suspendAuthRetriesForWorkingDir(activeWorkingDir);
     setGitBusy(true);
     try {
       const result = await window.orion.checkoutGitBranch({
@@ -3408,13 +3767,17 @@ const App: React.FC = () => {
         create: true,
       });
       if (result.ok) {
+        retireAuthRetriesForWorkingDir(activeWorkingDir);
         toast.success(`Created ${normalized}`);
         setBranchPickerOpen(false);
         await refreshGitState();
       } else {
         toast.error(result.error ?? `Could not create ${normalized}`);
       }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : `Could not create ${normalized}`);
     } finally {
+      resumeAuthRetriesForThreads(suspendedAuthRetryThreadIds);
       setGitBusy(false);
     }
   };
@@ -4742,6 +5105,7 @@ const App: React.FC = () => {
     const epic = thread?.epicId ? state.epics.find((candidate) => candidate.id === thread.epicId) : undefined;
     if (!thread || !epic) return;
     if (!epic.riftPath) {
+      retireAuthRetriesForThreads([thread.id], true);
       updateThread(thread.id, { epicId: undefined });
       return;
     }
@@ -4755,6 +5119,11 @@ const App: React.FC = () => {
 
     markRiftRemoval(epic.id, true);
     try {
+      // This thread will resolve its next run against a different workspace.
+      // Retire both automatic targets and their transcript payloads before any
+      // asynchronous teardown can let a completed login replay stale work.
+      retireAuthRetriesForThreads([thread.id], true);
+
       // Capture both renderer tracking views before changing membership. A
       // just-started run may only be present in runOutputMessages until React
       // publishes activeRunsByThreadRef.
@@ -4774,6 +5143,7 @@ const App: React.FC = () => {
             status: 'stopped',
             completedAt: new Date().toISOString(),
             statusText: 'Stopped because the thread left its epic rift.',
+            authRetryPayload: undefined,
           });
         }
       }
@@ -4976,6 +5346,10 @@ const App: React.FC = () => {
       // own. Guard the complete runtime set explicitly so those threads cannot
       // launch in the source checkout while their inherited Rift is removed.
       markRiftRemovalThreads(removalThreadIds, true);
+      // Every surviving runtime thread will lose this Rift identity. Invalidate
+      // historical auth replay payloads as well as pending/ready targets before
+      // the durable deletion can expose the source checkout.
+      retireAuthRetriesForThreads(removalThreadIds, true);
 
       // The restore ref can be the only surviving copy of a force-freed,
       // never-pushed branch. Persist the Epic deletion before main is allowed
@@ -5018,6 +5392,7 @@ const App: React.FC = () => {
             status: 'stopped',
             completedAt: new Date().toISOString(),
             statusText: 'Stopped because the epic rift was removed.',
+            authRetryPayload: undefined,
           });
         } else {
           const thread = state.threads.find((candidate) => candidate.id === threadId);
@@ -5028,6 +5403,7 @@ const App: React.FC = () => {
             updateThreadMessage(threadId, lastRun.id, {
               completedAt: new Date().toISOString(),
               statusText: 'Stopped because the epic rift was removed.',
+              authRetryPayload: undefined,
             });
           }
         }
@@ -5500,8 +5876,9 @@ const App: React.FC = () => {
     async (
       threadId: string,
       promptText: string,
-      attachments: ImageAttachment[]
-    ): Promise<{ ok: boolean; error?: string }> => {
+      attachments: ImageAttachment[],
+      options?: StartTurnOptions
+    ): Promise<AuthRetryResult> => {
       if (pendingTurnStartsRef.current.has(threadId)) {
         return { ok: false, error: 'An agent turn is already starting' };
       }
@@ -5510,6 +5887,16 @@ const App: React.FC = () => {
         await refreshLinkedTasksBeforeDispatch(threadId);
       } finally {
         pendingTurnStartsRef.current.delete(threadId);
+      }
+      // A branch/Rift transition can begin while linked-task freshness is
+      // awaited. Revalidate the retry generation before resolving the
+      // workspace or mutating the transcript.
+      if (options?.isRetryStillCurrent && !options.isRetryStillCurrent()) {
+        return {
+          ok: false,
+          cancelled: true,
+          error: 'The workspace changed before the request could resume',
+        };
       }
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
@@ -5562,8 +5949,18 @@ const App: React.FC = () => {
           error: 'This epic’s rift workspace is not available',
         };
       }
-      let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
-      if (!model) return { ok: false, error: 'Select an agent model first' };
+      const retryPayload = options?.resend;
+      let model = retryPayload
+        ? findExactAuthRetryModel(agentModels, retryPayload.modelId)
+        : findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      if (!model) {
+        return {
+          ok: false,
+          error: retryPayload
+            ? `The original model (${retryPayload.modelId}) is no longer available`
+            : 'Select an agent model first',
+        };
+      }
 
       // Orion pseudo-model: resolve the configured main driver EARLY and
       // replace `model` with it, so every downstream use (enabled/available
@@ -5583,7 +5980,7 @@ const App: React.FC = () => {
             generalInstructions: string;
           }
         | undefined;
-      if (model.providerId === 'orion' || isOrionModelId(thread.modelId)) {
+      if (!retryPayload && (model.providerId === 'orion' || isOrionModelId(thread.modelId))) {
         const roleModels = {
           ...defaultOrchestrationSettings.models,
           ...state.orchestrationSettings?.models,
@@ -5642,46 +6039,49 @@ const App: React.FC = () => {
       // prompt, so an empty draft is fine — their titles and descriptions
       // become the agent context (later turns resume the same session, so the
       // agent already has them). The chips move onto this turn's user message.
-      const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
-      if (!promptText && attachments.length === 0 && tasksToInject.length === 0) {
+      const tasksToInject = linkedTasksForTurnDispatch(thread.linkedTasks, Boolean(retryPayload));
+      if (!promptText && attachments.length === 0 && tasksToInject.length === 0 && !retryPayload) {
         return { ok: false, error: 'Type a message first' };
       }
 
-      const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
-      const turnAttachments = [...taskMediaAttachments, ...attachments];
+      const taskMediaAttachments = retryPayload ? [] : linkedTaskMediaAttachments(tasksToInject);
+      const turnAttachments = retryPayload?.attachments ?? [...taskMediaAttachments, ...attachments];
       const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
-      let agentPrompt = buildPromptWithAttachments(promptText, attachments);
-      if (tasksToInject.length > 0) {
-        agentPrompt = agentPrompt
-          ? `${buildLinkedTaskContext(tasksToInject, true)}\n\n${agentPrompt}`
-          : buildLinkedTaskContext(tasksToInject, false);
-        const injectedIds = new Set(tasksToInject.map((task) => task.id));
-        updateThread(threadId, {
-          linkedTasks: (thread.linkedTasks ?? []).map((task) =>
-            injectedIds.has(task.id) ? { ...task, injected: true } : task
-          ),
-        });
-      }
-      // @-model mentions in the user's original text: tell the agent which
-      // models were referenced so it can delegate to them. Works on any
-      // thread, not just Orion ones.
-      const mentionedModels = promptText ? parseModelMentions(promptText, agentModels) : [];
-      if (mentionedModels.length > 0) {
-        const mentionsContext = buildModelMentionsContext(mentionedModels);
-        agentPrompt = agentPrompt ? `${mentionsContext}\n\n${agentPrompt}` : mentionsContext;
-      }
-      if (orchestration) {
-        // Prepended last so it sits before the linked-task context when both apply.
-        const orchestrationContext = buildOrchestrationContext(
-          orchestration.roles,
-          orchestration.generalInstructions,
-          thread.accessMode ?? 'full-access'
-        );
-        agentPrompt = agentPrompt ? `${orchestrationContext}\n\n${agentPrompt}` : orchestrationContext;
+      let agentPrompt = retryPayload?.prompt ?? buildPromptWithAttachments(promptText, attachments);
+      let mentionedModels = retryPayload?.mentions ?? [];
+      const runOrchestration = retryPayload?.orchestration ?? orchestration;
+      if (!retryPayload) {
+        if (tasksToInject.length > 0) {
+          agentPrompt = agentPrompt
+            ? `${buildLinkedTaskContext(tasksToInject, true)}\n\n${agentPrompt}`
+            : buildLinkedTaskContext(tasksToInject, false);
+          const injectedIds = new Set(tasksToInject.map((task) => task.id));
+          updateThread(threadId, {
+            linkedTasks: (thread.linkedTasks ?? []).map((task) =>
+              injectedIds.has(task.id) ? { ...task, injected: true } : task
+            ),
+          });
+        }
+        // @-model mentions in the user's original text: tell the agent which
+        // models were referenced so it can delegate to them.
+        mentionedModels = promptText ? parseModelMentions(promptText, agentModels) : [];
+        if (mentionedModels.length > 0) {
+          const mentionsContext = buildModelMentionsContext(mentionedModels);
+          agentPrompt = agentPrompt ? `${mentionsContext}\n\n${agentPrompt}` : mentionsContext;
+        }
+        if (runOrchestration) {
+          // Prepended last so it sits before linked-task context when both apply.
+          const orchestrationContext = buildOrchestrationContext(
+            runOrchestration.roles,
+            runOrchestration.generalInstructions,
+            thread.accessMode ?? 'full-access'
+          );
+          agentPrompt = agentPrompt ? `${orchestrationContext}\n\n${agentPrompt}` : orchestrationContext;
+        }
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
-      if (thread.messages.length === 0 && isDefaultTitle(thread.title)) {
+      if (!retryPayload && thread.messages.length === 0 && isDefaultTitle(thread.title)) {
         const titleSeed = userContent || tasksToInject[0]?.title || '';
         const initialTitle = deriveTitle(titleSeed);
         if (isPlausibleTitle(initialTitle)) {
@@ -5694,20 +6094,38 @@ const App: React.FC = () => {
       }
 
       if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
-      addMessageToThread(threadId, {
-        role: 'user',
-        content: userContent,
+      // A new user dispatch supersedes login retries already pending for this
+      // thread. The authentication replay itself has already consumed its
+      // exact target before it reaches here.
+      if (!retryPayload) {
+        retireAuthRetriesForThreads([threadId]);
+      }
+      const authRetryPayload: TurnAuthRetryPayload = retryPayload ?? {
+        kind: 'turn',
+        modelId: model.id,
+        prompt: agentPrompt,
         attachments: turnAttachments,
-        ...(tasksToInject.length > 0
-          ? {
-              linkedTasks: tasksToInject.map((task) => ({
-                id: task.id,
-                title: task.title,
-                description: task.description,
-              })),
-            }
-          : {}),
-      });
+        ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
+        ...(runOrchestration ? { orchestration: runOrchestration } : {}),
+      };
+      // A resend replays a prompt that is already represented by the clicked
+      // failed turn's user message; appending it again would duplicate it.
+      if (!retryPayload) {
+        addMessageToThread(threadId, {
+          role: 'user',
+          content: userContent,
+          attachments: turnAttachments,
+          ...(tasksToInject.length > 0
+            ? {
+                linkedTasks: tasksToInject.map((task) => ({
+                  id: task.id,
+                  title: task.title,
+                  description: task.description,
+                })),
+              }
+            : {}),
+        });
+      }
       updateThread(threadId, { status: 'running' });
       pushLinkedTaskStatus(threadId, 'running');
 
@@ -5719,6 +6137,7 @@ const App: React.FC = () => {
         statusText: "I'm working on this now.",
         startedAt: new Date().toISOString(),
         activities: [],
+        authRetryPayload,
       });
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
@@ -5767,7 +6186,7 @@ const App: React.FC = () => {
               }
             : {}),
           ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
-          ...(orchestration ? { orchestration } : {}),
+          ...(runOrchestration ? { orchestration: runOrchestration } : {}),
         })
       );
       void startup.then((result) => {
@@ -5786,11 +6205,17 @@ const App: React.FC = () => {
           runOutputMessages.current.delete(runId);
           clearActiveRun(runId);
           appendToThreadMessage(threadId, messageId, result.error ?? 'The agent failed to start.');
+          const authProviderId =
+            model.providerId !== 'orion' && isProviderAuthErrorText(result.error)
+              ? model.providerId
+              : undefined;
           updateThreadMessage(threadId, messageId, {
             status: 'error',
             completedAt: new Date().toISOString(),
-            statusText: 'The agent failed to start.',
+            statusText: authProviderId ? 'The agent is logged out.' : 'The agent failed to start.',
             error: result.error,
+            authProviderId,
+            authRetryPayload: authProviderId ? authRetryPayload : undefined,
           });
           updateThread(threadId, { status: 'error' });
         }
@@ -5809,6 +6234,7 @@ const App: React.FC = () => {
       pushLinkedTaskStatus,
       trackRunStartup,
       refreshLinkedTasksBeforeDispatch,
+      retireAuthRetriesForThreads,
     ]
   );
 
@@ -5952,6 +6378,7 @@ const App: React.FC = () => {
       updateThreadMessage(threadId, lastRun.id, {
         statusText,
         completedAt: new Date().toISOString(),
+        authRetryPayload: undefined,
       });
     },
     [updateThreadMessage]
@@ -6043,6 +6470,10 @@ const App: React.FC = () => {
         }
       }
 
+      // An orchestrator stop is an explicit cancellation. Retire every queued
+      // or login-pending replay in the stopped subtree before live runs are
+      // untracked, otherwise the drain effect can restart historical work.
+      retireAuthRetriesForThreads(threadIds);
       const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
       const runsToStop: Array<{ threadId: string; runId: string }> = [];
       for (const candidate of stoppedThreads) {
@@ -6064,6 +6495,7 @@ const App: React.FC = () => {
             status: 'stopped',
             completedAt: new Date().toISOString(),
             statusText: 'Stopped by the orchestrator.',
+            authRetryPayload: undefined,
           });
         } else {
           markUntrackedRunStopped(runThreadId, 'Stopped by the orchestrator.');
@@ -6104,6 +6536,7 @@ const App: React.FC = () => {
       flushChunkBuffers,
       disposeThreadRuntime,
       markUntrackedRunStopped,
+      retireAuthRetriesForThreads,
     ]
   );
 
@@ -6288,11 +6721,8 @@ const App: React.FC = () => {
     (
       threadId: string,
       rawText: string,
-      goalAction: {
-        action: 'set' | 'resume';
-        objective?: string;
-        tokenBudget?: number;
-      }
+      goalAction: GoalRunAction,
+      retryPayload?: GoalAuthRetryPayload
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
@@ -6341,8 +6771,17 @@ const App: React.FC = () => {
           error: 'This epic’s rift workspace is not available',
         };
       }
-      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
-      if (!model) return { ok: false, error: 'Select an agent model first' };
+      const model = retryPayload
+        ? findExactAuthRetryModel(agentModels, retryPayload.modelId)
+        : findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      if (!model) {
+        return {
+          ok: false,
+          error: retryPayload
+            ? `The original model (${retryPayload.modelId}) is no longer available`
+            : 'Select an agent model first',
+        };
+      }
       if (model.providerId !== 'codex') {
         return { ok: false, error: '/goal is only available on Codex agents' };
       }
@@ -6359,7 +6798,19 @@ const App: React.FC = () => {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
 
-      addMessageToThread(threadId, { role: 'user', content: rawText });
+      if (!retryPayload) {
+        retireAuthRetriesForThreads([threadId]);
+      }
+      const authRetryPayload: GoalAuthRetryPayload = retryPayload ?? {
+        kind: 'goal',
+        modelId: model.id,
+        rawText,
+        prompt: goalAction.objective || 'Resume the goal.',
+        goal: goalAction,
+      };
+      if (!retryPayload) {
+        addMessageToThread(threadId, { role: 'user', content: rawText });
+      }
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
         content: '',
@@ -6368,6 +6819,7 @@ const App: React.FC = () => {
         statusText: 'Pursuing the goal.',
         startedAt: new Date().toISOString(),
         activities: [],
+        authRetryPayload,
       });
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
@@ -6381,7 +6833,7 @@ const App: React.FC = () => {
           threadId,
           epicId: thread.epicId,
           projectPath: workingDir,
-          prompt: goalAction.objective || 'Resume the goal.',
+          prompt: authRetryPayload.prompt,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
           resumeSessionId: thread.agentSessionIds?.codex,
@@ -6389,7 +6841,7 @@ const App: React.FC = () => {
           providerOptions: normalizedProviderSettings.codex?.options,
           codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
           codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
-          codexGoal: goalAction,
+          codexGoal: authRetryPayload.goal,
         })
         .then((result) => {
           if (result.ok && result.runId) {
@@ -6407,11 +6859,14 @@ const App: React.FC = () => {
             runOutputMessages.current.delete(runId);
             clearActiveRun(runId);
             appendToThreadMessage(threadId, messageId, result.error ?? 'The agent failed to start.');
+            const authProviderId = isProviderAuthErrorText(result.error) ? 'codex' : undefined;
             updateThreadMessage(threadId, messageId, {
               status: 'error',
               completedAt: new Date().toISOString(),
-              statusText: 'The agent failed to start.',
+              statusText: authProviderId ? 'The agent is logged out.' : 'The agent failed to start.',
               error: result.error,
+              authProviderId,
+              authRetryPayload: authProviderId ? authRetryPayload : undefined,
             });
             updateThread(threadId, { status: 'error' });
           }
@@ -6427,6 +6882,7 @@ const App: React.FC = () => {
       updateThread,
       updateThreadMessage,
       clearActiveRun,
+      retireAuthRetriesForThreads,
     ]
   );
 
@@ -6436,12 +6892,8 @@ const App: React.FC = () => {
     (
       threadId: string,
       rawText: string,
-      review: {
-        mode: 'uncommitted' | 'base' | 'commit' | 'custom';
-        base?: string;
-        commit?: string;
-        instructions?: string;
-      }
+      review: Omit<ReviewRunPayload, 'threadContext'>,
+      retryPayload?: ReviewAuthRetryPayload
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
@@ -6490,8 +6942,17 @@ const App: React.FC = () => {
           error: 'This epic’s rift workspace is not available',
         };
       }
-      const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
-      if (!model) return { ok: false, error: 'Select an agent model first' };
+      const model = retryPayload
+        ? findExactAuthRetryModel(agentModels, retryPayload.modelId)
+        : findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      if (!model) {
+        return {
+          ok: false,
+          error: retryPayload
+            ? `The original model (${retryPayload.modelId}) is no longer available`
+            : 'Select an agent model first',
+        };
+      }
       if (model.providerId !== 'codex') {
         return {
           ok: false,
@@ -6511,6 +6972,9 @@ const App: React.FC = () => {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
 
+      if (!retryPayload) {
+        retireAuthRetriesForThreads([threadId]);
+      }
       const reviewLabel =
         review.mode === 'base'
           ? `Code review against ${review.base}`
@@ -6527,7 +6991,20 @@ const App: React.FC = () => {
         updateThread(threadId, { title: 'Review Changes' });
       }
 
-      addMessageToThread(threadId, { role: 'user', content: rawText });
+      const codexReview = retryPayload?.review ?? {
+        ...review,
+        threadContext: buildReviewThreadContext(thread),
+      };
+      const authRetryPayload: ReviewAuthRetryPayload = retryPayload ?? {
+        kind: 'review',
+        modelId: model.id,
+        rawText,
+        prompt: review.instructions || reviewLabel,
+        review: codexReview,
+      };
+      if (!retryPayload) {
+        addMessageToThread(threadId, { role: 'user', content: rawText });
+      }
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
         content: '',
@@ -6536,6 +7013,7 @@ const App: React.FC = () => {
         statusText: 'Reviewing changes.',
         startedAt: new Date().toISOString(),
         activities: [],
+        authRetryPayload,
       });
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
@@ -6549,7 +7027,7 @@ const App: React.FC = () => {
           threadId,
           epicId: thread.epicId,
           projectPath: workingDir,
-          prompt: review.instructions || reviewLabel,
+          prompt: authRetryPayload.prompt,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
           resumeSessionId: thread.agentSessionIds?.codex,
@@ -6557,10 +7035,7 @@ const App: React.FC = () => {
           providerOptions: normalizedProviderSettings.codex?.options,
           codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
           codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
-          codexReview: {
-            ...review,
-            threadContext: buildReviewThreadContext(thread),
-          },
+          codexReview: authRetryPayload.review,
         })
         .then((result) => {
           if (result.ok && result.runId) {
@@ -6578,11 +7053,14 @@ const App: React.FC = () => {
             runOutputMessages.current.delete(runId);
             clearActiveRun(runId);
             appendToThreadMessage(threadId, messageId, result.error ?? 'The review failed to start.');
+            const authProviderId = isProviderAuthErrorText(result.error) ? 'codex' : undefined;
             updateThreadMessage(threadId, messageId, {
               status: 'error',
               completedAt: new Date().toISOString(),
-              statusText: 'The review failed to start.',
+              statusText: authProviderId ? 'The agent is logged out.' : 'The review failed to start.',
               error: result.error,
+              authProviderId,
+              authRetryPayload: authProviderId ? authRetryPayload : undefined,
             });
             updateThread(threadId, { status: 'error' });
           }
@@ -6598,8 +7076,169 @@ const App: React.FC = () => {
       updateThread,
       updateThreadMessage,
       clearActiveRun,
+      retireAuthRetriesForThreads,
     ]
   );
+
+  const retryAuthFailure = useCallback(
+    async (
+      providerId: string,
+      target: AuthRetryTarget,
+      generation: number
+    ): Promise<AuthRetryResult> => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === target.threadId);
+      const failedMessage = findRetryableAuthMessage(thread, target, providerId);
+      if (!failedMessage?.authRetryPayload) {
+        return { ok: false, error: 'That failed turn is no longer available to resume' };
+      }
+      const retryPayload = failedMessage.authRetryPayload;
+      const isRetryStillCurrent = () =>
+        (authRetryDispatchGenerationsRef.current.get(target.threadId) ?? 0) === generation &&
+        !authRetrySuspendedThreadIdsRef.current.has(target.threadId);
+      if (!isRetryStillCurrent()) {
+        return {
+          ok: false,
+          cancelled: true,
+          error: 'The workspace changed before the request could resume',
+        };
+      }
+      const runAlreadyStartingOrActive =
+        thread?.status === 'running' ||
+        pendingTurnStartsRef.current.has(target.threadId) ||
+        Boolean(activeRunsByThreadRef.current[target.threadId]) ||
+        [...runOutputMessages.current.values()].some((run) => run.threadId === target.threadId);
+      if (runAlreadyStartingOrActive) {
+        const error = 'The thread already has a run in flight';
+        updateThreadMessage(target.threadId, target.messageId, {
+          statusText: 'Authentication succeeded, but the request could not be resumed.',
+          error,
+        });
+        return { ok: false, error };
+      }
+
+      // Turn dispatch owns this reservation while it awaits linked-task
+      // refresh. Goal and review dispatch synchronously, so reserve their
+      // thread here before the queued-message effect can observe stale state.
+      const reservesThreadStart = retryPayload.kind !== 'turn';
+      if (reservesThreadStart) {
+        pendingTurnStartsRef.current.add(target.threadId);
+      }
+      let result: AuthRetryResult;
+      try {
+        result = await dispatchAuthRetryPayload(retryPayload, {
+          turn: (payload) =>
+            startTurnForThread(target.threadId, '', [], {
+              resend: payload,
+              isRetryStillCurrent,
+            }),
+          goal: (payload) =>
+            isRetryStillCurrent()
+              ? startGoalRunForThread(target.threadId, payload.rawText, payload.goal, payload)
+              : {
+                  ok: false,
+                  cancelled: true,
+                  error: 'The workspace changed before the request could resume',
+                },
+          review: (payload) =>
+            isRetryStillCurrent()
+              ? startReviewForThread(target.threadId, payload.rawText, payload.review, payload)
+              : {
+                  ok: false,
+                  cancelled: true,
+                  error: 'The workspace changed before the request could resume',
+                },
+        });
+      } catch (error) {
+        result = {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Could not resume the request',
+        };
+      } finally {
+        if (reservesThreadStart) {
+          pendingTurnStartsRef.current.delete(target.threadId);
+        }
+      }
+      if (result.cancelled) return result;
+      updateThreadMessage(target.threadId, target.messageId, {
+        statusText: result.ok
+          ? 'The agent was logged out — authenticated and resumed.'
+          : 'Authentication succeeded, but the request could not be resumed.',
+        error: result.ok ? undefined : (result.error ?? 'Could not resume the request'),
+        // Preserve the exact replay payload on dispatch failure. Once a new
+        // run is accepted, its own message carries the payload and this
+        // historical Authenticate action can be retired.
+        ...(result.ok
+          ? {
+              authProviderId: undefined,
+              authRetryPayload: undefined,
+            }
+          : {
+              authProviderId: providerId,
+              authRetryPayload: retryPayload,
+            }),
+      });
+      return result;
+    },
+    [startGoalRunForThread, startReviewForThread, startTurnForThread, updateThreadMessage]
+  );
+
+  useEffect(() => {
+    retryAuthFailureRef.current = retryAuthFailure;
+    return () => {
+      if (retryAuthFailureRef.current === retryAuthFailure) {
+        retryAuthFailureRef.current = null;
+      }
+    };
+  }, [retryAuthFailure]);
+
+  // Drain at most one authentication replay per idle thread. Keep the head in
+  // the queue while dispatch awaits linked-task refresh so workspace
+  // transitions can cancel it without losing the target.
+  useEffect(() => {
+    for (const [threadId, queue] of authRetryQueuesRef.current) {
+      if (queue.length === 0) {
+        authRetryQueuesRef.current.delete(threadId);
+        continue;
+      }
+      if (authRetryDispatchingThreadsRef.current.has(threadId)) continue;
+      if (authRetrySuspendedThreadIdsRef.current.has(threadId)) continue;
+      const thread = threads.find((candidate) => candidate.id === threadId);
+      const runInFlight =
+        thread?.status === 'running' ||
+        Boolean(activeRunsByThread[threadId]) ||
+        pendingTurnStartsRef.current.has(threadId) ||
+        [...runOutputMessages.current.values()].some((run) => run.threadId === threadId);
+      if (runInFlight) continue;
+
+      const next = queue[0];
+      if (!next) continue;
+      const generation = authRetryDispatchGenerationsRef.current.get(threadId) ?? 0;
+      const removeLiveQueueHead = () => {
+        const liveQueue = authRetryQueuesRef.current.get(threadId);
+        if (liveQueue?.[0] !== next) return;
+        liveQueue.shift();
+        if (liveQueue.length === 0) authRetryQueuesRef.current.delete(threadId);
+      };
+      authRetryDispatchingThreadsRef.current.add(threadId);
+      void retryAuthFailure(next.providerId, next.target, generation)
+        .then((result) => {
+          if (!result.cancelled) removeLiveQueueHead();
+          if (!result.ok && !result.cancelled) {
+            toast.error(result.error ?? 'Could not resume the thread after authenticating');
+          }
+        })
+        .catch((error) => {
+          removeLiveQueueHead();
+          toast.error(
+            error instanceof Error ? error.message : 'Could not resume the thread after authenticating'
+          );
+        })
+        .finally(() => {
+          authRetryDispatchingThreadsRef.current.delete(threadId);
+          setAuthRetryQueueVersion((version) => version + 1);
+        });
+    }
+  }, [activeRunsByThread, authRetryQueueVersion, retryAuthFailure, threads]);
 
   // Dismissing a still-running aside also kills its forked run.
   const dismissBtwExchange = useCallback(
@@ -6650,6 +7289,12 @@ const App: React.FC = () => {
   // failed transcript entry.
   const stopTrackedGoalRun = async (runId: string, statusText: string) => {
     const tracked = runOutputMessages.current.get(runId);
+    if (tracked) {
+      // Pause/clear is an explicit stop, including for a goal that was resumed
+      // from an authentication queue. Remove later historical retries before
+      // clearing this run and making the thread idle.
+      retireAuthRetriesForThreads([tracked.threadId]);
+    }
     runOutputMessages.current.delete(runId);
     clearActiveRun(runId);
     flushChunkBuffers();
@@ -6658,6 +7303,7 @@ const App: React.FC = () => {
         status: 'stopped',
         completedAt: new Date().toISOString(),
         statusText,
+        authRetryPayload: undefined,
       });
       updateThread(tracked.threadId, { status: 'idle' });
     }
@@ -7198,6 +7844,7 @@ const App: React.FC = () => {
         status: 'stopped',
         completedAt: new Date().toISOString(),
         statusText: 'Interrupted — steered to a new instruction.',
+        authRetryPayload: undefined,
       });
     }
     try {
@@ -7281,6 +7928,7 @@ const App: React.FC = () => {
                 : 'Finished before the steer could interrupt it.',
             ...(failed && failureError ? { error: failureError } : {}),
             ...(authProviderId ? { authProviderId } : {}),
+            authRetryPayload: authProviderId ? trackedMessage?.authRetryPayload : undefined,
             ...(outcome?.changedFiles ? { changedFiles: outcome.changedFiles } : {}),
             ...(outcome?.stats ? { stats: outcome.stats } : {}),
           });
@@ -7337,6 +7985,7 @@ const App: React.FC = () => {
           status: trackedMessage?.status ?? 'running',
           completedAt: trackedMessage?.completedAt,
           statusText: trackedMessage?.statusText ?? "I'm working on this now.",
+          authRetryPayload: trackedMessage?.authRetryPayload,
         });
         updateThread(tracked.threadId, { status: 'running' });
       }
@@ -7420,6 +8069,11 @@ const App: React.FC = () => {
       }
     }
 
+    // Stop retires every not-yet-dispatched authentication replay in the
+    // selected thread and its descendants before clearing any active run.
+    // A later login completion must not restart work the user just halted.
+    retireAuthRetriesForThreads(threadIds);
+
     const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
     const runsToStop: Array<{ threadId: string; runId: string }> = [];
     for (const candidate of stoppedThreads) {
@@ -7440,6 +8094,7 @@ const App: React.FC = () => {
           status: 'stopped',
           completedAt: new Date().toISOString(),
           statusText: 'Stopped by user.',
+          authRetryPayload: undefined,
         });
       } else {
         markUntrackedRunStopped(runThreadId, 'Stopped by user.');

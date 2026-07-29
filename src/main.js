@@ -4761,22 +4761,38 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
   };
 });
 
-ipcMain.handle('providers:authenticate', async (event, providerId) => {
+ipcMain.handle('providers:authenticate', async (event, providerId, attemptId) => {
   const { result, completion } = await authenticateProviderTool(providerId);
   if (result?.ok) {
     invalidateAgentModelsCache();
     const sender = event.sender;
     const generation = (providerAuthenticationGenerations.get(providerId) ?? 0) + 1;
     providerAuthenticationGenerations.set(providerId, generation);
-    void waitForProviderAuthentication(providerId, completion).then((authenticated) => {
-      if (providerAuthenticationGenerations.get(providerId) !== generation) return;
-      providerAuthenticationGenerations.delete(providerId);
-      if (!authenticated) return;
-      invalidateAgentModelsCache();
-      if (!sender.isDestroyed()) {
-        sender.send('providers:authenticated', { providerId });
+    void (async () => {
+      let authenticated = false;
+      try {
+        authenticated = await waitForProviderAuthentication(providerId, completion);
+      } catch {
+        authenticated = false;
       }
-    });
+      const latestAttempt = providerAuthenticationGenerations.get(providerId) === generation;
+      if (latestAttempt) {
+        providerAuthenticationGenerations.delete(providerId);
+      }
+      if (!sender.isDestroyed() && typeof attemptId === 'string' && attemptId) {
+        sender.send('providers:authentication-completed', {
+          providerId,
+          attemptId,
+          authenticated,
+        });
+      }
+      if (authenticated && latestAttempt) {
+        invalidateAgentModelsCache();
+        if (!sender.isDestroyed()) {
+          sender.send('providers:authenticated', { providerId });
+        }
+      }
+    })();
   }
   return result;
 });

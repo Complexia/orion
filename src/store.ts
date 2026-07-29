@@ -245,6 +245,70 @@ export type ImageAttachment = {
   size: number;
 };
 
+export type AgentModelMention = {
+  modelId: string;
+  providerId: string;
+  slug: string;
+  label: string;
+};
+
+export type AgentOrchestrationPayload = {
+  isOrchestrator: boolean;
+  roles: Array<{
+    role: string;
+    roleLabel: string;
+    modelId: string;
+    providerId: string;
+    slug: string;
+    modelLabel: string;
+  }>;
+  generalInstructions: string;
+};
+
+export type GoalRunAction = {
+  action: 'set' | 'resume';
+  objective?: string;
+  tokenBudget?: number;
+};
+
+export type ReviewRunPayload = {
+  mode: 'uncommitted' | 'base' | 'commit' | 'custom';
+  base?: string;
+  commit?: string;
+  instructions?: string;
+  /** Frozen transcript context from the original failed review dispatch. */
+  threadContext?: string;
+};
+
+/**
+ * Exact provider payload needed to replay a logged-out run. It lives on the
+ * agent-run message so authentication can resume the clicked failure after a
+ * renderer restart without consulting mutable thread-level state.
+ */
+export type AuthRetryPayload =
+  | {
+      kind: 'turn';
+      modelId: string;
+      prompt: string;
+      attachments: ImageAttachment[];
+      mentions?: AgentModelMention[];
+      orchestration?: AgentOrchestrationPayload;
+    }
+  | {
+      kind: 'goal';
+      modelId: string;
+      rawText: string;
+      prompt: string;
+      goal: GoalRunAction;
+    }
+  | {
+      kind: 'review';
+      modelId: string;
+      rawText: string;
+      prompt: string;
+      review: ReviewRunPayload;
+    };
+
 export type Message = {
   id: string;
   role: 'user' | 'agent' | 'system';
@@ -265,6 +329,14 @@ export type Message = {
    * dead-end error.
    */
   authProviderId?: string;
+  /** Persisted exact dispatch used only when this run fails authentication. */
+  authRetryPayload?: AuthRetryPayload;
+  /**
+   * Exact provider-login attempt launched for this failure. Persisting the
+   * association lets a reloaded renderer resume only the clicked failures
+   * when that specific CLI process completes.
+   */
+  authRetryAttemptId?: string;
   changedFiles?: ChangedFileSummary[];
   /** Per-turn token usage, when the provider reports it (grok ACP). */
   stats?: TurnTokenStats;
@@ -1728,6 +1800,8 @@ export const useOrionStore = create<OrionState>()(
                   status: 'stopped' as const,
                   completedAt: message.completedAt ?? restartedAt,
                   statusText: 'Interrupted by app restart.',
+                  authRetryPayload: undefined,
+                  authRetryAttemptId: undefined,
                 };
               }
               if (message.id === liveWaitId) {

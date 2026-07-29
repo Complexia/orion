@@ -107,11 +107,17 @@ contextBridge.exposeInMainWorld('orion', {
   },
   checkProviderUpdates: (input) => ipcRenderer.invoke('providers:checkUpdates', input),
   updateProviders: (input) => ipcRenderer.invoke('providers:updateAll', input),
-  authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
+  authenticateProvider: (providerId, attemptId) =>
+    ipcRenderer.invoke('providers:authenticate', providerId, attemptId),
   onProviderAuthenticated: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on('providers:authenticated', listener);
     return () => ipcRenderer.removeListener('providers:authenticated', listener);
+  },
+  onProviderAuthenticationCompleted: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('providers:authentication-completed', listener);
+    return () => ipcRenderer.removeListener('providers:authentication-completed', listener);
   },
 
   // Orion account
