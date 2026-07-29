@@ -1,7 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
 import {
-  FolderOpen,
-  FolderPlus,
   Plus,
   Trash2,
   MessageSquare,
@@ -12,58 +10,33 @@ import {
   GitPullRequest,
   GitPullRequestClosed,
   ChevronDown,
-  ChevronRight,
   Ellipsis,
-  EyeOff,
   SquarePen,
   Check,
   X,
-  Folder,
-  FileText,
-  Pin,
-  PinOff,
   Play,
   Pause,
   Target,
-  Search,
   Shield,
   Square,
   Terminal,
-  Wrench,
   Bot,
   Sparkles,
   ArrowUp,
-  Download,
   Image as ImageIcon,
   RefreshCw,
-  Settings,
-  Keyboard,
-  Link,
-  LoaderCircle,
   Archive,
-  Plug,
-  Palette,
-  UserRound,
-  LogIn,
-  LogOut,
   Cloud,
   CloudUpload,
   CloudDownload,
   Globe,
-  Copy,
   AppWindow,
   SquareArrowOutUpRight,
   ListPlus,
   Zap,
   SquareKanban,
   CircleCheck,
-  MousePointerClick,
-  ListChecks,
-  FilePen,
-  BookOpen,
-  Workflow,
   FlaskConical,
-  HardDrive,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -84,7 +57,6 @@ import {
   type OrchestrationRoleId,
   type Project,
   type ProviderId,
-  type ProviderRuntimeOptions,
   type Thread,
   type ThreadGoal,
   type TurnTokenStats,
@@ -101,7 +73,6 @@ import {
   codexServiceTierOptions,
   defaultAgentModelId,
   defaultClaudeContextWindow,
-  defaultClaudeReasoningEffort,
   defaultCodexServiceTier,
   defaultGrokReasoningEffort,
   getEffectiveCodexReasoningEffort,
@@ -111,7 +82,6 @@ import {
   isClaudeCodeCliModelId,
   isOrionModelId,
   providerFollowUpSupport,
-  providerOptionDefs,
   type AgentModel,
   type AgentProviderId,
   type ClaudeContextWindow,
@@ -121,117 +91,70 @@ import {
   type GrokReasoningEffort,
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
-import { CodeEditorPane } from './app/CodeEditorPane';
+import { CodeWorkspace } from './app/CodeWorkspace';
+import { AgentsSidebar, type AgentsSidebarModel } from './app/AgentsSidebar';
+import type { AppDialogsModel } from './app/AppDialogs';
 import { ProjectIcon } from './app/ProjectIcon';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
 import { ModelPickerPopover } from './app/ModelPickerPopover';
-import { SelectMenu } from './app/SelectMenu';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
-import { AttachmentThumb, buildPromptWithAttachments, formatAttachmentSize, getDroppedFilePath, isMediaFile, isVideoAttachment, isVideoFile } from './app/attachments';
+import {
+  AttachmentThumb,
+  buildPromptWithAttachments,
+  formatAttachmentSize,
+  getDroppedFilePath,
+  isMediaFile,
+  isVideoAttachment,
+  isVideoFile,
+} from './app/attachments';
 import { AgentFamilySwitcher, type ChatScrollPosition, ChatTranscript, isProviderAuthErrorText } from './app/chat';
-import { type FileTreeItem, FileTreeNode, InlineRenameInput } from './app/fileTree';
-import { claudeOneMillionOnlyModelSlugs, getDefaultClaudeReasoningEffort, getEffectiveClaudeContextWindow } from './app/modelPrefs';
-import { accessModeOptions, buildLinkedTaskContext, buildModelMentionsContext, buildOrchestrationContext, buildReviewThreadContext, linkedTaskFromBoardTask, linkedTaskMediaAttachments, linkedTaskStatusLabel, modelMentionToken, orchestrationRoleMeta, parseModelMentions } from './app/promptContext';
-import { ThreadSearchResults } from './app/threadSearch';
+import { InlineRenameInput } from './app/fileTree';
+import {
+  claudeOneMillionOnlyModelSlugs,
+  getDefaultClaudeReasoningEffort,
+  getEffectiveClaudeContextWindow,
+} from './app/modelPrefs';
+import {
+  accessModeOptions,
+  buildLinkedTaskContext,
+  buildModelMentionsContext,
+  buildOrchestrationContext,
+  buildReviewThreadContext,
+  linkedTaskFromBoardTask,
+  linkedTaskMediaAttachments,
+  linkedTaskStatusLabel,
+  modelMentionToken,
+  orchestrationRoleMeta,
+  parseModelMentions,
+} from './app/promptContext';
 import { formatShortTime, getThreadActivityTime } from './app/time';
 import { deriveTitle, isDefaultTitle, isPlausibleTitle, tryGenerateBetterTitle } from './app/titles';
+import type { SidebarFooterProps } from './app/SidebarFooter';
+import type { SettingsPageProps } from './app/SettingsPage';
+import type {
+  AppUpdateState,
+  EpicCommitDialogState,
+  EpicPrBaseDialogState,
+  EpicPrStatus,
+  EpicSettleDialogState,
+  GitRepoState,
+  NewEpicRiftBranches,
+  OrionAccountState,
+  ProviderUpdateState,
+  RiftSweepDialogState,
+  SettingsTab,
+} from './app/appTypes';
 
 // Lazy-loaded so xterm (and the TerminalView code) is split into its own
 // chunk and only fetched/parsed when a Claude Code CLI thread is actually
 // opened — the pseudo-model costs nothing at startup. (Its main-process
 // counterpart, node-pty, is likewise only import()ed on first terminal:ensure.)
 const TerminalView = React.lazy(() => import('./TerminalView'));
+const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
+const AppDialogs = React.lazy(() => import('./app/AppDialogs'));
 
-type GitBranchInfo = {
-  name: string;
-  current: boolean;
-  hasUpstream: boolean;
-};
-
-type GitRepoState = {
-  ok: boolean;
-  root?: string;
-  currentBranch?: string | null;
-  detachedHead?: string | null;
-  branches: GitBranchInfo[];
-  hasUncommittedChanges: boolean;
-  ahead?: number;
-  behind?: number;
-  error?: string;
-};
-
-const normalizeRepositoryPath = (value: string) =>
-  value.replace(/\\/g, '/').replace(/\/+$/, '');
-
-type ProviderUpdateItem = {
-  id: string;
-  label: string;
-  command: string;
-  enabled: boolean;
-  installed: boolean;
-  path?: string | null;
-  currentVersion?: string | null;
-  latestVersion?: string | null;
-  updateAvailable: boolean;
-  status: 'available' | 'current' | 'unknown' | 'missing' | 'error';
-  auth: {
-    authenticated: boolean | null;
-    status: 'authenticated' | 'unauthenticated' | 'unknown' | 'missing' | 'error';
-    label: string;
-    detail?: string;
-  };
-  error?: string;
-};
-
-type ProviderUpdateState = {
-  checkedAt: string;
-  updatesAvailable: number;
-  providers: ProviderUpdateItem[];
-};
-
-type AppUpdateState = {
-  status:
-    | 'idle'
-    | 'checking'
-    | 'available'
-    | 'downloading'
-    | 'downloaded'
-    | 'restarting'
-    | 'not-available'
-    | 'error';
-  currentVersion: string;
-  checkedAt?: string | null;
-  availableVersion?: string | null;
-  progress?: {
-    percent: number;
-    transferred: number;
-    total: number;
-    bytesPerSecond: number;
-  } | null;
-  error?: string | null;
-};
-
-type OrionAccountState = {
-  authenticated: boolean;
-  user: {
-    id: string;
-    email?: string | null;
-    name?: string | null;
-    imageUrl?: string | null;
-  } | null;
-  expiresAt: string | null;
-};
-
-type SettingsTab =
-  | 'account'
-  | 'general'
-  | 'providers'
-  | 'orchestration'
-  | 'computer-use'
-  | 'storage'
-  | 'cosmetics'
-  | 'experimental';
+const normalizeRepositoryPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
 
 /**
  * Sizes come from block accounting, which counts a copy-on-write clone's
@@ -279,8 +202,6 @@ const EPIC_PR_STATE_REFRESH_MS = 60_000;
 // is most likely stale, so focus gets its own much shorter throttle.
 const EPIC_PR_STATE_FOCUS_REFRESH_MS = 15_000;
 
-type EpicPrStatus = 'open' | 'merged' | 'closed';
-
 type EpicPrLookupRequest = {
   expectedPrUrl: string;
   order: number;
@@ -304,8 +225,7 @@ const UNCLAIMED_EPIC_GIT_WORKSPACE_KEY = 'git:unclaimed';
 
 const epicGitWorkspacesOverlap = (left: string, right: string) =>
   left === right ||
-  ((left === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY ||
-    right === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY) &&
+  ((left === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY || right === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY) &&
     !left.startsWith('rift:') &&
     !right.startsWith('rift:'));
 
@@ -327,9 +247,7 @@ const epicGitWorkspaceBusy = (
 // reads and URL-only batch reads both update the persisted epic, so rendering
 // from that value prevents an older local status cache masking a newer batch
 // result when the selected workspace later becomes unavailable.
-const epicPrStatus = (
-  epic: Pick<Epic, 'prUrl' | 'prState'> | undefined | null
-): EpicPrStatus | null => {
+const epicPrStatus = (epic: Pick<Epic, 'prUrl' | 'prState'> | undefined | null): EpicPrStatus | null => {
   if (!epic?.prUrl) return null;
   switch (epic.prState) {
     case 'OPEN':
@@ -359,17 +277,13 @@ const UTILITY_MODEL_PREFERENCE = [
 // Threads grouped under an epic that has a rift workspace (experimental Rifts
 // feature) run their agent processes inside the rift instead of the project
 // directory.
-const threadWorkingDir = (
-  epics: Epic[],
-  thread: { epicId?: string } | undefined,
-  project: Project
-) => {
+const threadWorkingDir = (epics: Epic[], thread: { epicId?: string } | undefined, project: Project) => {
   const epic = thread?.epicId ? epics.find((candidate) => candidate.id === thread.epicId) : undefined;
   // A thread that belongs to a Rift epic must never silently fall back to the
   // source checkout while that workspace is absent. Callers treat null as a
   // hard launch guard.
   if (epic?.riftReleased || epic?.riftRequest || epic?.riftCleanupPending) return null;
-  return epic?.riftPath ? epic.riftWorkingDir ?? epic.riftPath : project.path;
+  return epic?.riftPath ? (epic.riftWorkingDir ?? epic.riftPath) : project.path;
 };
 
 // Provider-native ids are not necessarily globally unique (Kimi uses values
@@ -381,11 +295,7 @@ const descendantThreadIds = (threads: Thread[], rootThreadId: string): Set<strin
   while (foundChild) {
     foundChild = false;
     for (const thread of threads) {
-      if (
-        thread.parentThreadId &&
-        ids.has(thread.parentThreadId) &&
-        !ids.has(thread.id)
-      ) {
+      if (thread.parentThreadId && ids.has(thread.parentThreadId) && !ids.has(thread.id)) {
         ids.add(thread.id);
         foundChild = true;
       }
@@ -493,24 +403,54 @@ const EpicDescriptionEditor: React.FC<{
 };
 
 const runtimeThreadsForEpic = (threads: Thread[], epicId: string) => {
-  const threadIds = new Set(
-    threads.filter((thread) => thread.epicId === epicId).map((thread) => thread.id)
-  );
+  const threadIds = new Set(threads.filter((thread) => thread.epicId === epicId).map((thread) => thread.id));
   let foundChild = true;
   while (foundChild) {
     foundChild = false;
     for (const thread of threads) {
-      if (
-        thread.parentThreadId &&
-        threadIds.has(thread.parentThreadId) &&
-        !threadIds.has(thread.id)
-      ) {
+      if (thread.parentThreadId && threadIds.has(thread.parentThreadId) && !threadIds.has(thread.id)) {
         threadIds.add(thread.id);
         foundChild = true;
       }
     }
   }
   return threads.filter((thread) => threadIds.has(thread.id));
+};
+
+const formatCheckedTime = (iso: string): string => {
+  try {
+    const then = new Date(iso).getTime();
+    const mins = Math.max(0, Math.floor((Date.now() - then) / 60000));
+    if (mins < 1) return 'just now';
+    if (mins === 1) return '1m ago';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+  } catch {
+    return 'recently';
+  }
+};
+
+const renderThreadCliBadge = (thread: Thread) =>
+  isClaudeCodeCliModelId(thread.modelId) ? (
+    <span className="thread-cli-badge" title="Claude Code CLI" aria-label="Claude Code CLI">
+      <Terminal size={10} strokeWidth={2.4} aria-hidden />
+    </span>
+  ) : null;
+
+const renderThreadStatusDot = (thread: Thread) => {
+  if (thread.status === 'running') {
+    return <span className="thread-working-dot" title="Working" />;
+  }
+  if (!thread.finishedUnseenAt) return null;
+  const failed = thread.status === 'error';
+  return (
+    <span
+      className={`thread-finished-dot ${failed ? 'error' : ''}`}
+      title={failed ? 'Failed — not opened yet' : 'Finished — not opened yet'}
+    />
+  );
 };
 
 const App: React.FC = () => {
@@ -550,9 +490,6 @@ const App: React.FC = () => {
     workspacePath,
     setWorkspacePath,
     activeFilePath,
-    openFile,
-    closeFile,
-    setActiveFile,
     closeAllFiles,
     providerSettings,
     setProviderEnabled,
@@ -608,9 +545,6 @@ const App: React.FC = () => {
       workspacePath: state.workspacePath,
       setWorkspacePath: state.setWorkspacePath,
       activeFilePath: state.activeFilePath,
-      openFile: state.openFile,
-      closeFile: state.closeFile,
-      setActiveFile: state.setActiveFile,
       closeAllFiles: state.closeAllFiles,
       providerSettings: state.providerSettings,
       setProviderEnabled: state.setProviderEnabled,
@@ -631,26 +565,8 @@ const App: React.FC = () => {
       removeBtwExchange: state.removeBtwExchange,
     }))
   );
-  const threadShellSignatures = useOrionStore(
-    useShallow((state) => state.threads.map(threadShellSignature))
-  );
-  const threads = useMemo(
-    () => useOrionStore.getState().threads,
-    [threadShellSignatures]
-  );
-  const openFileShellSignatures = useOrionStore(
-    useShallow((state) =>
-      state.openFiles.map((file) => `${file.path}\u0000${file.isDirty ? '1' : '0'}`)
-    )
-  );
-  const openFiles = useMemo(
-    () => useOrionStore.getState().openFiles,
-    [openFileShellSignatures]
-  );
-
-  const [treeRoot, setTreeRoot] = useState<string | null>(null);
-  const [treeItems, setTreeItems] = useState<FileTreeItem[]>([]);
-  const [treeRefreshToken, setTreeRefreshToken] = useState(0);
+  const threadShellSignatures = useOrionStore(useShallow((state) => state.threads.map(threadShellSignature)));
+  const threads = useMemo(() => useOrionStore.getState().threads, [threadShellSignatures]);
   // Bumped when a turn completes without the thread leaving 'running' (a
   // Claude turn still waiting on background agents) — invisible to the
   // runningAgentCount-based refresh below, but its files are on disk.
@@ -665,7 +581,7 @@ const App: React.FC = () => {
   useEffect(() => {
     activeRunsByThreadRef.current = activeRunsByThread;
   }, [activeRunsByThread]);
-  const activeRunId = selectedThreadId ? activeRunsByThread[selectedThreadId] ?? null : null;
+  const activeRunId = selectedThreadId ? (activeRunsByThread[selectedThreadId] ?? null) : null;
   const isSending = Boolean(activeRunId);
   const clearActiveRun = useCallback((runId: string) => {
     setActiveRunsByThread((current) => {
@@ -688,7 +604,10 @@ const App: React.FC = () => {
   const [utilityModelTab, setUtilityModelTab] = useState<AgentProviderId>('codex');
   // Active @-mention token in the composer: index of the '@' and the query
   // typed after it (null when the caret isn't inside a mention token).
-  const [chatMention, setChatMention] = useState<{ start: number; query: string } | null>(null);
+  const [chatMention, setChatMention] = useState<{
+    start: number;
+    query: string;
+  } | null>(null);
   const [chatMentionIndex, setChatMentionIndex] = useState(0);
   // Start offset of a token dismissed with Escape, so it stays closed until
   // the user begins a new mention.
@@ -707,9 +626,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!branchPickerOpen) setCreatingBranch(false);
   }, [branchPickerOpen]);
-  const [openWithApps, setOpenWithApps] = useState<
-    Array<{ id: string; name: string; icon: string | null }>
-  >([]);
+  const [openWithApps, setOpenWithApps] = useState<Array<{ id: string; name: string; icon: string | null }>>([]);
   const [openWithOpen, setOpenWithOpen] = useState(false);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
@@ -754,11 +671,7 @@ const App: React.FC = () => {
   const [newEpicRiftBaseBranch, setNewEpicRiftBaseBranch] = useState<string | null>(null);
   // Local branches of the modal's selected project, for the base picker.
   // Tagged with the project id so a stale list can't feed another project.
-  const [newEpicRiftBranches, setNewEpicRiftBranches] = useState<{
-    projectId: string;
-    currentBranch: string | null;
-    branches: string[];
-  } | null>(null);
+  const [newEpicRiftBranches, setNewEpicRiftBranches] = useState<NewEpicRiftBranches | null>(null);
   // Rift binary availability, fetched once (null while unknown).
   const [riftStatus, setRiftStatus] = useState<{
     available: boolean;
@@ -836,60 +749,32 @@ const App: React.FC = () => {
   // a click-time guard sees a just-started action before React re-renders.
   const [epicGitBusy, setEpicGitBusy] = useState<Record<string, EpicGitBusyEntry>>({});
   const epicGitBusyRef = useRef<Record<string, EpicGitBusyEntry>>({});
-  const markEpicGitBusy = useCallback(
-    (epicId: string, kind: EpicGitBusyKind | null, workspaceKey?: string) => {
-      const next = { ...epicGitBusyRef.current };
-      if (kind) next[epicId] = { kind, workspaceKey };
-      else delete next[epicId];
-      epicGitBusyRef.current = next;
-      setEpicGitBusy(next);
-    },
-    []
-  );
+  const markEpicGitBusy = useCallback((epicId: string, kind: EpicGitBusyKind | null, workspaceKey?: string) => {
+    const next = { ...epicGitBusyRef.current };
+    if (kind) next[epicId] = { kind, workspaceKey };
+    else delete next[epicId];
+    epicGitBusyRef.current = next;
+    setEpicGitBusy(next);
+  }, []);
   const anyEpicGitBusy = Object.keys(epicGitBusy).length > 0;
   // Message dialog shown before an epic's commit & push. An empty message
   // hands the write back to the epic message model.
-  const [epicCommitDialog, setEpicCommitDialog] = useState<{
-    epic: Epic;
-    message: string;
-  } | null>(null);
+  const [epicCommitDialog, setEpicCommitDialog] = useState<EpicCommitDialogState | null>(null);
   // Base-branch and message picker shown before opening an epic's pull
   // request. Holds the origin branches fetched for the picker, the user's
   // current selection, and their optional hand-written title/description.
   // The dialog opens before origin has answered, so the branch list starts
   // empty and loading while the base branch comes from local git.
-  const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<{
-    instanceId: number;
-    epic: Epic;
-    branches: string[];
-    branchesLoading: boolean;
-    branchesError: string;
-    defaultBranch: string;
-    sourceBranch: string;
-    baseBranch: string;
-    message: string;
-  } | null>(null);
+  const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<EpicPrBaseDialogState | null>(null);
   const epicPrBaseDialogInstanceRef = useRef(0);
-  const [epicSettleDialog, setEpicSettleDialog] = useState<{
-    epic: Epic;
-    warnings: string[];
-    /** Whether freeing the rift is offered at all — false unless Orion could
-     *  verify the workspace has nothing uncommitted or unpushed left in it. */
-    canReleaseRift: boolean;
-    /** Free the rift as part of settling; seeded from riftsSettings.releaseOnSettle. */
-    releaseRift: boolean;
-  } | null>(null);
+  const [epicSettleDialog, setEpicSettleDialog] = useState<EpicSettleDialogState | null>(null);
   const [riftStorageState, setRiftStorageState] = useState<RiftStorageState | null>(null);
   const [riftStorageBusy, setRiftStorageBusy] = useState(false);
   const riftStorageQueueRef = useRef<Promise<void>>(Promise.resolve());
   const riftStorageQueueDepthRef = useRef(0);
   // Rifts the user chose to free despite uncommitted or unpushed work.
   const [riftStorageForced, setRiftStorageForced] = useState<Record<string, boolean>>({});
-  const [riftSweepDialog, setRiftSweepDialog] = useState<{
-    entries: RiftStorageEntry[];
-    /** Also run `rift gc`, which permanently empties Rift's trash machine-wide. */
-    runGc: boolean;
-  } | null>(null);
+  const [riftSweepDialog, setRiftSweepDialog] = useState<RiftSweepDialogState | null>(null);
   const dismissRiftSweepDialog = useCallback(() => {
     setRiftSweepDialog(null);
     // "Free anyway" is approval for one confirmation flow, not a durable
@@ -922,9 +807,7 @@ const App: React.FC = () => {
   const riftSweepSelection = useMemo(
     () =>
       riftSweepCandidates.filter(
-        (entry) =>
-          riftStorageForced[entry.riftPath] ||
-          (!entry.hasUncommittedChanges && !entry.hasUnpushedCommits)
+        (entry) => riftStorageForced[entry.riftPath] || (!entry.hasUncommittedChanges && !entry.hasUnpushedCommits)
       ),
     [riftSweepCandidates, riftStorageForced]
   );
@@ -1031,9 +914,7 @@ const App: React.FC = () => {
   // Startup IPC resolves long before a normal turn ends. Retain its result for
   // a short grace window so a steer whose stop lands just after startup failed
   // can distinguish that failure from a run that completed naturally.
-  const runStartupResults = useRef(
-    new Map<string, Promise<{ ok: boolean; runId?: string; error?: string }>>()
-  );
+  const runStartupResults = useRef(new Map<string, Promise<{ ok: boolean; runId?: string; error?: string }>>());
   const trackRunStartup = useCallback(
     (runId: string, startup: Promise<{ ok: boolean; runId?: string; error?: string }>) => {
       runStartupResults.current.set(runId, startup);
@@ -1056,9 +937,7 @@ const App: React.FC = () => {
   // Provider-native subagents streamed by main (subagent/subagent-chunk/
   // subagent-activity events): `${parentThreadId}:${providerId}:${subagentId}`
   // → the child thread + agent-run message their transcript streams into.
-  const nativeSubagentTargets = useRef(
-    new Map<string, { threadId: string; messageId: string }>()
-  );
+  const nativeSubagentTargets = useRef(new Map<string, { threadId: string; messageId: string }>());
   const agentModelsRef = useRef<AgentModel[]>(fallbackAgentModels);
   const startTurnForThreadRef = useRef<
     | ((
@@ -1130,9 +1009,7 @@ const App: React.FC = () => {
   }, [threads]);
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
-  const selectedThreadProject = selectedThread
-    ? projects.find((p) => p.id === selectedThread.projectId)
-    : null;
+  const selectedThreadProject = selectedThread ? projects.find((p) => p.id === selectedThread.projectId) : null;
   // Candidate dirs for resolving relative media paths in agent markdown: the
   // thread's project dir, plus the grok CLI's per-session dir — Grok Imagine
   // saves generated images there (~/.grok/sessions/<encoded-cwd>/<session-id>/
@@ -1140,13 +1017,10 @@ const App: React.FC = () => {
   const selectedThreadEpic = selectedThread?.epicId
     ? epics.find((epic) => epic.id === selectedThread.epicId)
     : undefined;
-  const selectedThreadRiftPending = Boolean(
-    selectedThread?.epicId && riftSetupEpicIds[selectedThread.epicId]
-  );
+  const selectedThreadRiftPending = Boolean(selectedThread?.epicId && riftSetupEpicIds[selectedThread.epicId]);
   const selectedThreadRiftRemoving = Boolean(
     selectedThread &&
-      (riftRemovalThreadIds[selectedThread.id] ||
-        (selectedThread.epicId && riftRemovalEpicIds[selectedThread.epicId]))
+    (riftRemovalThreadIds[selectedThread.id] || (selectedThread.epicId && riftRemovalEpicIds[selectedThread.epicId]))
   );
   const selectedThreadRiftUnavailable =
     selectedThreadRiftPending ||
@@ -1157,43 +1031,35 @@ const App: React.FC = () => {
     // isolated workspace no longer exists. Never fall through to the source
     // project while the epic is waiting for its Rift to be recreated.
     Boolean(selectedThreadEpic?.riftReleased) ||
-    Boolean(
-      selectedThreadEpic &&
-        !selectedThreadEpic.riftPath &&
-        riftsSettings.enabled &&
-        riftStatus === null
-    );
+    Boolean(selectedThreadEpic && !selectedThreadEpic.riftPath && riftsSettings.enabled && riftStatus === null);
   // Threads grouped under an epic with a rift work inside that rift workspace.
   const selectedThreadProjectPath = selectedThreadRiftUnavailable
     ? undefined
     : selectedThreadEpic?.riftPath
-      ? selectedThreadEpic.riftWorkingDir ?? selectedThreadEpic.riftPath
+      ? (selectedThreadEpic.riftWorkingDir ?? selectedThreadEpic.riftPath)
       : selectedThreadProject?.path;
   const selectedThreadGrokSessionId = selectedThread?.agentSessionIds?.grok;
   const mediaBaseDirs = useMemo(() => {
     if (!selectedThreadProjectPath) return [];
     const dirs = [selectedThreadProjectPath];
     if (selectedThreadGrokSessionId) {
-      dirs.push(
-        `~/.grok/sessions/${encodeURIComponent(selectedThreadProjectPath)}/${selectedThreadGrokSessionId}`
-      );
+      dirs.push(`~/.grok/sessions/${encodeURIComponent(selectedThreadProjectPath)}/${selectedThreadGrokSessionId}`);
     }
     return dirs;
   }, [selectedThreadProjectPath, selectedThreadGrokSessionId]);
   // The card's placement is shell-level so it survives switching to Code and
   // back; only its plan lookup/rendering lives in the streaming chat boundary.
-  const [tasksCardPosition, setTasksCardPosition] = useState<{ x: number; y: number } | null>(null);
+  const [tasksCardPosition, setTasksCardPosition] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [tasksCardCollapsed, setTasksCardCollapsed] = useState(false);
   const [tasksCardDismissedFor, setTasksCardDismissedFor] = useState<string | null>(null);
-  const toggleTasksCard = useCallback(
-    () => setTasksCardCollapsed((current) => !current),
-    []
-  );
+  const toggleTasksCard = useCallback(() => setTasksCardCollapsed((current) => !current), []);
   const dismissTasksCard = useCallback((messageId: string) => {
     setTasksCardDismissedFor(messageId);
   }, []);
-  const selectedProject =
-    projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
+  const selectedProject = projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
   const latestThreadProjectId = useMemo(() => {
     let latestProjectId: string | null = null;
     let latestCreatedAt = -Infinity;
@@ -1226,10 +1092,7 @@ const App: React.FC = () => {
     return latestProjectId;
   }, [threads]);
   const defaultNewThreadProject =
-    selectedProject ??
-    projects.find((project) => project.id === latestThreadProjectId) ??
-    projects[0] ??
-    null;
+    selectedProject ?? projects.find((project) => project.id === latestThreadProjectId) ?? projects[0] ?? null;
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
   // empty composer.
@@ -1241,7 +1104,10 @@ const App: React.FC = () => {
     // Skip the render where the key just changed: chatInput still holds the
     // previous project's draft until the swap effect below runs.
     if (!composerDraftKey || composerDraftKeyRef.current !== composerDraftKey) return;
-    composerDraftsRef.current.set(composerDraftKey, { text: chatInput, attachments: chatAttachments });
+    composerDraftsRef.current.set(composerDraftKey, {
+      text: chatInput,
+      attachments: chatAttachments,
+    });
   }, [chatInput, chatAttachments, composerDraftKey]);
 
   useEffect(() => {
@@ -1273,20 +1139,17 @@ const App: React.FC = () => {
 
   const shellTitle =
     activeTab === 'agents'
-      ? selectedThread?.title ?? 'New thread'
+      ? (selectedThread?.title ?? 'New thread')
       : activeFilePath
-        ? activeFilePath.split(/[\\/]/).pop() ?? 'Code'
+        ? (activeFilePath.split(/[\\/]/).pop() ?? 'Code')
         : 'Code';
   const shellSubtitle =
     activeTab === 'agents'
       ? undefined
       : workspacePath
-        ? workspacePath.split(/[\\/]/).pop() ?? workspacePath
+        ? (workspacePath.split(/[\\/]/).pop() ?? workspacePath)
         : undefined;
-  const selectedAgentModel = findAgentModel(
-    agentModels,
-    selectedThread?.modelId ?? defaultAgentModelId
-  );
+  const selectedAgentModel = findAgentModel(agentModels, selectedThread?.modelId ?? defaultAgentModelId);
   // Claude Code CLI threads host the interactive `claude` TUI in an embedded
   // terminal; the composer feeds the PTY instead of dispatching agent turns.
   const isTerminalThread = selectedAgentModel?.id === claudeCodeCliModelId;
@@ -1301,26 +1164,17 @@ const App: React.FC = () => {
   );
   const selectedCodexServiceTier = selectedThread?.codexServiceTier ?? defaultCodexServiceTier;
   const selectedCodexReasoningLabel =
-    selectedCodexReasoningOptions.find((option) => option.value === selectedCodexReasoning)
-      ?.label ?? 'Medium';
+    selectedCodexReasoningOptions.find((option) => option.value === selectedCodexReasoning)?.label ?? 'Medium';
   const selectedCodexServiceTierLabel =
-    codexServiceTierOptions.find((option) => option.value === selectedCodexServiceTier)?.label ??
-    'Standard';
+    codexServiceTierOptions.find((option) => option.value === selectedCodexServiceTier)?.label ?? 'Standard';
   const selectedClaudeDefaultReasoning = getDefaultClaudeReasoningEffort(selectedAgentModel);
-  const selectedClaudeReasoning =
-    selectedThread?.claudeReasoningEffort ?? selectedClaudeDefaultReasoning;
-  const selectedClaudeContextWindow =
-    selectedThread?.claudeContextWindow ?? defaultClaudeContextWindow;
-  const effectiveClaudeContextWindow = getEffectiveClaudeContextWindow(
-    selectedAgentModel,
-    selectedClaudeContextWindow
-  );
+  const selectedClaudeReasoning = selectedThread?.claudeReasoningEffort ?? selectedClaudeDefaultReasoning;
+  const selectedClaudeContextWindow = selectedThread?.claudeContextWindow ?? defaultClaudeContextWindow;
+  const effectiveClaudeContextWindow = getEffectiveClaudeContextWindow(selectedAgentModel, selectedClaudeContextWindow);
   const selectedClaudeReasoningLabel =
-    claudeReasoningOptions.find((option) => option.value === selectedClaudeReasoning)?.label ??
-    'High';
+    claudeReasoningOptions.find((option) => option.value === selectedClaudeReasoning)?.label ?? 'High';
   const selectedClaudeContextWindowLabel =
-    claudeContextWindowOptions.find((option) => option.value === effectiveClaudeContextWindow)
-      ?.label ?? '200k';
+    claudeContextWindowOptions.find((option) => option.value === effectiveClaudeContextWindow)?.label ?? '200k';
   const selectedGrokReasoning = selectedThread?.grokReasoningEffort ?? defaultGrokReasoningEffort;
   const selectedGrokReasoningLabel =
     grokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
@@ -1358,9 +1212,7 @@ const App: React.FC = () => {
         .map((provider) => provider.id)
         // 'orion' has no providerSettings entry (it's a pseudo-provider, not a
         // CLI); it is always enabled.
-        .filter(
-          (id) => id === 'orion' || normalizedProviderSettings[id as ProviderId]?.enabled !== false
-        ),
+        .filter((id) => id === 'orion' || normalizedProviderSettings[id as ProviderId]?.enabled !== false),
     [normalizedProviderSettings]
   );
   const enabledProviderIdSet = useMemo(() => new Set(enabledProviderIds), [enabledProviderIds]);
@@ -1432,10 +1284,7 @@ const App: React.FC = () => {
         .filter((provider) => provider.id !== 'orion')
         .map((provider) => ({
           provider,
-          models: agentModels.filter(
-            (model) =>
-              model.providerId === provider.id && model.id !== claudeCodeCliModelId
-          ),
+          models: agentModels.filter((model) => model.providerId === provider.id && model.id !== claudeCodeCliModelId),
         }))
         .filter((group) => group.models.length > 0),
     [agentModels]
@@ -1468,10 +1317,7 @@ const App: React.FC = () => {
   const appUpdateVisible =
     !!appUpdateState &&
     ['available', 'downloading', 'downloaded', 'restarting', 'error'].includes(appUpdateState.status);
-  const appUpdatePercent = Math.max(
-    0,
-    Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0))
-  );
+  const appUpdatePercent = Math.max(0, Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0)));
   const appUpdateLabel =
     appUpdateState?.status === 'restarting'
       ? 'Restarting…'
@@ -1486,21 +1332,16 @@ const App: React.FC = () => {
               : 'Update available';
   const appUpdateTitle =
     appUpdateState?.status === 'error'
-      ? appUpdateState.error ?? 'Update failed'
+      ? (appUpdateState.error ?? 'Update failed')
       : appUpdateState?.status === 'restarting'
         ? 'Finishing the update, then reopening Orion'
         : appUpdateState?.availableVersion
           ? `Orion ${appUpdateState.availableVersion} is available`
           : appUpdateLabel;
-  const accountName =
-    accountState.user?.name ||
-    (accountState.authenticated ? 'Orion account' : 'Not signed in');
+  const accountName = accountState.user?.name || (accountState.authenticated ? 'Orion account' : 'Not signed in');
   const accountEmail = accountState.user?.email ?? null;
-  const accountIdentity = accountState.user
-    ? `${accountState.user.id}\n${accountEmail ?? ''}`
-    : null;
-  const accountEmailRevealed =
-    accountIdentity !== null && revealedAccountIdentity === accountIdentity;
+  const accountIdentity = accountState.user ? `${accountState.user.id}\n${accountEmail ?? ''}` : null;
+  const accountEmailRevealed = accountIdentity !== null && revealedAccountIdentity === accountIdentity;
   const accountInitials = (accountState.user?.name || accountState.user?.email || 'O')
     .split(/\s+|@/)
     .filter(Boolean)
@@ -1520,9 +1361,7 @@ const App: React.FC = () => {
       if (ts > prev) lastActivityByProject.set(thread.projectId, ts);
     }
     return [...projects].sort(
-      (a, b) =>
-        (lastActivityByProject.get(b.id) ?? -Infinity) -
-        (lastActivityByProject.get(a.id) ?? -Infinity)
+      (a, b) => (lastActivityByProject.get(b.id) ?? -Infinity) - (lastActivityByProject.get(a.id) ?? -Infinity)
     );
   }, [projects, threads]);
 
@@ -1548,9 +1387,7 @@ const App: React.FC = () => {
     () =>
       threads
         .filter((t) => t.pinnedAt && !childThreadIds.has(t.id))
-        .sort(
-          (a, b) => new Date(b.pinnedAt ?? 0).getTime() - new Date(a.pinnedAt ?? 0).getTime()
-        ),
+        .sort((a, b) => new Date(b.pinnedAt ?? 0).getTime() - new Date(a.pinnedAt ?? 0).getTime()),
     [childThreadIds, threads]
   );
 
@@ -1600,35 +1437,25 @@ const App: React.FC = () => {
     [updateThread]
   );
 
-  const runningAgentCount = useMemo(
-    () => threads.filter((t) => t.status === 'running').length,
-    [threads]
-  );
+  const runningAgentCount = useMemo(() => threads.filter((t) => t.status === 'running').length, [threads]);
 
-  const projectThreadsByProject = useMemo(
-    () => {
-      const grouped = new Map<string, Thread[]>();
-      for (const thread of threads) {
-        // Top-level rows only; children render nested under their parent.
-        if (childThreadIds.has(thread.id)) continue;
-        const projectThreads = grouped.get(thread.projectId);
-        if (projectThreads) projectThreads.push(thread);
-        else grouped.set(thread.projectId, [thread]);
-      }
-      for (const projectThreads of grouped.values()) {
-        projectThreads.sort(
-          (a, b) =>
-            getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
-        );
-      }
-      return grouped;
-    },
-    [childThreadIds, threads]
-  );
+  const projectThreadsByProject = useMemo(() => {
+    const grouped = new Map<string, Thread[]>();
+    for (const thread of threads) {
+      // Top-level rows only; children render nested under their parent.
+      if (childThreadIds.has(thread.id)) continue;
+      const projectThreads = grouped.get(thread.projectId);
+      if (projectThreads) projectThreads.push(thread);
+      else grouped.set(thread.projectId, [thread]);
+    }
+    for (const projectThreads of grouped.values()) {
+      projectThreads.sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime());
+    }
+    return grouped;
+  }, [childThreadIds, threads]);
 
   const epicsEnabled = epicsSettings?.enabled ?? defaultEpicsSettings.enabled;
-  const epicPromptGitMessages =
-    epicsSettings?.promptGitMessages ?? defaultEpicsSettings.promptGitMessages;
+  const epicPromptGitMessages = epicsSettings?.promptGitMessages ?? defaultEpicsSettings.promptGitMessages;
 
   const activeEpics = useMemo(() => epics.filter((epic) => !epic.settledAt), [epics]);
 
@@ -1636,9 +1463,7 @@ const App: React.FC = () => {
     () =>
       epics
         .filter((epic) => epic.settledAt)
-        .sort(
-          (a, b) => new Date(b.settledAt ?? 0).getTime() - new Date(a.settledAt ?? 0).getTime()
-        ),
+        .sort((a, b) => new Date(b.settledAt ?? 0).getTime() - new Date(a.settledAt ?? 0).getTime()),
     [epics]
   );
 
@@ -1654,9 +1479,7 @@ const App: React.FC = () => {
       else grouped.set(thread.epicId, [thread]);
     }
     for (const epicThreads of grouped.values()) {
-      epicThreads.sort(
-        (a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime()
-      );
+      epicThreads.sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime());
     }
     return grouped;
   }, [childThreadIds, epicsEnabled, threads]);
@@ -1693,10 +1516,7 @@ const App: React.FC = () => {
       const normalizedRoot = normalizeRepositoryPath(gitRoot);
       const belongsToRoot = (project: Project) => {
         const normalizedProjectPath = normalizeRepositoryPath(project.path);
-        return (
-          normalizedProjectPath === normalizedRoot ||
-          normalizedProjectPath.startsWith(`${normalizedRoot}/`)
-        );
+        return normalizedProjectPath === normalizedRoot || normalizedProjectPath.startsWith(`${normalizedRoot}/`);
       };
       const preferredProject = preferredProjectId
         ? projects.find((project) => project.id === preferredProjectId)
@@ -1724,50 +1544,40 @@ const App: React.FC = () => {
       if (selectedRepository) return selectedRepository;
 
       const lastThread = threadsByEpic.get(epic.id)?.[0];
-      const lastProject = lastThread
-        ? projects.find((p) => p.id === lastThread.projectId)
-        : undefined;
+      const lastProject = lastThread ? projects.find((p) => p.id === lastThread.projectId) : undefined;
       return lastProject ?? defaultNewThreadProject ?? projects[0] ?? null;
     },
     [defaultNewThreadProject, projectForGitRoot, projects, threadsByEpic]
   );
 
-  const selectedEpic = epicsEnabled
-    ? epics.find((epic) => epic.id === selectedEpicId) ?? null
-    : null;
+  const selectedEpic = epicsEnabled ? (epics.find((epic) => epic.id === selectedEpicId) ?? null) : null;
 
   // The store retargets selectedProjectId to an epic's repository. Do not
   // apply the generic new-thread fallback while an epic is selected: an
   // unbound epic must leave repository controls hidden instead of exposing a
   // stale project. Gate on the resolved epic, not the persisted id, so a
   // leftover id cannot hide the controls once Epics is turned off.
-  const activeThreadProject =
-    selectedThreadProject ?? (selectedEpic ? selectedProject : defaultNewThreadProject);
+  const activeThreadProject = selectedThreadProject ?? (selectedEpic ? selectedProject : defaultNewThreadProject);
 
   // The directory the repository controls act on. A thread grouped under an
   // epic with a rift has its agents working inside that rift, so the git
   // state, branch actions, commit/push, cloud sync, Code tab and Open With
   // have to follow it there — reading or committing the source repository
   // instead would show and act on a tree nobody is editing.
-  const activeRift =
-    selectedThread ? selectedThreadEpic : selectedEpic;
+  const activeRift = selectedThread ? selectedThreadEpic : selectedEpic;
   const activeRiftPath =
-    activeRift?.riftPath && !activeRift.riftCleanupPending
-      ? activeRift.riftWorkingDir ?? activeRift.riftPath
-      : null;
+    activeRift?.riftPath && !activeRift.riftCleanupPending ? (activeRift.riftWorkingDir ?? activeRift.riftPath) : null;
   const activeRiftUnavailable = Boolean(
     selectedThreadRiftUnavailable ||
-      (activeRift &&
-        (riftSetupEpicIds[activeRift.id] ||
-          riftRemovalEpicIds[activeRift.id] ||
-          activeRift.riftRequest ||
-          activeRift.riftCleanupPending ||
-          activeRift.riftReleased ||
-          (!activeRift.riftPath && riftsSettings.enabled && riftStatus === null)))
+    (activeRift &&
+      (riftSetupEpicIds[activeRift.id] ||
+        riftRemovalEpicIds[activeRift.id] ||
+        activeRift.riftRequest ||
+        activeRift.riftCleanupPending ||
+        activeRift.riftReleased ||
+        (!activeRift.riftPath && riftsSettings.enabled && riftStatus === null)))
   );
-  const activeWorkingDir = activeRiftUnavailable
-    ? null
-    : activeRiftPath ?? activeThreadProject?.path ?? null;
+  const activeWorkingDir = activeRiftUnavailable ? null : (activeRiftPath ?? activeThreadProject?.path ?? null);
   const previousActiveWorkingDirRef = useRef(activeWorkingDir);
   useLayoutEffect(() => {
     const workingDirChanged = previousActiveWorkingDirRef.current !== activeWorkingDir;
@@ -1780,12 +1590,10 @@ const App: React.FC = () => {
     }
   }, [activeRiftUnavailable, activeWorkingDir, activeTab, setActiveTab]);
 
-  const selectedEpicThreads = selectedEpic ? threadsByEpic.get(selectedEpic.id) ?? [] : [];
-  const selectedEpicHasRunningAgents = selectedEpic
-    ? runningAgentEpicIds.has(selectedEpic.id)
-    : false;
+  const selectedEpicThreads = selectedEpic ? (threadsByEpic.get(selectedEpic.id) ?? []) : [];
+  const selectedEpicHasRunningAgents = selectedEpic ? runningAgentEpicIds.has(selectedEpic.id) : false;
   const selectedEpicRepositoryProject = selectedEpic?.repositoryProjectId
-    ? projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null
+    ? (projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null)
     : null;
   const selectedEpicClaimedProject = selectedEpic
     ? projectForGitRoot(selectedEpic.gitRoot, selectedEpic.repositoryProjectId)
@@ -1793,9 +1601,7 @@ const App: React.FC = () => {
   const selectedEpicGitStatus = selectedEpic ? epicGitStatuses[selectedEpic.id] : undefined;
   // Fail open: until the first status arrives, the commit button stays enabled.
   const selectedEpicHasWorkToPush =
-    !selectedEpicGitStatus ||
-    selectedEpicGitStatus.hasChangesToCommit ||
-    selectedEpicGitStatus.hasUnpushedCommits;
+    !selectedEpicGitStatus || selectedEpicGitStatus.hasChangesToCommit || selectedEpicGitStatus.hasUnpushedCommits;
   const selectedEpicPrStatus = epicPrStatus(selectedEpic);
   const selectedEpicPrBadge = !selectedEpicPrStatus
     ? null
@@ -1809,8 +1615,8 @@ const App: React.FC = () => {
               : // Distinguish a confirmed-open PR from one we've only just
                 // created and not yet read back.
                 selectedEpic?.prState
-                  ? 'PR open'
-                  : 'PR created',
+                ? 'PR open'
+                : 'PR created',
       };
 
   // Models eligible for the hidden text-generation turns. Orion can't delegate
@@ -1820,10 +1626,7 @@ const App: React.FC = () => {
   const utilityCandidateModels = useMemo(
     () =>
       agentModels.filter(
-        (model) =>
-          !isOrionModelId(model.id) &&
-          model.id !== claudeCodeCliModelId &&
-          model.providerId !== 'opencode'
+        (model) => !isOrionModelId(model.id) && model.id !== claudeCodeCliModelId && model.providerId !== 'opencode'
       ),
     [agentModels]
   );
@@ -1852,9 +1655,8 @@ const App: React.FC = () => {
       if (isUsable(id)) return id;
     }
     return (
-      utilityCandidateModels.find(
-        (model) => model.available !== false && enabledProviderIdSet.has(model.providerId)
-      )?.id ?? null
+      utilityCandidateModels.find((model) => model.available !== false && enabledProviderIdSet.has(model.providerId))
+        ?.id ?? null
     );
   }, [enabledProviderIdSet, textGenerationSettings?.modelId, utilityCandidateModels]);
   const resolvedUtilityModel = useMemo(
@@ -1916,11 +1718,7 @@ const App: React.FC = () => {
       while (foundChild) {
         foundChild = false;
         for (const thread of state.threads) {
-          if (
-            thread.parentThreadId &&
-            threadIds.has(thread.parentThreadId) &&
-            !threadIds.has(thread.id)
-          ) {
+          if (thread.parentThreadId && threadIds.has(thread.parentThreadId) && !threadIds.has(thread.id)) {
             threadIds.add(thread.id);
             foundChild = true;
           }
@@ -1940,11 +1738,7 @@ const App: React.FC = () => {
         if (thread.spawnId) spawnIds.push(thread.spawnId);
       }
 
-      await Promise.all(
-        runIds.map((runId) =>
-          window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })
-        )
-      );
+      await Promise.all(runIds.map((runId) => window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })));
       await Promise.all(removedThreads.map((thread) => disposeThreadRuntime(thread.id)));
       for (const spawnId of spawnIds) {
         void window.orion?.reportSubagentResult?.({
@@ -1962,9 +1756,7 @@ const App: React.FC = () => {
 
   const removeProjectWithRuntimes = useCallback(
     async (projectId: string) => {
-      const projectThreads = useOrionStore
-        .getState()
-        .threads.filter((thread) => thread.projectId === projectId);
+      const projectThreads = useOrionStore.getState().threads.filter((thread) => thread.projectId === projectId);
       const runIds = projectThreads
         .map((thread) => activeRunsByThread[thread.id])
         .filter((runId): runId is string => Boolean(runId));
@@ -1972,11 +1764,7 @@ const App: React.FC = () => {
         runOutputMessages.current.delete(runId);
         clearActiveRun(runId);
       }
-      await Promise.all(
-        runIds.map((runId) =>
-          window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })
-        )
-      );
+      await Promise.all(runIds.map((runId) => window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })));
       await Promise.all(projectThreads.map((thread) => disposeThreadRuntime(thread.id)));
       for (const thread of projectThreads) {
         if (!thread.spawnId) continue;
@@ -2066,12 +1854,8 @@ const App: React.FC = () => {
     ) => {
       if (released.length === 0) return true;
       const state = useOrionStore.getState();
-      const epicMatchesRelease = (
-        epic: Epic,
-        { epicId, riftPath }: { epicId: string; riftPath: string }
-      ) =>
-        epic.id === epicId &&
-        (epic.riftPath === riftPath || (!epic.riftPath && epic.riftReleased === true));
+      const epicMatchesRelease = (epic: Epic, { epicId, riftPath }: { epicId: string; riftPath: string }) =>
+        epic.id === epicId && (epic.riftPath === riftPath || (!epic.riftPath && epic.riftReleased === true));
       // Startup state and the live release event can deliver the same journal
       // result more than once. A restored epic may already own a replacement
       // Rift by then, so stale payloads must not touch its new runtimes/state.
@@ -2081,25 +1865,16 @@ const App: React.FC = () => {
         state.epics.some((epic) => epicMatchesRelease(epic, release))
       );
       const runtimeThreadsByEpic = new Map(
-        matchingReleases.map(({ epicId }) => [
-          epicId,
-          runtimeThreadsForEpic(state.threads, epicId),
-        ])
+        matchingReleases.map(({ epicId }) => [epicId, runtimeThreadsForEpic(state.threads, epicId)])
       );
       const runtimeThreads = [
-        ...new Map(
-          [...runtimeThreadsByEpic.values()]
-            .flat()
-            .map((thread) => [thread.id, thread])
-        ).values(),
+        ...new Map([...runtimeThreadsByEpic.values()].flat().map((thread) => [thread.id, thread])).values(),
       ];
 
       let runtimesDisposed = true;
       if (disposeRuntimes && window.orion?.disposeAgentThread) {
         try {
-          await Promise.all(
-            runtimeThreads.map((thread) => window.orion!.disposeAgentThread(thread.id))
-          );
+          await Promise.all(runtimeThreads.map((thread) => window.orion!.disposeAgentThread(thread.id)));
         } catch (error) {
           runtimesDisposed = false;
           console.error('Could not dispose every runtime for released Rifts', error);
@@ -2227,13 +2002,18 @@ const App: React.FC = () => {
   useEffect(() => {
     let mounted = true;
 
-    void window.orion?.getAccountSession?.()
+    void window.orion
+      ?.getAccountSession?.()
       .then((state) => {
         if (mounted) setAccountState(state);
       })
       .catch(() => {
         if (mounted) {
-          setAccountState({ authenticated: false, user: null, expiresAt: null });
+          setAccountState({
+            authenticated: false,
+            user: null,
+            expiresAt: null,
+          });
         }
       })
       .finally(() => {
@@ -2565,23 +2345,26 @@ const App: React.FC = () => {
     }
   }, [accountBusy]);
 
-  const handleAuthenticateProvider = useCallback(async (providerId: string) => {
-    if (!window.orion?.authenticateProvider || authenticatingProviderId) return;
+  const handleAuthenticateProvider = useCallback(
+    async (providerId: string) => {
+      if (!window.orion?.authenticateProvider || authenticatingProviderId) return;
 
-    setAuthenticatingProviderId(providerId);
-    try {
-      const result = await window.orion.authenticateProvider(providerId);
-      if (result.ok) {
-        toast.info('Authentication started');
-      } else {
-        toast.error(result.error ?? 'Could not start authentication');
+      setAuthenticatingProviderId(providerId);
+      try {
+        const result = await window.orion.authenticateProvider(providerId);
+        if (result.ok) {
+          toast.info('Authentication started');
+        } else {
+          toast.error(result.error ?? 'Could not start authentication');
+        }
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Could not start authentication');
+      } finally {
+        setAuthenticatingProviderId(null);
       }
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Could not start authentication');
-    } finally {
-      setAuthenticatingProviderId(null);
-    }
-  }, [authenticatingProviderId]);
+    },
+    [authenticatingProviderId]
+  );
 
   useEffect(() => {
     if (
@@ -2595,7 +2378,8 @@ const App: React.FC = () => {
       projectMenuOpenId === null &&
       threadItemMenuKey === null &&
       epicMenuOpenId === null
-    ) return undefined;
+    )
+      return undefined;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node;
@@ -2652,7 +2436,18 @@ const App: React.FC = () => {
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [branchPickerOpen, projectPickerOpen, threadMenuOpen, goalMenuOpen, threadSearchOpen, openWithOpen, projectMenuOpenId, threadItemMenuKey, epicMenuOpenId, epicRepoPickerOpen]);
+  }, [
+    branchPickerOpen,
+    projectPickerOpen,
+    threadMenuOpen,
+    goalMenuOpen,
+    threadSearchOpen,
+    openWithOpen,
+    projectMenuOpenId,
+    threadItemMenuKey,
+    epicMenuOpenId,
+    epicRepoPickerOpen,
+  ]);
 
   useEffect(() => {
     setThreadMenuOpen(false);
@@ -2674,9 +2469,7 @@ const App: React.FC = () => {
 
   // Streamed chunks can arrive many times per second; buffer them briefly so
   // each token doesn't trigger a full store update (and a store persist).
-  const chunkBuffers = useRef(
-    new Map<string, { threadId: string; messageId: string; text: string }>()
-  );
+  const chunkBuffers = useRef(new Map<string, { threadId: string; messageId: string; text: string }>());
   const chunkFlushTimer = useRef<number | null>(null);
 
   // --- Linked board tasks (Orion web kanban) -----------------------------------
@@ -2703,7 +2496,9 @@ const App: React.FC = () => {
       const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
       const remaining = (thread?.linkedTasks ?? []).filter((task) => task.id !== taskId);
       if (remaining.length === (thread?.linkedTasks?.length ?? 0)) return;
-      updateThread(threadId, { linkedTasks: remaining.length > 0 ? remaining : undefined });
+      updateThread(threadId, {
+        linkedTasks: remaining.length > 0 ? remaining : undefined,
+      });
     },
     [updateThread]
   );
@@ -2712,12 +2507,7 @@ const App: React.FC = () => {
   // when the action targets one chip (e.g. "mark done"). Pending cards have
   // not been sent to the agent and must not inherit the active run's lifecycle.
   const pushLinkedTaskStatus = useCallback(
-    (
-      threadId: string,
-      status: 'running' | 'finished' | 'done' | 'error',
-      notes?: string,
-      taskIds?: string[]
-    ) => {
+    (threadId: string, status: 'running' | 'finished' | 'done' | 'error', notes?: string, taskIds?: string[]) => {
       const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
       const linkedTasks = thread?.linkedTasks ?? [];
       const targets = taskIds
@@ -2726,13 +2516,16 @@ const App: React.FC = () => {
       if (targets.length === 0 || !window.orion?.updateBoardTaskThreadStatus) return;
       const targetIds = new Set(targets.map((task) => task.id));
       updateThread(threadId, {
-        linkedTasks: linkedTasks.map((task) =>
-          targetIds.has(task.id) ? { ...task, lastStatus: status } : task
-        ),
+        linkedTasks: linkedTasks.map((task) => (targetIds.has(task.id) ? { ...task, lastStatus: status } : task)),
       });
       for (const linked of targets) {
         void window.orion
-          .updateBoardTaskThreadStatus({ taskId: linked.id, threadId, status, notes })
+          .updateBoardTaskThreadStatus({
+            taskId: linked.id,
+            threadId,
+            status,
+            notes,
+          })
           .then((result) => {
             if (result.ok || !result.stale) return;
             // The card was unlinked or relinked on the web — drop our side.
@@ -2750,19 +2543,19 @@ const App: React.FC = () => {
   // path to keep in sync.
   const notifyThreadFinished = useCallback((threadId: string, outcome: 'done' | 'error') => {
     const state = useOrionStore.getState();
-    const settings = { ...defaultNotificationSettings, ...state.notificationSettings };
+    const settings = {
+      ...defaultNotificationSettings,
+      ...state.notificationSettings,
+    };
     if (!settings.enabled) return;
     if (document.hasFocus() && state.selectedThreadId === threadId) return;
     if (typeof Notification === 'undefined' || Notification.permission === 'denied') return;
     const thread = state.threads.find((t) => t.id === threadId);
-    const notification = new Notification(
-      outcome === 'error' ? 'Agent stopped with an error' : 'Agent finished',
-      {
-        body: thread?.title?.trim() || 'Agent thread',
-        silent: !settings.sound,
-        tag: `thread-finished-${threadId}`,
-      }
-    );
+    const notification = new Notification(outcome === 'error' ? 'Agent stopped with an error' : 'Agent finished', {
+      body: thread?.title?.trim() || 'Agent thread',
+      silent: !settings.sound,
+      tag: `thread-finished-${threadId}`,
+    });
     notification.onclick = () => {
       window.orion?.focusWindow?.().catch(() => {});
       const store = useOrionStore.getState();
@@ -2787,9 +2580,7 @@ const App: React.FC = () => {
           terminalActivityAt: new Date().toISOString(),
         });
         notifyThreadFinished(event.threadId, 'done');
-        const stillRunning = (thread.linkedTasks ?? []).filter(
-          (task) => task.lastStatus === 'running'
-        );
+        const stillRunning = (thread.linkedTasks ?? []).filter((task) => task.lastStatus === 'running');
         if (stillRunning.length > 0) {
           pushLinkedTaskStatus(
             event.threadId,
@@ -2804,7 +2595,9 @@ const App: React.FC = () => {
         // A freshly spawned/reattached TUI is idle at its prompt — record the
         // activity for recency ordering but leave the run status alone.
         if (thread.status !== 'running') {
-          updateThread(event.threadId, { terminalActivityAt: new Date().toISOString() });
+          updateThread(event.threadId, {
+            terminalActivityAt: new Date().toISOString(),
+          });
         }
         return;
       }
@@ -2813,9 +2606,7 @@ const App: React.FC = () => {
         terminalActivityAt: new Date().toISOString(),
       });
       if (event.kind === 'prompt') {
-        const notRunning = (thread.linkedTasks ?? []).filter(
-          (task) => task.injected && task.lastStatus !== 'running'
-        );
+        const notRunning = (thread.linkedTasks ?? []).filter((task) => task.injected && task.lastStatus !== 'running');
         if (notRunning.length > 0) {
           pushLinkedTaskStatus(
             event.threadId,
@@ -2862,7 +2653,10 @@ const App: React.FC = () => {
           return false;
         }
         try {
-          const result = await window.orion.unlinkBoardTask({ taskId, threadId });
+          const result = await window.orion.unlinkBoardTask({
+            taskId,
+            threadId,
+          });
           if (!result.ok && !result.stale) {
             toast.error(result.error ?? 'Could not unlink the task');
             return false;
@@ -2909,8 +2703,7 @@ const App: React.FC = () => {
       if (!window.orion?.linkBoardTask) return;
       const project = state.projects.find((p) => p.id === thread.projectId);
       // A fresh, untitled thread adopts the first task's title.
-      const adoptTitle =
-        linkedTasks.length === 0 && thread.messages.length === 0 && isDefaultTitle(thread.title);
+      const adoptTitle = linkedTasks.length === 0 && thread.messages.length === 0 && isDefaultTitle(thread.title);
 
       const result = await window.orion.linkBoardTask({
         taskId: task.id,
@@ -2924,12 +2717,9 @@ const App: React.FC = () => {
       }
       const linkedTask = linkedTaskFromBoardTask(result.task ?? task);
       // Re-read: the link round-trip is async, so the list may have moved.
-      const current =
-        useOrionStore.getState().threads.find((t) => t.id === thread.id)?.linkedTasks ?? [];
+      const current = useOrionStore.getState().threads.find((t) => t.id === thread.id)?.linkedTasks ?? [];
       updateThread(thread.id, {
-        linkedTasks: current.some((linked) => linked.id === linkedTask.id)
-          ? current
-          : [...current, linkedTask],
+        linkedTasks: current.some((linked) => linked.id === linkedTask.id) ? current : [...current, linkedTask],
         ...(adoptTitle ? { title: task.title } : {}),
       });
       const unavailableCount = linkedTask.attachments?.filter((attachment) => !attachment.path).length ?? 0;
@@ -3013,12 +2803,11 @@ const App: React.FC = () => {
     () => (selectedThread?.linkedTasks ?? []).map((task) => task.id),
     [selectedThread?.linkedTasks]
   );
-  const linkedTasksLabel =
-    selectedThread?.linkedTasks?.length
-      ? `Linked ${selectedThread.linkedTasks.length === 1 ? 'task' : 'tasks'}: ${selectedThread.linkedTasks
-          .map((task) => task.title)
-          .join(', ')}`
-      : 'Link tasks from your Orion board';
+  const linkedTasksLabel = selectedThread?.linkedTasks?.length
+    ? `Linked ${selectedThread.linkedTasks.length === 1 ? 'task' : 'tasks'}: ${selectedThread.linkedTasks
+        .map((task) => task.title)
+        .join(', ')}`
+    : 'Link tasks from your Orion board';
   // Signature of that set, so selecting a thread re-refreshes only when it
   // actually changed (not on every status push).
   const pendingLinkedTaskKey = pendingLinkedTasks.map((task) => task.id).join(':');
@@ -3069,14 +2858,12 @@ const App: React.FC = () => {
               .threads.find((thread) => thread.id === btwRun.threadId)
               ?.btwExchanges?.find((exchange) => exchange.id === btwRun.exchangeId)
               ?.answer.slice(-1200) ?? '';
-          const asideLoggedOut =
-            isProviderAuthErrorText(event.error) || isProviderAuthErrorText(asideAnswerTail);
+          const asideLoggedOut = isProviderAuthErrorText(event.error) || isProviderAuthErrorText(asideAnswerTail);
           updateBtwExchange(btwRun.threadId, btwRun.exchangeId, {
             status: 'error',
             completedAt: new Date().toISOString(),
             error: event.error,
-            authProviderId:
-              asideLoggedOut && event.providerId !== 'orion' ? event.providerId : undefined,
+            authProviderId: asideLoggedOut && event.providerId !== 'orion' ? event.providerId : undefined,
           });
           btwRuns.current.delete(event.runId);
         }
@@ -3115,7 +2902,9 @@ const App: React.FC = () => {
         notifyThreadFinished(event.threadId, 'done');
         pushLinkedTaskStatus(event.threadId, 'finished', lastRun?.content.trim() || undefined);
         if (lastRun && lastRun.status === 'done') {
-          updateThreadMessage(event.threadId, lastRun.id, { statusText: 'Finished.' });
+          updateThreadMessage(event.threadId, lastRun.id, {
+            statusText: 'Finished.',
+          });
         }
         return;
       }
@@ -3127,8 +2916,7 @@ const App: React.FC = () => {
       // switcher can flip between main and subagents uniformly.
       if (
         (event.type === 'subagent' && event.subagent) ||
-        ((event.type === 'subagent-chunk' || event.type === 'subagent-activity') &&
-          event.subagentId)
+        ((event.type === 'subagent-chunk' || event.type === 'subagent-activity') && event.subagentId)
       ) {
         const info = event.type === 'subagent' ? event.subagent : undefined;
         const subagentId = info?.id ?? event.subagentId;
@@ -3136,9 +2924,7 @@ const App: React.FC = () => {
         const state = useOrionStore.getState();
         const runThread = state.threads.find((t) => t.id === event.threadId);
         if (!runThread) return;
-        const providerId = (info?.providerId ??
-          event.providerId ??
-          runThread.modelId.split(':')[0]) as ProviderId;
+        const providerId = (info?.providerId ?? event.providerId ?? runThread.modelId.split(':')[0]) as ProviderId;
         const key = `${event.threadId}:${providerId}:${subagentId}`;
         const familyThreadIds = descendantThreadIds(state.threads, runThread.id);
         const findFamilySubagent = (providerSubagentId: string) =>
@@ -3155,9 +2941,7 @@ const App: React.FC = () => {
         // provider-local ids inside this run's thread family.
         if (!target) {
           const existing = findFamilySubagent(subagentId);
-          const lastRun = existing
-            ? [...existing.messages].reverse().find((m) => m.kind === 'agent-run')
-            : undefined;
+          const lastRun = existing ? [...existing.messages].reverse().find((m) => m.kind === 'agent-run') : undefined;
           if (existing && lastRun) {
             target = { threadId: existing.id, messageId: lastRun.id };
             nativeSubagentTargets.current.set(key, target);
@@ -3169,30 +2953,27 @@ const App: React.FC = () => {
           // spawns). Hang it off the spawning subagent's thread when main
           // reports one, so the switcher shows the real tree instead of
           // flattening every descendant onto the run's thread.
-          const parent =
-            (info.parentSubagentId && findFamilySubagent(info.parentSubagentId)) ||
-            runThread;
-          const childThreadId = state.createThread(
-            parent.projectId,
-            info.title || info.kind || 'Subagent',
-            {
-              parentThreadId: parent.id,
-              modelId: parent.modelId,
-              hiddenFromRecent: true,
-              accessMode: parent.accessMode,
-              epicId: parent.epicId,
-              select: false,
-              subagent: {
-                id: subagentId,
-                providerId,
-                kind: info.kind,
-                model: info.model,
-                prompt: info.prompt,
-              },
-            }
-          );
+          const parent = (info.parentSubagentId && findFamilySubagent(info.parentSubagentId)) || runThread;
+          const childThreadId = state.createThread(parent.projectId, info.title || info.kind || 'Subagent', {
+            parentThreadId: parent.id,
+            modelId: parent.modelId,
+            hiddenFromRecent: true,
+            accessMode: parent.accessMode,
+            epicId: parent.epicId,
+            select: false,
+            subagent: {
+              id: subagentId,
+              providerId,
+              kind: info.kind,
+              model: info.model,
+              prompt: info.prompt,
+            },
+          });
           if (info.prompt) {
-            addMessageToThread(childThreadId, { role: 'user', content: info.prompt });
+            addMessageToThread(childThreadId, {
+              role: 'user',
+              content: info.prompt,
+            });
           }
           const messageId = addMessageToThread(childThreadId, {
             role: 'agent',
@@ -3227,11 +3008,7 @@ const App: React.FC = () => {
           }
           // A late-arriving prompt (codex delivers it inside the rollout)
           // fills in the transcript's opening user bubble.
-          if (
-            childThread &&
-            info.prompt &&
-            !childThread.messages.some((m) => m.role === 'user')
-          ) {
+          if (childThread && info.prompt && !childThread.messages.some((m) => m.role === 'user')) {
             updateThread(target.threadId, {
               messages: [
                 {
@@ -3250,14 +3027,8 @@ const App: React.FC = () => {
             updateThreadMessage(target.threadId, target.messageId, {
               status: stopped ? 'stopped' : failed ? 'error' : 'done',
               completedAt: new Date(info.completedAt ?? Date.now()).toISOString(),
-              statusText: stopped
-                ? 'Stopped by user.'
-                : failed
-                  ? 'The subagent stopped with an error.'
-                  : 'Finished.',
-              ...(info.stats?.totalTokens
-                ? { stats: { totalTokens: info.stats.totalTokens } }
-                : {}),
+              statusText: stopped ? 'Stopped by user.' : failed ? 'The subagent stopped with an error.' : 'Finished.',
+              ...(info.stats?.totalTokens ? { stats: { totalTokens: info.stats.totalTokens } } : {}),
             });
             updateThread(target.threadId, {
               status: stopped ? 'idle' : failed ? 'error' : 'done',
@@ -3276,7 +3047,9 @@ const App: React.FC = () => {
         // untracks the message, dropping that chunk would lose both the real
         // diagnostic and the text used to recognize authentication failures.
         if (steeringRunsRef.current.has(event.runId)) {
-          const raced = steerLostRaceOutcomes.current.get(event.runId) ?? { chunks: '' };
+          const raced = steerLostRaceOutcomes.current.get(event.runId) ?? {
+            chunks: '',
+          };
           if (event.type === 'chunk' && event.chunk) {
             raced.chunks += event.chunk;
             steerLostRaceOutcomes.current.set(event.runId, raced);
@@ -3308,8 +3081,14 @@ const App: React.FC = () => {
             startedAt: new Date().toISOString(),
             activities: [],
           });
-          runOutputMessages.current.set(event.runId, { threadId: event.threadId, messageId });
-          setActiveRunsByThread((current) => ({ ...current, [event.threadId]: event.runId }));
+          runOutputMessages.current.set(event.runId, {
+            threadId: event.threadId,
+            messageId,
+          });
+          setActiveRunsByThread((current) => ({
+            ...current,
+            [event.threadId]: event.runId,
+          }));
           updateThread(event.threadId, { status: 'running' });
           pushLinkedTaskStatus(event.threadId, 'running');
         }
@@ -3405,26 +3184,17 @@ const App: React.FC = () => {
         // in the terminal error text or in the tail of the streamed output,
         // where stderr lands — and mark the message so the transcript offers
         // an Authenticate button instead of a dead-end error.
-        const errorThread = useOrionStore
-          .getState()
-          .threads.find((thread) => thread.id === tracked.threadId);
+        const errorThread = useOrionStore.getState().threads.find((thread) => thread.id === tracked.threadId);
         const contentTail =
-          errorThread?.messages
-            .find((message) => message.id === tracked.messageId)
-            ?.content.slice(-1200) ?? '';
-        const looksLoggedOut =
-          isProviderAuthErrorText(event.error) || isProviderAuthErrorText(contentTail);
-        const rawAuthProviderId = looksLoggedOut
-          ? event.providerId ?? errorThread?.modelId.split(':')[0]
-          : undefined;
+          errorThread?.messages.find((message) => message.id === tracked.messageId)?.content.slice(-1200) ?? '';
+        const looksLoggedOut = isProviderAuthErrorText(event.error) || isProviderAuthErrorText(contentTail);
+        const rawAuthProviderId = looksLoggedOut ? (event.providerId ?? errorThread?.modelId.split(':')[0]) : undefined;
         // The Orion pseudo-provider has no CLI of its own to authenticate.
         const authProviderId = rawAuthProviderId === 'orion' ? undefined : rawAuthProviderId;
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'error',
           completedAt: new Date().toISOString(),
-          statusText: authProviderId
-            ? 'The agent is logged out.'
-            : 'The agent stopped with an error.',
+          statusText: authProviderId ? 'The agent is logged out.' : 'The agent stopped with an error.',
           error: event.error,
           authProviderId,
           changedFiles: event.changedFiles ?? [],
@@ -3441,7 +3211,20 @@ const App: React.FC = () => {
       unsubscribe?.();
       flushChunkBuffers();
     };
-  }, [addActivityToThreadMessage, addMessageToThread, appendToThreadMessage, appendToBtwExchange, clearActiveRun, flushChunkBuffers, notifyThreadFinished, pushLinkedTaskStatus, setThreadAgentSession, updateBtwExchange, updateThread, updateThreadMessage]);
+  }, [
+    addActivityToThreadMessage,
+    addMessageToThread,
+    appendToThreadMessage,
+    appendToBtwExchange,
+    clearActiveRun,
+    flushChunkBuffers,
+    notifyThreadFinished,
+    pushLinkedTaskStatus,
+    setThreadAgentSession,
+    updateBtwExchange,
+    updateThread,
+    updateThreadMessage,
+  ]);
 
   useEffect(() => {
     if (recoveredInterruptedRuns.current || threads.length === 0) return;
@@ -3480,133 +3263,6 @@ const App: React.FC = () => {
     }
   }, [workspacePath, projects, setWorkspacePath]);
 
-  // Keep treeRoot in sync. The ref mirrors it synchronously so in-flight
-  // directory reads can tell they raced a workspace switch.
-  const treeRootRef = useRef<string | null>(null);
-  useEffect(() => {
-    treeRootRef.current = workspacePath;
-    setTreeRoot(workspacePath);
-  }, [workspacePath]);
-
-  // Load tree when root changes. Only the newest read may set treeItems: the
-  // root check discards reads that raced a workspace switch, and the sequence
-  // check discards an older same-root read resolving after a newer one (the
-  // backend snapshots entries before a potentially slow git status, so the
-  // older listing can finish last and resurrect deleted files).
-  const loadRootSeqRef = useRef(0);
-  const loadRoot = useCallback(async (root: string) => {
-    if (!root || !window.orion) return;
-    const seq = ++loadRootSeqRef.current;
-    const items = await window.orion.readDirectory(root);
-    if (treeRootRef.current !== root || loadRootSeqRef.current !== seq) return;
-    setTreeItems(items);
-  }, []);
-
-  useEffect(() => {
-    if (treeRoot) {
-      loadRoot(treeRoot);
-    } else {
-      setTreeItems([]);
-    }
-  }, [treeRoot, loadRoot]);
-
-  // Load a file into editor (from Code tab)
-  const handleOpenFile = async (filePath: string) => {
-    if (!window.orion) return;
-    const content = await window.orion.readFile(filePath);
-    openFile(filePath, content);
-  };
-
-  // Load children for tree nodes
-  const loadChildren = async (dirPath: string): Promise<FileTreeItem[]> => {
-    if (!window.orion) return [];
-    return await window.orion.readDirectory(dirPath);
-  };
-
-  // Reload the root listing and tell expanded nodes to re-fetch their children.
-  const refreshTree = useCallback(() => {
-    if (treeRoot) loadRoot(treeRoot);
-    setTreeRefreshToken((v) => v + 1);
-  }, [treeRoot, loadRoot]);
-
-  // There is no filesystem watcher on the workspace, so files created outside
-  // the explorer (typically by agents) only appear on a re-list. Re-list when
-  // the Code tab gains focus; while it stays hidden the tree is unmounted and
-  // the focus refresh covers anything that changed in the meantime.
-  const prevActiveTabRef = useRef(activeTab);
-  useEffect(() => {
-    const gainedFocus = activeTab === 'code' && prevActiveTabRef.current !== 'code';
-    prevActiveTabRef.current = activeTab;
-    if (gainedFocus) refreshTree();
-  }, [activeTab, refreshTree]);
-
-  // Re-list when an agent turn completes while the Code tab is visible.
-  // Debounced so a batch of subagents finishing together re-lists once. The
-  // timer lives in a ref because the effect re-runs when a queued follow-up
-  // starts the next turn (runningAgentCount goes back up) — a cleanup-owned
-  // timer would be cancelled right there and the explorer would stay stale
-  // for that whole turn.
-  const prevRunningAgentCountRef = useRef(runningAgentCount);
-  const prevTreeTurnRefreshTickRef = useRef(treeTurnRefreshTick);
-  const treeRefreshTimerRef = useRef<number | null>(null);
-  useEffect(() => {
-    const turnCompleted =
-      runningAgentCount < prevRunningAgentCountRef.current ||
-      treeTurnRefreshTick !== prevTreeTurnRefreshTickRef.current;
-    prevRunningAgentCountRef.current = runningAgentCount;
-    prevTreeTurnRefreshTickRef.current = treeTurnRefreshTick;
-    if (!turnCompleted || activeTab !== 'code') return;
-    if (treeRefreshTimerRef.current !== null) window.clearTimeout(treeRefreshTimerRef.current);
-    treeRefreshTimerRef.current = window.setTimeout(() => {
-      treeRefreshTimerRef.current = null;
-      refreshTree();
-    }, 300);
-  }, [runningAgentCount, treeTurnRefreshTick, activeTab, refreshTree]);
-  useEffect(
-    () => () => {
-      if (treeRefreshTimerRef.current !== null) window.clearTimeout(treeRefreshTimerRef.current);
-    },
-    []
-  );
-
-  const isPathWithin = (candidate: string, ancestor: string) =>
-    candidate === ancestor ||
-    candidate.startsWith(`${ancestor}/`) ||
-    candidate.startsWith(`${ancestor}\\`);
-
-  // Delete a tree entry after native confirmation; closes any editor tabs
-  // showing the deleted file (or files inside the deleted folder).
-  const handleDeleteTreeItem = async (item: FileTreeItem) => {
-    if (!window.orion) return;
-    const confirmed = await window.orion.confirmDeletePath({
-      path: item.path,
-      isDirectory: item.isDirectory,
-    });
-    if (!confirmed) return;
-    const ok = await window.orion.deletePath(item.path);
-    if (!ok) {
-      toast.error(`Could not delete ${item.name}`);
-      return;
-    }
-    for (const file of openFiles) {
-      if (isPathWithin(file.path, item.path)) closeFile(file.path);
-    }
-    toast.success(`Deleted ${item.name}`);
-    refreshTree();
-  };
-
-  // After a rename, retarget open editor tabs and refresh the tree.
-  const handleTreeItemRenamed = async (oldPath: string, newPath: string, isDirectory: boolean) => {
-    const wasOpen = openFiles.some((file) => file.path === oldPath);
-    for (const file of openFiles) {
-      if (isPathWithin(file.path, oldPath)) closeFile(file.path);
-    }
-    if (!isDirectory && wasOpen) {
-      await handleOpenFile(newPath);
-    }
-    refreshTree();
-  };
-
   // Add a project. Keep this stable because it crosses the memoized transcript
   // boundary and App also renders on every composer edit.
   const handleAddProject = useCallback(
@@ -3620,8 +3276,7 @@ const App: React.FC = () => {
         const selectedRoot = selectedRepository.ok ? selectedRepository.root : undefined;
         if (
           !selectedRoot ||
-          normalizeRepositoryPath(selectedRoot) !==
-            normalizeRepositoryPath(options.expectedGitRoot)
+          normalizeRepositoryPath(selectedRoot) !== normalizeRepositoryPath(options.expectedGitRoot)
         ) {
           toast.error('That folder belongs to a different repository', {
             description: `Select ${options.expectedGitRoot}`,
@@ -3645,17 +3300,6 @@ const App: React.FC = () => {
     },
     [addProject, createThread, repositoryOperationBusy, setActiveTab, setWorkspacePath]
   );
-
-  // Open folder directly for code tab
-  const handleOpenFolderForCode = async () => {
-    if (!window.orion) return;
-    const dir = await window.orion.openDirectory();
-    if (dir) {
-      setWorkspacePath(dir);
-      closeAllFiles();
-      toast.success('Workspace opened');
-    }
-  };
 
   const handleSetActiveTab = (tab: 'agents' | 'code') => {
     // Open the directory the agents are actually editing: a rift workspace
@@ -3692,9 +3336,7 @@ const App: React.FC = () => {
       // Read the thread at call time instead of depending on the Thread
       // object: its identity churns with every shell-signature change, and a
       // churning callback would break ChatTranscript's memo boundary.
-      const thread = useOrionStore
-        .getState()
-        .threads.find((candidate) => candidate.id === selectedThreadId);
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === selectedThreadId);
       if (!thread) {
         selectProject(projectId);
         setProjectPickerOpen(false);
@@ -3715,9 +3357,7 @@ const App: React.FC = () => {
         return;
       }
       if (!canChangeSelectedThreadProject) {
-        toast.error(
-          'Project can only be changed before the agent runs in this thread'
-        );
+        toast.error('Project can only be changed before the agent runs in this thread');
         setProjectPickerOpen(false);
         return;
       }
@@ -3726,22 +3366,11 @@ const App: React.FC = () => {
       selectProject(projectId);
       setProjectPickerOpen(false);
     },
-    [
-      canChangeSelectedThreadProject,
-      projects,
-      repositoryOperationBusy,
-      selectProject,
-      selectedThreadId,
-      updateThread,
-    ]
+    [canChangeSelectedThreadProject, projects, repositoryOperationBusy, selectProject, selectedThreadId, updateThread]
   );
 
   const handleCheckoutBranch = async (branchName: string) => {
-    if (
-      !activeWorkingDir ||
-      !window.orion?.checkoutGitBranch ||
-      repositoryOperationBusy
-    ) return;
+    if (!activeWorkingDir || !window.orion?.checkoutGitBranch || repositoryOperationBusy) return;
     if (gitState?.hasUncommittedChanges) {
       toast.error('Commit or discard local changes before checking out another branch');
       return;
@@ -3766,11 +3395,7 @@ const App: React.FC = () => {
   };
 
   const handleCreateBranch = async (branchName: string) => {
-    if (
-      !activeWorkingDir ||
-      !window.orion?.checkoutGitBranch ||
-      repositoryOperationBusy
-    ) return;
+    if (!activeWorkingDir || !window.orion?.checkoutGitBranch || repositoryOperationBusy) return;
 
     const normalized = branchName.trim();
     if (!normalized) return;
@@ -3795,11 +3420,7 @@ const App: React.FC = () => {
   };
 
   const handleCommitAndPush = async () => {
-    if (
-      !activeWorkingDir ||
-      !window.orion?.commitAndPush ||
-      repositoryOperationBusy
-    ) return;
+    if (!activeWorkingDir || !window.orion?.commitAndPush || repositoryOperationBusy) return;
 
     setGitBusy(true);
     try {
@@ -3823,15 +3444,13 @@ const App: React.FC = () => {
   };
 
   const handleCloudPublish = async () => {
-    if (
-      !activeWorkingDir ||
-      !window.orion?.publishToCloud ||
-      repositoryOperationBusy
-    ) return;
+    if (!activeWorkingDir || !window.orion?.publishToCloud || repositoryOperationBusy) return;
 
     setCloudBusy(true);
     try {
-      const result = await window.orion.publishToCloud({ projectPath: activeWorkingDir });
+      const result = await window.orion.publishToCloud({
+        projectPath: activeWorkingDir,
+      });
       if (result.ok && result.alreadyLinked) {
         toast.success(result.upToDate ? 'Orion Cloud is already up to date' : 'Pushed to Orion Cloud');
         await refreshCloudState();
@@ -3857,11 +3476,7 @@ const App: React.FC = () => {
   };
 
   const handleCloudPush = async () => {
-    if (
-      !activeWorkingDir ||
-      !window.orion?.pushToCloud ||
-      repositoryOperationBusy
-    ) return;
+    if (!activeWorkingDir || !window.orion?.pushToCloud || repositoryOperationBusy) return;
 
     setCloudBusy(true);
     try {
@@ -3894,11 +3509,7 @@ const App: React.FC = () => {
   };
 
   const handleCloudPull = async () => {
-    if (
-      !activeWorkingDir ||
-      !window.orion?.pullFromCloud ||
-      repositoryOperationBusy
-    ) return;
+    if (!activeWorkingDir || !window.orion?.pullFromCloud || repositoryOperationBusy) return;
 
     setCloudBusy(true);
     try {
@@ -3978,9 +3589,7 @@ const App: React.FC = () => {
       const project =
         state.projects.find((candidate) => candidate.id === requestedProjectId) ??
         state.projects.find((candidate) => candidate.path === ownership.projectPath) ??
-        state.projects.find(
-          (candidate) => candidate.path === epic.riftRequest?.projectPath
-        );
+        state.projects.find((candidate) => candidate.path === epic.riftRequest?.projectPath);
       if (!project) {
         return {
           ok: false,
@@ -4012,7 +3621,10 @@ const App: React.FC = () => {
         (await window.orion?.epicAcknowledgeRift?.({
           epicId: ownership.epicId,
           riftPath: ownership.riftPath,
-        })) ?? { ok: false, error: 'This Orion build cannot acknowledge Rift ownership.' }
+        })) ?? {
+          ok: false,
+          error: 'This Orion build cannot acknowledge Rift ownership.',
+        }
       );
     },
     [updateEpic, updateThread]
@@ -4035,10 +3647,7 @@ const App: React.FC = () => {
         if (disposed) return;
         setRiftStatus(status);
         const pending = Object.fromEntries(
-          [
-            ...(status.pendingEpicIds ?? []),
-            ...locallyStartedRiftEpicIdsRef.current,
-          ].map((epicId) => [epicId, true])
+          [...(status.pendingEpicIds ?? []), ...locallyStartedRiftEpicIdsRef.current].map((epicId) => [epicId, true])
         );
         // Main owns this lock across macOS window recreation. Mirror its
         // current state so the reopened UI also disables controls immediately
@@ -4055,10 +3664,10 @@ const App: React.FC = () => {
             if (acknowledgement.ok) {
               if (locallyStartedRiftEpicIdsRef.current.delete(ownership.epicId)) {
                 const recoveredPending = Object.fromEntries(
-                  [
-                    ...(status.pendingEpicIds ?? []),
-                    ...locallyStartedRiftEpicIdsRef.current,
-                  ].map((epicId) => [epicId, true])
+                  [...(status.pendingEpicIds ?? []), ...locallyStartedRiftEpicIdsRef.current].map((epicId) => [
+                    epicId,
+                    true,
+                  ])
                 );
                 riftSetupEpicIdsRef.current = recoveredPending;
                 setRiftSetupEpicIds(recoveredPending);
@@ -4083,9 +3692,7 @@ const App: React.FC = () => {
             if (disposed) return;
             setRiftStorageState(storageState);
             if ((storageState.pendingReleases?.length ?? 0) > 0) {
-              shouldRetryReleasedRifts = !(
-                await finalizeReleasedRifts(storageState.pendingReleases ?? [])
-              );
+              shouldRetryReleasedRifts = !(await finalizeReleasedRifts(storageState.pendingReleases ?? []));
             }
           } catch (error) {
             shouldRetryReleasedRifts = true;
@@ -4118,9 +3725,7 @@ const App: React.FC = () => {
       } catch {
         if (
           !disposed &&
-          (locallyStartedRiftEpicIdsRef.current.size > 0 ||
-            shouldRetryReadyRift ||
-            pendingRemovalObserved)
+          (locallyStartedRiftEpicIdsRef.current.size > 0 || shouldRetryReadyRift || pendingRemovalObserved)
         ) {
           if (pendingRemovalObserved) {
             releaseRecoveryRetryCount += 1;
@@ -4128,14 +3733,7 @@ const App: React.FC = () => {
             recoveryRetryCount += 1;
           }
           const retryDelay = Math.min(
-            500 *
-              2 **
-                Math.min(
-                  pendingRemovalObserved
-                    ? releaseRecoveryRetryCount
-                    : recoveryRetryCount,
-                  4
-                ),
+            500 * 2 ** Math.min(pendingRemovalObserved ? releaseRecoveryRetryCount : recoveryRetryCount, 4),
             5000
           );
           refreshTimer = window.setTimeout(() => void refresh(), retryDelay);
@@ -4153,19 +3751,12 @@ const App: React.FC = () => {
     setNewEpicName('');
     setNewEpicDescription('');
     setNewEpicProjectId(
-      (projects.find((project) => project.id === lastMessagedProjectId) ?? defaultNewThreadProject)
-        ?.id ?? null
+      (projects.find((project) => project.id === lastMessagedProjectId) ?? defaultNewThreadProject)?.id ?? null
     );
     setNewEpicCreateRift(riftsActive && riftsSettings.autoCreateForEpics);
     setEpicsSectionOpen(true);
     setCreateEpicOpen(true);
-  }, [
-    defaultNewThreadProject,
-    lastMessagedProjectId,
-    projects,
-    riftsActive,
-    riftsSettings.autoCreateForEpics,
-  ]);
+  }, [defaultNewThreadProject, lastMessagedProjectId, projects, riftsActive, riftsSettings.autoCreateForEpics]);
 
   const closeCreateEpicModal = useCallback(() => {
     setCreateEpicOpen(false);
@@ -4216,10 +3807,8 @@ const App: React.FC = () => {
     if (!epic || !request || epic.riftPath) return;
     const project =
       state.projects.find(
-        (candidate) =>
-          candidate.id === request.projectId && candidate.path === request.projectPath
-      ) ??
-      state.projects.find((candidate) => candidate.path === request.projectPath);
+        (candidate) => candidate.id === request.projectId && candidate.path === request.projectPath
+      ) ?? state.projects.find((candidate) => candidate.path === request.projectPath);
     if (!project) {
       updateEpic(epicId, {
         riftRequest: {
@@ -4416,28 +4005,17 @@ const App: React.FC = () => {
       window.clearTimeout(id);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [
-    closeCreateEpicModal,
-    createEpicOpen,
-    createEpicProjectPickerOpen,
-    createEpicRiftBranchPickerOpen,
-  ]);
+  }, [closeCreateEpicModal, createEpicOpen, createEpicProjectPickerOpen, createEpicRiftBranchPickerOpen]);
 
   // Click-outside for create-epic Tailwind dropdowns.
   useEffect(() => {
     if (!createEpicProjectPickerOpen && !createEpicRiftBranchPickerOpen) return undefined;
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node;
-      if (
-        createEpicProjectPickerOpen &&
-        !createEpicProjectPickerRef.current?.contains(target)
-      ) {
+      if (createEpicProjectPickerOpen && !createEpicProjectPickerRef.current?.contains(target)) {
         setCreateEpicProjectPickerOpen(false);
       }
-      if (
-        createEpicRiftBranchPickerOpen &&
-        !createEpicRiftBranchPickerRef.current?.contains(target)
-      ) {
+      if (createEpicRiftBranchPickerOpen && !createEpicRiftBranchPickerRef.current?.contains(target)) {
         setCreateEpicRiftBranchPickerOpen(false);
       }
     };
@@ -4491,14 +4069,12 @@ const App: React.FC = () => {
   // don't apply there.
   const resolveEpicGitTarget = (epic: Epic) => {
     const project = epic.repositoryProjectId
-      ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
+      ? (projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null)
       : null;
     const isRift = Boolean(epic.riftPath && !epic.riftCleanupPending);
     return {
       project,
-      projectPath: epic.riftCleanupPending
-        ? undefined
-        : epic.riftPath ?? epic.gitRoot ?? project?.path,
+      projectPath: epic.riftCleanupPending ? undefined : (epic.riftPath ?? epic.gitRoot ?? project?.path),
       claim: isRift
         ? {
             isRift: true as const,
@@ -4512,10 +4088,7 @@ const App: React.FC = () => {
             claimedBranches: epics
               .filter(
                 (candidate) =>
-                  candidate.id !== epic.id &&
-                  !candidate.riftPath &&
-                  candidate.gitRoot &&
-                  candidate.gitBranch
+                  candidate.id !== epic.id && !candidate.riftPath && candidate.gitRoot && candidate.gitBranch
               )
               .map((candidate) => ({
                 gitRoot: candidate.gitRoot!,
@@ -4540,22 +4113,14 @@ const App: React.FC = () => {
     if (epic.gitRoot) {
       return `git:${normalizeRepositoryPath(epic.gitRoot)}`;
     }
-    return resolveEpicGitTarget(epic).projectPath
-      ? UNCLAIMED_EPIC_GIT_WORKSPACE_KEY
-      : undefined;
+    return resolveEpicGitTarget(epic).projectPath ? UNCLAIMED_EPIC_GIT_WORKSPACE_KEY : undefined;
   };
 
   // Click-time guard for one epic's git actions. Shell git/cloud work still
   // blocks them — it can touch the same checkout — as does an epic sharing this
   // one's workspace, but an unrelated epic's in-flight commit or PR does not.
   const epicOperationBusy = (epic: Epic) =>
-    gitBusy ||
-    cloudBusy ||
-    epicGitWorkspaceBusy(
-      epic.id,
-      epicGitWorkspaceKey(epic),
-      epicGitBusyRef.current
-    );
+    gitBusy || cloudBusy || epicGitWorkspaceBusy(epic.id, epicGitWorkspaceKey(epic), epicGitBusyRef.current);
 
   // A rift epic's gitRoot stays the source repository root (it associates the
   // epic with its project); the main process reports the rift itself as the
@@ -4601,14 +4166,11 @@ const App: React.FC = () => {
   // which is why the background interval remains what actually catches merges.
   // Lives outside the poll effect so it survives that effect restarting.
   const epicPrRefreshArmedRef = useRef(false);
-  const openEpicPrUrl = (prUrl: string) => {
+  const openEpicPrUrl = useCallback((prUrl: string) => {
     epicPrRefreshArmedRef.current = true;
     void window.orion?.openExternalUrl?.(prUrl);
-  };
-  const beginEpicPrLookup = (
-    epicId: string,
-    expectedPrUrl: string
-  ): EpicPrLookupRequest => {
+  }, []);
+  const beginEpicPrLookup = (epicId: string, expectedPrUrl: string): EpicPrLookupRequest => {
     const order = ++epicPrLookupOrderRef.current;
     latestEpicPrLookupOrderRef.current.set(epicId, order);
     return {
@@ -4618,14 +4180,8 @@ const App: React.FC = () => {
     };
   };
 
-  const persistEpicPrLookup = (
-    epicId: string,
-    state: 'OPEN' | 'CLOSED' | 'MERGED',
-    request: EpicPrLookupRequest
-  ) => {
-    const currentEpic = useOrionStore
-      .getState()
-      .epics.find((epic) => epic.id === epicId);
+  const persistEpicPrLookup = (epicId: string, state: 'OPEN' | 'CLOSED' | 'MERGED', request: EpicPrLookupRequest) => {
+    const currentEpic = useOrionStore.getState().epics.find((epic) => epic.id === epicId);
     if (
       !currentEpic ||
       currentEpic.prUrl !== request.expectedPrUrl ||
@@ -4655,41 +4211,25 @@ const App: React.FC = () => {
         resolveEpicGitTarget(selectedEpic).projectPath ?? null,
       ])
     : null;
-  const selectedEpicRemovalPending = selectedEpic
-    ? Boolean(riftRemovalEpicIds[selectedEpic.id])
-    : false;
+  const selectedEpicRemovalPending = selectedEpic ? Boolean(riftRemovalEpicIds[selectedEpic.id]) : false;
   // Only the selected epic's own git action pauses its status poll and names
   // the in-progress label; work running in an unrelated epic leaves this view
   // alone. The button guard also stands down for an epic sharing this one's
   // checkout, matching the click-time guard.
-  const selectedEpicGitBusy = selectedEpic ? epicGitBusy[selectedEpic.id]?.kind ?? null : null;
+  const selectedEpicGitBusy = selectedEpic ? (epicGitBusy[selectedEpic.id]?.kind ?? null) : null;
   const selectedEpicOperationBusy =
     gitBusy ||
     cloudBusy ||
-    (selectedEpic
-      ? epicGitWorkspaceBusy(
-          selectedEpic.id,
-          epicGitWorkspaceKey(selectedEpic),
-          epicGitBusy
-        )
-      : false);
+    (selectedEpic ? epicGitWorkspaceBusy(selectedEpic.id, epicGitWorkspaceKey(selectedEpic), epicGitBusy) : false);
 
   useEffect(() => {
-    if (
-      !selectedEpic ||
-      selectedEpicGitBusy ||
-      activeRiftUnavailable ||
-      selectedEpicRemovalPending
-    ) {
+    if (!selectedEpic || selectedEpicGitBusy || activeRiftUnavailable || selectedEpicRemovalPending) {
       return;
     }
     let cancelled = false;
     let refreshTimer: number | undefined;
     const run = async (includePr: boolean) => {
-      const prLookup =
-        includePr && selectedEpic.prUrl
-          ? beginEpicPrLookup(selectedEpic.id, selectedEpic.prUrl)
-          : null;
+      const prLookup = includePr && selectedEpic.prUrl ? beginEpicPrLookup(selectedEpic.id, selectedEpic.prUrl) : null;
       const result = await refreshEpicGitStatus(selectedEpic, { includePr });
       if (cancelled) return;
       if (result) {
@@ -4715,12 +4255,7 @@ const App: React.FC = () => {
     // refreshEpicGitStatus is recreated every render; depending on it would
     // refire the effect every render and defeat the refresh loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    selectedEpicGitPollKey,
-    selectedEpicGitBusy,
-    activeRiftUnavailable,
-    selectedEpicRemovalPending,
-  ]);
+  }, [selectedEpicGitPollKey, selectedEpicGitBusy, activeRiftUnavailable, selectedEpicRemovalPending]);
 
   // The sidebar and archive both colour epic icons by PR state, so include
   // settled epics as well as active ones. Merged PRs are immutable and need no
@@ -4733,12 +4268,16 @@ const App: React.FC = () => {
       if (!epic.prUrl || epic.prState === 'MERGED') return [];
       const projectPath = epic.riftCleanupPending
         ? undefined
-        : epic.riftPath ??
+        : (epic.riftPath ??
           epic.gitRoot ??
-          (epic.repositoryProjectId
-            ? projectPathsById.get(epic.repositoryProjectId)
-            : undefined);
-      return [{ epicId: epic.id, prUrl: epic.prUrl, ...(projectPath ? { projectPath } : {}) }];
+          (epic.repositoryProjectId ? projectPathsById.get(epic.repositoryProjectId) : undefined));
+      return [
+        {
+          epicId: epic.id,
+          prUrl: epic.prUrl,
+          ...(projectPath ? { projectPath } : {}),
+        },
+      ];
     });
   }, [epics, epicsEnabled, projects]);
   const epicPrTargetsRef = useRef(epicPrTargets);
@@ -4772,19 +4311,12 @@ const App: React.FC = () => {
       // the browser — and having opened this PR from Orion first is stronger
       // still, so that skips the throttle entirely.
       const armed = reason === 'focus' && epicPrRefreshArmedRef.current;
-      const minElapsed = armed
-        ? 0
-        : reason === 'focus'
-          ? EPIC_PR_STATE_FOCUS_REFRESH_MS
-          : EPIC_PR_STATE_REFRESH_MS;
+      const minElapsed = armed ? 0 : reason === 'focus' ? EPIC_PR_STATE_FOCUS_REFRESH_MS : EPIC_PR_STATE_REFRESH_MS;
       const elapsed = Date.now() - lastLookupAt;
       if (lastLookupAt > 0 && elapsed < minElapsed) {
         // Reschedule at the background cadence, never at the focus one: a focus
         // arriving just after a tick must not convert the loop into a 15s poll.
-        timer = window.setTimeout(
-          () => void run(),
-          Math.max(0, EPIC_PR_STATE_REFRESH_MS - elapsed)
-        );
+        timer = window.setTimeout(() => void run(), Math.max(0, EPIC_PR_STATE_REFRESH_MS - elapsed));
         return;
       }
       // Spend the arm only now that this refresh is definitely going ahead: a
@@ -4795,16 +4327,13 @@ const App: React.FC = () => {
       try {
         const requestedTargets = epicPrTargetsRef.current;
         const lookupRequests = new Map(
-          requestedTargets.map((target) => [
-            target.epicId,
-            beginEpicPrLookup(target.epicId, target.prUrl),
-          ])
+          requestedTargets.map((target) => [target.epicId, beginEpicPrLookup(target.epicId, target.prUrl)])
         );
-        const result = await window.orion.epicPrStates({ epics: requestedTargets });
+        const result = await window.orion.epicPrStates({
+          epics: requestedTargets,
+        });
         if (cancelled) return;
-        const knownById = new Map(
-          useOrionStore.getState().epics.map((epic) => [epic.id, epic])
-        );
+        const knownById = new Map(useOrionStore.getState().epics.map((epic) => [epic.id, epic]));
         for (const entry of result.states ?? []) {
           if (!knownById.has(entry.epicId)) continue;
           const request = lookupRequests.get(entry.epicId);
@@ -4847,9 +4376,7 @@ const App: React.FC = () => {
   // updated synchronously, so merge both views (same as handleDeleteEpic).
   const epicHasRunningAgents = (epicId: string) => {
     const state = useOrionStore.getState();
-    const runsByThread = new Map<string, string>(
-      Object.entries(activeRunsByThreadRef.current)
-    );
+    const runsByThread = new Map<string, string>(Object.entries(activeRunsByThreadRef.current));
     for (const [runId, tracked] of runOutputMessages.current) {
       runsByThread.set(tracked.threadId, runId);
     }
@@ -4860,20 +4387,14 @@ const App: React.FC = () => {
     while (foundChild) {
       foundChild = false;
       for (const thread of state.threads) {
-        if (
-          thread.parentThreadId &&
-          epicThreadIds.has(thread.parentThreadId) &&
-          !epicThreadIds.has(thread.id)
-        ) {
+        if (thread.parentThreadId && epicThreadIds.has(thread.parentThreadId) && !epicThreadIds.has(thread.id)) {
           epicThreadIds.add(thread.id);
           foundChild = true;
         }
       }
     }
     return state.threads.some(
-      (thread) =>
-        epicThreadIds.has(thread.id) &&
-        (thread.status === 'running' || runsByThread.has(thread.id))
+      (thread) => epicThreadIds.has(thread.id) && (thread.status === 'running' || runsByThread.has(thread.id))
     );
   };
 
@@ -4985,7 +4506,7 @@ const App: React.FC = () => {
   // lives in the source repository the rift was made from.
   const resolveEpicSourceProjectPath = (epic: Epic) => {
     const project = epic.repositoryProjectId
-      ? projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null
+      ? (projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null)
       : null;
     return epic.gitRoot ?? project?.path;
   };
@@ -5013,12 +4534,8 @@ const App: React.FC = () => {
     if (branches.length === 0) {
       return { error: 'No branches found on origin to use as the PR base' };
     }
-    const defaultBranch =
-      result.defaultBranch && branches.includes(result.defaultBranch)
-        ? result.defaultBranch
-        : '';
-    const sourceBranch =
-      result.sourceBranch && branches.includes(result.sourceBranch) ? result.sourceBranch : '';
+    const defaultBranch = result.defaultBranch && branches.includes(result.defaultBranch) ? result.defaultBranch : '';
+    const sourceBranch = result.sourceBranch && branches.includes(result.sourceBranch) ? result.sourceBranch : '';
     return {
       branches,
       defaultBranch,
@@ -5031,9 +4548,7 @@ const App: React.FC = () => {
   // can be closed and reopened while an earlier request is still in flight.
   const patchEpicPrBaseDialog = (
     instanceId: number,
-    patch: (
-      current: NonNullable<typeof epicPrBaseDialog>
-    ) => Partial<NonNullable<typeof epicPrBaseDialog>>
+    patch: (current: NonNullable<typeof epicPrBaseDialog>) => Partial<NonNullable<typeof epicPrBaseDialog>>
   ) =>
     setEpicPrBaseDialog((current) =>
       current && current.instanceId === instanceId ? { ...current, ...patch(current) } : current
@@ -5061,7 +4576,11 @@ const App: React.FC = () => {
         // Origin already answered — its list is the authoritative one.
         current.branches.length > 0 || current.baseBranch
           ? {}
-          : { sourceBranch, defaultBranch, baseBranch: sourceBranch || defaultBranch }
+          : {
+              sourceBranch,
+              defaultBranch,
+              baseBranch: sourceBranch || defaultBranch,
+            }
       );
     } catch {
       // The picker still fills from origin.
@@ -5092,8 +4611,7 @@ const App: React.FC = () => {
     } catch (error) {
       patchEpicPrBaseDialog(instanceId, () => ({
         branchesLoading: false,
-        branchesError:
-          error instanceof Error ? error.message : 'Could not list the branches on origin',
+        branchesError: error instanceof Error ? error.message : 'Could not list the branches on origin',
       }));
     } finally {
       markEpicGitBusy(epic.id, null);
@@ -5198,9 +4716,7 @@ const App: React.FC = () => {
           });
         }
         toast.success(
-          result.alreadyExists
-            ? 'A pull request for this branch is already open'
-            : 'Pull request opened',
+          result.alreadyExists ? 'A pull request for this branch is already open' : 'Pull request opened',
           url
             ? {
                 action: {
@@ -5223,9 +4739,7 @@ const App: React.FC = () => {
   const handleRemoveThreadFromEpic = async (threadId: string) => {
     const state = useOrionStore.getState();
     const thread = state.threads.find((candidate) => candidate.id === threadId);
-    const epic = thread?.epicId
-      ? state.epics.find((candidate) => candidate.id === thread.epicId)
-      : undefined;
+    const epic = thread?.epicId ? state.epics.find((candidate) => candidate.id === thread.epicId) : undefined;
     if (!thread || !epic) return;
     if (!epic.riftPath) {
       updateThread(thread.id, { epicId: undefined });
@@ -5267,9 +4781,7 @@ const App: React.FC = () => {
 
       if (window.orion?.stopAgentTurn) {
         await Promise.allSettled(
-          [...runIds].map((runId) =>
-            window.orion!.stopAgentTurn(runId, { terminateBackground: true })
-          )
+          [...runIds].map((runId) => window.orion!.stopAgentTurn(runId, { terminateBackground: true }))
         );
       }
       await disposeAgentThread(thread.id);
@@ -5312,9 +4824,7 @@ const App: React.FC = () => {
     }
     try {
       const projectPath = epic.repositoryProjectId
-        ? useOrionStore
-            .getState()
-            .projects.find((project) => project.id === epic.repositoryProjectId)?.path
+        ? useOrionStore.getState().projects.find((project) => project.id === epic.repositoryProjectId)?.path
         : undefined;
       const result = await cleanup({
         epicId: epic.id,
@@ -5357,9 +4867,7 @@ const App: React.FC = () => {
     const currentEpic = state.epics.find((candidate) => candidate.id === epic.id);
     if (!currentEpic) return;
     const epicThreads = state.threads.filter((thread) => thread.epicId === currentEpic.id);
-    const originalEpicIndex = state.epics.findIndex(
-      (candidate) => candidate.id === currentEpic.id
-    );
+    const originalEpicIndex = state.epics.findIndex((candidate) => candidate.id === currentEpic.id);
     const directThreadIds = new Set(epicThreads.map((thread) => thread.id));
     const restoreDeletedEpic = async () => {
       // Preserve unrelated state changes that may land during deletion while
@@ -5370,19 +4878,13 @@ const App: React.FC = () => {
           ? latest.epics
           : (() => {
               const restored = [...latest.epics];
-              restored.splice(
-                Math.min(Math.max(originalEpicIndex, 0), restored.length),
-                0,
-                currentEpic
-              );
+              restored.splice(Math.min(Math.max(originalEpicIndex, 0), restored.length), 0, currentEpic);
               return restored;
             })();
         return {
           epics: nextEpics,
           threads: latest.threads.map((thread) =>
-            directThreadIds.has(thread.id) && !thread.epicId
-              ? { ...thread, epicId: currentEpic.id }
-              : thread
+            directThreadIds.has(thread.id) && !thread.epicId ? { ...thread, epicId: currentEpic.id } : thread
           ),
           selectedEpicId:
             latest.selectedEpicId === null && state.selectedEpicId === currentEpic.id
@@ -5390,18 +4892,11 @@ const App: React.FC = () => {
               : latest.selectedEpicId,
         };
       });
-      const [storeSaved, threadsSaved] = await Promise.all([
-        flushOrionStoreSave(),
-        flushOrionThreadsSave(),
-      ]);
+      const [storeSaved, threadsSaved] = await Promise.all([flushOrionStoreSave(), flushOrionThreadsSave()]);
       return storeSaved && threadsSaved;
     };
     if (!currentEpic.riftPath) {
-      if (
-        !confirm(
-          `Delete epic "${currentEpic.name}"? Its threads are kept — they just leave this group.`
-        )
-      ) {
+      if (!confirm(`Delete epic "${currentEpic.name}"? Its threads are kept — they just leave this group.`)) {
         return;
       }
       if (!currentEpic.riftReleased) {
@@ -5430,8 +4925,7 @@ const App: React.FC = () => {
     }
 
     const fallbackProject =
-      state.projects.find((project) => project.id === currentEpic.repositoryProjectId)?.name ??
-      'their project';
+      state.projects.find((project) => project.id === currentEpic.repositoryProjectId)?.name ?? 'their project';
     if (
       !confirm(
         `Delete epic "${currentEpic.name}"?\n\n` +
@@ -5502,9 +4996,7 @@ const App: React.FC = () => {
       // The ref can lag a just-started run until the next render, while the
       // output map is updated synchronously. Merge both views so every tracked
       // foreground or retained background run is stopped.
-      const runsByThread = new Map<string, string>(
-        Object.entries(activeRunsByThreadRef.current)
-      );
+      const runsByThread = new Map<string, string>(Object.entries(activeRunsByThreadRef.current));
       for (const [runId, tracked] of runOutputMessages.current) {
         runsByThread.set(tracked.threadId, runId);
       }
@@ -5513,9 +5005,7 @@ const App: React.FC = () => {
           const runId = runsByThread.get(thread.id);
           return runId ? { threadId: thread.id, runId } : null;
         })
-        .filter(
-          (entry): entry is { threadId: string; runId: string } => entry !== null
-        );
+        .filter((entry): entry is { threadId: string; runId: string } => entry !== null);
 
       // Untrack before IPC so terminal events racing with teardown cannot mark
       // an intentionally stopped run as finished.
@@ -5565,9 +5055,7 @@ const App: React.FC = () => {
 
       const finalizeDeletedEpicThreads = async () => {
         for (const thread of runtimeThreads) {
-          const latestThread = useOrionStore
-            .getState()
-            .threads.find((candidate) => candidate.id === thread.id);
+          const latestThread = useOrionStore.getState().threads.find((candidate) => candidate.id === thread.id);
           updateThread(thread.id, {
             ...(latestThread?.epicId === currentEpic.id ? { epicId: undefined } : {}),
             agentSessionIds: undefined,
@@ -5682,14 +5170,10 @@ const App: React.FC = () => {
 
     const warnings: string[] = [];
     if (status?.hasChangesToCommit) {
-      warnings.push(
-        'This workspace has uncommitted changes. The epic will be archived without committing them.'
-      );
+      warnings.push('This workspace has uncommitted changes. The epic will be archived without committing them.');
     }
     if (status?.hasUnpushedCommits) {
-      warnings.push(
-        'This workspace has commits that have not been pushed. Settling will not publish them.'
-      );
+      warnings.push('This workspace has commits that have not been pushed. Settling will not publish them.');
     }
     if (!epic.prUrl) {
       warnings.push('This epic has no pull request. It will be archived without one.');
@@ -5718,11 +5202,8 @@ const App: React.FC = () => {
     // workspace has nothing left in it — settling warns about uncommitted and
     // unpushed work but never publishes it, so an unverified workspace must
     // not be swept. A missing status means the inspection itself failed.
-    const canReleaseRift = Boolean(
-      epic.riftPath && status && !status.hasChangesToCommit && !status.hasUnpushedCommits
-    );
-    const releaseRift =
-      canReleaseRift && (riftsSettings.releaseOnSettle ?? defaultRiftsSettings.releaseOnSettle);
+    const canReleaseRift = Boolean(epic.riftPath && status && !status.hasChangesToCommit && !status.hasUnpushedCommits);
+    const releaseRift = canReleaseRift && (riftsSettings.releaseOnSettle ?? defaultRiftsSettings.releaseOnSettle);
 
     const confirmSettle = epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle;
     if (confirmSettle || warnings.length > 0) {
@@ -5732,7 +5213,9 @@ const App: React.FC = () => {
     settleEpic(epic.id);
     toast.success(`Settled ${epic.name}`);
     if (releaseRift && epic.riftPath) {
-      void releaseRiftStorage([{ riftPath: epic.riftPath }], { queueIfBusy: true });
+      void releaseRiftStorage([{ riftPath: epic.riftPath }], {
+        queueIfBusy: true,
+      });
     }
   };
 
@@ -5740,10 +5223,7 @@ const App: React.FC = () => {
   // branch it already owns. Keep it archived until recreation can actually
   // start so its threads cannot become active without an isolated workspace.
   const handleRestoreEpic = (epic: Epic) => {
-    if (
-      riftRemovalEpicIdsRef.current.has(epic.id) ||
-      riftStatus?.pendingRemovalEpicIds?.includes(epic.id)
-    ) {
+    if (riftRemovalEpicIdsRef.current.has(epic.id) || riftStatus?.pendingRemovalEpicIds?.includes(epic.id)) {
       toast.info(`Wait for ${epic.name}’s rift cleanup to finish before restoring it`);
       return;
     }
@@ -5799,9 +5279,7 @@ const App: React.FC = () => {
         try {
           const state = useOrionStore.getState();
           const requestedPaths = new Set(entries.map((entry) => entry.riftPath));
-          const requestedEpics = state.epics.filter(
-            (epic) => epic.riftPath && requestedPaths.has(epic.riftPath)
-          );
+          const requestedEpics = state.epics.filter((epic) => epic.riftPath && requestedPaths.has(epic.riftPath));
           // Register the renderer guard before the first await. Restore and
           // launch actions can otherwise cross the store flush while main is
           // about to act on the still-settled snapshot.
@@ -5815,9 +5293,7 @@ const App: React.FC = () => {
             toast.error('Rift cleanup could not start because Orion storage is unavailable');
             return;
           }
-          const busyEpicIds = state.epics
-            .filter((epic) => epicHasRunningAgents(epic.id))
-            .map((epic) => epic.id);
+          const busyEpicIds = state.epics.filter((epic) => epicHasRunningAgents(epic.id)).map((epic) => epic.id);
           const runtimeThreadIdsByEpic = Object.fromEntries(
             requestedEpics.map((epic) => [
               epic.id,
@@ -5855,12 +5331,8 @@ const App: React.FC = () => {
               // The per-rift sizes count blocks a clone still shares with its source,
               // so report what free space actually moved rather than that estimate.
               const reclaimed =
-                result.reclaimedBytes != null
-                  ? ` — reclaimed ${formatBytes(result.reclaimedBytes)}`
-                  : '';
-              toast.success(
-                `Freed ${freed.length} rift${freed.length === 1 ? '' : 's'}${reclaimed}`
-              );
+                result.reclaimedBytes != null ? ` — reclaimed ${formatBytes(result.reclaimedBytes)}` : '';
+              toast.success(`Freed ${freed.length} rift${freed.length === 1 ? '' : 's'}${reclaimed}`);
             } else {
               // Main retains the durable release journal and launch guard
               // until acknowledgement. The status poll may be idle after a
@@ -5869,15 +5341,11 @@ const App: React.FC = () => {
               toast.error('Rifts were freed, but Orion could not durably finish their cleanup');
             }
           } else if (runGc && !result.gcError) {
-            const reclaimed =
-              result.reclaimedBytes != null
-                ? ` — reclaimed ${formatBytes(result.reclaimedBytes)}`
-                : '';
+            const reclaimed = result.reclaimedBytes != null ? ` — reclaimed ${formatBytes(result.reclaimedBytes)}` : '';
             toast.success(`Emptied Rift trash${reclaimed}`);
           }
           for (const entry of skipped) {
-            const label =
-              RIFT_RELEASE_REASON_LABELS[entry.reason ?? ''] ?? entry.error ?? 'was skipped';
+            const label = RIFT_RELEASE_REASON_LABELS[entry.reason ?? ''] ?? entry.error ?? 'was skipped';
             toast.warning(`${entry.riftPath.split('/').pop()}: ${label}`);
           }
           if (result.gcError) toast.error(`Could not empty the rift trash: ${result.gcError}`);
@@ -5900,14 +5368,10 @@ const App: React.FC = () => {
     // The dialog can stay open while a new run starts, so the sole settlement
     // blocker gets one final click-time check.
     if (epicHasRunningAgents(epic.id)) {
-      toast.error(
-        'Agents are still running in this epic — wait for them to finish before settling it'
-      );
+      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
       return;
     }
-    const currentEpic = useOrionStore
-      .getState()
-      .epics.find((candidate) => candidate.id === epic.id);
+    const currentEpic = useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id);
     if (!currentEpic || currentEpic.settledAt) return;
     settleEpic(epic.id);
     toast.success(`Settled ${currentEpic.name}`);
@@ -5915,7 +5379,9 @@ const App: React.FC = () => {
     // releaseRiftStorage flushes the store first, so this ordering is what
     // makes the guard pass.
     if (releaseRift && currentEpic.riftPath) {
-      void releaseRiftStorage([{ riftPath: currentEpic.riftPath }], { queueIfBusy: true });
+      void releaseRiftStorage([{ riftPath: currentEpic.riftPath }], {
+        queueIfBusy: true,
+      });
     }
   };
 
@@ -5987,15 +5453,7 @@ const App: React.FC = () => {
 
       return true;
     },
-    [
-      activeTab,
-      handleCreateThread,
-      projects,
-      selectThread,
-      selectedProject?.id,
-      selectedThreadId,
-      setActiveTab,
-    ]
+    [activeTab, handleCreateThread, projects, selectThread, selectedProject?.id, selectedThreadId, setActiveTab]
   );
 
   const handleRootDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
@@ -6073,9 +5531,7 @@ const App: React.FC = () => {
           error: 'This epic’s rift workspace is still being created — try again in a moment',
         };
       }
-      const threadEpic = thread.epicId
-        ? state.epics.find((epic) => epic.id === thread.epicId)
-        : undefined;
+      const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       if (threadEpic?.riftRequest) {
         return {
           ok: false,
@@ -6133,33 +5589,22 @@ const App: React.FC = () => {
           ...state.orchestrationSettings?.models,
         };
         const generalInstructions =
-          state.orchestrationSettings?.generalInstructions ??
-          defaultOrchestrationSettings.generalInstructions;
+          state.orchestrationSettings?.generalInstructions ?? defaultOrchestrationSettings.generalInstructions;
         let driverModel = agentModels.find((candidate) => candidate.id === roleModels.mainDriver);
-        if (
-          !driverModel ||
-          driverModel.providerId === 'orion' ||
-          driverModel.id === claudeCodeCliModelId
-        ) {
+        if (!driverModel || driverModel.providerId === 'orion' || driverModel.id === claudeCodeCliModelId) {
           // Misconfigured/pseudo driver: fall back to a real agent model.
           driverModel =
             agentModels.find((candidate) => candidate.id === defaultAgentModelId) ??
-            agentModels.find(
-              (candidate) =>
-                candidate.providerId !== 'orion' && candidate.id !== claudeCodeCliModelId
-            );
+            agentModels.find((candidate) => candidate.providerId !== 'orion' && candidate.id !== claudeCodeCliModelId);
         }
-        if (
-          !driverModel ||
-          driverModel.providerId === 'orion' ||
-          driverModel.id === claudeCodeCliModelId
-        ) {
-          return { ok: false, error: 'Pick a main driver model in Settings → Orchestration' };
+        if (!driverModel || driverModel.providerId === 'orion' || driverModel.id === claudeCodeCliModelId) {
+          return {
+            ok: false,
+            error: 'Pick a main driver model in Settings → Orchestration',
+          };
         }
         const roles = orchestrationRoleMeta.map((meta) => {
-          const configuredRoleModel = agentModels.find(
-            (candidate) => candidate.id === roleModels[meta.id]
-          );
+          const configuredRoleModel = agentModels.find((candidate) => candidate.id === roleModels[meta.id]);
           const roleModel =
             meta.id === 'mainDriver' ||
             !configuredRoleModel ||
@@ -6184,7 +5629,10 @@ const App: React.FC = () => {
         return { ok: false, error: `${model.providerLabel} is disabled` };
       }
       if (model.available === false) {
-        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+        return {
+          ok: false,
+          error: model.unavailableReason ?? `${model.label} is unavailable`,
+        };
       }
       if (!window.orion?.runAgentTurn) {
         return { ok: false, error: 'Agent runtime is unavailable' };
@@ -6229,9 +5677,7 @@ const App: React.FC = () => {
           orchestration.generalInstructions,
           thread.accessMode ?? 'full-access'
         );
-        agentPrompt = agentPrompt
-          ? `${orchestrationContext}\n\n${agentPrompt}`
-          : orchestrationContext;
+        agentPrompt = agentPrompt ? `${orchestrationContext}\n\n${agentPrompt}` : orchestrationContext;
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
@@ -6244,14 +5690,7 @@ const App: React.FC = () => {
         // Kick off async LLM refinement for a nicer title. The thread's own
         // model may be a slow reasoning one (or Orion, which can't run a
         // one-shot), so this goes through the text-generation model instead.
-        void tryGenerateBetterTitle(
-          threadId,
-          titleSeed,
-          resolveUtilityTurn(),
-          workingDir,
-          updateThread,
-          thread.epicId
-        );
+        void tryGenerateBetterTitle(threadId, titleSeed, resolveUtilityTurn(), workingDir, updateThread, thread.epicId);
       }
 
       if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
@@ -6299,30 +5738,23 @@ const App: React.FC = () => {
           // Branched thread's first turn per provider: fork the inherited
           // session instead of resuming the parent's in place.
           forkSession: Boolean(
-            thread.agentSessionIds?.[model.providerId] &&
-              thread.pendingForkProviders?.includes(model.providerId)
+            thread.agentSessionIds?.[model.providerId] && thread.pendingForkProviders?.includes(model.providerId)
           ),
           providerOptions: normalizedProviderSettings[model.providerId]?.options,
           // Kimi's ACP adapter accepts native image content blocks. Preserve
           // the text/path context as a fallback, but also pass the attachment
           // metadata so main can read the bytes without routing them through
           // the renderer or relying on Kimi to reproduce a Unicode file path.
-          ...(model.providerId === 'kimi' && turnAttachments.length > 0
-            ? { attachments: turnAttachments }
-            : {}),
+          ...(model.providerId === 'kimi' && turnAttachments.length > 0 ? { attachments: turnAttachments } : {}),
           ...(model.providerId === 'codex'
             ? {
-                codexReasoningEffort: getEffectiveCodexReasoningEffort(
-                  model,
-                  thread.codexReasoningEffort
-                ),
+                codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
                 codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
               }
             : {}),
           ...(model.providerId === 'claude'
             ? {
-                claudeReasoningEffort:
-                  thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
+                claudeReasoningEffort: thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
                 claudeContextWindow: getEffectiveClaudeContextWindow(
                   model,
                   thread.claudeContextWindow ?? defaultClaudeContextWindow
@@ -6330,7 +5762,9 @@ const App: React.FC = () => {
               }
             : {}),
           ...(model.providerId === 'grok'
-            ? { grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort }
+            ? {
+                grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort,
+              }
             : {}),
           ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
           ...(orchestration ? { orchestration } : {}),
@@ -6340,7 +5774,10 @@ const App: React.FC = () => {
         if (result.ok && result.runId) {
           if (result.runId !== runId) {
             runOutputMessages.current.delete(runId);
-            runOutputMessages.current.set(result.runId, { threadId, messageId });
+            runOutputMessages.current.set(result.runId, {
+              threadId,
+              messageId,
+            });
             setActiveRunsByThread((current) =>
               current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
             );
@@ -6387,7 +5824,11 @@ const App: React.FC = () => {
     if (!window.orion?.onSubagentSpawnRequest) return undefined;
     const unsubscribe = window.orion.onSubagentSpawnRequest((request) => {
       const report = (ok: boolean, result: string) => {
-        void window.orion?.reportSubagentResult?.({ spawnId: request.spawnId, ok, result });
+        void window.orion?.reportSubagentResult?.({
+          spawnId: request.spawnId,
+          ok,
+          result,
+        });
       };
       const state = useOrionStore.getState();
       const driverThread = state.threads.find((t) => t.id === request.threadId);
@@ -6395,21 +5836,16 @@ const App: React.FC = () => {
         report(false, 'Driver thread not found');
         return;
       }
-      const driverEpic = driverThread.epicId
-        ? state.epics.find((epic) => epic.id === driverThread.epicId)
-        : undefined;
+      const driverEpic = driverThread.epicId ? state.epics.find((epic) => epic.id === driverThread.epicId) : undefined;
       if (
         riftRemovalThreadIdsRef.current.has(driverThread.id) ||
         (driverThread.epicId &&
-          (riftSetupEpicIdsRef.current[driverThread.epicId] ||
-            riftRemovalEpicIdsRef.current.has(driverThread.epicId)))
+          (riftSetupEpicIdsRef.current[driverThread.epicId] || riftRemovalEpicIdsRef.current.has(driverThread.epicId)))
       ) {
         report(false, 'The driver epic’s rift workspace is not available');
         return;
       }
-      if (
-        driverEpic?.riftRequest
-      ) {
+      if (driverEpic?.riftRequest) {
         report(false, 'The driver epic’s rift setup must finish before spawning subagents');
         return;
       }
@@ -6432,11 +5868,7 @@ const App: React.FC = () => {
         models.find((m) => m.id === wanted) ??
         models.find((m) => m.slug.toLowerCase() === wantedLower) ??
         models.find((m) => m.label.toLowerCase() === wantedLower) ??
-        models.find(
-          (m) =>
-            m.slug.toLowerCase().includes(wantedLower) ||
-            m.label.toLowerCase().includes(wantedLower)
-        );
+        models.find((m) => m.slug.toLowerCase().includes(wantedLower) || m.label.toLowerCase().includes(wantedLower));
       if (!model) {
         const available = models
           .filter((m) => m.providerId !== 'orion')
@@ -6459,8 +5891,7 @@ const App: React.FC = () => {
       const promptSlice = request.prompt.trim().slice(0, 44);
       const roleMeta = orchestrationRoleMeta.find((meta) => meta.id === request.role);
       const title =
-        request.title ||
-        (roleMeta ? `${roleMeta.label}: ${promptSlice}` : `${model.label}: ${promptSlice}`);
+        request.title || (roleMeta ? `${roleMeta.label}: ${promptSlice}` : `${model.label}: ${promptSlice}`);
 
       // Background spawn: never touch the user's selection (thread, project,
       // or epic view) — restoring it after the fact loses the epic overview,
@@ -6496,10 +5927,7 @@ const App: React.FC = () => {
         },
         (error) => {
           state.updateThread(childThreadId, { spawnId: undefined });
-          report(
-            false,
-            error instanceof Error ? error.message : 'The subagent turn could not start'
-          );
+          report(false, error instanceof Error ? error.message : 'The subagent turn could not start');
         }
       );
     });
@@ -6535,15 +5963,13 @@ const App: React.FC = () => {
   // button would, resolve its pending spawn_subagent call, and report what
   // was stopped back to the driver's blocked stop_subagent call.
   const stopSubagentsForRequest = useCallback(
-    async (request: {
-      stopId: string;
-      threadId: string;
-      model?: string;
-      title?: string;
-      all?: boolean;
-    }) => {
+    async (request: { stopId: string; threadId: string; model?: string; title?: string; all?: boolean }) => {
       const report = (ok: boolean, result: string) => {
-        void window.orion?.reportSubagentStopResult?.({ stopId: request.stopId, ok, result });
+        void window.orion?.reportSubagentStopResult?.({
+          stopId: request.stopId,
+          ok,
+          result,
+        });
       };
       const state = useOrionStore.getState();
       // activeRunsByThreadRef only catches up in an effect after the next
@@ -6552,9 +5978,7 @@ const App: React.FC = () => {
       // terminating the provider process. runOutputMessages is maintained
       // synchronously through registration, runId swaps, and completion, so
       // its entries win over the ref.
-      const runsByThread = new Map<string, string>(
-        Object.entries(activeRunsByThreadRef.current)
-      );
+      const runsByThread = new Map<string, string>(Object.entries(activeRunsByThreadRef.current));
       for (const [runId, tracked] of runOutputMessages.current) {
         runsByThread.set(tracked.threadId, runId);
       }
@@ -6591,10 +6015,7 @@ const App: React.FC = () => {
         targets = targets.filter((thread) => thread.title.toLowerCase().includes(wantedTitle));
       }
       if (targets.length === 0) {
-        report(
-          false,
-          `No running subagent matches. Running subagents: ${running.map(describe).join(', ')}.`
-        );
+        report(false, `No running subagent matches. Running subagents: ${running.map(describe).join(', ')}.`);
         return;
       }
       // A broad selector (or none) must not take down parallel siblings by
@@ -6615,11 +6036,7 @@ const App: React.FC = () => {
       while (foundChild) {
         foundChild = false;
         for (const candidate of state.threads) {
-          if (
-            candidate.parentThreadId &&
-            threadIds.has(candidate.parentThreadId) &&
-            !threadIds.has(candidate.id)
-          ) {
+          if (candidate.parentThreadId && threadIds.has(candidate.parentThreadId) && !threadIds.has(candidate.id)) {
             threadIds.add(candidate.id);
             foundChild = true;
           }
@@ -6667,9 +6084,7 @@ const App: React.FC = () => {
       // Each Orion child is its own provider runtime, so terminate every
       // active run and dispose every stopped thread before reporting back.
       await Promise.all(
-        runsToStop.map(({ runId }) =>
-          window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })
-        )
+        runsToStop.map(({ runId }) => window.orion?.stopAgentTurn?.(runId, { terminateBackground: true }))
       );
       await Promise.all(stoppedThreads.map((candidate) => disposeThreadRuntime(candidate.id)));
       for (const spawnId of pendingSpawnIds) {
@@ -6747,9 +6162,7 @@ const App: React.FC = () => {
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
-      const threadEpic = thread.epicId
-        ? state.epics.find((epic) => epic.id === thread.epicId)
-        : undefined;
+      const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       if (
         (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) ||
         threadEpic?.riftRequest ||
@@ -6758,11 +6171,17 @@ const App: React.FC = () => {
         riftRemovalThreadIdsRef.current.has(thread.id) ||
         (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
       ) {
-        return { ok: false, error: 'This epic’s rift workspace is not available' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is not available',
+        };
       }
       const workingDir = threadWorkingDir(state.epics, thread, project);
       if (!workingDir) {
-        return { ok: false, error: 'This epic’s rift workspace is not available' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is not available',
+        };
       }
       let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       // Orion threads run on their configured main-driver model. Resolve the
@@ -6777,13 +6196,19 @@ const App: React.FC = () => {
       }
       if (!model) return { ok: false, error: 'Select an agent model first' };
       if (model.providerId !== 'claude') {
-        return { ok: false, error: '/btw is only available on Claude agents for now' };
+        return {
+          ok: false,
+          error: '/btw is only available on Claude agents for now',
+        };
       }
       if (normalizedProviderSettings.claude?.enabled === false) {
         return { ok: false, error: `${model.providerLabel} is disabled` };
       }
       if (model.available === false) {
-        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+        return {
+          ok: false,
+          error: model.unavailableReason ?? `${model.label} is unavailable`,
+        };
       }
       if (!window.orion?.runAgentTurn) {
         return { ok: false, error: 'Agent runtime is unavailable' };
@@ -6828,8 +6253,7 @@ const App: React.FC = () => {
           // replace) the thread's persistent claude session.
           aside: true,
           providerOptions: normalizedProviderSettings.claude?.options,
-          claudeReasoningEffort:
-            thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
+          claudeReasoningEffort: thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
           claudeContextWindow: getEffectiveClaudeContextWindow(
             model,
             thread.claudeContextWindow ?? defaultClaudeContextWindow
@@ -6864,16 +6288,18 @@ const App: React.FC = () => {
     (
       threadId: string,
       rawText: string,
-      goalAction: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number }
+      goalAction: {
+        action: 'set' | 'resume';
+        objective?: string;
+        tokenBudget?: number;
+      }
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
-      const threadEpic = thread.epicId
-        ? state.epics.find((epic) => epic.id === thread.epicId)
-        : undefined;
+      const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       // Wait for the epic's rift: see startTurnForThread.
       if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
         return {
@@ -6897,14 +6323,23 @@ const App: React.FC = () => {
         riftRemovalThreadIdsRef.current.has(thread.id) ||
         (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
       ) {
-        return { ok: false, error: 'This epic’s rift workspace is being removed' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is being removed',
+        };
       }
       if (threadEpic?.riftReleased) {
-        return { ok: false, error: 'This epic’s rift workspace is not available' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is not available',
+        };
       }
       const workingDir = threadWorkingDir(state.epics, thread, project);
       if (!workingDir) {
-        return { ok: false, error: 'This epic’s rift workspace is not available' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is not available',
+        };
       }
       const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
@@ -6915,7 +6350,10 @@ const App: React.FC = () => {
         return { ok: false, error: `${model.providerLabel} is disabled` };
       }
       if (model.available === false) {
-        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+        return {
+          ok: false,
+          error: model.unavailableReason ?? `${model.label} is unavailable`,
+        };
       }
       if (!window.orion?.runAgentTurn) {
         return { ok: false, error: 'Agent runtime is unavailable' };
@@ -6947,14 +6385,9 @@ const App: React.FC = () => {
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
           resumeSessionId: thread.agentSessionIds?.codex,
-          forkSession: Boolean(
-            thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')
-          ),
+          forkSession: Boolean(thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')),
           providerOptions: normalizedProviderSettings.codex?.options,
-          codexReasoningEffort: getEffectiveCodexReasoningEffort(
-            model,
-            thread.codexReasoningEffort
-          ),
+          codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
           codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
           codexGoal: goalAction,
         })
@@ -6962,7 +6395,10 @@ const App: React.FC = () => {
           if (result.ok && result.runId) {
             if (result.runId !== runId) {
               runOutputMessages.current.delete(runId);
-              runOutputMessages.current.set(result.runId, { threadId, messageId });
+              runOutputMessages.current.set(result.runId, {
+                threadId,
+                messageId,
+              });
               setActiveRunsByThread((current) =>
                 current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
               );
@@ -7000,16 +6436,19 @@ const App: React.FC = () => {
     (
       threadId: string,
       rawText: string,
-      review: { mode: 'uncommitted' | 'base' | 'commit' | 'custom'; base?: string; commit?: string; instructions?: string }
+      review: {
+        mode: 'uncommitted' | 'base' | 'commit' | 'custom';
+        base?: string;
+        commit?: string;
+        instructions?: string;
+      }
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = state.projects.find((p) => p.id === thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
-      const threadEpic = thread.epicId
-        ? state.epics.find((epic) => epic.id === thread.epicId)
-        : undefined;
+      const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       // Wait for the epic's rift: see startTurnForThread.
       if (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) {
         return {
@@ -7033,25 +6472,40 @@ const App: React.FC = () => {
         riftRemovalThreadIdsRef.current.has(thread.id) ||
         (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
       ) {
-        return { ok: false, error: 'This epic’s rift workspace is being removed' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is being removed',
+        };
       }
       if (threadEpic?.riftReleased) {
-        return { ok: false, error: 'This epic’s rift workspace is not available' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is not available',
+        };
       }
       const workingDir = threadWorkingDir(state.epics, thread, project);
       if (!workingDir) {
-        return { ok: false, error: 'This epic’s rift workspace is not available' };
+        return {
+          ok: false,
+          error: 'This epic’s rift workspace is not available',
+        };
       }
       const model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
       if (!model) return { ok: false, error: 'Select an agent model first' };
       if (model.providerId !== 'codex') {
-        return { ok: false, error: '/review is only available on Codex agents' };
+        return {
+          ok: false,
+          error: '/review is only available on Codex agents',
+        };
       }
       if (normalizedProviderSettings.codex?.enabled === false) {
         return { ok: false, error: `${model.providerLabel} is disabled` };
       }
       if (model.available === false) {
-        return { ok: false, error: model.unavailableReason ?? `${model.label} is unavailable` };
+        return {
+          ok: false,
+          error: model.unavailableReason ?? `${model.label} is unavailable`,
+        };
       }
       if (!window.orion?.runAgentTurn) {
         return { ok: false, error: 'Agent runtime is unavailable' };
@@ -7099,14 +6553,9 @@ const App: React.FC = () => {
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
           resumeSessionId: thread.agentSessionIds?.codex,
-          forkSession: Boolean(
-            thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')
-          ),
+          forkSession: Boolean(thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')),
           providerOptions: normalizedProviderSettings.codex?.options,
-          codexReasoningEffort: getEffectiveCodexReasoningEffort(
-            model,
-            thread.codexReasoningEffort
-          ),
+          codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
           codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
           codexReview: {
             ...review,
@@ -7117,7 +6566,10 @@ const App: React.FC = () => {
           if (result.ok && result.runId) {
             if (result.runId !== runId) {
               runOutputMessages.current.delete(runId);
-              runOutputMessages.current.set(result.runId, { threadId, messageId });
+              runOutputMessages.current.set(result.runId, {
+                threadId,
+                messageId,
+              });
               setActiveRunsByThread((current) =>
                 current[threadId] === runId ? { ...current, [threadId]: result.runId! } : current
               );
@@ -7170,11 +6622,7 @@ const App: React.FC = () => {
     for (const thread of threads) {
       const next = thread.queuedMessages?.[0];
       if (!next) continue;
-      if (
-        thread.status === 'running' ||
-        activeRunsByThread[thread.id] ||
-        pendingTurnStartsRef.current.has(thread.id)
-      ) {
+      if (thread.status === 'running' || activeRunsByThread[thread.id] || pendingTurnStartsRef.current.has(thread.id)) {
         continue;
       }
       removeQueuedThreadMessage(thread.id, next.id);
@@ -7189,9 +6637,7 @@ const App: React.FC = () => {
         (error) => {
           addMessageToThread(thread.id, {
             role: 'system',
-            content: `Could not send the queued message: ${
-              error instanceof Error ? error.message : 'unknown error'
-            }`,
+            content: `Could not send the queued message: ${error instanceof Error ? error.message : 'unknown error'}`,
           });
         }
       );
@@ -7257,7 +6703,7 @@ const App: React.FC = () => {
             if (result.ok) updateThread(selectedThreadId, { goal: result.goal ?? null });
             const latest = result.ok ? result.goal : goal;
             if (latest) toast.success(goalSummaryLine(latest));
-            else toast.error(result.ok ? 'No goal on this thread.' : result.error ?? 'Could not read the goal.');
+            else toast.error(result.ok ? 'No goal on this thread.' : (result.error ?? 'Could not read the goal.'));
           });
       } else if (goal) {
         toast.success(goalSummaryLine(goal));
@@ -7284,11 +6730,11 @@ const App: React.FC = () => {
           // The main-process goal event normally installed the authoritative
           // paused state while stopAgentTurn was awaiting the app-server. Use
           // a local fallback only if that event did not arrive.
-          const latest = useOrionStore
-            .getState()
-            .threads.find((thread) => thread.id === selectedThreadId)?.goal;
+          const latest = useOrionStore.getState().threads.find((thread) => thread.id === selectedThreadId)?.goal;
           if (latest?.status === 'active') {
-            updateThread(selectedThreadId, { goal: { ...latest, status: 'paused' } });
+            updateThread(selectedThreadId, {
+              goal: { ...latest, status: 'paused' },
+            });
           }
           toast.success('Goal paused.');
         });
@@ -7303,7 +6749,9 @@ const App: React.FC = () => {
           })
           .then((result) => {
             if (result.ok) {
-              updateThread(selectedThreadId, { goal: result.goal ?? { ...goal, status: 'paused' } });
+              updateThread(selectedThreadId, {
+                goal: result.goal ?? { ...goal, status: 'paused' },
+              });
               toast.success('Goal paused.');
             } else {
               toast.error(result.error ?? 'Could not pause the goal.');
@@ -7368,7 +6816,9 @@ const App: React.FC = () => {
         toast.error('A run is already in flight on this thread.');
         return;
       }
-      const result = startGoalRunForThread(selectedThreadId, promptText, { action: 'resume' });
+      const result = startGoalRunForThread(selectedThreadId, promptText, {
+        action: 'resume',
+      });
       if (!result.ok) {
         toast.error(result.error);
         return;
@@ -7411,7 +6861,12 @@ const App: React.FC = () => {
   // `commit <sha>`, anything else = custom instructions (codex's own modes).
   const dispatchReview = (
     rawText: string,
-    review: { mode: 'uncommitted' | 'base' | 'commit' | 'custom'; base?: string; commit?: string; instructions?: string }
+    review: {
+      mode: 'uncommitted' | 'base' | 'commit' | 'custom';
+      base?: string;
+      commit?: string;
+      instructions?: string;
+    }
   ) => {
     if (!selectedThreadId) return;
     if (isSending) {
@@ -7462,11 +6917,7 @@ const App: React.FC = () => {
   // Async delivery can outlive the originating thread selection. Restore a
   // failed submission to that thread's draft rather than overwriting whatever
   // the user is currently composing elsewhere.
-  const restoreComposerDraft = (
-    threadId: string,
-    promptText: string,
-    attachments: ImageAttachment[]
-  ) => {
+  const restoreComposerDraft = (threadId: string, promptText: string, attachments: ImageAttachment[]) => {
     if (composerDraftKeyRef.current === threadId) {
       setChatInput((current) => [promptText, current].filter(Boolean).join('\n\n'));
       setChatAttachments((current) => [...attachments, ...current]);
@@ -7519,21 +6970,16 @@ const App: React.FC = () => {
         await refreshLinkedTasksBeforeDispatch(submittedThreadId);
       } catch (error) {
         restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
-        toast.error(
-          error instanceof Error ? error.message : 'The linked tasks could not be refreshed'
-        );
+        toast.error(error instanceof Error ? error.message : 'The linked tasks could not be refreshed');
         return;
       } finally {
         pendingTurnStartsRef.current.delete(submittedThreadId);
       }
-      const currentThread = useOrionStore
-        .getState()
-        .threads.find((thread) => thread.id === submittedThreadId);
+      const currentThread = useOrionStore.getState().threads.find((thread) => thread.id === submittedThreadId);
       if (
         currentThread &&
         (riftRemovalThreadIdsRef.current.has(currentThread.id) ||
-          (currentThread.epicId &&
-            riftRemovalEpicIdsRef.current.has(currentThread.epicId)))
+          (currentThread.epicId && riftRemovalEpicIdsRef.current.has(currentThread.epicId)))
       ) {
         restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
         toast.error('This epic’s rift workspace is being removed');
@@ -7562,9 +7008,7 @@ const App: React.FC = () => {
         });
       } catch (error) {
         restoreTerminalDraft();
-        toast.error(
-          error instanceof Error ? error.message : 'The Claude Code terminal is not running.'
-        );
+        toast.error(error instanceof Error ? error.message : 'The Claude Code terminal is not running.');
         return;
       } finally {
         pendingTurnStartsRef.current.delete(submittedThreadId);
@@ -7577,8 +7021,7 @@ const App: React.FC = () => {
       if (tasksToInject.length > 0) {
         const injectedIds = new Set(tasksToInject.map((task) => task.id));
         const currentLinkedTasks =
-          useOrionStore.getState().threads.find((thread) => thread.id === submittedThreadId)
-            ?.linkedTasks ?? [];
+          useOrionStore.getState().threads.find((thread) => thread.id === submittedThreadId)?.linkedTasks ?? [];
         if (currentLinkedTasks.some((task) => injectedIds.has(task.id) && !task.injected)) {
           updateThread(submittedThreadId, {
             linkedTasks: currentLinkedTasks.map((task) =>
@@ -7652,7 +7095,10 @@ const App: React.FC = () => {
     // Agent mid-run: hold the message; it dispatches when the current turn ends.
     if (isSending) {
       chatPinnedRef.current = true;
-      queueMessageToThread(selectedThreadId, { text: promptText, attachments: chatAttachments });
+      queueMessageToThread(selectedThreadId, {
+        text: promptText,
+        attachments: chatAttachments,
+      });
       setChatInput('');
       setChatMention(null);
       setChatAttachments([]);
@@ -7667,11 +7113,7 @@ const App: React.FC = () => {
     setChatAttachments([]);
     let result: { ok: boolean; error?: string };
     try {
-      result = await startTurnForThread(
-        submittedThreadId,
-        promptText,
-        submittedAttachments
-      );
+      result = await startTurnForThread(submittedThreadId, promptText, submittedAttachments);
     } catch (error) {
       restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
       toast.error(error instanceof Error ? error.message : 'The agent turn could not start');
@@ -7694,13 +7136,9 @@ const App: React.FC = () => {
   // orchestrated thread would bypass the driver resolution), so treat it as
   // unsupported instead of crashing mid-run.
   const steerSupported =
-    isSending &&
-    !!selectedAgentModel &&
-    providerFollowUpSupport[selectedAgentModel.providerId]?.steer === true;
+    isSending && !!selectedAgentModel && providerFollowUpSupport[selectedAgentModel.providerId]?.steer === true;
   const steerReady =
-    steerSupported &&
-    !!selectedAgentModel &&
-    !!selectedThread?.agentSessionIds?.[selectedAgentModel.providerId];
+    steerSupported && !!selectedAgentModel && !!selectedThread?.agentSessionIds?.[selectedAgentModel.providerId];
 
   // Runs with an interrupt in flight. Steering claude can take a few seconds
   // (interrupt ack + finalize wait, possibly a session teardown), and the run
@@ -7824,17 +7262,13 @@ const App: React.FC = () => {
           if (failed && failureError && !startupFailureAlreadyHandled) {
             appendToThreadMessage(tracked.threadId, tracked.messageId, `\n\n${failureError}`);
           }
-          const errorThread = useOrionStore
-            .getState()
-            .threads.find((thread) => thread.id === tracked.threadId);
+          const errorThread = useOrionStore.getState().threads.find((thread) => thread.id === tracked.threadId);
           const looksLoggedOut =
-            failed &&
-            (isProviderAuthErrorText(failureError) || isProviderAuthErrorText(outcome?.chunks));
+            failed && (isProviderAuthErrorText(failureError) || isProviderAuthErrorText(outcome?.chunks));
           const rawAuthProviderId = looksLoggedOut
-            ? outcome?.providerId ?? errorThread?.modelId.split(':')[0]
+            ? (outcome?.providerId ?? errorThread?.modelId.split(':')[0])
             : undefined;
-          const authProviderId =
-            rawAuthProviderId === 'orion' ? undefined : rawAuthProviderId;
+          const authProviderId = rawAuthProviderId === 'orion' ? undefined : rawAuthProviderId;
           updateThreadMessage(tracked.threadId, tracked.messageId, {
             status: failed ? 'error' : 'done',
             completedAt: new Date().toISOString(),
@@ -7876,11 +7310,7 @@ const App: React.FC = () => {
                     ?.messages.find((message) => message.id === tracked.messageId)
                     ?.content.trim()
                 : undefined;
-            pushLinkedTaskStatus(
-              threadId,
-              failed ? 'error' : 'finished',
-              finalResponse || undefined
-            );
+            pushLinkedTaskStatus(threadId, failed ? 'error' : 'finished', finalResponse || undefined);
           }
         }
         if (!waiting) clearActiveRun(runId);
@@ -7975,9 +7405,7 @@ const App: React.FC = () => {
     const queued = thread?.queuedMessages ?? [];
     if (thread && queued.length > 0) {
       updateThread(thread.id, { queuedMessages: [] });
-      setChatInput((current) =>
-        [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n')
-      );
+      setChatInput((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
       setChatAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
     }
     const threadIds = new Set(thread ? [thread.id] : []);
@@ -7985,11 +7413,7 @@ const App: React.FC = () => {
     while (foundChild) {
       foundChild = false;
       for (const candidate of state.threads) {
-        if (
-          candidate.parentThreadId &&
-          threadIds.has(candidate.parentThreadId) &&
-          !threadIds.has(candidate.id)
-        ) {
+        if (candidate.parentThreadId && threadIds.has(candidate.parentThreadId) && !threadIds.has(candidate.id)) {
           threadIds.add(candidate.id);
           foundChild = true;
         }
@@ -8038,11 +7462,7 @@ const App: React.FC = () => {
 
     // Each Orion child is its own provider runtime, so terminate every active
     // run and dispose every descendant before unblocking the parent's tool.
-    await Promise.all(
-      runsToStop.map(({ runId }) =>
-        window.orion.stopAgentTurn(runId, { terminateBackground: true })
-      )
-    );
+    await Promise.all(runsToStop.map(({ runId }) => window.orion.stopAgentTurn(runId, { terminateBackground: true })));
     await Promise.all(
       stoppedThreads
         .filter((candidate) => candidate.id !== thread?.id)
@@ -8093,8 +7513,7 @@ const App: React.FC = () => {
     while (replaceEnd < chatInput.length && /[A-Za-z0-9._:/-]/.test(chatInput[replaceEnd])) {
       replaceEnd += 1;
     }
-    const nextValue =
-      chatInput.slice(0, chatMention.start) + inserted + chatInput.slice(replaceEnd);
+    const nextValue = chatInput.slice(0, chatMention.start) + inserted + chatInput.slice(replaceEnd);
     const caret = chatMention.start + inserted.length;
     setChatInput(nextValue);
     setChatMention(null);
@@ -8141,105 +7560,299 @@ const App: React.FC = () => {
     sendMessage();
   };
 
-  const formatCheckedTime = (iso: string): string => {
-    try {
-      const then = new Date(iso).getTime();
-      const mins = Math.max(0, Math.floor((Date.now() - then) / 60000));
-      if (mins < 1) return 'just now';
-      if (mins === 1) return '1m ago';
-      if (mins < 60) return `${mins}m ago`;
-      const hrs = Math.floor(mins / 60);
-      if (hrs < 24) return `${hrs}h ago`;
-      const days = Math.floor(hrs / 24);
-      return `${days}d ago`;
-    } catch {
-      return 'recently';
-    }
-  };
-
-  // Tiny CLI mark for Claude Code CLI threads — sits before the title.
-  const renderThreadCliBadge = (thread: Thread) =>
-    isClaudeCodeCliModelId(thread.modelId) ? (
-      <span className="thread-cli-badge" title="Claude Code CLI" aria-label="Claude Code CLI">
-        <Terminal size={10} strokeWidth={2.4} aria-hidden />
-      </span>
-    ) : null;
-
-  // Status dot at the head of a thread row: pulsing while the agent works, then
-  // steady for a run that finished while the user was elsewhere (cleared when
-  // the thread is opened). Nothing otherwise.
-  const renderThreadStatusDot = (thread: Thread) => {
-    if (thread.status === 'running') {
-      return <span className="thread-working-dot" title="Working" />;
-    }
-    if (!thread.finishedUnseenAt) return null;
-    const failed = thread.status === 'error';
-    return (
-      <span
-        className={`thread-finished-dot ${failed ? 'error' : ''}`}
-        title={failed ? 'Failed — not opened yet' : 'Finished — not opened yet'}
-      />
-    );
-  };
-
-  const renderSidebarFooter = () => (
-    <div className="sidebar-footer">
-      {appUpdateVisible && (
-        <button
-          type="button"
-          className={`sidebar-update-button ${appUpdateState?.status ?? 'idle'}`}
-          onClick={handleAppUpdateClick}
-          title={appUpdateTitle}
-          disabled={
-            appUpdateBusy ||
-            appUpdateState?.status === 'downloading' ||
-            appUpdateState?.status === 'restarting'
-          }
-        >
-          {appUpdateState?.status === 'downloaded' || appUpdateState?.status === 'restarting' ? (
-            <RefreshCw size={15} />
-          ) : appUpdateState?.status === 'downloading' ? (
-            <span className="sidebar-update-progress" style={{ '--update-progress': `${appUpdatePercent}%` } as React.CSSProperties}>
-              <Download size={14} />
-            </span>
-          ) : (
-            <Download size={15} />
-          )}
-          <span>{appUpdateLabel}</span>
-        </button>
-      )}
-      <button
-        type="button"
-        className={`sidebar-account-button ${accountState.authenticated ? 'signed-in' : ''}`}
-        onClick={() => {
-          if (accountState.authenticated) {
-            setSettingsTab('account');
-            setSettingsOpen(true);
-            return;
-          }
-          handleStartAccountAuth();
-        }}
-        title={accountState.authenticated ? accountName : 'Sign in to Orion'}
-        disabled={accountLoading || accountBusy}
-      >
-        {accountState.authenticated && accountState.user?.imageUrl ? (
-          <img src={accountState.user.imageUrl} alt="" />
-        ) : accountState.authenticated ? (
-          <span>{accountInitials || 'O'}</span>
-        ) : (
-          <LogIn size={16} />
-        )}
-      </button>
-      <button
-        type="button"
-        className="sidebar-settings-button"
-        onClick={() => setSettingsOpen(true)}
-        title="Settings"
-      >
-        <Settings size={16} />
-      </button>
-    </div>
+  const openAccountSettings = useCallback(() => {
+    setSettingsTab('account');
+    setSettingsOpen(true);
+  }, []);
+  const openSettings = useCallback(() => setSettingsOpen(true), []);
+  const sidebarFooterProps = useMemo<SidebarFooterProps>(
+    () => ({
+      appUpdateVisible,
+      appUpdateState,
+      appUpdateBusy,
+      appUpdatePercent,
+      appUpdateLabel,
+      appUpdateTitle,
+      accountState,
+      accountName,
+      accountInitials,
+      accountLoading,
+      accountBusy,
+      onAppUpdateClick: handleAppUpdateClick,
+      onOpenAccount: openAccountSettings,
+      onStartAccountAuth: handleStartAccountAuth,
+      onOpenSettings: openSettings,
+    }),
+    [
+      accountBusy,
+      accountInitials,
+      accountLoading,
+      accountName,
+      accountState,
+      appUpdateBusy,
+      appUpdateLabel,
+      appUpdatePercent,
+      appUpdateState,
+      appUpdateTitle,
+      appUpdateVisible,
+      handleAppUpdateClick,
+      handleStartAccountAuth,
+      openAccountSettings,
+      openSettings,
+    ]
   );
+
+  const settingsEpicActionsRef = useRef({ handleDeleteEpic, handleRestoreEpic });
+  useLayoutEffect(() => {
+    settingsEpicActionsRef.current = { handleDeleteEpic, handleRestoreEpic };
+  });
+  const stableSettingsEpicActions = useMemo(
+    () => ({
+      handleDeleteEpic: (...args: Parameters<typeof handleDeleteEpic>) =>
+        settingsEpicActionsRef.current.handleDeleteEpic(...args),
+      handleRestoreEpic: (...args: Parameters<typeof handleRestoreEpic>) =>
+        settingsEpicActionsRef.current.handleRestoreEpic(...args),
+    }),
+    []
+  );
+
+  const settingsPageModel: SettingsPageProps = {
+    notificationSettings,
+    setNotificationSettings,
+    setTextGenerationSettings,
+    setEpicsSettings,
+    epicsSettings,
+    providerSettings,
+    setProviderEnabled,
+    setProviderOptions,
+    setOrchestrationRoleModel,
+    setOrchestrationGeneralInstructions,
+    riftsSettings,
+    setRiftsSettings,
+    setUtilityModelPickerOpen,
+    utilityModelPickerOpen,
+    setUtilityModelSearch,
+    utilityModelSearch,
+    setUtilityModelTab,
+    utilityModelTab,
+    riftStatus,
+    riftStorageState,
+    riftStorageBusy,
+    riftStorageForced,
+    setRiftStorageForced,
+    setRiftSweepDialog,
+    riftStorageEntries,
+    riftStorageSummary,
+    riftSweepSelection,
+    providerUpdateState,
+    providerUpdatesRunning,
+    appUpdateState,
+    setSettingsOpen,
+    settingsTab,
+    setSettingsTab,
+    authenticatingProviderId,
+    accountState,
+    accountLoading,
+    accountBusy,
+    computerUsePerms,
+    computerUseBusyKind,
+    revealedProviderEmails,
+    setRevealedProviderEmails,
+    setRevealedAccountIdentity,
+    expandedProviderOptions,
+    setExpandedProviderOptions,
+    utilityModelPickerRef,
+    normalizedProviderSettings,
+    normalizedOrchestrationSettings,
+    orchestrationModelGroups,
+    providerStatusById,
+    accountName,
+    accountEmail,
+    accountIdentity,
+    accountEmailRevealed,
+    accountInitials,
+    epicsEnabled,
+    epicPromptGitMessages,
+    archivedEpics,
+    utilityCandidateModels,
+    utilityProviders,
+    resolvedUtilityModelId,
+    resolvedUtilityModel,
+    utilityModelProviderId,
+    utilityReasoningOptions,
+    resolvedUtilityReasoningEffort,
+    refreshProviderUpdates,
+    handleRequestComputerUsePermission,
+    handleOpenChromeDebugSetup,
+    handleStartAccountAuth,
+    handleSignOutAccount,
+    handleAuthenticateProvider,
+    openEpicPrUrl,
+    ...stableSettingsEpicActions,
+    formatCheckedTime,
+    formatBytes,
+    epicPrStatus,
+  };
+
+  const appDialogsModel: AppDialogsModel = {
+    projects,
+    createEpicOpen,
+    newEpicName,
+    setNewEpicName,
+    newEpicDescription,
+    setNewEpicDescription,
+    newEpicProjectId,
+    setNewEpicProjectId,
+    setCreateEpicProjectPickerOpen,
+    createEpicProjectPickerOpen,
+    setCreateEpicRiftBranchPickerOpen,
+    createEpicRiftBranchPickerOpen,
+    newEpicCreateRift,
+    setNewEpicCreateRift,
+    newEpicRiftBaseBranch,
+    setNewEpicRiftBaseBranch,
+    newEpicRiftBranches,
+    createEpicTitleRef,
+    createEpicProjectPickerRef,
+    createEpicRiftBranchPickerRef,
+    riftsActive,
+    closeCreateEpicModal,
+    handleCreateEpic,
+    epicCommitDialog,
+    setEpicCommitDialog,
+    handleEpicCommitAndPush,
+    epicPrBaseDialog,
+    setEpicPrBaseDialog,
+    setEpicPrBaseBranchPickerOpen,
+    epicPrBaseBranchPickerOpen,
+    epicPrBaseBranchPickerRef,
+    handleEpicCreatePr,
+    epicSettleDialog,
+    setEpicSettleDialog,
+    confirmEpicSettlement,
+    riftStorageForced,
+    setRiftStorageForced,
+    riftSweepDialog,
+    setRiftSweepDialog,
+    dismissRiftSweepDialog,
+    releaseRiftStorage,
+    formatBytes,
+  };
+  const hasOpenDialog = Boolean(
+    epicCommitDialog || epicPrBaseDialog || epicSettleDialog || riftSweepDialog || createEpicOpen
+  );
+
+  // Keep the memoized sidebar detached from composer typing. These wrappers
+  // retain stable identities while their targets advance only after a render
+  // commits, so they never point at an abandoned concurrent render.
+  const agentsSidebarActionsRef = useRef({
+    handleNewAgent,
+    handleCreateThread,
+    handleCreateThreadForEpic,
+    handleRemoveThreadFromEpic,
+    handleDeleteEpic,
+    handleSettleEpic,
+  });
+  useLayoutEffect(() => {
+    agentsSidebarActionsRef.current = {
+      handleNewAgent,
+      handleCreateThread,
+      handleCreateThreadForEpic,
+      handleRemoveThreadFromEpic,
+      handleDeleteEpic,
+      handleSettleEpic,
+    };
+  });
+  const stableAgentsSidebarActions = useMemo(
+    () => ({
+      handleNewAgent: (...args: Parameters<typeof handleNewAgent>) =>
+        agentsSidebarActionsRef.current.handleNewAgent(...args),
+      handleCreateThread: (...args: Parameters<typeof handleCreateThread>) =>
+        agentsSidebarActionsRef.current.handleCreateThread(...args),
+      handleCreateThreadForEpic: (...args: Parameters<typeof handleCreateThreadForEpic>) =>
+        agentsSidebarActionsRef.current.handleCreateThreadForEpic(...args),
+      handleRemoveThreadFromEpic: (...args: Parameters<typeof handleRemoveThreadFromEpic>) =>
+        agentsSidebarActionsRef.current.handleRemoveThreadFromEpic(...args),
+      handleDeleteEpic: (...args: Parameters<typeof handleDeleteEpic>) =>
+        agentsSidebarActionsRef.current.handleDeleteEpic(...args),
+      handleSettleEpic: (...args: Parameters<typeof handleSettleEpic>) =>
+        agentsSidebarActionsRef.current.handleSettleEpic(...args),
+    }),
+    []
+  );
+
+  const agentsSidebarModel: AgentsSidebarModel = {
+    projects,
+    selectThread,
+    setActiveTab,
+    selectedThreadId,
+    updateThread,
+    branchThread,
+    selectedEpicId,
+    renameEpic,
+    selectEpic,
+    renameProject,
+    selectProject,
+    threadSearchOpen,
+    setThreadSearchOpen,
+    threadSearchQuery,
+    setThreadSearchQuery,
+    projectMenuOpenId,
+    setProjectMenuOpenId,
+    threadItemMenuKey,
+    setThreadItemMenuKey,
+    threadRenameKey,
+    setThreadRenameKey,
+    projectRenameId,
+    setProjectRenameId,
+    threadListLimits,
+    setThreadListLimits,
+    collapsedProjects,
+    setCollapsedProjects,
+    setRecentAgentsOpen,
+    recentAgentsOpen,
+    setRecentAgentsShowAll,
+    recentAgentsShowAll,
+    setPinnedAgentsOpen,
+    pinnedAgentsOpen,
+    setPinnedAgentsShowAll,
+    pinnedAgentsShowAll,
+    setEpicsSectionOpen,
+    epicsSectionOpen,
+    collapsedEpics,
+    setCollapsedEpics,
+    epicMenuOpenId,
+    setEpicMenuOpenId,
+    epicRenameId,
+    setEpicRenameId,
+    threadSearchRef,
+    projectMenuRef,
+    threadItemMenuRef,
+    epicMenuRef,
+    selectedProject,
+    sortedProjects,
+    recentAgentsTargetProject,
+    pinnedThreads,
+    recentThreads,
+    pinThread,
+    unpinThread,
+    runningAgentCount,
+    projectThreadsByProject,
+    epicsEnabled,
+    activeEpics,
+    threadsByEpic,
+    runningAgentEpicIds,
+    projectForGitRoot,
+    deleteThreadWithRuntime,
+    removeProjectWithRuntimes,
+    handleAddProject,
+    ...stableAgentsSidebarActions,
+    openCreateEpicModal,
+    renderThreadCliBadge,
+    renderThreadStatusDot,
+    sidebarFooterProps,
+    epicPrStatus,
+  };
 
   return (
     <div
@@ -8353,13 +7966,9 @@ const App: React.FC = () => {
                   <span className="goal-chip-status">
                     {goalStatusLabels[selectedThread.goal.status] ?? selectedThread.goal.status}
                   </span>
-                  <span className="goal-chip-objective truncate">
-                    {selectedThread.goal.objective}
-                  </span>
+                  <span className="goal-chip-objective truncate">{selectedThread.goal.objective}</span>
                   {goalUsageSummary(selectedThread.goal) && (
-                    <span className="goal-chip-usage">
-                      {goalUsageSummary(selectedThread.goal)}
-                    </span>
+                    <span className="goal-chip-usage">{goalUsageSummary(selectedThread.goal)}</span>
                   )}
                 </button>
                 {goalMenuOpen && (
@@ -8432,11 +8041,11 @@ const App: React.FC = () => {
                         ? 'Repository operation in progress'
                         : activeRiftUnavailable
                           ? 'Wait for the epic’s rift workspace to become available'
-                        : selectedThread && !canChangeSelectedThreadProject
-                          ? selectedThreadEpic?.riftPath || selectedThreadRiftPending
-                            ? 'Project is locked to the epic’s rift'
-                            : 'Project is locked after an agent runs'
-                          : activeThreadProject.path
+                          : selectedThread && !canChangeSelectedThreadProject
+                            ? selectedThreadEpic?.riftPath || selectedThreadRiftPending
+                              ? 'Project is locked to the epic’s rift'
+                              : 'Project is locked after an agent runs'
+                            : activeThreadProject.path
                     }
                     aria-haspopup="menu"
                     aria-expanded={projectPickerOpen && !repositoryOperationBusy}
@@ -8444,10 +8053,7 @@ const App: React.FC = () => {
                     <ProjectIcon projectPath={activeThreadProject.path} size={14} />
                     <span className="truncate">{activeThreadProject.name}</span>
                     {(!selectedThread || canChangeSelectedThreadProject) && (
-                      <ChevronDown
-                        size={13}
-                        className={`project-pill-chevron ${projectPickerOpen ? 'open' : ''}`}
-                      />
+                      <ChevronDown size={13} className={`project-pill-chevron ${projectPickerOpen ? 'open' : ''}`} />
                     )}
                   </button>
                   {projectPickerOpen &&
@@ -8504,12 +8110,7 @@ const App: React.FC = () => {
                     onClick={() => {
                       if (!activeRiftUnavailable) setBranchPickerOpen((open) => !open);
                     }}
-                    disabled={
-                      activeRiftUnavailable ||
-                      gitLoading ||
-                      repositoryOperationBusy ||
-                      !gitState?.ok
-                    }
+                    disabled={activeRiftUnavailable || gitLoading || repositoryOperationBusy || !gitState?.ok}
                     title={gitState?.error ?? gitState?.root ?? 'Git state'}
                     aria-haspopup="menu"
                     aria-expanded={branchPickerOpen && !repositoryOperationBusy}
@@ -8518,15 +8119,10 @@ const App: React.FC = () => {
                     <span className="truncate">
                       {gitLoading
                         ? 'Git...'
-                        : gitState?.currentBranch ??
-                          (gitState?.detachedHead
-                            ? `Detached @ ${gitState.detachedHead}`
-                            : 'No Git')}
+                        : (gitState?.currentBranch ??
+                          (gitState?.detachedHead ? `Detached @ ${gitState.detachedHead}` : 'No Git'))}
                     </span>
-                    <ChevronDown
-                      size={13}
-                      className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`}
-                    />
+                    <ChevronDown size={13} className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`} />
                   </button>
                   {branchPickerOpen && !repositoryOperationBusy && !activeRiftUnavailable && (
                     <div className="shell-branch-picker" role="menu">
@@ -8539,11 +8135,7 @@ const App: React.FC = () => {
                           type="button"
                           className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
                           onClick={() => handleCheckoutBranch(branch.name)}
-                          disabled={
-                            branch.current ||
-                            gitState.hasUncommittedChanges ||
-                            repositoryOperationBusy
-                          }
+                          disabled={branch.current || gitState.hasUncommittedChanges || repositoryOperationBusy}
                           title={
                             gitState.hasUncommittedChanges && !branch.current
                               ? 'Unavailable with uncommitted changes'
@@ -8589,9 +8181,7 @@ const App: React.FC = () => {
                           setBranchPickerOpen(false);
                           void handleCommitAndPush();
                         }}
-                        disabled={
-                          repositoryOperationBusy || !gitState?.ok || !gitState.currentBranch
-                        }
+                        disabled={repositoryOperationBusy || !gitState?.ok || !gitState.currentBranch}
                         title="git add . && git commit && git push"
                       >
                         <GitCommit size={13} /> Commit and Push
@@ -8663,10 +8253,7 @@ const App: React.FC = () => {
                     <button
                       type="button"
                       className="shell-cloud-icon-button"
-                      onClick={() =>
-                        activeWorkingDir &&
-                        void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir)
-                      }
+                      onClick={() => activeWorkingDir && void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir)}
                       disabled={!cloudState.linked}
                       title="Open on Orion Cloud"
                     >
@@ -8694,10 +8281,7 @@ const App: React.FC = () => {
                   aria-expanded={openWithOpen}
                 >
                   <SquareArrowOutUpRight size={14} />
-                  <ChevronDown
-                    size={13}
-                    className={`project-pill-chevron ${openWithOpen ? 'open' : ''}`}
-                  />
+                  <ChevronDown size={13} className={`project-pill-chevron ${openWithOpen ? 'open' : ''}`} />
                 </button>
                 {openWithOpen && (
                   <div className="shell-openwith-menu" role="menu">
@@ -8784,4272 +8368,1143 @@ const App: React.FC = () => {
       )}
 
       {settingsOpen && (
-        <div className="settings-page">
-          <div className="settings-sidebar">
-            <div className="settings-sidebar-header">
-              <Settings size={16} />
-              <span>Settings</span>
-            </div>
-            <div className="settings-nav">
-              {[
-                { id: 'account', label: 'Account', Icon: UserRound },
-                { id: 'general', label: 'General', Icon: Settings },
-                { id: 'providers', label: 'Providers', Icon: Plug },
-                { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
-                { id: 'computer-use', label: 'Computer Use', Icon: MousePointerClick },
-                { id: 'storage', label: 'Storage', Icon: HardDrive },
-                { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
-                { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
-              ].map(({ id, label, Icon }) => (
-                <button
-                  key={id}
-                  type="button"
-                  className={`settings-nav-item ${settingsTab === id ? 'active' : ''}`}
-                  onClick={() => setSettingsTab(id as SettingsTab)}
-                >
-                  <Icon size={15} />
-                  <span>{label}</span>
-                </button>
-              ))}
-            </div>
-            <div className="settings-sidebar-footer">
-              <button
-                type="button"
-                className="settings-back-button"
-                onClick={() => setSettingsOpen(false)}
-              >
-                ← Back
-              </button>
-            </div>
-          </div>
-
-          <div className="settings-content">
-            <div className="settings-content-header">
-              {settingsTab === 'account' && 'ACCOUNT'}
-              {settingsTab === 'general' && 'GENERAL'}
-              {settingsTab === 'providers' && 'PROVIDERS'}
-              {settingsTab === 'orchestration' && 'ORCHESTRATION'}
-              {settingsTab === 'computer-use' && 'COMPUTER USE'}
-              {settingsTab === 'storage' && 'STORAGE'}
-              {settingsTab === 'cosmetics' && 'COSMETICS'}
-              {settingsTab === 'experimental' && 'EXPERIMENTAL'}
-            </div>
-
-            <div
-              className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' ? ' settings-panel-grouped' : ''}`}
-            >
-              {settingsTab === 'account' && (
-                <>
-                  <div className="account-row">
-                    <div className="account-card-main">
-                      {accountState.user?.imageUrl ? (
-                        <img
-                          className="account-avatar"
-                          src={accountState.user.imageUrl}
-                          alt=""
-                          aria-hidden
-                        />
-                      ) : (
-                        <div className="account-avatar account-avatar-fallback">
-                          {accountInitials || 'O'}
-                        </div>
-                      )}
-                      <div className="account-card-text">
-                        <div className="account-card-title">{accountName}</div>
-                        <div className="account-card-subtitle">
-                          {accountLoading ? (
-                            'Checking Orion account...'
-                          ) : accountState.authenticated ? (
-                            accountEmail ? (
-                              <button
-                                type="button"
-                                className={`account-email-toggle${accountEmailRevealed ? ' revealed' : ''}`}
-                                onClick={() =>
-                                  setRevealedAccountIdentity((current) =>
-                                    current === accountIdentity ? null : accountIdentity
-                                  )
-                                }
-                                title={accountEmailRevealed ? 'Click to hide email' : 'Click to reveal email'}
-                                aria-label={accountEmailRevealed ? 'Hide email address' : 'Reveal email address'}
-                              >
-                                {accountEmail}
-                              </button>
-                            ) : (
-                              'Signed in to Orion Web'
-                            )
-                          ) : (
-                            'Sign in through Orion Web to authorize this desktop app.'
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                    <span className={`account-status-chip ${accountState.authenticated ? 'signed-in' : ''}`}>
-                      {accountLoading ? 'Checking' : accountState.authenticated ? 'Signed in' : 'Signed out'}
-                    </span>
-                  </div>
-
-                  {accountState.authenticated && (
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Desktop session</div>
-                        <div className="setting-label-desc">
-                          Authorized by Orion Web{accountState.expiresAt ? ` until ${formatCheckedTime(accountState.expiresAt)}` : ''}.
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        className="provider-auth-button"
-                        onClick={handleSignOutAccount}
-                        disabled={accountBusy}
-                      >
-                        <LogOut size={13} />
-                        Sign out
-                      </button>
-                    </div>
-                  )}
-
-                  {!accountState.authenticated && (
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Authorize Orion Desktop</div>
-                        <div className="setting-label-desc">
-                          Opens Orion Web in your browser and returns here after approval.
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        className="provider-auth-button account-primary-button"
-                        onClick={handleStartAccountAuth}
-                        disabled={accountBusy || accountLoading}
-                      >
-                        <LogIn size={13} />
-                        {accountBusy ? 'Opening...' : 'Sign in'}
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-
-              {settingsTab === 'general' && (
-                <>
-                  <div className="settings-group-label">Appearance</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Theme</div>
-                        <div className="setting-label-desc">Choose how Orion looks across the app.</div>
-                      </div>
-                      <select className="setting-select" defaultValue="system">
-                        <option value="system">System</option>
-                        <option value="dark">Dark</option>
-                        <option value="light">Light</option>
-                      </select>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Time format</div>
-                        <div className="setting-label-desc">System default follows your browser or OS clock preference.</div>
-                      </div>
-                      <select className="setting-select" defaultValue="system">
-                        <option value="system">System default</option>
-                        <option value="12h">12-hour</option>
-                        <option value="24h">24-hour</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="settings-group-label">Content</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Word wrap</div>
-                        <div className="setting-label-desc">Wrap long lines in code blocks, tables, diffs, and file previews by default.</div>
-                      </div>
-                      <label className="provider-toggle" title="Word wrap">
-                        <input type="checkbox" defaultChecked />
-                        <span />
-                      </label>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Hide whitespace changes</div>
-                        <div className="setting-label-desc">Set whether the diff panel ignores whitespace-only edits by default.</div>
-                      </div>
-                      <label className="provider-toggle" title="Hide whitespace">
-                        <input type="checkbox" defaultChecked />
-                        <span />
-                      </label>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Assistant output</div>
-                        <div className="setting-label-desc">Show token-by-token output while a response is in progress.</div>
-                      </div>
-                      <label className="provider-toggle" title="Assistant output">
-                        <input type="checkbox" />
-                        <span />
-                      </label>
-                    </div>
-                  </div>
-
-                  <div className="settings-group-label">Notifications</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Thread notifications</div>
-                        <div className="setting-label-desc">Show a desktop notification when an agent thread finishes while you're looking elsewhere.</div>
-                      </div>
-                      <label className="provider-toggle" title="Thread notifications">
-                        <input
-                          type="checkbox"
-                          checked={notificationSettings?.enabled ?? true}
-                          onChange={(e) => setNotificationSettings({ enabled: e.target.checked })}
-                        />
-                        <span />
-                      </label>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Notification sound</div>
-                        <div className="setting-label-desc">Play the system sound with thread-finished notifications.</div>
-                      </div>
-                      <label className="provider-toggle" title="Notification sound">
-                        <input
-                          type="checkbox"
-                          checked={notificationSettings?.sound ?? true}
-                          disabled={!(notificationSettings?.enabled ?? true)}
-                          onChange={(e) => setNotificationSettings({ sound: e.target.checked })}
-                        />
-                        <span />
-                      </label>
-                    </div>
-                  </div>
-
-                  <div className="settings-group-label">Threads</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">New threads</div>
-                        <div className="setting-label-desc">Pick the default workspace mode for newly created draft threads.</div>
-                      </div>
-                      <select className="setting-select" defaultValue="local">
-                        <option value="local">Local</option>
-                        <option value="remote">Remote</option>
-                      </select>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Archive confirmation</div>
-                        <div className="setting-label-desc">Require a second click on the inline archive action before a thread is archived.</div>
-                      </div>
-                      <label className="provider-toggle" title="Archive confirmation">
-                        <input type="checkbox" />
-                        <span />
-                      </label>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Delete confirmation</div>
-                        <div className="setting-label-desc">Ask before deleting a thread and its chat history.</div>
-                      </div>
-                      <label className="provider-toggle" title="Delete confirmation">
-                        <input type="checkbox" defaultChecked />
-                        <span />
-                      </label>
-                    </div>
-                  </div>
-
-                  <div className="settings-group-label">Providers</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Provider update checks</div>
-                        <div className="setting-label-desc">Check installed provider CLIs for newer available versions.</div>
-                      </div>
-                      <label className="provider-toggle" title="Provider update checks">
-                        <input type="checkbox" defaultChecked />
-                        <span />
-                      </label>
-                    </div>
-                  </div>
-
-                  <div className="settings-group-label">Text generation</div>
-                  <div className="settings-group settings-group-overflowing">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Model</div>
-                        <div className="setting-label-desc">
-                          Writes Orion's short generated text: thread titles, epic commit messages
-                          from staged changes, and PR descriptions from branch changes. Defaults to
-                          the fastest model on the providers you have installed.
-                        </div>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-2">
-                        <div className="model-picker-anchor" ref={utilityModelPickerRef}>
-                          <button
-                            className="model-trigger"
-                            onClick={() => {
-                              setUtilityModelPickerOpen((open) => {
-                                if (!open) {
-                                  setUtilityModelSearch('');
-                                  // Open on the resolved model's provider, or the
-                                  // first one with rows if nothing resolved.
-                                  setUtilityModelTab(
-                                    utilityModelProviderId ??
-                                      utilityProviders[0]?.id ??
-                                      'codex'
-                                  );
-                                }
-                                return !open;
-                              });
-                            }}
-                          >
-                            {resolvedUtilityModel &&
-                              (() => {
-                                const ProviderIcon =
-                                  agentProviders.find(
-                                    (provider) => provider.id === resolvedUtilityModel.providerId
-                                  )?.icon ?? Play;
-                                return <ProviderIcon size={15} />;
-                              })()}
-                            <span>{resolvedUtilityModel?.label ?? 'No model available'}</span>
-                            <ChevronDown
-                              size={14}
-                              className={`model-trigger-chevron ${utilityModelPickerOpen ? 'open' : ''}`}
-                            />
-                          </button>
-
-                          {utilityModelPickerOpen && (
-                            <ModelPickerPopover
-                              placement="below"
-                              className="compact"
-                              providers={utilityProviders}
-                              models={utilityCandidateModels}
-                              activeProviderId={utilityModelTab}
-                              onActiveProviderChange={setUtilityModelTab}
-                              search={utilityModelSearch}
-                              onSearchChange={setUtilityModelSearch}
-                              selectedModelId={resolvedUtilityModelId}
-                              onSelect={(model) => {
-                                setTextGenerationSettings({ modelId: model.id });
-                                setUtilityModelPickerOpen(false);
-                                setUtilityModelSearch('');
-                              }}
-                            />
-                          )}
-                        </div>
-
-                        {utilityReasoningOptions.length > 0 && (
-                          <SelectMenu
-                            label="Reasoning effort"
-                            value={resolvedUtilityReasoningEffort}
-                            options={utilityReasoningOptions}
-                            onChange={(value) =>
-                              setTextGenerationSettings({ reasoningEffort: value })
-                            }
-                          />
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="settings-group-label">Epics</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Epics section</div>
-                        <div className="setting-label-desc">
-                          Show Epics in the sidebar — big-ticket tasks that group threads and can
-                          commit, push, and open PRs for the work as a whole.
-                        </div>
-                      </div>
-                      <label className="provider-toggle" title="Epics section">
-                        <input
-                          type="checkbox"
-                          checked={epicsEnabled}
-                          onChange={(e) => setEpicsSettings({ enabled: e.target.checked })}
-                        />
-                        <span />
-                      </label>
-                    </div>
-
-                    {epicsEnabled && (
-                      <div className="setting-row">
-                        <div className="setting-label">
-                          <div className="setting-label-title">Settle confirmation</div>
-                          <div className="setting-label-desc">
-                            Ask before every settlement. Orion still warns when work may be
-                            archived without a commit, push, or pull request.
-                          </div>
-                        </div>
-                        <label className="provider-toggle" title="Settle confirmation">
-                          <input
-                            type="checkbox"
-                            checked={epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle}
-                            onChange={(e) => setEpicsSettings({ confirmSettle: e.target.checked })}
-                          />
-                          <span />
-                        </label>
-                      </div>
-                    )}
-
-                    {epicsEnabled && archivedEpics.length > 0 && (
-                      <div className="setting-row setting-row-stacked">
-                        <div className="setting-label">
-                          <div className="setting-label-title">Archived epics</div>
-                          <div className="setting-label-desc">
-                            Settled epics land here. Restore one to bring it back to the sidebar.
-                          </div>
-                        </div>
-                        <div className="archived-epics-list">
-                          {archivedEpics.map((epic) => {
-                            const prStatus = epicPrStatus(epic);
-                            return (
-                              <div key={epic.id} className="archived-epic-row">
-                                <SquareKanban
-                                  size={13}
-                                  className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
-                                />
-                                <span className="archived-epic-name truncate" title={epic.name}>
-                                  {epic.name}
-                                </span>
-                                <span className="archived-epic-date">
-                                  Settled{' '}
-                                  {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
-                                </span>
-                                {epic.riftReleased && (
-                                  <span
-                                    className="provider-status-chip"
-                                    title="Its rift was freed to reclaim disk. Restoring recreates it on the same branch."
-                                  >
-                                    Rift freed
-                                  </span>
-                                )}
-                                {epic.prUrl && (
-                                  <button
-                                    type="button"
-                                    className="archived-epic-action"
-                                    title="Open the pull request"
-                                    onClick={() => openEpicPrUrl(epic.prUrl as string)}
-                                  >
-                                    <GitPullRequest size={13} />
-                                  </button>
-                                )}
-                                <button
-                                  type="button"
-                                  className="archived-epic-action"
-                                  title={
-                                    epic.riftReleased
-                                      ? 'Restore to the sidebar and recreate its rift'
-                                      : 'Restore to the sidebar'
-                                  }
-                                  onClick={() => handleRestoreEpic(epic)}
-                                >
-                                  <RefreshCw size={13} />
-                                </button>
-                                <button
-                                  type="button"
-                                  className="archived-epic-action danger"
-                                  title="Delete epic"
-                                  onClick={() => handleDeleteEpic(epic)}
-                                >
-                                  <Trash2 size={13} />
-                                </button>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="settings-group-label">About</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">About</div>
-                        <div className="setting-label-desc">The Orion version currently installed.</div>
-                      </div>
-                      <span className="setting-version">
-                        {appUpdateState?.currentVersion ? `v${appUpdateState.currentVersion}` : '—'}
-                      </span>
-                    </div>
-                  </div>
-                </>
-              )}
-
-              {settingsTab === 'providers' && (
-                <>
-                  <div className="providers-toolbar">
-                    <div className="providers-toolbar-actions">
-                      {providerUpdateState?.checkedAt && (
-                        <span className="providers-checked">
-                          Checked {formatCheckedTime(providerUpdateState.checkedAt)}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        className="providers-action-btn"
-                        title="Refresh"
-                        onClick={() => {
-                          void refreshProviderUpdates();
-                        }}
-                        disabled={providerUpdatesRunning}
-                      >
-                        <RefreshCw size={13} className={providerUpdatesRunning ? 'spinning' : ''} />
-                      </button>
-                    </div>
-                  </div>
-                  {agentProviders
-                    // Orion is a pseudo-provider (the orchestrator), not an
-                    // installable CLI — no row in Providers.
-                    .filter((provider) => provider.id !== 'orion')
-                    .map((provider) => {
-                      const Icon = provider.icon;
-                      const status = providerStatusById.get(provider.id);
-                      const providerEnabled =
-                        normalizedProviderSettings[provider.id as ProviderId]?.enabled !== false;
-                      const authenticated = status?.auth?.authenticated === true;
-                      const canAuthenticate = status?.installed !== false && status?.auth?.status !== 'missing';
-                      const version = status?.currentVersion
-                        ? status.currentVersion.replace(/^v/i, '')
-                        : null;
-                      const hasUpdate = !!status?.updateAvailable;
-
-                      // Determine subtitle
-                      let subtitle = '';
-                      if (!providerEnabled) {
-                        subtitle = `Disabled – ${provider.label} is disabled in settings.`;
-                      } else if (status?.installed === false) {
-                        const cmd = status?.command || provider.id;
-                        subtitle = `Not found – ${provider.label} CLI (${cmd}) is not installed or not on PATH.`;
-                      } else if (authenticated) {
-                        const raw = status?.auth?.detail || 'Authenticated';
-                        subtitle = /authenticated/i.test(raw) ? raw : `Authenticated as ${raw}`;
-                      } else if (status?.auth?.authenticated === false) {
-                        subtitle = 'Available – Installed and ready, but authentication could not be verified.';
-                      } else if (status?.installed) {
-                        subtitle = 'Available – Installed and ready.';
-                      } else {
-                        subtitle = status?.auth?.label || 'Unknown';
-                      }
-
-                      const revealed = !!revealedProviderEmails[provider.id];
-                      const displaySubtitle = subtitle.replace(
-                        /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g,
-                        (email) =>
-                          revealed
-                            ? email
-                            : email.replace(/^(.{1,2}).*?(@.*)$/, '$1••••$2')
-                      );
-                      const hasEmailInSubtitle = /\S+@\S+/.test(subtitle);
-
-                      const statusColor = !providerEnabled
-                        ? 'yellow'
-                        : status?.installed === false
-                          ? 'red'
-                          : 'green';
-
-                      const optionDefs = providerOptionDefs[provider.id] ?? [];
-                      const optionsExpanded = !!expandedProviderOptions[provider.id];
-                      const optionValues =
-                        providerSettings[provider.id as ProviderId]?.options ?? {};
-
-                      return (
-                        <div key={provider.id} className="provider-row-wrap">
-                        <div className="provider-row">
-                          <div className="provider-left">
-                            <span className={`provider-status-dot ${statusColor}`} />
-                            <span className="provider-icon-wrap">
-                              <Icon size={18} />
-                            </span>
-                            <div className="provider-meta">
-                              <div className="provider-head">
-                                <span className="provider-name">{provider.label}</span>
-                                {version && <span className="provider-version">v{version}</span>}
-                                {hasUpdate && <span className="provider-update-arrow" title="Update available">↑</span>}
-                              </div>
-                              <div
-                                className="provider-subtitle"
-                                onClick={() => {
-                                  if (hasEmailInSubtitle) {
-                                    setRevealedProviderEmails((prev) => ({
-                                      ...prev,
-                                      [provider.id]: !prev[provider.id],
-                                    }));
-                                  }
-                                }}
-                                title={hasEmailInSubtitle && !revealed ? 'Click to reveal email' : undefined}
-                              >
-                                {displaySubtitle}
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="provider-right">
-                            <button
-                              type="button"
-                              className={`provider-menu-btn ${optionsExpanded ? 'open' : ''}`}
-                              title={optionsExpanded ? 'Hide options' : 'Provider options'}
-                              onClick={() => {
-                                setExpandedProviderOptions((prev) => ({
-                                  ...prev,
-                                  [provider.id]: !prev[provider.id],
-                                }));
-                              }}
-                            >
-                              <ChevronDown size={14} />
-                            </button>
-
-                            {canAuthenticate && (
-                              <button
-                                type="button"
-                                className="provider-auth-button compact"
-                                onClick={() => handleAuthenticateProvider(provider.id)}
-                                disabled={authenticatingProviderId === provider.id}
-                              >
-                                {authenticated ? 'Re-authenticate' : 'Authenticate'}
-                              </button>
-                            )}
-
-                            <label className="provider-toggle" title={providerEnabled ? 'Enabled' : 'Disabled'}>
-                              <input
-                                type="checkbox"
-                                checked={providerEnabled}
-                                onChange={(event) => {
-                                  setProviderEnabled(provider.id as ProviderId, event.target.checked);
-                                }}
-                              />
-                              <span />
-                            </label>
-                          </div>
-                        </div>
-
-                        {optionsExpanded && optionDefs.length > 0 && (
-                          <div className="provider-options">
-                            {optionDefs.map((option) => {
-                              if (option.type === 'boolean') {
-                                const checked = optionValues[option.key] === true;
-                                return (
-                                  <div key={option.key} className="provider-option">
-                                    <span className="provider-option-text">
-                                      <span className="provider-option-label">{option.label}</span>
-                                      <span className="provider-option-description">{option.description}</span>
-                                    </span>
-                                    <label className="provider-toggle">
-                                      <input
-                                        type="checkbox"
-                                        checked={checked}
-                                        onChange={(event) => {
-                                          setProviderOptions(provider.id as ProviderId, {
-                                            [option.key]: event.target.checked,
-                                          } as Partial<ProviderRuntimeOptions>);
-                                        }}
-                                      />
-                                      <span />
-                                    </label>
-                                  </div>
-                                );
-                              }
-
-                              const value = optionValues[option.key];
-                              return (
-                                <div key={option.key} className="provider-option column">
-                                  <span className="provider-option-text">
-                                    <span className="provider-option-label">{option.label}</span>
-                                    <span className="provider-option-description">{option.description}</span>
-                                  </span>
-                                  <input
-                                    type="text"
-                                    className="provider-option-input"
-                                    placeholder={option.placeholder}
-                                    value={typeof value === 'string' ? value : ''}
-                                    onChange={(event) => {
-                                      setProviderOptions(provider.id as ProviderId, {
-                                        [option.key]: event.target.value,
-                                      } as Partial<ProviderRuntimeOptions>);
-                                    }}
-                                  />
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-                        </div>
-                      );
-                    })}
-                  </>
-              )}
-
-              {settingsTab === 'orchestration' && (
-                <>
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="settings-panel-title">Orchestration</div>
-                      <div className="settings-muted">
-                        Pick “Orion” as a thread’s model and Fable-style orchestration kicks in: the
-                        main driver model coordinates the work, talks to you, and delegates to the
-                        role models below via subagents.
-                      </div>
-                    </div>
-                  </div>
-
-                  {orchestrationRoleMeta.map((role) => (
-                    <div className="setting-row" key={role.id}>
-                      <div className="setting-label">
-                        <div className="setting-label-title">{role.label}</div>
-                        <div className="setting-label-desc">{role.desc}</div>
-                      </div>
-                      <select
-                        className="setting-select"
-                        value={normalizedOrchestrationSettings.models[role.id]}
-                        onChange={(e) => setOrchestrationRoleModel(role.id, e.target.value)}
-                      >
-                        {orchestrationModelGroups.map((group) => (
-                          <optgroup key={group.provider.id} label={group.provider.label}>
-                            {group.models.map((model) => (
-                              <option key={model.id} value={model.id}>
-                                {model.label}
-                              </option>
-                            ))}
-                          </optgroup>
-                        ))}
-                      </select>
-                    </div>
-                  ))}
-
-                  <div className="setting-row setting-row-stacked">
-                    <div className="setting-label">
-                      <div className="setting-label-title">General instructions</div>
-                      <div className="setting-label-desc">
-                        Free-form guidance included in the orchestrator's instructions
-                      </div>
-                    </div>
-                    <textarea
-                      className="setting-textarea"
-                      rows={6}
-                      value={normalizedOrchestrationSettings.generalInstructions}
-                      onChange={(e) => setOrchestrationGeneralInstructions(e.target.value)}
-                      placeholder="e.g. Always run the test suite before reporting a task as done."
-                    />
-                  </div>
-                </>
-              )}
-
-              {settingsTab === 'computer-use' && (
-                computerUsePerms && !computerUsePerms.supported ? (
-                  <div className="settings-empty-panel">
-                    <div className="settings-panel-title">Computer use</div>
-                    <div className="settings-muted">
-                      Computer use permissions only apply on macOS. Nothing to configure on this platform.
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">macOS permissions</div>
-                        <div className="setting-label-desc">
-                          Agents that control the mouse, keyboard, and screen (Codex computer use and similar) need
-                          Orion to hold these macOS permissions. macOS attributes every CLI Orion launches — codex,
-                          claude, grok, cursor — back to Orion, so granting them here covers all providers.
-                        </div>
-                      </div>
-                    </div>
-
-                    {([
-                      {
-                        kind: 'accessibility',
-                        title: 'Accessibility',
-                        desc: 'Lets agents read app windows and send clicks and keystrokes. After requesting, enable Orion in the Accessibility list.',
-                        status: computerUsePerms?.accessibility ?? 'not-determined',
-                      },
-                      {
-                        kind: 'screen-recording',
-                        title: 'Screen Recording',
-                        desc: 'Lets agent screenshots include other apps’ window contents. Without it, captures show only the wallpaper.',
-                        status: computerUsePerms?.screenRecording ?? 'not-determined',
-                      },
-                      {
-                        kind: 'automation',
-                        title: 'Automation (Apple Events)',
-                        desc: 'Lets agents drive apps through AppleScript and System Events. macOS asks once per app an agent controls; the status here reflects the System Events grant.',
-                        status: computerUsePerms?.automation ?? 'not-determined',
-                      },
-                    ] as Array<{
-                      kind: OrionComputerUsePermissionKind;
-                      title: string;
-                      desc: string;
-                      status: OrionComputerUsePermissionStatus;
-                    }>).map((row) => {
-                      const granted = row.status === 'granted';
-                      const chip =
-                        row.status === 'granted'
-                          ? { className: 'authenticated', label: 'Granted' }
-                          : row.status === 'denied' || row.status === 'restricted'
-                            ? { className: 'unauthenticated', label: 'Not granted' }
-                            : row.status === 'not-determined'
-                              ? { className: '', label: 'Not requested' }
-                              : null;
-                      return (
-                        <div className="setting-row" key={row.kind}>
-                          <div className="setting-label">
-                            <div className="setting-label-title">{row.title}</div>
-                            <div className="setting-label-desc">{row.desc}</div>
-                          </div>
-                          <div className="setting-row-actions">
-                            {chip && (
-                              <span className={`provider-status-chip ${chip.className}`}>{chip.label}</span>
-                            )}
-                            <button
-                              type="button"
-                              className="provider-auth-button"
-                              onClick={() => {
-                                void handleRequestComputerUsePermission(row.kind);
-                              }}
-                              disabled={computerUseBusyKind !== null}
-                            >
-                              <SquareArrowOutUpRight size={13} />
-                              {computerUseBusyKind === row.kind
-                                ? 'Requesting...'
-                                : granted
-                                  ? 'System Settings'
-                                  : row.kind === 'automation'
-                                    ? 'Request access'
-                                    : 'Grant access'}
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Apply new grants</div>
-                        <div className="setting-label-desc">
-                          macOS applies Screen Recording (and sometimes Accessibility) to an already-running app
-                          only after it relaunches. Restart Orion once you’ve granted access.
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        className="provider-auth-button"
-                        onClick={() => {
-                          void window.orion.relaunchApp();
-                        }}
-                      >
-                        <RefreshCw size={13} />
-                        Relaunch Orion
-                      </button>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Browser control</div>
-                        <div className="setting-label-desc">
-                          Codex’s built-in ChatGPT-extension browser only works inside the ChatGPT desktop app, so
-                          Orion gives each provider its own browser tooling instead. These mirror the same options
-                          under Settings → Providers.
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Codex · Browser control</div>
-                        <div className="setting-label-desc">
-                          Full browser control through chrome-devtools-mcp: navigate, click, read pages, screenshot.
-                          Launches a dedicated Chrome with a persistent profile — sign in to sites once there and
-                          logins stick across runs.
-                        </div>
-                      </div>
-                      <div className="setting-row-actions">
-                        <label className="provider-toggle">
-                          <input
-                            type="checkbox"
-                            checked={providerSettings.codex?.options?.browserControl === true}
-                            onChange={(event) => {
-                              setProviderOptions('codex', { browserControl: event.target.checked });
-                            }}
-                          />
-                          <span />
-                        </label>
-                      </div>
-                    </div>
-
-                    {(() => {
-                      const browserControlOn = providerSettings.codex?.options?.browserControl === true;
-                      const autoConnectOn = providerSettings.codex?.options?.browserAutoConnect === true;
-                      const debugStatus = computerUsePerms?.chromeDebug?.status ?? 'disabled';
-                      const chip =
-                        debugStatus === 'enabled'
-                          ? { className: 'authenticated', label: 'Ready' }
-                          : debugStatus === 'stale'
-                            ? { className: '', label: 'Restart Chrome' }
-                            : autoConnectOn
-                              ? { className: 'unauthenticated', label: 'Setup needed' }
-                              : { className: '', label: 'Not set up' };
-                      return (
-                        <div className="setting-row">
-                          <div className="setting-label">
-                            <div className="setting-label-title">Codex · Use your signed-in Chrome</div>
-                            <div className="setting-label-desc">
-                              Attach browser control to your real Chrome profile — existing tabs, logins, and
-                              cookies — instead of the dedicated one. Requires Browser control above.
-                              {autoConnectOn && debugStatus !== 'enabled' && (
-                                <>
-                                  <br />
-                                  One-time setup: 1. Click “Set up in Chrome” (the link is also copied to your
-                                  clipboard — paste it in Chrome’s address bar if no tab opens). 2. On that page,
-                                  turn on “Enable remote debugging” (Chrome 144+). 3. Quit Chrome fully (⌘Q) and
-                                  reopen it — the server only starts on launch. The status here flips to Ready
-                                  automatically.
-                                </>
-                              )}
-                              {autoConnectOn && !browserControlOn && (
-                                <>
-                                  <br />
-                                  Turn on Browser control above for this to take effect.
-                                </>
-                              )}
-                            </div>
-                          </div>
-                          <div className="setting-row-actions">
-                            <span className={`provider-status-chip ${chip.className}`}>{chip.label}</span>
-                            <button
-                              type="button"
-                              className="provider-auth-button"
-                              onClick={() => {
-                                void handleOpenChromeDebugSetup();
-                              }}
-                            >
-                              <SquareArrowOutUpRight size={13} />
-                              Set up in Chrome
-                            </button>
-                            <label className="provider-toggle">
-                              <input
-                                type="checkbox"
-                                checked={autoConnectOn}
-                                onChange={(event) => {
-                                  setProviderOptions('codex', { browserAutoConnect: event.target.checked });
-                                }}
-                              />
-                              <span />
-                            </label>
-                          </div>
-                        </div>
-                      );
-                    })()}
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Claude · Claude in Chrome</div>
-                        <div className="setting-label-desc">
-                          Browser control through the Claude Chrome extension (--chrome): drives your real signed-in
-                          Chrome. Requires the extension to be installed in Chrome.
-                        </div>
-                      </div>
-                      <div className="setting-row-actions">
-                        <label className="provider-toggle">
-                          <input
-                            type="checkbox"
-                            checked={providerSettings.claude?.options?.chrome === true}
-                            onChange={(event) => {
-                              setProviderOptions('claude', { chrome: event.target.checked });
-                            }}
-                          />
-                          <span />
-                        </label>
-                      </div>
-                    </div>
-                  </>
-                )
-              )}
-
-              {settingsTab === 'storage' && (
-                <>
-                  <div className="settings-group-label">Rift workspaces</div>
-                  <div className="settings-group">
-                    <div className="storage-summary">
-                      <div className="storage-summary-main">
-                        <div className="storage-summary-total">
-                          {formatBytes(riftStorageSummary.total)}
-                        </div>
-                        <div className="storage-summary-caption">
-                          Across {riftStorageEntries.length} rift
-                          {riftStorageEntries.length === 1 ? '' : 's'}. Rifts share unchanged files
-                          with their source repository, so freeing them usually reclaims less than
-                          this.
-                        </div>
-                      </div>
-                      <div className="storage-summary-actions">
-                        <button
-                          type="button"
-                          className="btn secondary small"
-                          disabled={riftStorageState?.scanning || riftStorageBusy}
-                          onClick={() => void window.orion?.scanRiftStorage?.({ remeasure: true })}
-                        >
-                          <RefreshCw size={13} />
-                          {riftStorageState?.scanning ? 'Measuring...' : 'Rescan'}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn danger small"
-                          disabled={
-                            riftStorageBusy ||
-                            riftStorageState?.scanning ||
-                            (riftSweepSelection.length === 0 && riftStorageSummary.trash <= 0)
-                          }
-                          onClick={() =>
-                            setRiftSweepDialog({ entries: riftSweepSelection, runGc: true })
-                          }
-                        >
-                          <Trash2 size={13} />
-                          {riftStorageBusy
-                            ? 'Freeing...'
-                            : riftSweepSelection.length === 0
-                              ? `Empty ${formatBytes(riftStorageSummary.trash)} trash`
-                              : `Free up ${formatBytes(
-                                  riftSweepSelection.reduce(
-                                    (total, entry) => total + (entry.bytes ?? 0),
-                                    0
-                                  )
-                                )}`}
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="storage-breakdown">
-                      {[
-                        { label: 'Active epics', bytes: riftStorageSummary.active },
-                        { label: 'Settled epics', bytes: riftStorageSummary.settled },
-                        { label: 'No epic', bytes: riftStorageSummary.orphan },
-                        { label: 'Rift trash', bytes: riftStorageSummary.trash },
-                      ].map(({ label, bytes }) => (
-                        <div key={label} className="storage-breakdown-item">
-                          <span className="storage-breakdown-label">{label}</span>
-                          <span className="storage-breakdown-value">{formatBytes(bytes)}</span>
-                        </div>
-                      ))}
-                    </div>
-
-                    {riftStorageState?.error && (
-                      <div className="setting-row">
-                        <div className="setting-label">
-                          <div className="setting-label-desc">{riftStorageState.error}</div>
-                        </div>
-                      </div>
-                    )}
-
-                    {riftStorageEntries.length === 0 && !riftStorageState?.scanning && (
-                      <div className="setting-row">
-                        <div className="setting-label">
-                          <div className="setting-label-desc">
-                            No rift workspaces found. Rifts appear here once epics start creating
-                            them.
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {riftStorageEntries.length > 0 && (
-                      <div className="setting-row setting-row-stacked">
-                        <div className="storage-rift-list">
-                          {riftStorageEntries.map((entry) => {
-                            const blocked =
-                              entry.hasUncommittedChanges || entry.hasUnpushedCommits;
-                            const forced = Boolean(riftStorageForced[entry.riftPath]);
-                            return (
-                              <div key={entry.riftPath} className="storage-rift-row">
-                                <div className="storage-rift-main">
-                                  <span
-                                    className="storage-rift-name truncate"
-                                    title={entry.riftPath}
-                                  >
-                                    {entry.epicName || entry.name}
-                                  </span>
-                                  <span className="storage-rift-meta truncate">
-                                    {entry.repoName}
-                                    {entry.gitBranch ? ` · ${entry.gitBranch}` : ''}
-                                    {entry.settledAt
-                                      ? ` · settled ${formatShortTime(new Date(entry.settledAt))}`
-                                      : ''}
-                                  </span>
-                                </div>
-                                {entry.status === 'active' && (
-                                  <span className="provider-status-chip">Active</span>
-                                )}
-                                {entry.status === 'orphan' && (
-                                  <span className="provider-status-chip">No epic</span>
-                                )}
-                                {entry.status === 'cleanupPending' && (
-                                  <span className="provider-status-chip">Incomplete</span>
-                                )}
-                                {blocked && (
-                                  <button
-                                    type="button"
-                                    className={`storage-rift-flag${forced ? ' active' : ''}`}
-                                    title={
-                                      forced
-                                        ? 'This rift will be freed even though it has unpushed work'
-                                        : 'Has uncommitted or unpushed work — click to free it anyway'
-                                    }
-                                    onClick={() =>
-                                      setRiftStorageForced((current) => ({
-                                        ...current,
-                                        [entry.riftPath]: !current[entry.riftPath],
-                                      }))
-                                    }
-                                  >
-                                    {forced ? 'Freeing anyway' : 'Unpushed work'}
-                                  </button>
-                                )}
-                                <span className="storage-rift-size">
-                                  {formatBytes(entry.bytes)}
-                                </span>
-                                <button
-                                  type="button"
-                                  className="archived-epic-action danger"
-                                  title="Free this rift"
-                                  disabled={
-                                    riftStorageBusy ||
-                                    entry.status === 'active' ||
-                                    !entry.hasMarker ||
-                                    (blocked && !forced)
-                                  }
-                                  onClick={() =>
-                                    setRiftSweepDialog({ entries: [entry], runGc: true })
-                                  }
-                                >
-                                  <Trash2 size={13} />
-                                </button>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="settings-group-label">Automatic cleanup</div>
-                  <div className="settings-group settings-group-overflowing">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Free the rift when settling</div>
-                        <div className="setting-label-desc">
-                          Settling an epic also frees its rift workspace. The epic keeps its branch
-                          and pull request, and restoring it recreates the rift. Rifts with
-                          uncommitted or unpushed work are never freed automatically.
-                        </div>
-                      </div>
-                      <label className="provider-toggle" title="Free the rift when settling">
-                        <input
-                          type="checkbox"
-                          checked={
-                            riftsSettings.releaseOnSettle ?? defaultRiftsSettings.releaseOnSettle
-                          }
-                          onChange={(e) =>
-                            setRiftsSettings({ releaseOnSettle: e.target.checked })
-                          }
-                        />
-                        <span />
-                      </label>
-                    </div>
-
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Free settled rifts after</div>
-                        <div className="setting-label-desc">
-                          Checked once at startup. Freed rifts stay recoverable in Rift's trash
-                          until you empty it from this page.
-                        </div>
-                      </div>
-                      <SelectMenu
-                        label="Free settled rifts after"
-                        value={String(
-                          riftsSettings.retentionDays ?? defaultRiftsSettings.retentionDays ?? '',
-                        )}
-                        options={[
-                          { value: '', label: 'Never' },
-                          { value: '7', label: '7 days' },
-                          { value: '14', label: '14 days' },
-                          { value: '30', label: '30 days' },
-                        ]}
-                        onChange={(value) =>
-                          setRiftsSettings({
-                            retentionDays: value ? Number(value) : null,
-                          })
-                        }
-                      />
-                    </div>
-                  </div>
-                </>
-              )}
-
-              {settingsTab === 'cosmetics' && (
-                <div className="settings-empty-panel">
-                  <div className="settings-panel-title">Cosmetics</div>
-                  <div className="settings-muted">Coming soon.</div>
-                </div>
-              )}
-              {settingsTab === 'experimental' && (
-                <>
-                  {epicsEnabled && (
-                    <>
-                      <div className="settings-group-label">Epics</div>
-                      <div className="settings-group">
-                        <div className="setting-row">
-                          <div className="setting-label">
-                            <div className="setting-label-title">
-                              Commit &amp; PR message prompts
-                            </div>
-                            <div className="setting-label-desc">
-                              Ask before an epic commits or opens a PR, so you can write the
-                              message yourself (leave it empty and the epic message model still
-                              writes it) and pick the PR's base branch. Turn off to skip both
-                              dialogs: messages are always generated, and PRs target your
-                              project's current branch on origin.
-                            </div>
-                          </div>
-                          <label className="provider-toggle" title="Commit & PR message prompts">
-                            <input
-                              type="checkbox"
-                              checked={epicPromptGitMessages}
-                              onChange={(e) =>
-                                setEpicsSettings({ promptGitMessages: e.target.checked })
-                              }
-                            />
-                            <span />
-                          </label>
-                        </div>
-                      </div>
-                    </>
-                  )}
-
-                  <div className="settings-group-label">Rifts</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Enable Rifts</div>
-                        <div className="setting-label-desc">
-                          Give each epic an instant copy-on-write clone of its repository
-                          (github.com/anomalyco/rift). Epic threads, commits, pushes, and PRs all
-                          happen inside the rift, so unrelated local changes never mix in.
-                          {riftStatus?.available === false
-                            ? ' Unavailable: the bundled rift binary does not support this platform.'
-                            : riftStatus?.version
-                              ? ` Bundled rift v${riftStatus.version} — update with "bun run update-rifts".`
-                              : ''}
-                        </div>
-                      </div>
-                      <label className="provider-toggle" title="Enable Rifts">
-                        <input
-                          type="checkbox"
-                          checked={riftsSettings.enabled}
-                          disabled={riftStatus?.available === false}
-                          onChange={(e) => setRiftsSettings({ enabled: e.target.checked })}
-                        />
-                        <span />
-                      </label>
-                    </div>
-
-                    {riftsSettings.enabled && (
-                      <div className="setting-row">
-                        <div className="setting-label">
-                          <div className="setting-label-title">Create a rift per epic</div>
-                          <div className="setting-label-desc">
-                            New epics get a rift and a dedicated branch (named by the epic
-                            message model) automatically. You can still opt out per epic in the
-                            create dialog.
-                          </div>
-                        </div>
-                        <label className="provider-toggle" title="Create a rift per epic">
-                          <input
-                            type="checkbox"
-                            checked={riftsSettings.autoCreateForEpics}
-                            onChange={(e) => setRiftsSettings({ autoCreateForEpics: e.target.checked })}
-                          />
-                          <span />
-                        </label>
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
+        <React.Suspense fallback={<div className="settings-page" />}>
+          <SettingsPage {...settingsPageModel} />
+        </React.Suspense>
       )}
 
       {!settingsOpen && (
         <div className="main-content">
-        {/* ========== AGENTS TAB ========== */}
-        {activeTab === 'agents' && (
-          <>
-            {/* Sidebar: Projects + Threads */}
-            <div className="sidebar agents-sidebar">
-              <div className="sidebar-content agents-sidebar-content">
-                {projects.length === 0 && (
-                  <div className="empty-state p-8 text-center">
-                    <div className="empty-state-icon">
-                      <FolderOpen size={28} />
-                    </div>
-                    <div className="empty-state-title">No projects yet</div>
-                    <div className="text-xs text-[#6b6b74]">Add a folder to start agent threads</div>
-                    <button onClick={() => void handleAddProject()} className="btn mt-3">
-                      <Plus size={14} /> Add Project
-                    </button>
-                  </div>
-                )}
+          {/* ========== AGENTS TAB ========== */}
+          {activeTab === 'agents' && (
+            <>
+              {/* Sidebar: Projects + Threads */}
+              <AgentsSidebar {...agentsSidebarModel} />
 
-                {projects.length > 0 && (
-                  <div className="sidebar-primary-actions">
-                    <button type="button" className="sidebar-action-button primary" onClick={handleNewAgent}>
-                      <SquarePen size={15} />
-                      <span>New agent</span>
-                    </button>
-                    <div className="sidebar-search-wrap" ref={threadSearchRef}>
-                      <button
-                        type="button"
-                        className={`sidebar-action-button ${threadSearchOpen ? 'active' : ''}`}
-                        onClick={() => setThreadSearchOpen((open) => !open)}
-                        aria-expanded={threadSearchOpen}
+              {/* Main Panel: Thread view */}
+              <div className="panel agents-panel">
+                {!selectedThread && selectedEpic ? (
+                  <div className="epic-view">
+                    <div className="epic-view-header">
+                      <div
+                        className={`epic-view-icon ${
+                          selectedEpicPrStatus ? `epic-view-icon--${selectedEpicPrStatus}` : ''
+                        }`}
                       >
-                        <Search size={15} />
-                        <span>Search</span>
-                      </button>
-                      {threadSearchOpen && (
-                        <div className="thread-search-panel">
-                          <div className="thread-search-input">
-                            <Search size={14} />
-                            <input
-                              autoFocus
-                              value={threadSearchQuery}
-                              onChange={(event) => setThreadSearchQuery(event.target.value)}
-                              placeholder="Search threads..."
+                        <SquareKanban size={24} />
+                      </div>
+                      <div className="epic-view-heading">
+                        <h2 className="epic-view-title">{selectedEpic.name}</h2>
+                        <div className="epic-view-meta">
+                          {(selectedEpicRepositoryProject || selectedEpicClaimedProject) && (
+                            <span
+                              className="epic-view-project"
+                              title={
+                                selectedEpic.gitRoot ??
+                                selectedEpicRepositoryProject?.path ??
+                                selectedEpicClaimedProject?.path
+                              }
+                            >
+                              <ProjectIcon
+                                projectPath={
+                                  selectedEpic.gitRoot ??
+                                  selectedEpicRepositoryProject?.path ??
+                                  selectedEpicClaimedProject!.path
+                                }
+                                size={13}
+                              />
+                              {selectedEpicRepositoryProject?.name ?? selectedEpicClaimedProject?.name}
+                            </span>
+                          )}
+                          <span>
+                            {selectedEpicThreads.length === 1 ? '1 thread' : `${selectedEpicThreads.length} threads`}
+                          </span>
+                          <span>Created {formatShortTime(new Date(selectedEpic.createdAt))}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="epic-view-description-block">
+                      <label className="epic-view-description-label" htmlFor="epic-description">
+                        Description
+                      </label>
+                      <EpicDescriptionEditor
+                        key={selectedEpic.id}
+                        epicId={selectedEpic.id}
+                        initialValue={selectedEpic.description ?? ''}
+                        onCommit={(epicId, description) => updateEpic(epicId, { description })}
+                      />
+                    </div>
+
+                    <div className="epic-view-repository-block">
+                      <label className="epic-view-description-label" id="epic-repository-label">
+                        Repository
+                      </label>
+                      {selectedEpic.gitRoot ? (
+                        <div className="epic-view-repository-claimed" title={selectedEpic.gitRoot}>
+                          <GitBranch size={14} />
+                          <span>
+                            {selectedEpicClaimedProject?.name ?? selectedEpic.gitRoot}
+                            {selectedEpic.gitBranch ? ` · ${selectedEpic.gitBranch}` : ''}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="epic-view-repository-picker" ref={epicRepoPickerRef}>
+                          <button
+                            type="button"
+                            id="epic-repository"
+                            className="epic-view-repository-trigger"
+                            disabled={
+                              selectedEpicOperationBusy || Boolean(selectedEpic.riftRequest) || projects.length === 0
+                            }
+                            onClick={() => {
+                              if (selectedEpicOperationBusy || selectedEpic.riftRequest) return;
+                              setEpicRepoPickerOpen((open) => !open);
+                            }}
+                            aria-haspopup="menu"
+                            aria-expanded={epicRepoPickerOpen && !selectedEpicOperationBusy}
+                            aria-labelledby="epic-repository-label"
+                            title={
+                              selectedEpicRepositoryProject?.path ??
+                              (projects.length === 0 ? 'Add a project first' : 'Choose the repository for this epic')
+                            }
+                          >
+                            {selectedEpicRepositoryProject ? (
+                              <>
+                                <ProjectIcon projectPath={selectedEpicRepositoryProject.path} size={14} />
+                                <span className="truncate">{selectedEpicRepositoryProject.name}</span>
+                              </>
+                            ) : (
+                              <span className="epic-view-repository-placeholder truncate">
+                                {projects.length === 0 ? 'No projects available' : 'Select repository…'}
+                              </span>
+                            )}
+                            <ChevronDown
+                              size={14}
+                              className={`project-pill-chevron ${epicRepoPickerOpen ? 'open' : ''}`}
                             />
-                          </div>
-                          <div className="thread-search-results">
-                            <ThreadSearchResults
-                              projects={projects}
-                              query={threadSearchQuery}
-                              onSelectThread={(threadId) => {
-                                selectThread(threadId);
-                                setActiveTab('agents');
-                                setThreadSearchOpen(false);
-                              }}
-                            />
-                          </div>
+                          </button>
+                          {epicRepoPickerOpen &&
+                            !selectedEpicOperationBusy &&
+                            !selectedEpic.riftRequest &&
+                            projects.length > 0 && (
+                              <div
+                                className="shell-project-picker epic-view-repository-menu"
+                                role="menu"
+                                aria-labelledby="epic-repository-label"
+                              >
+                                {projects.map((option) => {
+                                  const selected = option.id === selectedEpic.repositoryProjectId;
+                                  return (
+                                    <button
+                                      key={option.id}
+                                      type="button"
+                                      role="menuitemradio"
+                                      aria-checked={selected}
+                                      className={`project-picker-item ${selected ? 'selected' : ''}`}
+                                      onClick={() => {
+                                        setEpicRepoPickerOpen(false);
+                                        updateEpic(selectedEpic.id, {
+                                          repositoryProjectId: option.id,
+                                        });
+                                      }}
+                                      title={option.path}
+                                    >
+                                      <ProjectIcon projectPath={option.path} size={13} />
+                                      <span className="truncate">{option.name}</span>
+                                      {selected && <Check size={13} />}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
                         </div>
                       )}
+                      {selectedEpic.riftPath && (
+                        <div className="epic-view-repository-claimed epic-view-rift" title={selectedEpic.riftPath}>
+                          <FlaskConical size={14} />
+                          <span className="truncate">Rift · {selectedEpic.riftPath}</span>
+                        </div>
+                      )}
+                      <span className="epic-view-repository-hint">
+                        {selectedEpic.riftPath
+                          ? 'Threads and git actions run inside this epic’s rift workspace.'
+                          : selectedEpic.riftRequest
+                            ? 'This epic stays locked to its requested project until Rift setup succeeds.'
+                            : selectedEpic.gitRoot
+                              ? 'This epic is locked to its claimed repository and feature branch.'
+                              : 'Choose the repository explicitly before using git actions.'}
+                      </span>
                     </div>
-                  </div>
-                )}
 
-                {pinnedThreads.length > 0 && (
-                  <div className="recent-agents-section">
-                    <button
-                      type="button"
-                      className="sidebar-section-toggle"
-                      onClick={() =>
-                        setPinnedAgentsOpen((open) => {
-                          // Collapsing resets the list back to the default 5 on next expand.
-                          if (open) setPinnedAgentsShowAll(false);
-                          return !open;
-                        })
-                      }
-                      aria-expanded={pinnedAgentsOpen}
-                    >
-                      <ChevronRight
-                        size={12}
-                        className={`sidebar-section-chevron ${pinnedAgentsOpen ? 'open' : ''}`}
-                      />
-                      <span>Pinned</span>
-                    </button>
-                    {pinnedAgentsOpen && (
-                      <>
-                      <div className="threads-list recent-agents-list">
-                        {(pinnedAgentsShowAll
-                          ? pinnedThreads
-                          : pinnedThreads.slice(0, THREADS_VISIBLE_LIMIT)
-                        ).map((thread) => (
-                          <div
-                            key={thread.id}
-                            className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                            onClick={() => {
-                              if (threadRenameKey !== `pinned:${thread.id}`) selectThread(thread.id);
-                            }}
+                    <div className="epic-view-actions">
+                      <div className="flex flex-col items-start gap-1.5">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={
+                            selectedEpicOperationBusy ||
+                            activeRiftUnavailable ||
+                            riftRemovalEpicIds[selectedEpic.id] ||
+                            (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
+                            !selectedEpicHasWorkToPush ||
+                            selectedEpicHasRunningAgents
+                          }
+                          onClick={() => {
+                            if (epicPromptGitMessages) openEpicCommitDialog(selectedEpic);
+                            else void handleEpicCommitAndPush(selectedEpic);
+                          }}
+                          title={
+                            selectedEpicHasRunningAgents
+                              ? 'Agents are still running in this epic — wait for them to finish before committing'
+                              : !selectedEpicHasWorkToPush
+                                ? 'Nothing to commit — the workspace is clean and fully pushed'
+                                : epicPromptGitMessages
+                                  ? 'Stage all changes, write or generate a commit message, then commit and push'
+                                  : 'Stage all changes, generate a commit message, then commit and push'
+                          }
+                        >
+                          <GitCommit size={14} />
+                          {selectedEpicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
+                        </button>
+                        <label
+                          className="inline-flex items-center gap-1.5 cursor-pointer select-none group"
+                          title={
+                            selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
+                              ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
+                              : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
+                          }
+                        >
+                          <input
+                            type="checkbox"
+                            className="peer sr-only"
+                            checked={Boolean(selectedEpic.autoPrAfterCommit)}
+                            onChange={(e) =>
+                              updateEpic(selectedEpic.id, {
+                                autoPrAfterCommit: e.target.checked,
+                              })
+                            }
+                          />
+                          <span
+                            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
+                            aria-hidden
                           >
-                            {renderThreadStatusDot(thread)}
-                            {threadRenameKey === `pinned:${thread.id}` ? (
-                              <InlineRenameInput
-                                className="thread-rename-input"
-                                initialValue={thread.title}
-                                onSubmit={(title) => {
-                                  updateThread(thread.id, { title });
-                                  setThreadRenameKey(null);
-                                }}
-                                onCancel={() => setThreadRenameKey(null)}
-                              />
-                            ) : (
+                            <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
+                          </span>
+                          <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
+                            Auto create PR on commit
+                          </span>
+                        </label>
+                      </div>
+                      {selectedEpicPrBadge && (
+                        <button
+                          type="button"
+                          className={`btn epic-view-pr-state epic-view-pr-state--${selectedEpicPrBadge.modifier}`}
+                          onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
+                          title={
+                            selectedEpicPrBadge.modifier === 'merged'
+                              ? 'The pull request is merged — settle the epic to archive it'
+                              : 'This epic already has a pull request — click to view it on GitHub'
+                          }
+                        >
+                          {selectedEpicPrBadge.modifier === 'merged' ? (
+                            <GitMerge size={14} />
+                          ) : selectedEpicPrBadge.modifier === 'closed' ? (
+                            <GitPullRequestClosed size={14} />
+                          ) : (
+                            <GitPullRequest size={14} />
+                          )}
+                          {selectedEpicPrBadge.label}
+                        </button>
+                      )}
+                      {(!selectedEpicPrBadge || selectedEpicPrBadge.modifier === 'closed') && (
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={
+                            selectedEpicOperationBusy ||
+                            activeRiftUnavailable ||
+                            riftRemovalEpicIds[selectedEpic.id] ||
+                            (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
+                            selectedEpicHasRunningAgents
+                          }
+                          onClick={() => {
+                            if (epicPromptGitMessages) openEpicPrBaseDialog(selectedEpic);
+                            else void createEpicPrWithoutPrompt(selectedEpic);
+                          }}
+                          title={
+                            selectedEpicHasRunningAgents
+                              ? 'Agents are still running in this epic — wait for them to finish before opening a PR'
+                              : selectedEpicPrBadge?.modifier === 'closed'
+                                ? 'Open a replacement pull request for this branch'
+                                : epicPromptGitMessages
+                                  ? 'Choose a base branch and optionally write the title and description, then open a pull request'
+                                  : 'Open a pull request into your project’s current branch with a generated title and description'
+                          }
+                        >
+                          <GitPullRequest size={14} />
+                          {selectedEpicGitBusy === 'pr'
+                            ? 'Opening PR…'
+                            : selectedEpicGitBusy === 'pr-branches'
+                              ? 'Loading branches…'
+                              : selectedEpicPrBadge?.modifier === 'closed'
+                                ? 'Create replacement PR'
+                                : 'Create PR'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn epic-view-settle"
+                        disabled={!!selectedEpicGitBusy || selectedEpicHasRunningAgents}
+                        onClick={() => void handleSettleEpic(selectedEpic)}
+                        title={
+                          selectedEpicHasRunningAgents
+                            ? 'Agents are still running in this epic — wait for them to finish before settling it'
+                            : 'Archive this epic; uncommitted work or pull request state will be explained before settling'
+                        }
+                      >
+                        <Archive size={14} />
+                        Settle
+                      </button>
+                    </div>
+
+                    {(selectedEpicGitBusy || riftSetupEpicIds[selectedEpic.id]) && (
+                      <div className="epic-view-status">
+                        <span className="working-dots" aria-hidden="true">
+                          <span />
+                          <span />
+                          <span />
+                        </span>
+                        {riftSetupEpicIds[selectedEpic.id]
+                          ? 'Creating the epic’s rift workspace and branch…'
+                          : selectedEpicGitBusy === 'commit'
+                            ? 'Staging all changes and writing a commit message, then pushing…'
+                            : selectedEpicGitBusy === 'pr-branches'
+                              ? 'Fetching the branches on origin…'
+                              : selectedEpicGitBusy === 'settle'
+                                ? 'Checking the workspace and pull request state…'
+                                : 'Writing the PR message and opening the pull request…'}
+                      </div>
+                    )}
+
+                    {selectedEpic.riftRequest &&
+                      !riftSetupEpicIds[selectedEpic.id] &&
+                      !selectedEpic.riftCleanupPending && (
+                        <div className="epic-view-rift-retry">
+                          <span>
+                            {selectedEpic.riftRequest.error ??
+                              'Rift setup still needs to finish before this epic can run.'}
+                          </span>
+                          <button
+                            type="button"
+                            className="btn secondary"
+                            disabled={repositoryOperationBusy}
+                            onClick={() => void setupRiftForEpic(selectedEpic.id)}
+                          >
+                            <RefreshCw size={13} />
+                            Retry Rift setup
+                          </button>
+                        </div>
+                      )}
+
+                    {selectedEpic.prUrl && (
+                      <button
+                        type="button"
+                        className="epic-view-pr-link"
+                        onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
+                        title="Open the pull request in your browser"
+                      >
+                        <GitPullRequest size={13} />
+                        <span className="truncate">{selectedEpic.prUrl}</span>
+                        <SquareArrowOutUpRight size={12} />
+                      </button>
+                    )}
+
+                    <div className="epic-view-threads">
+                      <div className="epic-view-threads-header">
+                        <span>Threads</span>
+                        <button
+                          type="button"
+                          className="sidebar-section-action"
+                          title="New thread"
+                          aria-label="New thread"
+                          onClick={() => handleCreateThreadForEpic(selectedEpic)}
+                        >
+                          <Plus size={14} />
+                        </button>
+                      </div>
+                      {selectedEpicThreads.length === 0 ? (
+                        <div className="epic-view-empty">No threads yet — spawn one to start working this epic.</div>
+                      ) : (
+                        <div className="threads-list epic-view-threads-list">
+                          {selectedEpicThreads.map((thread) => (
+                            <div key={thread.id} className="thread-item" onClick={() => selectThread(thread.id)}>
+                              {renderThreadStatusDot(thread)}
                               <span className="thread-title">
                                 {renderThreadCliBadge(thread)}
                                 <span className="thread-title-text">{thread.title}</span>
                               </span>
-                            )}
-                            <span className="thread-project-tag thread-meta">
-                              {projects.find((p) => p.id === thread.projectId)?.name}
-                            </span>
-                            <span className="thread-time thread-meta">
-                              {formatShortTime(getThreadActivityTime(thread))}
-                            </span>
-                            <div
-                              className="thread-menu-wrap"
-                              ref={threadItemMenuKey === `pinned:${thread.id}` ? threadItemMenuRef : undefined}
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <button
-                                type="button"
-                                className="thread-options-trigger"
-                                title="Thread options"
-                                aria-label={`Options for ${thread.title}`}
-                                aria-haspopup="menu"
-                                aria-expanded={threadItemMenuKey === `pinned:${thread.id}`}
-                                onClick={() =>
-                                  setThreadItemMenuKey((open) =>
-                                    open === `pinned:${thread.id}` ? null : `pinned:${thread.id}`
-                                  )
-                                }
-                              >
-                                <Ellipsis size={13} />
-                              </button>
-                              {threadItemMenuKey === `pinned:${thread.id}` && (
-                                <div className="thread-menu thread-item-menu" role="menu">
-                                  <button
-                                    type="button"
-                                    className="project-menu-item"
-                                    role="menuitem"
-                                    onClick={() => {
-                                      setThreadItemMenuKey(null);
-                                      setThreadRenameKey(`pinned:${thread.id}`);
-                                    }}
-                                  >
-                                    <SquarePen size={13} /> Rename
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="project-menu-item"
-                                    role="menuitem"
-                                    onClick={() => {
-                                      setThreadItemMenuKey(null);
-                                      branchThread(thread.id);
-                                    }}
-                                  >
-                                    <GitBranch size={13} /> Branch
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="project-menu-item"
-                                    role="menuitem"
-                                    onClick={() => {
-                                      setThreadItemMenuKey(null);
-                                      unpinThread(thread.id);
-                                    }}
-                                  >
-                                    <PinOff size={13} /> Unpin
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="project-menu-item danger"
-                                    role="menuitem"
-                                    onClick={() => {
-                                      setThreadItemMenuKey(null);
-                                      if (confirm('Delete this thread?')) {
-                                        void deleteThreadWithRuntime(thread.id);
-                                      }
-                                    }}
-                                  >
-                                    <Trash2 size={13} /> Delete
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                      {pinnedThreads.length > THREADS_VISIBLE_LIMIT && (
-                        <button
-                          type="button"
-                          className="threads-show-more"
-                          onClick={() => setPinnedAgentsShowAll((showAll) => !showAll)}
-                        >
-                          {pinnedAgentsShowAll ? 'Show less' : 'Show more'}
-                        </button>
-                      )}
-                      </>
-                    )}
-                  </div>
-                )}
-
-                {epicsEnabled && projects.length > 0 && (
-                  <div className="recent-agents-section epics-section">
-                    <div className="epics-section-header">
-                      <button
-                        type="button"
-                        className="sidebar-section-toggle"
-                        onClick={() => setEpicsSectionOpen((open) => !open)}
-                        aria-expanded={epicsSectionOpen}
-                      >
-                        <ChevronRight
-                          size={15}
-                          className={`sidebar-section-chevron ${epicsSectionOpen ? 'open' : ''}`}
-                        />
-                        <span>Epics</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="sidebar-section-action"
-                        title="New epic"
-                        onClick={openCreateEpicModal}
-                      >
-                        <Plus size={15} />
-                      </button>
-                    </div>
-                    {epicsSectionOpen && (
-                      <>
-                        {activeEpics.map((epic) => {
-                          const epicThreads = threadsByEpic.get(epic.id) ?? [];
-                          // The project label sits on the epic row instead of
-                          // repeating on every thread under it — but only while
-                          // those threads agree on one project, so a mixed epic
-                          // keeps its per-thread tags.
-                          const epicProjectNames = new Set(
-                            epicThreads
-                              .map((thread) => projects.find((p) => p.id === thread.projectId)?.name)
-                              .filter((name): name is string => Boolean(name))
-                          );
-                          const explicitlyBoundEpicProject = epic.gitRoot
-                            ? projectForGitRoot(epic.gitRoot, epic.repositoryProjectId)
-                            : epic.repositoryProjectId
-                              ? projects.find((project) => project.id === epic.repositoryProjectId)
-                              : undefined;
-                          const epicProjectName =
-                            epicThreads.length === 0
-                              ? explicitlyBoundEpicProject?.name
-                              : epicProjectNames.size === 1
-                                ? [...epicProjectNames][0]
-                                : undefined;
-                          const isEpicCollapsed = collapsedEpics[epic.id] ?? false;
-                          const isEpicSelected =
-                            selectedEpicId === epic.id && !selectedThreadId;
-                          const prStatus = epicPrStatus(epic);
-
-                          return (
-                            <div key={epic.id} className="project-section epic-section">
-                              <div className="project-section-header-row">
-                                <button
-                                  type="button"
-                                  className="project-collapse-toggle"
-                                  title={isEpicCollapsed ? 'Expand threads' : 'Collapse threads'}
-                                  aria-expanded={!isEpicCollapsed}
-                                  onClick={() =>
-                                    setCollapsedEpics((prev) => ({
-                                      ...prev,
-                                      [epic.id]: !isEpicCollapsed,
-                                    }))
-                                  }
-                                >
-                                  <ChevronRight
-                                    size={12}
-                                    className={`sidebar-section-chevron ${isEpicCollapsed ? '' : 'open'}`}
-                                  />
-                                </button>
-                                {epicRenameId === epic.id ? (
-                                  <div className="project-section-header project-section-header-renaming">
-                                    <SquareKanban
-                                      size={13}
-                                      className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
-                                    />
-                                    <InlineRenameInput
-                                      className="thread-rename-input"
-                                      initialValue={epic.name}
-                                      onSubmit={(name) => {
-                                        renameEpic(epic.id, name);
-                                        setEpicRenameId(null);
-                                      }}
-                                      onCancel={() => setEpicRenameId(null)}
-                                    />
-                                  </div>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    className={`project-section-header epic-section-header ${isEpicSelected ? 'epic-section-header-selected' : ''}`}
-                                    onClick={() => {
-                                      selectEpic(epic.id);
-                                      setActiveTab('agents');
-                                    }}
-                                    title={
-                                      prStatus ? `${epic.name} — PR ${prStatus}` : epic.name
-                                    }
-                                  >
-                                    <SquareKanban
-                                      size={13}
-                                      className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
-                                    />
-                                    {epicProjectName && (
-                                      <span className="epic-project-tag">{epicProjectName}</span>
-                                    )}
-                                    <span className="truncate">{epic.name}</span>
-                                    {isEpicCollapsed && epicThreads.length > 0 && (
-                                      <span className="sidebar-section-count">
-                                        {epicThreads.length}
-                                      </span>
-                                    )}
-                                  </button>
-                                )}
-                                <div
-                                  className="project-menu-wrap"
-                                  ref={epicMenuOpenId === epic.id ? epicMenuRef : undefined}
-                                >
-                                  <button
-                                    type="button"
-                                    className="project-options-trigger"
-                                    title="Epic options"
-                                    aria-label={`Options for ${epic.name}`}
-                                    aria-haspopup="menu"
-                                    aria-expanded={epicMenuOpenId === epic.id}
-                                    onClick={() =>
-                                      setEpicMenuOpenId((open) =>
-                                        open === epic.id ? null : epic.id
-                                      )
-                                    }
-                                  >
-                                    <Ellipsis size={13} />
-                                  </button>
-                                  {epicMenuOpenId === epic.id && (
-                                    <div className="thread-menu project-menu" role="menu">
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setEpicMenuOpenId(null);
-                                          setEpicRenameId(epic.id);
-                                        }}
-                                      >
-                                        <SquarePen size={13} /> Rename
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        disabled={runningAgentEpicIds.has(epic.id)}
-                                        title={
-                                          runningAgentEpicIds.has(epic.id)
-                                            ? 'Agents are still running in this epic — wait for them to finish before settling it'
-                                            : undefined
-                                        }
-                                        onClick={() => {
-                                          setEpicMenuOpenId(null);
-                                          void handleSettleEpic(epic);
-                                        }}
-                                      >
-                                        <Archive size={13} /> Settle
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item danger"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setEpicMenuOpenId(null);
-                                          handleDeleteEpic(epic);
-                                        }}
-                                      >
-                                        <Trash2 size={13} /> Delete
-                                      </button>
-                                    </div>
-                                  )}
-                                </div>
-                                <button
-                                  type="button"
-                                  className="project-new-thread"
-                                  title={`New thread in ${epic.name}`}
-                                  onClick={() => handleCreateThreadForEpic(epic)}
-                                >
-                                  <SquarePen size={13} />
-                                </button>
-                              </div>
-
-                              {!isEpicCollapsed && (
-                                <div className="threads-list">
-                                  {epicThreads.length === 0 ? (
-                                    <button
-                                      type="button"
-                                      className="thread-item thread-item-empty"
-                                      onClick={() => handleCreateThreadForEpic(epic)}
-                                    >
-                                      <span className="thread-title">New thread</span>
-                                    </button>
-                                  ) : (
-                                    epicThreads.map((thread) => (
-                                      <div
-                                        key={thread.id}
-                                        className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                                        onClick={() => {
-                                          if (threadRenameKey !== `epic:${thread.id}`) {
-                                            selectThread(thread.id);
-                                          }
-                                        }}
-                                      >
-                                        {renderThreadStatusDot(thread)}
-                                        {threadRenameKey === `epic:${thread.id}` ? (
-                                          <InlineRenameInput
-                                            className="thread-rename-input"
-                                            initialValue={thread.title}
-                                            onSubmit={(title) => {
-                                              updateThread(thread.id, { title });
-                                              setThreadRenameKey(null);
-                                            }}
-                                            onCancel={() => setThreadRenameKey(null)}
-                                          />
-                                        ) : (
-                                          <span className="thread-title">
-                                            {renderThreadCliBadge(thread)}
-                                            <span className="thread-title-text">{thread.title}</span>
-                                          </span>
-                                        )}
-                                        {!epicProjectName && (
-                                          <span className="thread-project-tag thread-meta">
-                                            {projects.find((p) => p.id === thread.projectId)?.name}
-                                          </span>
-                                        )}
-                                        <span className="thread-time thread-meta">
-                                          {formatShortTime(getThreadActivityTime(thread))}
-                                        </span>
-                                        <div
-                                          className="thread-menu-wrap"
-                                          ref={threadItemMenuKey === `epic:${thread.id}` ? threadItemMenuRef : undefined}
-                                          onClick={(e) => e.stopPropagation()}
-                                        >
-                                          <button
-                                            type="button"
-                                            className="thread-options-trigger"
-                                            title="Thread options"
-                                            aria-label={`Options for ${thread.title}`}
-                                            aria-haspopup="menu"
-                                            aria-expanded={threadItemMenuKey === `epic:${thread.id}`}
-                                            onClick={() =>
-                                              setThreadItemMenuKey((open) =>
-                                                open === `epic:${thread.id}` ? null : `epic:${thread.id}`
-                                              )
-                                            }
-                                          >
-                                            <Ellipsis size={13} />
-                                          </button>
-                                          {threadItemMenuKey === `epic:${thread.id}` && (
-                                            <div className="thread-menu thread-item-menu" role="menu">
-                                              <button
-                                                type="button"
-                                                className="project-menu-item"
-                                                role="menuitem"
-                                                onClick={() => {
-                                                  setThreadItemMenuKey(null);
-                                                  setThreadRenameKey(`epic:${thread.id}`);
-                                                }}
-                                              >
-                                                <SquarePen size={13} /> Rename
-                                              </button>
-                                              <button
-                                                type="button"
-                                                className="project-menu-item"
-                                                role="menuitem"
-                                                onClick={() => {
-                                                  setThreadItemMenuKey(null);
-                                                  branchThread(thread.id);
-                                                }}
-                                              >
-                                                <GitBranch size={13} /> Branch
-                                              </button>
-                                              <button
-                                                type="button"
-                                                className="project-menu-item"
-                                                role="menuitem"
-                                                onClick={() => {
-                                                  setThreadItemMenuKey(null);
-                                                  void handleRemoveThreadFromEpic(thread.id);
-                                                }}
-                                              >
-                                                <EyeOff size={13} /> Remove from epic
-                                              </button>
-                                              <button
-                                                type="button"
-                                                className="project-menu-item danger"
-                                                role="menuitem"
-                                                onClick={() => {
-                                                  setThreadItemMenuKey(null);
-                                                  if (confirm('Delete this thread?')) {
-                                                    void deleteThreadWithRuntime(thread.id);
-                                                  }
-                                                }}
-                                              >
-                                                <Trash2 size={13} /> Delete
-                                              </button>
-                                            </div>
-                                          )}
-                                        </div>
-                                      </div>
-                                    ))
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </>
-                    )}
-                  </div>
-                )}
-
-                {projects.length > 0 && (
-                  <div className="recent-agents-section">
-                    <div className="recent-agents-header-row">
-                      <button
-                        type="button"
-                        className="sidebar-section-toggle"
-                        onClick={() =>
-                          setRecentAgentsOpen((open) => {
-                            // Collapsing resets the list back to the default 5 on next expand.
-                            if (open) setRecentAgentsShowAll(false);
-                            return !open;
-                          })
-                        }
-                        aria-expanded={recentAgentsOpen}
-                      >
-                        <ChevronRight
-                          size={12}
-                          className={`sidebar-section-chevron ${recentAgentsOpen ? 'open' : ''}`}
-                        />
-                        <span>Recent agents</span>
-                      </button>
-                      {recentAgentsTargetProject && (
-                        <button
-                          type="button"
-                          className="project-new-thread"
-                          title={`New thread in ${recentAgentsTargetProject.name}`}
-                          aria-label={`New thread in ${recentAgentsTargetProject.name}`}
-                          onClick={() => {
-                            // The new thread lands at the top of this list, so
-                            // make sure the list is showing.
-                            setRecentAgentsOpen(true);
-                            handleCreateThread(recentAgentsTargetProject.id);
-                          }}
-                        >
-                          <SquarePen size={13} />
-                        </button>
-                      )}
-                      {runningAgentCount > 0 && (
-                        <span className="sidebar-section-count">{runningAgentCount}</span>
-                      )}
-                    </div>
-                    {recentAgentsOpen && (
-                      <>
-                      <div className="threads-list recent-agents-list">
-                        {recentThreads.length === 0 ? (
-                          <div className="recent-agents-empty">No recent agents</div>
-                        ) : (
-                          (recentAgentsShowAll
-                            ? recentThreads
-                            : recentThreads.slice(0, THREADS_VISIBLE_LIMIT)
-                          ).map((thread) => (
-                            <div
-                              key={thread.id}
-                              className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                              onClick={() => {
-                                if (threadRenameKey !== `recent:${thread.id}`) selectThread(thread.id);
-                              }}
-                            >
-                              {renderThreadStatusDot(thread)}
-                              {threadRenameKey === `recent:${thread.id}` ? (
-                                <InlineRenameInput
-                                  className="thread-rename-input"
-                                  initialValue={thread.title}
-                                  onSubmit={(title) => {
-                                    updateThread(thread.id, { title });
-                                    setThreadRenameKey(null);
-                                  }}
-                                  onCancel={() => setThreadRenameKey(null)}
-                                />
-                              ) : (
-                                <span className="thread-title">
-                                  {renderThreadCliBadge(thread)}
-                                  <span className="thread-title-text">{thread.title}</span>
-                                </span>
-                              )}
                               <span className="thread-project-tag thread-meta">
                                 {projects.find((p) => p.id === thread.projectId)?.name}
                               </span>
                               <span className="thread-time thread-meta">
                                 {formatShortTime(getThreadActivityTime(thread))}
                               </span>
-                              <div
-                                className="thread-menu-wrap"
-                                ref={threadItemMenuKey === `recent:${thread.id}` ? threadItemMenuRef : undefined}
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <button
-                                  type="button"
-                                  className="thread-options-trigger"
-                                  title="Thread options"
-                                  aria-label={`Options for ${thread.title}`}
-                                  aria-haspopup="menu"
-                                  aria-expanded={threadItemMenuKey === `recent:${thread.id}`}
-                                  onClick={() =>
-                                    setThreadItemMenuKey((open) =>
-                                      open === `recent:${thread.id}` ? null : `recent:${thread.id}`
-                                    )
-                                  }
-                                >
-                                  <Ellipsis size={13} />
-                                </button>
-                                {threadItemMenuKey === `recent:${thread.id}` && (
-                                  <div className="thread-menu thread-item-menu" role="menu">
-                                    <button
-                                      type="button"
-                                      className="project-menu-item"
-                                      role="menuitem"
-                                      onClick={() => {
-                                        setThreadItemMenuKey(null);
-                                        setThreadRenameKey(`recent:${thread.id}`);
-                                      }}
-                                    >
-                                      <SquarePen size={13} /> Rename
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="project-menu-item"
-                                      role="menuitem"
-                                      onClick={() => {
-                                        setThreadItemMenuKey(null);
-                                        branchThread(thread.id);
-                                      }}
-                                    >
-                                      <GitBranch size={13} /> Branch
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="project-menu-item"
-                                      role="menuitem"
-                                      onClick={() => {
-                                        setThreadItemMenuKey(null);
-                                        pinThread(thread.id);
-                                      }}
-                                    >
-                                      <Pin size={13} /> Pin
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="project-menu-item"
-                                      role="menuitem"
-                                      onClick={() => {
-                                        setThreadItemMenuKey(null);
-                                        updateThread(thread.id, { hiddenFromRecent: true });
-                                      }}
-                                    >
-                                      <EyeOff size={13} /> Remove from Recent
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="project-menu-item danger"
-                                      role="menuitem"
-                                      onClick={() => {
-                                        setThreadItemMenuKey(null);
-                                        if (confirm('Delete this thread?')) {
-                                          void deleteThreadWithRuntime(thread.id);
-                                        }
-                                      }}
-                                    >
-                                      <Trash2 size={13} /> Delete
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
                             </div>
-                          ))
-                        )}
-                      </div>
-                      {recentThreads.length > THREADS_VISIBLE_LIMIT && (
-                        <button
-                          type="button"
-                          className="threads-show-more"
-                          onClick={() => setRecentAgentsShowAll((showAll) => !showAll)}
-                        >
-                          {recentAgentsShowAll ? 'Show less' : 'Show more'}
-                        </button>
+                          ))}
+                        </div>
                       )}
-                      </>
+                    </div>
+                  </div>
+                ) : !selectedThread ? (
+                  <div className="empty-state">
+                    <div className="empty-state-icon">
+                      <Bot size={30} />
+                    </div>
+                    <div className="empty-state-title">Select a thread</div>
+                    <div className="text-xs text-[#6b6b74]">Pick a conversation or start a new one</div>
+                    {projects.length > 0 && (
+                      <button
+                        onClick={() => handleCreateThread(selectedProject?.id ?? projects[0].id)}
+                        className="btn mt-2"
+                      >
+                        <Plus size={15} /> Start new thread
+                      </button>
                     )}
                   </div>
-                )}
-
-                {projects.length > 0 && (
-                  <div className="sidebar-section-header">
-                    <span className="sidebar-section-title">Projects</span>
-                    <button
-                      type="button"
-                      className="sidebar-section-action"
-                      title="Add project"
-                      onClick={() => void handleAddProject()}
-                    >
-                      <FolderPlus size={14} />
-                    </button>
-                  </div>
-                )}
-
-                {sortedProjects.map((project) => {
-                  const projectThreads = projectThreadsByProject.get(project.id) ?? [];
-                  const isActiveProject = selectedProject?.id === project.id;
-                  const isCollapsed = collapsedProjects[project.id] ?? false;
-                  const visibleLimit = threadListLimits[project.id] ?? THREADS_VISIBLE_LIMIT;
-                  const visibleThreads = projectThreads.slice(0, visibleLimit);
-                  const hasMoreThreads = projectThreads.length > visibleLimit;
-                  const isListExpanded =
-                    visibleLimit > THREADS_VISIBLE_LIMIT &&
-                    projectThreads.length > THREADS_VISIBLE_LIMIT;
-
-                  return (
-                    <div
-                      key={project.id}
-                      className={`project-section ${isActiveProject ? 'project-section-active' : ''}`}
-                    >
-                      <div className="project-section-header-row">
-                        <button
-                          type="button"
-                          className="project-collapse-toggle"
-                          title={isCollapsed ? 'Expand threads' : 'Collapse threads'}
-                          aria-expanded={!isCollapsed}
-                          onClick={() => {
-                            // Collapsing resets the list back to the default 5 on next expand.
-                            if (!isCollapsed) {
-                              setThreadListLimits((prev) => {
-                                if (!(project.id in prev)) return prev;
-                                const { [project.id]: _removed, ...rest } = prev;
-                                return rest;
-                              });
-                            }
-                            setCollapsedProjects((prev) => ({
-                              ...prev,
-                              [project.id]: !isCollapsed,
-                            }));
-                          }}
-                        >
-                          <ChevronRight
-                            size={12}
-                            className={`sidebar-section-chevron ${isCollapsed ? '' : 'open'}`}
-                          />
-                        </button>
-                        {projectRenameId === project.id ? (
-                          <div className="project-section-header project-section-header-renaming">
-                            <ProjectIcon projectPath={project.path} size={13} />
-                            <InlineRenameInput
-                              className="thread-rename-input"
-                              initialValue={project.name}
-                              onSubmit={(name) => {
-                                renameProject(project.id, name);
-                                setProjectRenameId(null);
-                              }}
-                              onCancel={() => setProjectRenameId(null)}
-                            />
-                          </div>
+                ) : (
+                  <>
+                    <div className="panel-content">
+                      {isTerminalThread ? (
+                        // Mounting spawns the CLI: hold off until the epic's
+                        // rift exists so the terminal never opens in the source
+                        // repository and then has to move.
+                        selectedThreadRiftUnavailable ? (
+                          <div className="terminal-view" />
                         ) : (
-                          <button
-                            type="button"
-                            className="project-section-header"
-                            onClick={() => selectProject(project.id)}
-                            title={project.path}
-                          >
-                            <ProjectIcon projectPath={project.path} size={13} />
-                            <span className="truncate">{project.name}</span>
-                            {isCollapsed && projectThreads.length > 0 && (
-                              <span className="sidebar-section-count">{projectThreads.length}</span>
-                            )}
-                          </button>
-                        )}
-                        <div
-                          className="project-menu-wrap"
-                          ref={projectMenuOpenId === project.id ? projectMenuRef : undefined}
-                        >
-                          <button
-                            type="button"
-                            className="project-options-trigger"
-                            title="Project options"
-                            aria-label={`Options for ${project.name}`}
-                            aria-haspopup="menu"
-                            aria-expanded={projectMenuOpenId === project.id}
-                            onClick={() =>
-                              setProjectMenuOpenId((open) =>
-                                open === project.id ? null : project.id
-                              )
-                            }
-                          >
-                            <Ellipsis size={13} />
-                          </button>
-                          {projectMenuOpenId === project.id && (
-                            <div className="thread-menu project-menu" role="menu">
-                              <button
-                                type="button"
-                                className="project-menu-item"
-                                role="menuitem"
-                                onClick={() => {
-                                  setProjectMenuOpenId(null);
-                                  setProjectRenameId(project.id);
-                                }}
-                              >
-                                <SquarePen size={13} /> Rename
-                              </button>
-                              <button
-                                type="button"
-                                className="project-menu-item danger"
-                                role="menuitem"
-                                onClick={() => {
-                                  setProjectMenuOpenId(null);
-                                  if (
-                                    confirm(
-                                      `Remove "${project.name}" and its threads? Files on disk are not affected.`
-                                    )
-                                  ) {
-                                    void removeProjectWithRuntimes(project.id);
-                                  }
-                                }}
-                              >
-                                <Trash2 size={13} /> Delete
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                        <button
-                          type="button"
-                          className="project-new-thread"
-                          title={`New thread in ${project.name}`}
-                          onClick={() => handleCreateThread(project.id)}
-                        >
-                          <SquarePen size={13} />
-                        </button>
-                      </div>
-
-                      {!isCollapsed && (
+                          <React.Suspense fallback={<div className="terminal-view" />}>
+                            <TerminalView
+                              key={selectedThread.id}
+                              threadId={selectedThread.id}
+                              epicId={selectedThread.epicId}
+                              projectPath={selectedThreadProjectPath ?? ''}
+                              accessMode={selectedThread.accessMode ?? 'full-access'}
+                              resumeSessionId={selectedThread.agentSessionIds?.claude}
+                              forkSession={selectedThread.pendingForkProviders?.includes('claude')}
+                            />
+                          </React.Suspense>
+                        )
+                      ) : (
                         <>
-                        <div className="threads-list">
-                          {projectThreads.length === 0 ? (
-                            <button
-                              type="button"
-                              className="thread-item thread-item-empty"
-                              onClick={() => handleCreateThread(project.id)}
-                            >
-                              <span className="thread-title">New thread</span>
-                            </button>
-                          ) : (
-                            visibleThreads.map((thread) => (
-                              <div
-                                key={thread.id}
-                                className={`thread-item ${selectedThreadId === thread.id ? 'selected' : ''}`}
-                                onClick={() => {
-                                  if (threadRenameKey !== `project:${thread.id}`) selectThread(thread.id);
-                                }}
-                              >
-                                {renderThreadStatusDot(thread)}
-                                {threadRenameKey === `project:${thread.id}` ? (
-                                  <InlineRenameInput
-                                    className="thread-rename-input"
-                                    initialValue={thread.title}
-                                    onSubmit={(title) => {
-                                      updateThread(thread.id, { title });
-                                      setThreadRenameKey(null);
-                                    }}
-                                    onCancel={() => setThreadRenameKey(null)}
-                                  />
-                                ) : (
-                                  <span className="thread-title">
-                                    {renderThreadCliBadge(thread)}
-                                    <span className="thread-title-text">{thread.title}</span>
-                                  </span>
-                                )}
-                                <span className="thread-time thread-meta">
-                                  {formatShortTime(getThreadActivityTime(thread))}
-                                </span>
-                                <div
-                                  className="thread-menu-wrap"
-                                  ref={threadItemMenuKey === `project:${thread.id}` ? threadItemMenuRef : undefined}
-                                  onClick={(e) => e.stopPropagation()}
-                                >
-                                  <button
-                                    type="button"
-                                    className="thread-options-trigger"
-                                    title="Thread options"
-                                    aria-label={`Options for ${thread.title}`}
-                                    aria-haspopup="menu"
-                                    aria-expanded={threadItemMenuKey === `project:${thread.id}`}
-                                    onClick={() =>
-                                      setThreadItemMenuKey((open) =>
-                                        open === `project:${thread.id}` ? null : `project:${thread.id}`
-                                      )
-                                    }
-                                  >
-                                    <Ellipsis size={13} />
-                                  </button>
-                                  {threadItemMenuKey === `project:${thread.id}` && (
-                                    <div className="thread-menu thread-item-menu" role="menu">
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          setThreadRenameKey(`project:${thread.id}`);
-                                        }}
-                                      >
-                                        <SquarePen size={13} /> Rename
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          branchThread(thread.id);
-                                        }}
-                                      >
-                                        <GitBranch size={13} /> Branch
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          if (thread.pinnedAt) unpinThread(thread.id);
-                                          else pinThread(thread.id);
-                                        }}
-                                      >
-                                        {thread.pinnedAt ? (
-                                          <>
-                                            <PinOff size={13} /> Unpin
-                                          </>
-                                        ) : (
-                                          <>
-                                            <Pin size={13} /> Pin
-                                          </>
-                                        )}
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item danger"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          if (confirm('Delete this thread?')) {
-                                            void deleteThreadWithRuntime(thread.id);
-                                          }
-                                        }}
-                                      >
-                                        <Trash2 size={13} /> Delete
-                                      </button>
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            ))
-                          )}
-                        </div>
-
-                        {(hasMoreThreads || isListExpanded) && (
-                          <button
-                            type="button"
-                            className="threads-show-more"
-                            onClick={() =>
-                              setThreadListLimits((prev) => {
-                                if (hasMoreThreads) {
-                                  return { ...prev, [project.id]: projectThreads.length };
-                                }
-                                const { [project.id]: _removed, ...rest } = prev;
-                                return rest;
-                              })
-                            }
-                          >
-                            {hasMoreThreads ? 'Show more' : 'Show less'}
-                          </button>
-                        )}
+                          <ChatTranscript
+                            threadId={selectedThread.id}
+                            projectName={selectedThreadProject?.name}
+                            projects={projects}
+                            canChangeProject={canChangeSelectedThreadProject}
+                            onSelectProject={handleChangeSelectedThreadProject}
+                            onAddProject={handleAddProject}
+                            mediaBaseDirs={mediaBaseDirs}
+                            isSending={isSending}
+                            steerSupported={steerSupported}
+                            steerReady={steerReady}
+                            authenticatingProviderId={authenticatingProviderId}
+                            chatScrollRef={chatScrollRef}
+                            chatEndRef={chatEndRef}
+                            chatPinnedRef={chatPinnedRef}
+                            chatScrollTopRef={chatScrollTopRef}
+                            chatScrollPositionsRef={chatScrollPositionsRef}
+                            tasksCardPosition={tasksCardPosition}
+                            tasksCardCollapsed={tasksCardCollapsed}
+                            tasksCardDismissedFor={tasksCardDismissedFor}
+                            onMoveTasksCard={setTasksCardPosition}
+                            onToggleTasksCard={toggleTasksCard}
+                            onDismissTasksCard={dismissTasksCard}
+                            onMarkTaskDone={markLinkedTaskDone}
+                            onUnlinkTask={unlinkTaskFromThread}
+                            onDismissBtwExchange={dismissBtwExchange}
+                            onAuthenticateProvider={handleAuthenticateProvider}
+                            onSteerQueuedMessage={steerQueuedMessage}
+                          />
                         </>
                       )}
 
-                    </div>
-                  );
-                })}
-              </div>
-              {renderSidebarFooter()}
-            </div>
-
-            {/* Main Panel: Thread view */}
-            <div className="panel agents-panel">
-              {!selectedThread && selectedEpic ? (
-                <div className="epic-view">
-                  <div className="epic-view-header">
-                    <div
-                      className={`epic-view-icon ${
-                        selectedEpicPrStatus ? `epic-view-icon--${selectedEpicPrStatus}` : ''
-                      }`}
-                    >
-                      <SquareKanban size={24} />
-                    </div>
-                    <div className="epic-view-heading">
-                      <h2 className="epic-view-title">{selectedEpic.name}</h2>
-                      <div className="epic-view-meta">
-                        {(selectedEpicRepositoryProject || selectedEpicClaimedProject) && (
-                          <span
-                            className="epic-view-project"
-                            title={
-                              selectedEpic.gitRoot ??
-                              selectedEpicRepositoryProject?.path ??
-                              selectedEpicClaimedProject?.path
-                            }
-                          >
-                            <ProjectIcon
-                              projectPath={
-                                selectedEpic.gitRoot ??
-                                selectedEpicRepositoryProject?.path ??
-                                selectedEpicClaimedProject!.path
-                              }
-                              size={13}
-                            />
-                            {selectedEpicRepositoryProject?.name ??
-                              selectedEpicClaimedProject?.name}
-                          </span>
-                        )}
-                        <span>
-                          {selectedEpicThreads.length === 1
-                            ? '1 thread'
-                            : `${selectedEpicThreads.length} threads`}
-                        </span>
-                        <span>Created {formatShortTime(new Date(selectedEpic.createdAt))}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="epic-view-description-block">
-                    <label className="epic-view-description-label" htmlFor="epic-description">
-                      Description
-                    </label>
-                    <EpicDescriptionEditor
-                      key={selectedEpic.id}
-                      epicId={selectedEpic.id}
-                      initialValue={selectedEpic.description ?? ''}
-                      onCommit={(epicId, description) => updateEpic(epicId, { description })}
-                    />
-                  </div>
-
-                  <div className="epic-view-repository-block">
-                    <label className="epic-view-description-label" id="epic-repository-label">
-                      Repository
-                    </label>
-                    {selectedEpic.gitRoot ? (
-                      <div className="epic-view-repository-claimed" title={selectedEpic.gitRoot}>
-                        <GitBranch size={14} />
-                        <span>
-                          {selectedEpicClaimedProject?.name ?? selectedEpic.gitRoot}
-                          {selectedEpic.gitBranch ? ` · ${selectedEpic.gitBranch}` : ''}
-                        </span>
-                      </div>
-                    ) : (
-                      <div className="epic-view-repository-picker" ref={epicRepoPickerRef}>
-                        <button
-                          type="button"
-                          id="epic-repository"
-                          className="epic-view-repository-trigger"
-                          disabled={
-                            selectedEpicOperationBusy ||
-                            Boolean(selectedEpic.riftRequest) ||
-                            projects.length === 0
-                          }
-                          onClick={() => {
-                            if (selectedEpicOperationBusy || selectedEpic.riftRequest) return;
-                            setEpicRepoPickerOpen((open) => !open);
-                          }}
-                          aria-haspopup="menu"
-                          aria-expanded={epicRepoPickerOpen && !selectedEpicOperationBusy}
-                          aria-labelledby="epic-repository-label"
-                          title={
-                            selectedEpicRepositoryProject?.path ??
-                            (projects.length === 0
-                              ? 'Add a project first'
-                              : 'Choose the repository for this epic')
-                          }
-                        >
-                          {selectedEpicRepositoryProject ? (
-                            <>
-                              <ProjectIcon
-                                projectPath={selectedEpicRepositoryProject.path}
-                                size={14}
-                              />
-                              <span className="truncate">
-                                {selectedEpicRepositoryProject.name}
-                              </span>
-                            </>
-                          ) : (
-                            <span className="epic-view-repository-placeholder truncate">
-                              {projects.length === 0
-                                ? 'No projects available'
-                                : 'Select repository…'}
-                            </span>
-                          )}
-                          <ChevronDown
-                            size={14}
-                            className={`project-pill-chevron ${epicRepoPickerOpen ? 'open' : ''}`}
-                          />
-                        </button>
-                        {epicRepoPickerOpen &&
-                          !selectedEpicOperationBusy &&
-                          !selectedEpic.riftRequest &&
-                          projects.length > 0 && (
-                          <div
-                            className="shell-project-picker epic-view-repository-menu"
-                            role="menu"
-                            aria-labelledby="epic-repository-label"
-                          >
-                            {projects.map((option) => {
-                              const selected =
-                                option.id === selectedEpic.repositoryProjectId;
-                              return (
-                                <button
-                                  key={option.id}
-                                  type="button"
-                                  role="menuitemradio"
-                                  aria-checked={selected}
-                                  className={`project-picker-item ${selected ? 'selected' : ''}`}
-                                  onClick={() => {
-                                    setEpicRepoPickerOpen(false);
-                                    updateEpic(selectedEpic.id, {
-                                      repositoryProjectId: option.id,
-                                    });
-                                  }}
-                                  title={option.path}
-                                >
-                                  <ProjectIcon projectPath={option.path} size={13} />
-                                  <span className="truncate">{option.name}</span>
-                                  {selected && <Check size={13} />}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                    {selectedEpic.riftPath && (
-                      <div
-                        className="epic-view-repository-claimed epic-view-rift"
-                        title={selectedEpic.riftPath}
-                      >
-                        <FlaskConical size={14} />
-                        <span className="truncate">Rift · {selectedEpic.riftPath}</span>
-                      </div>
-                    )}
-                    <span className="epic-view-repository-hint">
-                      {selectedEpic.riftPath
-                        ? 'Threads and git actions run inside this epic’s rift workspace.'
-                        : selectedEpic.riftRequest
-                          ? 'This epic stays locked to its requested project until Rift setup succeeds.'
-                        : selectedEpic.gitRoot
-                          ? 'This epic is locked to its claimed repository and feature branch.'
-                          : 'Choose the repository explicitly before using git actions.'}
-                    </span>
-                  </div>
-
-                  <div className="epic-view-actions">
-                    <div className="flex flex-col items-start gap-1.5">
-                      <button
-                        type="button"
-                        className="btn"
-                        disabled={
-                          selectedEpicOperationBusy ||
-                          activeRiftUnavailable ||
-                          riftRemovalEpicIds[selectedEpic.id] ||
-                          (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
-                          !selectedEpicHasWorkToPush ||
-                          selectedEpicHasRunningAgents
-                        }
-                        onClick={() => {
-                          if (epicPromptGitMessages) openEpicCommitDialog(selectedEpic);
-                          else void handleEpicCommitAndPush(selectedEpic);
-                        }}
-                        title={
-                          selectedEpicHasRunningAgents
-                            ? 'Agents are still running in this epic — wait for them to finish before committing'
-                            : !selectedEpicHasWorkToPush
-                              ? 'Nothing to commit — the workspace is clean and fully pushed'
-                              : epicPromptGitMessages
-                                ? 'Stage all changes, write or generate a commit message, then commit and push'
-                                : 'Stage all changes, generate a commit message, then commit and push'
-                        }
-                      >
-                        <GitCommit size={14} />
-                        {selectedEpicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
-                      </button>
-                      <label
-                        className="inline-flex items-center gap-1.5 cursor-pointer select-none group"
-                        title={
-                          selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
-                            ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
-                            : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
-                        }
-                      >
-                        <input
-                          type="checkbox"
-                          className="peer sr-only"
-                          checked={Boolean(selectedEpic.autoPrAfterCommit)}
-                          onChange={(e) =>
-                            updateEpic(selectedEpic.id, { autoPrAfterCommit: e.target.checked })
-                          }
-                        />
-                        <span
-                          className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
-                          aria-hidden
-                        >
-                          <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
-                        </span>
-                        <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
-                          Auto create PR on commit
-                        </span>
-                      </label>
-                    </div>
-                    {selectedEpicPrBadge && (
-                      <button
-                        type="button"
-                        className={`btn epic-view-pr-state epic-view-pr-state--${selectedEpicPrBadge.modifier}`}
-                        onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
-                        title={
-                          selectedEpicPrBadge.modifier === 'merged'
-                            ? 'The pull request is merged — settle the epic to archive it'
-                            : 'This epic already has a pull request — click to view it on GitHub'
-                        }
-                      >
-                        {selectedEpicPrBadge.modifier === 'merged' ? (
-                          <GitMerge size={14} />
-                        ) : selectedEpicPrBadge.modifier === 'closed' ? (
-                          <GitPullRequestClosed size={14} />
-                        ) : (
-                          <GitPullRequest size={14} />
-                        )}
-                        {selectedEpicPrBadge.label}
-                      </button>
-                    )}
-                    {(!selectedEpicPrBadge || selectedEpicPrBadge.modifier === 'closed') && (
-                      <button
-                        type="button"
-                        className="btn"
-                        disabled={
-                          selectedEpicOperationBusy ||
-                          activeRiftUnavailable ||
-                          riftRemovalEpicIds[selectedEpic.id] ||
-                          (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
-                          selectedEpicHasRunningAgents
-                        }
-                        onClick={() => {
-                          if (epicPromptGitMessages) openEpicPrBaseDialog(selectedEpic);
-                          else void createEpicPrWithoutPrompt(selectedEpic);
-                        }}
-                        title={
-                          selectedEpicHasRunningAgents
-                            ? 'Agents are still running in this epic — wait for them to finish before opening a PR'
-                            : selectedEpicPrBadge?.modifier === 'closed'
-                              ? 'Open a replacement pull request for this branch'
-                              : epicPromptGitMessages
-                                ? 'Choose a base branch and optionally write the title and description, then open a pull request'
-                                : 'Open a pull request into your project’s current branch with a generated title and description'
-                        }
-                      >
-                        <GitPullRequest size={14} />
-                        {selectedEpicGitBusy === 'pr'
-                          ? 'Opening PR…'
-                          : selectedEpicGitBusy === 'pr-branches'
-                            ? 'Loading branches…'
-                            : selectedEpicPrBadge?.modifier === 'closed'
-                              ? 'Create replacement PR'
-                              : 'Create PR'}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="btn epic-view-settle"
-                      disabled={
-                        !!selectedEpicGitBusy ||
-                        selectedEpicHasRunningAgents
-                      }
-                      onClick={() => void handleSettleEpic(selectedEpic)}
-                      title={
-                        selectedEpicHasRunningAgents
-                          ? 'Agents are still running in this epic — wait for them to finish before settling it'
-                          : 'Archive this epic; uncommitted work or pull request state will be explained before settling'
-                      }
-                    >
-                      <Archive size={14} />
-                      Settle
-                    </button>
-                  </div>
-
-                  {(selectedEpicGitBusy || riftSetupEpicIds[selectedEpic.id]) && (
-                    <div className="epic-view-status">
-                      <span className="working-dots" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
-                      </span>
-                      {riftSetupEpicIds[selectedEpic.id]
-                        ? 'Creating the epic’s rift workspace and branch…'
-                        : selectedEpicGitBusy === 'commit'
-                          ? 'Staging all changes and writing a commit message, then pushing…'
-                          : selectedEpicGitBusy === 'pr-branches'
-                            ? 'Fetching the branches on origin…'
-                            : selectedEpicGitBusy === 'settle'
-                              ? 'Checking the workspace and pull request state…'
-                              : 'Writing the PR message and opening the pull request…'}
-                    </div>
-                  )}
-
-                  {selectedEpic.riftRequest &&
-                    !riftSetupEpicIds[selectedEpic.id] &&
-                    !selectedEpic.riftCleanupPending && (
-                      <div className="epic-view-rift-retry">
-                        <span>
-                          {selectedEpic.riftRequest.error ??
-                            'Rift setup still needs to finish before this epic can run.'}
-                        </span>
-                        <button
-                          type="button"
-                          className="btn secondary"
-                          disabled={repositoryOperationBusy}
-                          onClick={() => void setupRiftForEpic(selectedEpic.id)}
-                        >
-                          <RefreshCw size={13} />
-                          Retry Rift setup
-                        </button>
-                      </div>
-                    )}
-
-                  {selectedEpic.prUrl && (
-                    <button
-                      type="button"
-                      className="epic-view-pr-link"
-                      onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
-                      title="Open the pull request in your browser"
-                    >
-                      <GitPullRequest size={13} />
-                      <span className="truncate">{selectedEpic.prUrl}</span>
-                      <SquareArrowOutUpRight size={12} />
-                    </button>
-                  )}
-
-                  <div className="epic-view-threads">
-                    <div className="epic-view-threads-header">
-                      <span>Threads</span>
-                      <button
-                        type="button"
-                        className="sidebar-section-action"
-                        title="New thread"
-                        aria-label="New thread"
-                        onClick={() => handleCreateThreadForEpic(selectedEpic)}
-                      >
-                        <Plus size={14} />
-                      </button>
-                    </div>
-                    {selectedEpicThreads.length === 0 ? (
-                      <div className="epic-view-empty">
-                        No threads yet — spawn one to start working this epic.
-                      </div>
-                    ) : (
-                      <div className="threads-list epic-view-threads-list">
-                        {selectedEpicThreads.map((thread) => (
-                          <div
-                            key={thread.id}
-                            className="thread-item"
-                            onClick={() => selectThread(thread.id)}
-                          >
-                            {renderThreadStatusDot(thread)}
-                            <span className="thread-title">
-                              {renderThreadCliBadge(thread)}
-                              <span className="thread-title-text">{thread.title}</span>
-                            </span>
-                            <span className="thread-project-tag thread-meta">
-                              {projects.find((p) => p.id === thread.projectId)?.name}
-                            </span>
-                            <span className="thread-time thread-meta">
-                              {formatShortTime(getThreadActivityTime(thread))}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ) : !selectedThread ? (
-                <div className="empty-state">
-                  <div className="empty-state-icon">
-                    <Bot size={30} />
-                  </div>
-                  <div className="empty-state-title">Select a thread</div>
-                  <div className="text-xs text-[#6b6b74]">Pick a conversation or start a new one</div>
-                  {projects.length > 0 && (
-                    <button
-                      onClick={() => handleCreateThread(selectedProject?.id ?? projects[0].id)}
-                      className="btn mt-2"
-                    >
-                      <Plus size={15} /> Start new thread
-                    </button>
-                  )}
-                </div>
-              ) : (
-                <>
-                  <div className="panel-content">
-                    {isTerminalThread ? (
-                      // Mounting spawns the CLI: hold off until the epic's
-                      // rift exists so the terminal never opens in the source
-                      // repository and then has to move.
-                      selectedThreadRiftUnavailable ? (
-                        <div className="terminal-view" />
-                      ) : (
-                      <React.Suspense fallback={<div className="terminal-view" />}>
-                        <TerminalView
-                          key={selectedThread.id}
-                          threadId={selectedThread.id}
-                          epicId={selectedThread.epicId}
-                          projectPath={selectedThreadProjectPath ?? ''}
-                          accessMode={selectedThread.accessMode ?? 'full-access'}
-                          resumeSessionId={selectedThread.agentSessionIds?.claude}
-                          forkSession={selectedThread.pendingForkProviders?.includes('claude')}
-                        />
-                      </React.Suspense>
-                      )
-                    ) : (
-                      <>
-                        <ChatTranscript
-                          threadId={selectedThread.id}
-                          projectName={selectedThreadProject?.name}
-                          projects={projects}
-                          canChangeProject={canChangeSelectedThreadProject}
-                          onSelectProject={handleChangeSelectedThreadProject}
-                          onAddProject={handleAddProject}
-                          mediaBaseDirs={mediaBaseDirs}
-                          isSending={isSending}
-                          steerSupported={steerSupported}
-                          steerReady={steerReady}
-                          authenticatingProviderId={authenticatingProviderId}
-                          chatScrollRef={chatScrollRef}
-                          chatEndRef={chatEndRef}
-                          chatPinnedRef={chatPinnedRef}
-                          chatScrollTopRef={chatScrollTopRef}
-                          chatScrollPositionsRef={chatScrollPositionsRef}
-                          tasksCardPosition={tasksCardPosition}
-                          tasksCardCollapsed={tasksCardCollapsed}
-                          tasksCardDismissedFor={tasksCardDismissedFor}
-                          onMoveTasksCard={setTasksCardPosition}
-                          onToggleTasksCard={toggleTasksCard}
-                          onDismissTasksCard={dismissTasksCard}
-                          onMarkTaskDone={markLinkedTaskDone}
-                          onUnlinkTask={unlinkTaskFromThread}
-                          onDismissBtwExchange={dismissBtwExchange}
-                          onAuthenticateProvider={handleAuthenticateProvider}
-                          onSteerQueuedMessage={steerQueuedMessage}
-                        />
-                      </>
-                    )}
-
-                    <div className="chat-input-area">
-                      <AgentFamilySwitcher
-                        currentThread={selectedThread}
-                        threads={threads}
-                        onSelect={selectThread}
-                      />
-                      <div className="composer-shell">
-                        {chatAttachments.length > 0 && (
-                          <div className="composer-attachments">
-                            {chatAttachments.map((attachment) => (
-                              <div key={attachment.id} className="composer-attachment" title={attachment.path}>
-                                <AttachmentThumb attachment={attachment} />
-                                <span className="composer-attachment-meta">
-                                  <span className="composer-attachment-name">{attachment.name}</span>
-                                  <span className="composer-attachment-size">
-                                    {formatAttachmentSize(attachment.size)}
+                      <div className="chat-input-area">
+                        <AgentFamilySwitcher currentThread={selectedThread} threads={threads} onSelect={selectThread} />
+                        <div className="composer-shell">
+                          {chatAttachments.length > 0 && (
+                            <div className="composer-attachments">
+                              {chatAttachments.map((attachment) => (
+                                <div key={attachment.id} className="composer-attachment" title={attachment.path}>
+                                  <AttachmentThumb attachment={attachment} />
+                                  <span className="composer-attachment-meta">
+                                    <span className="composer-attachment-name">{attachment.name}</span>
+                                    <span className="composer-attachment-size">
+                                      {formatAttachmentSize(attachment.size)}
+                                    </span>
                                   </span>
-                                </span>
-                                <button
-                                  type="button"
-                                  className="composer-attachment-remove"
-                                  onClick={() => removeChatAttachment(attachment.id)}
-                                  title="Remove attachment"
-                                >
-                                  <X size={13} />
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        {hasPendingLinkedTasks && (
-                          <div className="composer-task-row">
-                            {pendingLinkedTasks.map((linkedTask) => (
-                              <div
-                                key={linkedTask.id}
-                                className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
-                                title={linkedTask.description || linkedTask.title}
-                              >
-                                <SquareKanban size={13} />
-                                <span className="composer-task-title">{linkedTask.title}</span>
-                                <span className="composer-task-status">
-                                  {linkedTaskStatusLabel(linkedTask.lastStatus)}
-                                </span>
-                                {linkedTask.lastStatus !== 'done' && !isSending && (
                                   <button
                                     type="button"
-                                    className="composer-task-action done"
-                                    onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
-                                    title="Mark the task as done on the board"
+                                    className="composer-attachment-remove"
+                                    onClick={() => removeChatAttachment(attachment.id)}
+                                    title="Remove attachment"
                                   >
-                                    <CircleCheck size={13} />
+                                    <X size={13} />
                                   </button>
-                                )}
-                                <button
-                                  type="button"
-                                  className="composer-task-action"
-                                  onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
-                                  title="Unlink task"
-                                >
-                                  <X size={12} />
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        {!isTerminalThread && /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
-                          <div className="composer-btw-hint">
-                            <SquarePen size={12} />
-                            <span>
-                              {selectedAgentModel?.providerId === 'codex'
-                                ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
-                                : '/review is only available on Codex agents.'}
-                            </span>
-                          </div>
-                        )}
-                        {!isTerminalThread && /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
-                          <div className="composer-btw-hint">
-                            <Target size={12} />
-                            <span>
-                              {selectedAgentModel?.providerId === 'codex'
-                                ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
-                                : '/goal is only available on Codex agents.'}
-                            </span>
-                          </div>
-                        )}
-                        {!isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
-                          <div className="composer-btw-hint">
-                            <Sparkles size={12} />
-                            <span>
-                              {selectedAgentModel?.providerId === 'claude' ||
-                              (isOrionModelId(selectedThread.modelId) &&
-                                findAgentModel(
-                                  agentModels,
-                                  normalizedOrchestrationSettings.models.mainDriver
-                                )?.providerId === 'claude')
-                                ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
-                                : '/btw is only available on Claude agents for now.'}
-                            </span>
-                          </div>
-                        )}
-                        {selectedAgentModel?.providerId === 'codex' &&
-                          /^\/review\s*$/i.test(chatInput.trimStart()) && (
-                            <ComposerPopover className="review-popover">
-                              <button
-                                type="button"
-                                role="option"
-                                className="mention-row"
-                                onMouseDown={(e) => e.preventDefault()}
-                                onClick={() => dispatchReview('/review', { mode: 'uncommitted' })}
-                              >
-                                <SquarePen size={14} />
-                                <span className="mention-row-label">Review uncommitted changes</span>
-                              </button>
-                              <button
-                                type="button"
-                                role="option"
-                                className="mention-row"
-                                onMouseDown={(e) => e.preventDefault()}
-                                onClick={() => setChatInput('/review base ')}
-                              >
-                                <GitBranch size={14} />
-                                <span className="mention-row-label">Review against a base branch</span>
-                              </button>
-                            </ComposerPopover>
-                          )}
-                        {selectedAgentModel?.providerId === 'codex' &&
-                          /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
-                            <ComposerPopover className="review-popover">
-                              {(gitState?.branches ?? [])
-                                .filter((branch) => !branch.current)
-                                .slice(0, 12)
-                                .map((branch) => (
-                                  <button
-                                    key={branch.name}
-                                    type="button"
-                                    role="option"
-                                    className="mention-row"
-                                    onMouseDown={(e) => e.preventDefault()}
-                                    onClick={() =>
-                                      dispatchReview(`/review base ${branch.name}`, {
-                                        mode: 'base',
-                                        base: branch.name,
-                                      })
-                                    }
-                                  >
-                                    <GitBranch size={14} />
-                                    <span className="mention-row-label">{branch.name}</span>
-                                  </button>
-                                ))}
-                              {!(gitState?.branches ?? []).some((branch) => !branch.current) && (
-                                <div className="mention-row" aria-disabled="true">
-                                  <GitBranch size={14} />
-                                  <span className="mention-row-label">
-                                    No other branches — type a branch name
-                                  </span>
                                 </div>
-                              )}
-                            </ComposerPopover>
-                          )}
-                        {chatMentionOpen && (
-                          <ComposerPopover>
-                            {chatMentionCandidates.map((model, index) => {
-                              const ProviderIcon =
-                                agentProviders.find((provider) => provider.id === model.providerId)
-                                  ?.icon ?? Play;
-                              return (
-                                <button
-                                  key={model.id}
-                                  ref={index === chatMentionIndex ? chatMentionSelectedRef : null}
-                                  type="button"
-                                  role="option"
-                                  aria-selected={index === chatMentionIndex}
-                                  className={`mention-row ${index === chatMentionIndex ? 'selected' : ''}`}
-                                  onMouseEnter={() => setChatMentionIndex(index)}
-                                  // Keep the textarea focused so selection doesn't blur the composer.
-                                  onMouseDown={(e) => e.preventDefault()}
-                                  onClick={() => insertChatMention(model)}
-                                  title={modelMentionToken(model, agentModels)}
-                                >
-                                  <ProviderIcon size={16} />
-                                  <span className="mention-row-label">{model.label}</span>
-                                  <span className="mention-row-slug">
-                                    {modelMentionToken(model, agentModels)}
-                                  </span>
-                                </button>
-                              );
-                            })}
-                          </ComposerPopover>
-                        )}
-                        <textarea
-                          ref={setChatInputRef}
-                          className="chat-input min-h-[52px]"
-                          disabled={isNativeSubagentThread || selectedThreadRiftUnavailable}
-                          placeholder={
-                            isNativeSubagentThread
-                              ? 'Read-only subagent transcript — steer from the parent thread.'
-                              : selectedThreadRiftUnavailable
-                              ? selectedThreadRiftRemoving
-                                ? 'Removing this epic’s rift workspace…'
-                                : selectedThreadEpic?.riftRequest?.error
-                                  ? 'Rift setup needs attention — retry it from the epic view.'
-                                  : 'Creating this epic’s rift workspace — one moment…'
-                              : isTerminalThread
-                              ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
-                              : isSending
-                              ? steerSupported
-                                ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
-                                : 'Queue a follow-up — sends when the agent finishes (⏎)…'
-                              : chatAttachments.length > 0
-                                ? `Ask something about the attached ${chatAttachments.some(isVideoAttachment) ? 'media' : 'image'}...`
-                                : hasPendingLinkedTasks
-                                  ? `Add details (optional) — send starts on the linked ${
-                                      pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
-                                    }...`
-                                  : 'Describe what you want the agent to do...'
-                          }
-                          value={chatInput}
-                          onChange={(e) => {
-                            setChatInput(e.target.value);
-                            updateChatMention(e.target.value, e.target.selectionStart);
-                          }}
-                          onKeyDown={handleChatKeyDown}
-                          // Caret moves without input still open/close the mention
-                          // dropdown. Dropdown-navigation keys are excluded so a
-                          // handled keydown can't immediately recompute the token.
-                          onKeyUp={(e) => {
-                            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
-                              updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart);
-                            }
-                          }}
-                          onClick={(e) =>
-                            updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart)
-                          }
-                          rows={2}
-                        />
-                        <div className="composer-controls">
-                          <div className="model-picker-anchor" ref={modelPickerRef}>
-                            <button
-                              className="model-trigger"
-                              onClick={() => {
-                                setModelPickerOpen((open) => {
-                                  if (!open) {
-                                    setActiveProviderTab(selectedAgentModel.providerId);
-                                  }
-                                  return !open;
-                                });
-                              }}
-                              disabled={isSending}
-                            >
-                              {selectedAgentModel && (() => {
-                                const ProviderIcon =
-                                  agentProviders.find((provider) => provider.id === selectedAgentModel.providerId)
-                                    ?.icon ?? Play;
-                                return <ProviderIcon size={15} />;
-                              })()}
-                              <span>{selectedAgentModel?.label ?? 'Select model'}</span>
-                              <ChevronDown size={14} className={`model-trigger-chevron ${modelPickerOpen ? 'open' : ''}`} />
-                            </button>
-
-                            {modelPickerOpen && (
-                              <ModelPickerPopover
-                                providers={agentProviders}
-                                models={visibleAgentModels}
-                                activeProviderId={activeProviderTab}
-                                onActiveProviderChange={setActiveProviderTab}
-                                search={modelSearch}
-                                onSearchChange={setModelSearch}
-                                selectedModelId={selectedThread.modelId}
-                                onSelect={async (model) => {
-                                  if (
-                                    selectedThread.modelId === claudeCodeCliModelId &&
-                                    model.id !== claudeCodeCliModelId
-                                  ) {
-                                    try {
-                                      await window.orion?.terminalKill?.(selectedThread.id);
-                                    } catch (error) {
-                                      console.error('Could not stop Claude Code terminal', error);
-                                    }
-                                  }
-                                  updateThread(selectedThread.id, {
-                                    modelId: model.id,
-                                    ...(selectedThread.modelId === claudeCodeCliModelId &&
-                                    model.id !== claudeCodeCliModelId
-                                      ? { status: 'idle' as const }
-                                      : {}),
-                                  });
-                                  setModelPickerOpen(false);
-                                  setModelSearch('');
-                                  if (
-                                    model.providerId !== 'codex' &&
-                                    model.providerId !== 'claude' &&
-                                    model.providerId !== 'grok'
-                                  ) {
-                                    setCodexSettingsOpen(false);
-                                  }
-                                }}
-                                overlay={
-                                  activeProviderTab === 'claude' && claudeCodeCliModel ? (
-                                    <button
-                                      type="button"
-                                      className={`model-cli-overlay${
-                                        selectedThread.modelId === claudeCodeCliModelId
-                                          ? ' selected'
-                                          : ''
-                                      }`}
-                                      onClick={() => {
-                                        if (selectedThread.modelId !== claudeCodeCliModelId) {
-                                          updateThread(selectedThread.id, {
-                                            modelId: claudeCodeCliModelId,
-                                          });
-                                        }
-                                        setModelPickerOpen(false);
-                                        setModelSearch('');
-                                      }}
-                                      disabled={claudeCodeCliModel.available === false}
-                                      title={
-                                        claudeCodeCliModel.unavailableReason ??
-                                        'Open an interactive Claude Code terminal in this thread'
-                                      }
-                                    >
-                                      <span className="model-cli-overlay-glow" aria-hidden />
-                                      <Terminal size={14} strokeWidth={2.25} />
-                                      <span className="model-cli-overlay-label">Claude Code CLI</span>
-                                      {selectedThread.modelId === claudeCodeCliModelId && (
-                                        <Check size={13} strokeWidth={2.5} />
-                                      )}
-                                    </button>
-                                  ) : undefined
-                                }
-                              />
-                          )}
-                        </div>
-
-                        {shouldShowAgentSettings && (
-                          <div className="codex-settings-anchor" ref={codexSettingsRef}>
-                            <button
-                              className="codex-settings-trigger"
-                              onClick={() => setCodexSettingsOpen((open) => !open)}
-                              disabled={isSending}
-                              title={
-                                selectedAgentModel?.providerId === 'claude'
-                                  ? 'Claude reasoning and context window'
-                                  : selectedAgentModel?.providerId === 'grok'
-                                    ? 'Grok reasoning effort'
-                                    : 'Codex reasoning and service tier'
-                              }
-                            >
-                              <span>
-                                {selectedAgentModel?.providerId === 'claude'
-                                  ? selectedClaudeReasoningLabel
-                                  : selectedAgentModel?.providerId === 'grok'
-                                    ? selectedGrokReasoningLabel
-                                    : selectedCodexReasoningLabel}
-                              </span>
-                              {selectedAgentModel?.providerId !== 'grok' && (
-                                <>
-                                  <span className="control-dot">·</span>
-                                  <span>
-                                    {selectedAgentModel?.providerId === 'claude'
-                                      ? selectedClaudeContextWindowLabel
-                                      : selectedCodexServiceTierLabel}
-                                  </span>
-                                </>
-                              )}
-                              <ChevronDown
-                                size={14}
-                                className={`model-trigger-chevron ${codexSettingsOpen ? 'open' : ''}`}
-                              />
-                            </button>
-
-                            {codexSettingsOpen && (
-                              <div className="codex-settings-popover">
-                                {selectedAgentModel?.providerId === 'grok' ? (
-                                  <div className="codex-settings-section">
-                                    <div className="codex-settings-heading">Reasoning</div>
-                                    <div className="codex-settings-options">
-                                      {grokReasoningOptions.map((option) => {
-                                        const selected = selectedGrokReasoning === option.value;
-                                        return (
-                                          <button
-                                            key={option.value}
-                                            className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                            onClick={() =>
-                                              updateThread(selectedThread.id, {
-                                                grokReasoningEffort: option.value as GrokReasoningEffort,
-                                              })
-                                            }
-                                          >
-                                            <span className="settings-check">
-                                              {selected && <Check size={17} />}
-                                            </span>
-                                            <span>
-                                              {option.label}
-                                              {option.default ? ' (default)' : ''}
-                                              {option.description && (
-                                                <span className="codex-settings-row-description">
-                                                  {option.description}
-                                                </span>
-                                              )}
-                                            </span>
-                                          </button>
-                                        );
-                                      })}
-                                    </div>
-                                  </div>
-                                ) : selectedAgentModel?.providerId === 'claude' ? (
-                                  <>
-                                    <div className="codex-settings-section">
-                                      <div className="codex-settings-heading">Reasoning</div>
-                                      <div className="codex-settings-options">
-                                        {claudeReasoningOptions.map((option) => {
-                                          const selected = selectedClaudeReasoning === option.value;
-                                          const isDefault = option.value === selectedClaudeDefaultReasoning;
-                                          return (
-                                            <button
-                                              key={option.value}
-                                              className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                              onClick={() =>
-                                                updateThread(selectedThread.id, {
-                                                  claudeReasoningEffort: option.value as ClaudeReasoningEffort,
-                                                })
-                                              }
-                                            >
-                                              <span className="settings-check">
-                                                {selected && <Check size={17} />}
-                                              </span>
-                                              <span>{option.label}{isDefault ? ' (default)' : ''}</span>
-                                            </button>
-                                          );
-                                        })}
-                                      </div>
-                                    </div>
-
-                                    <div className="codex-settings-divider" />
-
-                                    <div className="codex-settings-section">
-                                      <div className="codex-settings-heading">Context Window</div>
-                                      <div className="codex-settings-options">
-                                        {claudeContextWindowOptions.map((option) => {
-                                          const selected = effectiveClaudeContextWindow === option.value;
-                                          const oneMillionOnly =
-                                            !!selectedAgentModel &&
-                                            claudeOneMillionOnlyModelSlugs.has(selectedAgentModel.slug);
-                                          const disabled = oneMillionOnly && option.value === '200k';
-                                          return (
-                                            <button
-                                              key={option.value}
-                                              className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                              onClick={() =>
-                                                updateThread(selectedThread.id, {
-                                                  claudeContextWindow: option.value as ClaudeContextWindow,
-                                                })
-                                              }
-                                              disabled={disabled}
-                                              title={
-                                                disabled && selectedAgentModel
-                                                  ? `${selectedAgentModel.label} always uses 1M context`
-                                                  : undefined
-                                              }
-                                            >
-                                              <span className="settings-check">
-                                                {selected && <Check size={17} />}
-                                              </span>
-                                              <span>{option.label}{option.value === defaultClaudeContextWindow && !oneMillionOnly ? ' (default)' : ''}</span>
-                                            </button>
-                                          );
-                                        })}
-                                      </div>
-                                    </div>
-                                  </>
-                                ) : (
-                                  <>
-                                    <div className="codex-settings-section">
-                                      <div className="codex-settings-heading">Reasoning</div>
-                                      <div className="codex-settings-options">
-                                        {selectedCodexReasoningOptions.map((option) => {
-                                          const selected = selectedCodexReasoning === option.value;
-                                          return (
-                                            <button
-                                              key={option.value}
-                                              className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                              onClick={() =>
-                                                updateThread(selectedThread.id, {
-                                                  codexReasoningEffort: option.value as CodexReasoningEffort,
-                                                })
-                                              }
-                                            >
-                                              <span className="settings-check">
-                                                {selected && <Check size={17} />}
-                                              </span>
-                                              <span>
-                                                {option.label}{option.default ? ' (default)' : ''}
-                                                {option.description && (
-                                                  <span className="codex-settings-row-description">
-                                                    {option.description}
-                                                  </span>
-                                                )}
-                                              </span>
-                                            </button>
-                                          );
-                                        })}
-                                      </div>
-                                    </div>
-
-                                    <div className="codex-settings-divider" />
-
-                                    <div className="codex-settings-section">
-                                      <div className="codex-settings-heading">Service Tier</div>
-                                      <div className="codex-settings-options">
-                                        {codexServiceTierOptions.map((option) => {
-                                          const selected = selectedCodexServiceTier === option.value;
-                                          return (
-                                            <button
-                                              key={option.value}
-                                              className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                              onClick={() =>
-                                                updateThread(selectedThread.id, {
-                                                  codexServiceTier: option.value as CodexServiceTier,
-                                                })
-                                              }
-                                            >
-                                              <span className="settings-check">
-                                                {selected && <Check size={17} />}
-                                              </span>
-                                              <span>{option.label}{option.default ? ' (default)' : ''}</span>
-                                            </button>
-                                          );
-                                        })}
-                                      </div>
-                                    </div>
-                                  </>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        )}
-
-                        <div className="access-mode-anchor" ref={accessModeRef}>
-                          <button
-                            type="button"
-                            className="access-select"
-                            onClick={() => setAccessModeOpen((open) => !open)}
-                            disabled={isSending}
-                            title="Access level"
-                          >
-                            <Shield size={15} />
-                            <span>{selectedAccessModeLabel}</span>
-                            <ChevronDown
-                              size={13}
-                              className={`model-trigger-chevron ${accessModeOpen ? 'open' : ''}`}
-                            />
-                          </button>
-
-                          {accessModeOpen && !isSending && (
-                            <div className="access-mode-popover">
-                              <div className="codex-settings-options">
-                                {accessModeOptions.map((option) => {
-                                  const selected = selectedAccessMode === option.value;
-                                  return (
-                                    <button
-                                      key={option.value}
-                                      type="button"
-                                      className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                      onClick={() => {
-                                        updateThread(selectedThread.id, {
-                                          accessMode: option.value,
-                                        });
-                                        setAccessModeOpen(false);
-                                      }}
-                                    >
-                                      <span className="settings-check">
-                                        {selected && <Check size={17} />}
-                                      </span>
-                                      <span>{option.label}</span>
-                                    </button>
-                                  );
-                                })}
-                              </div>
+                              ))}
                             </div>
                           )}
-                        </div>
-
-                        {!isTerminalThread && (
-                        <div className="task-picker-anchor" ref={taskPickerRef}>
-                          <button
-                            className={`model-trigger task-link-trigger ${linkedTaskIds.length > 0 ? 'linked' : ''}`}
-                            onClick={() => setTaskPickerOpen((open) => !open)}
-                            title={linkedTasksLabel}
-                            aria-label={linkedTasksLabel}
-                          >
-                            <SquareKanban size={15} />
-                            {linkedTaskIds.length > 1 && (
-                              <span className="task-link-count">{linkedTaskIds.length}</span>
-                            )}
-                          </button>
-                          {taskPickerOpen && (
-                            <TaskPickerPopover
-                              linkedTaskIds={linkedTaskIds}
-                              authenticated={accountState.authenticated}
-                              onSignIn={() => void handleStartAccountAuth()}
-                              onPick={toggleTaskOnSelectedThread}
-                            />
-                          )}
-                        </div>
-                        )}
-
-                        {isSending ? (
-                          <>
-                            {(chatInput.trim() || chatAttachments.length > 0) && (
-                              <>
-                                <button
-                                  className="send-button"
-                                  onClick={sendMessage}
-                                  title="Queue — sends when the current run finishes (⏎)"
+                          {hasPendingLinkedTasks && (
+                            <div className="composer-task-row">
+                              {pendingLinkedTasks.map((linkedTask) => (
+                                <div
+                                  key={linkedTask.id}
+                                  className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
+                                  title={linkedTask.description || linkedTask.title}
                                 >
-                                  <ListPlus size={15} />
-                                </button>
-                                {steerSupported && (
+                                  <SquareKanban size={13} />
+                                  <span className="composer-task-title">{linkedTask.title}</span>
+                                  <span className="composer-task-status">
+                                    {linkedTaskStatusLabel(linkedTask.lastStatus)}
+                                  </span>
+                                  {linkedTask.lastStatus !== 'done' && !isSending && (
+                                    <button
+                                      type="button"
+                                      className="composer-task-action done"
+                                      onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
+                                      title="Mark the task as done on the board"
+                                    >
+                                      <CircleCheck size={13} />
+                                    </button>
+                                  )}
                                   <button
-                                    className="send-button steer"
-                                    onClick={steerActiveAgent}
-                                    disabled={!steerReady}
-                                    title={
-                                      steerReady
-                                        ? 'Steer — interrupt the agent and redirect it now (⌘⏎)'
-                                        : 'Steer becomes available once the agent reports its session'
-                                    }
+                                    type="button"
+                                    className="composer-task-action"
+                                    onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
+                                    title="Unlink task"
                                   >
-                                    <Zap size={14} />
+                                    <X size={12} />
                                   </button>
-                                )}
-                              </>
-                            )}
-                            <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
-                              <Square size={14} fill="currentColor" />
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            className="send-button"
-                            onClick={sendMessage}
-                            disabled={
-                              (!chatInput.trim() &&
-                                chatAttachments.length === 0 &&
-                                !hasPendingLinkedTasks) ||
-                              selectedAgentModel?.available === false
-                            }
-                            title="Send"
-                          >
-                            <ArrowUp size={16} strokeWidth={2.5} />
-                          </button>
-                        )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-          </>
-        )}
-
-        {/* ========== CODE TAB ========== */}
-        {activeTab === 'code' && (
-          <>
-            {/* File Explorer Sidebar */}
-            <div className="sidebar">
-              <div className="sidebar-header">
-                <span>Explorer</span>
-                <div className="flex gap-1">
-                  <button
-                    onClick={handleOpenFolderForCode}
-                    className="btn secondary small"
-                    title="Open folder"
-                  >
-                    <FolderOpen size={13} />
-                  </button>
-                  <button
-                    onClick={() => {
-                      const p = selectedProject ?? projects[0];
-                      if (p) {
-                        setWorkspacePath(p.path);
-                        closeAllFiles();
-                        toast.info(`Opened ${p.name}`);
-                      } else {
-                        handleOpenFolderForCode();
-                      }
-                    }}
-                    className="btn secondary small"
-                    title="Use selected project as workspace"
-                  >
-                    <Folder size={13} />
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (workspacePath) loadRoot(workspacePath);
-                    }}
-                    className="btn secondary small"
-                    title="Refresh"
-                  >
-                    ↻
-                  </button>
-                </div>
-              </div>
-
-              <div className="sidebar-content">
-                {!treeRoot && (
-                  <div className="empty-state p-6">
-                    <Folder size={32} />
-                    <div className="mt-1">No folder open</div>
-                    <button onClick={handleOpenFolderForCode} className="btn mt-3">
-                      Open Folder
-                    </button>
-                    {projects.length > 0 && (
-                      <div className="mt-4 text-[11px] text-[#777]">
-                        Or select a project in Agents tab
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {treeRoot && (
-                  <div className="file-tree pt-1">
-                    {treeItems.map((item) => (
-                      <FileTreeNode
-                        key={item.path}
-                        item={item}
-                        onFileClick={handleOpenFile}
-                        activePath={activeFilePath}
-                        loadChildren={loadChildren}
-                        rootPath={treeRoot}
-                        refreshToken={treeRefreshToken}
-                        onRequestDelete={handleDeleteTreeItem}
-                        onRenamed={handleTreeItemRenamed}
-                      />
-                    ))}
-                  </div>
-                )}
-              </div>
-              {renderSidebarFooter()}
-            </div>
-
-            {/* Editor Panel */}
-            <div className="panel">
-              {/* Editor Tabs */}
-              {openFiles.length > 0 && (
-                <div className="editor-tabs">
-                  {openFiles.map((file) => {
-                    const fileName = file.path.split(/[\\/]/).pop() || file.path;
-                    const isActive = file.path === activeFilePath;
-                    return (
-                      <div
-                        key={file.path}
-                        className={`editor-tab ${isActive ? 'active' : ''}`}
-                        onClick={() => setActiveFile(file.path)}
-                        title={file.path}
-                      >
-                        <span className="truncate">{fileName}</span>
-                        {file.isDirty && <span className="text-[#f4a261]">●</span>}
-                        <span
-                          className="close"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            closeFile(file.path);
-                          }}
-                        >
-                          <X size={13} />
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              <CodeEditorPane />
-            </div>
-          </>
-        )}
-      </div>
-      )}
-
-      {epicCommitDialog && (
-        <div
-          className="modal-backdrop"
-          role="presentation"
-          onClick={() => setEpicCommitDialog(null)}
-        >
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="epic-commit-title"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="epic-commit-title" className="modal-title">
-              Commit &amp; push
-            </h2>
-            <p className="modal-subtitle">
-              Stages everything in {epicCommitDialog.epic.riftPath ? 'this epic’s rift' : 'the repository'}, then pushes.
-            </p>
-            <form
-              className="modal-form"
-              onSubmit={(e) => {
-                e.preventDefault();
-                const dialog = epicCommitDialog;
-                setEpicCommitDialog(null);
-                void handleEpicCommitAndPush(dialog.epic, dialog.message);
-              }}
-            >
-              <label className="modal-field">
-                <span className="modal-field-label">
-                  Commit message <span className="modal-optional">optional</span>
-                </span>
-                <textarea
-                  className="modal-textarea"
-                  value={epicCommitDialog.message}
-                  onChange={(e) =>
-                    setEpicCommitDialog((current) =>
-                      current ? { ...current, message: e.target.value } : current
-                    )
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                      e.preventDefault();
-                      e.currentTarget.form?.requestSubmit();
-                    }
-                  }}
-                  placeholder="Leave empty and Orion writes one from the staged changes"
-                  rows={5}
-                  autoFocus
-                />
-              </label>
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="btn secondary"
-                  onClick={() => setEpicCommitDialog(null)}
-                >
-                  Cancel
-                </button>
-                <button type="submit" className="btn">
-                  <GitCommit size={14} />
-                  Commit &amp; push
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {epicPrBaseDialog && (
-        <div
-          className="modal-backdrop"
-          role="presentation"
-          onClick={() => setEpicPrBaseDialog(null)}
-        >
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="epic-pr-base-title"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="epic-pr-base-title" className="modal-title">
-              Create pull request
-            </h2>
-            <p className="modal-subtitle">
-              Choose the branch the pull request merges into, and optionally write it yourself.
-            </p>
-            <form
-              className="modal-form"
-              onSubmit={(e) => {
-                e.preventDefault();
-                const dialog = epicPrBaseDialog;
-                if (
-                  dialog.branchesLoading ||
-                  !dialog.baseBranch ||
-                  !dialog.branches.includes(dialog.baseBranch)
-                ) {
-                  return;
-                }
-                setEpicPrBaseDialog(null);
-                void handleEpicCreatePr(dialog.epic, dialog.baseBranch, dialog.message);
-              }}
-            >
-              <div className="modal-field">
-                <span className="modal-field-label">Base branch</span>
-                <div className="relative" ref={epicPrBaseBranchPickerRef}>
-                  <button
-                    type="button"
-                    className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
-                    onClick={() => setEpicPrBaseBranchPickerOpen((open) => !open)}
-                    aria-haspopup="listbox"
-                    aria-expanded={epicPrBaseBranchPickerOpen}
-                  >
-                    <span className="truncate">
-                      {!epicPrBaseDialog.baseBranch
-                        ? epicPrBaseDialog.branchesLoading
-                          ? 'Finding the base branch…'
-                          : 'No base branch found'
-                        : epicPrBaseDialog.baseBranch === epicPrBaseDialog.sourceBranch
-                          ? `${epicPrBaseDialog.baseBranch} (your current branch)`
-                          : epicPrBaseDialog.baseBranch === epicPrBaseDialog.defaultBranch
-                            ? `${epicPrBaseDialog.baseBranch} (default)`
-                            : epicPrBaseDialog.baseBranch}
-                    </span>
-                    <ChevronDown
-                      size={14}
-                      className={`shrink-0 text-[var(--text-muted)] transition-transform ${
-                        epicPrBaseBranchPickerOpen ? 'rotate-180' : ''
-                      }`}
-                    />
-                  </button>
-                  {epicPrBaseBranchPickerOpen && (
-                    <div
-                      role="listbox"
-                      aria-label="Base branch"
-                      className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
-                    >
-                      {/* Origin is still being asked; the picker fills itself
-                          without the user having to close and reopen it. */}
-                      {epicPrBaseDialog.branchesLoading && (
-                        <div className="flex items-center gap-2 px-2.5 py-1.5 text-[13px] text-[var(--text-muted)]">
-                          <LoaderCircle size={13} className="spinning shrink-0" />
-                          Loading branches on origin…
-                        </div>
-                      )}
-                      {!epicPrBaseDialog.branchesLoading &&
-                        epicPrBaseDialog.branches.length === 0 && (
-                          <div className="px-2.5 py-1.5 text-[13px] text-[var(--text-muted)]">
-                            {epicPrBaseDialog.branchesError || 'No branches found on origin'}
-                          </div>
-                        )}
-                      {epicPrBaseDialog.branches.map((name) => {
-                        const selected = name === epicPrBaseDialog.baseBranch;
-                        const label =
-                          name === epicPrBaseDialog.sourceBranch
-                            ? `${name} (your current branch)`
-                            : name === epicPrBaseDialog.defaultBranch
-                              ? `${name} (default)`
-                              : name;
-                        return (
-                          <button
-                            key={name}
-                            type="button"
-                            role="option"
-                            aria-selected={selected}
-                            className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                              selected
-                                ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                                : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                            }`}
-                            onClick={() => {
-                              setEpicPrBaseDialog((current) =>
-                                current ? { ...current, baseBranch: name } : current
-                              );
-                              setEpicPrBaseBranchPickerOpen(false);
-                            }}
-                          >
-                            <span className="min-w-0 flex-1 truncate">{label}</span>
-                            {selected && <Check size={13} className="shrink-0" />}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-                {/* A provisional local base is never submitted. Origin must
-                    confirm the branch before the PR action is enabled. */}
-                {epicPrBaseDialog.branchesError && (
-                  <span className="text-[12px] text-[var(--text-muted)]">
-                    {epicPrBaseDialog.branchesError}
-                  </span>
-                )}
-              </div>
-              <label className="modal-field">
-                <span className="modal-field-label">
-                  Title and description <span className="modal-optional">optional</span>
-                </span>
-                <textarea
-                  className="modal-textarea"
-                  value={epicPrBaseDialog.message}
-                  onChange={(e) =>
-                    setEpicPrBaseDialog((current) =>
-                      current ? { ...current, message: e.target.value } : current
-                    )
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                      e.preventDefault();
-                      e.currentTarget.form?.requestSubmit();
-                    }
-                  }}
-                  placeholder="Leave empty and Orion writes them from the branch changes. Otherwise: first line is the title, the rest is the description."
-                  rows={6}
-                />
-              </label>
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="btn secondary"
-                  onClick={() => setEpicPrBaseDialog(null)}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="btn"
-                  disabled={
-                    epicPrBaseDialog.branchesLoading ||
-                    !epicPrBaseDialog.baseBranch ||
-                    !epicPrBaseDialog.branches.includes(epicPrBaseDialog.baseBranch)
-                  }
-                >
-                  <GitPullRequest size={14} />
-                  Create PR
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {epicSettleDialog && (
-        <div
-          className="modal-backdrop"
-          role="presentation"
-          onClick={() => setEpicSettleDialog(null)}
-        >
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="epic-settle-title"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="epic-settle-title" className="modal-title">
-              Settle “{epicSettleDialog.epic.name}”?
-            </h2>
-            <p className="modal-subtitle">
-              The epic moves to the archive. Its threads stay in Recent agents and their projects.
-            </p>
-            {epicSettleDialog.warnings.length > 0 && (
-              <div className="epic-settle-warnings">
-                {epicSettleDialog.warnings.map((warning) => (
-                  <p key={warning}>{warning}</p>
-                ))}
-              </div>
-            )}
-            {epicSettleDialog.canReleaseRift && (
-              <label className="storage-sweep-option">
-                <input
-                  type="checkbox"
-                  checked={epicSettleDialog.releaseRift}
-                  onChange={(e) =>
-                    setEpicSettleDialog((current) =>
-                      current ? { ...current, releaseRift: e.target.checked } : current
-                    )
-                  }
-                />
-                <span>
-                  Also free its rift workspace to reclaim disk. The branch and pull request are
-                  kept, and restoring the epic recreates the rift.
-                </span>
-              </label>
-            )}
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="btn secondary"
-                onClick={() => setEpicSettleDialog(null)}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="btn"
-                onClick={() =>
-                  confirmEpicSettlement(epicSettleDialog.epic, epicSettleDialog.releaseRift)
-                }
-              >
-                <Archive size={14} />
-                Settle epic
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {riftSweepDialog && (
-        <div
-          className="modal-backdrop"
-          role="presentation"
-          onClick={dismissRiftSweepDialog}
-        >
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="rift-sweep-title"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="rift-sweep-title" className="modal-title">
-              {riftSweepDialog.entries.length === 0
-                ? "Empty Rift's trash?"
-                : riftSweepDialog.entries.length === 1
-                  ? `Free “${riftSweepDialog.entries[0].epicName || riftSweepDialog.entries[0].name}”?`
-                  : `Free ${riftSweepDialog.entries.length} rift workspaces?`}
-            </h2>
-            <p className="modal-subtitle">
-              {riftSweepDialog.entries.length === 0
-                ? "This permanently empties Rift's trash across every repository on this machine."
-                : 'Their epics keep their branches, commits, and pull requests. Restoring an epic recreates its rift from the source repository.'}
-            </p>
-            {riftSweepDialog.entries.length > 0 && (
-              <div className="storage-sweep-list">
-                {riftSweepDialog.entries.map((entry) => (
-                  <div key={entry.riftPath} className="storage-sweep-item">
-                    <span className="truncate" title={entry.riftPath}>
-                      {entry.epicName || entry.name}
-                    </span>
-                    <span className="storage-rift-size">{formatBytes(entry.bytes)}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-            {riftSweepDialog.entries.some(
-              (entry) => entry.hasUncommittedChanges || entry.hasUnpushedCommits
-            ) && (
-              <div className="epic-settle-warnings">
-                <p>
-                  Some of these have uncommitted or unpushed work that exists nowhere else. You
-                  chose to free them anyway.
-                </p>
-              </div>
-            )}
-            {riftSweepDialog.entries.length > 0 && (
-              <label className="storage-sweep-option">
-                <input
-                  type="checkbox"
-                  checked={riftSweepDialog.runGc}
-                  onChange={(e) =>
-                    setRiftSweepDialog((current) =>
-                      current ? { ...current, runGc: e.target.checked } : current
-                    )
-                  }
-                />
-                <span>
-                  Empty Rift's trash afterwards. Without this the space is not actually reclaimed —
-                  but emptying it is permanent and covers every repository on this machine, not just
-                  Orion's.
-                </span>
-              </label>
-            )}
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="btn secondary"
-                onClick={dismissRiftSweepDialog}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="btn danger"
-                onClick={() => {
-                  const { entries, runGc } = riftSweepDialog;
-                  const forcePaths = entries
-                    .filter(
-                      (entry) =>
-                        (entry.hasUncommittedChanges || entry.hasUnpushedCommits) &&
-                        riftStorageForced[entry.riftPath]
-                    )
-                    .map((entry) => entry.riftPath);
-                  setRiftSweepDialog(null);
-                  setRiftStorageForced({});
-                  void releaseRiftStorage(entries, { runGc, forcePaths });
-                }}
-              >
-                <Trash2 size={14} />
-                {riftSweepDialog.entries.length === 0
-                  ? 'Empty trash'
-                  : `Free ${riftSweepDialog.entries.length === 1 ? 'rift' : 'rifts'}`}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {createEpicOpen && (
-        <div
-          className="modal-backdrop"
-          role="presentation"
-          onClick={closeCreateEpicModal}
-        >
-          <div
-            className="modal create-epic-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="create-epic-title"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="create-epic-title" className="modal-title">
-              New epic
-            </h2>
-            <p className="modal-subtitle">
-              Group threads around a big-ticket task.
-            </p>
-            <form
-              className="modal-form"
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleCreateEpic();
-              }}
-            >
-              <label className="modal-field">
-                <span className="modal-field-label">
-                  Title <span className="modal-required">*</span>
-                </span>
-                <input
-                  ref={createEpicTitleRef}
-                  type="text"
-                  className="modal-input"
-                  value={newEpicName}
-                  onChange={(e) => setNewEpicName(e.target.value)}
-                  placeholder="e.g. Optimize memory usage"
-                  autoComplete="off"
-                />
-              </label>
-              <label className="modal-field">
-                <span className="modal-field-label">
-                  Description <span className="modal-optional">optional</span>
-                </span>
-                <textarea
-                  className="modal-textarea"
-                  value={newEpicDescription}
-                  onChange={(e) => setNewEpicDescription(e.target.value)}
-                  placeholder="What does this epic cover?"
-                  rows={4}
-                />
-              </label>
-              {projects.length > 0 && (
-                <div className="modal-field">
-                  <span className="modal-field-label">Project</span>
-                  <div className="relative" ref={createEpicProjectPickerRef}>
-                    {(() => {
-                      const selectedProject =
-                        projects.find((project) => project.id === newEpicProjectId) ?? null;
-                      return (
-                    <button
-                      type="button"
-                      className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
-                      onClick={() => {
-                        setCreateEpicRiftBranchPickerOpen(false);
-                        setCreateEpicProjectPickerOpen((open) => !open);
-                      }}
-                      aria-haspopup="listbox"
-                      aria-expanded={createEpicProjectPickerOpen}
-                    >
-                      <span className="flex min-w-0 items-center gap-2">
-                        {selectedProject ? (
-                          <>
-                            <ProjectIcon projectPath={selectedProject.path} size={13} />
-                            <span className="truncate">{selectedProject.name}</span>
-                          </>
-                        ) : (
-                          <span className="truncate text-[var(--text-muted)]">No project</span>
-                        )}
-                      </span>
-                      <ChevronDown
-                        size={14}
-                        className={`shrink-0 text-[var(--text-muted)] transition-transform ${
-                          createEpicProjectPickerOpen ? 'rotate-180' : ''
-                        }`}
-                      />
-                    </button>
-                      );
-                    })()}
-                    {createEpicProjectPickerOpen && (
-                      <div
-                        role="listbox"
-                        aria-label="Project"
-                        className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
-                      >
-                        <button
-                          type="button"
-                          role="option"
-                          aria-selected={!newEpicProjectId}
-                          className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                            !newEpicProjectId
-                              ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                              : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                          }`}
-                          onClick={() => {
-                            setNewEpicProjectId(null);
-                            setCreateEpicProjectPickerOpen(false);
-                          }}
-                        >
-                          <span className="min-w-0 flex-1 truncate">No project</span>
-                          {!newEpicProjectId && <Check size={13} className="shrink-0" />}
-                        </button>
-                        {projects.map((project) => {
-                          const selected = project.id === newEpicProjectId;
-                          return (
-                            <button
-                              key={project.id}
-                              type="button"
-                              role="option"
-                              aria-selected={selected}
-                              title={project.path}
-                              className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                                selected
-                                  ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                                  : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                              }`}
-                              onClick={() => {
-                                setNewEpicProjectId(project.id);
-                                setCreateEpicProjectPickerOpen(false);
-                              }}
-                            >
-                              <ProjectIcon projectPath={project.path} size={13} />
-                              <span className="min-w-0 flex-1 truncate">{project.name}</span>
-                              {selected && <Check size={13} className="shrink-0" />}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-              {riftsActive && (
-                <label className="modal-field modal-field-checkbox">
-                  <span className="modal-field-label">Rift</span>
-                  <span className="modal-checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={newEpicCreateRift}
-                      onChange={(e) => setNewEpicCreateRift(e.target.checked)}
-                    />
-                    <span className="modal-checkbox-text">
-                      Work in a rift — a copy-on-write clone of{' '}
-                      {projects.find((project) => project.id === newEpicProjectId)?.name ??
-                        'the selected project'}{' '}
-                      on its own branch
-                    </span>
-                  </span>
-                </label>
-              )}
-              {riftsActive &&
-                newEpicCreateRift &&
-                newEpicRiftBranches &&
-                newEpicRiftBranches.projectId === newEpicProjectId &&
-                newEpicRiftBranches.branches.length > 0 && (
-                  <div className="modal-field">
-                    <span className="modal-field-label">Rift branch from</span>
-                    <div className="relative" ref={createEpicRiftBranchPickerRef}>
-                      <button
-                        type="button"
-                        className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
-                        onClick={() => {
-                          setCreateEpicProjectPickerOpen(false);
-                          setCreateEpicRiftBranchPickerOpen((open) => !open);
-                        }}
-                        aria-haspopup="listbox"
-                        aria-expanded={createEpicRiftBranchPickerOpen}
-                      >
-                        <span className="truncate">
-                          {(() => {
-                            const selectedBranch =
-                              newEpicRiftBaseBranch ??
-                              newEpicRiftBranches.currentBranch ??
-                              '';
-                            if (!selectedBranch) return 'Current commit (detached HEAD)';
-                            return selectedBranch === newEpicRiftBranches.currentBranch
-                              ? `${selectedBranch} (current)`
-                              : selectedBranch;
-                          })()}
-                        </span>
-                        <ChevronDown
-                          size={14}
-                          className={`shrink-0 text-[var(--text-muted)] transition-transform ${
-                            createEpicRiftBranchPickerOpen ? 'rotate-180' : ''
-                          }`}
-                        />
-                      </button>
-                      {createEpicRiftBranchPickerOpen && (
-                        <div
-                          role="listbox"
-                          aria-label="Rift branch from"
-                          className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
-                        >
-                          {newEpicRiftBranches.currentBranch === null && (
-                            <button
-                              type="button"
-                              role="option"
-                              aria-selected={
-                                !(
-                                  newEpicRiftBaseBranch ??
-                                  newEpicRiftBranches.currentBranch
-                                )
-                              }
-                              className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                                !(
-                                  newEpicRiftBaseBranch ??
-                                  newEpicRiftBranches.currentBranch
-                                )
-                                  ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                                  : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                              }`}
-                              onClick={() => {
-                                setNewEpicRiftBaseBranch(null);
-                                setCreateEpicRiftBranchPickerOpen(false);
-                              }}
-                            >
-                              <span className="min-w-0 flex-1 truncate">
-                                Current commit (detached HEAD)
-                              </span>
-                              {!(
-                                newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch
-                              ) && <Check size={13} className="shrink-0" />}
-                            </button>
+                                </div>
+                              ))}
+                            </div>
                           )}
-                          {newEpicRiftBranches.branches.map((name) => {
-                            const selectedBranch =
-                              newEpicRiftBaseBranch ??
-                              newEpicRiftBranches.currentBranch ??
-                              '';
-                            const selected = name === selectedBranch;
-                            const label =
-                              name === newEpicRiftBranches.currentBranch
-                                ? `${name} (current)`
-                                : name;
-                            return (
+                          {!isTerminalThread && /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
+                            <div className="composer-btw-hint">
+                              <SquarePen size={12} />
+                              <span>
+                                {selectedAgentModel?.providerId === 'codex'
+                                  ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
+                                  : '/review is only available on Codex agents.'}
+                              </span>
+                            </div>
+                          )}
+                          {!isTerminalThread && /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
+                            <div className="composer-btw-hint">
+                              <Target size={12} />
+                              <span>
+                                {selectedAgentModel?.providerId === 'codex'
+                                  ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
+                                  : '/goal is only available on Codex agents.'}
+                              </span>
+                            </div>
+                          )}
+                          {!isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
+                            <div className="composer-btw-hint">
+                              <Sparkles size={12} />
+                              <span>
+                                {selectedAgentModel?.providerId === 'claude' ||
+                                (isOrionModelId(selectedThread.modelId) &&
+                                  findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)
+                                    ?.providerId === 'claude')
+                                  ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
+                                  : '/btw is only available on Claude agents for now.'}
+                              </span>
+                            </div>
+                          )}
+                          {selectedAgentModel?.providerId === 'codex' &&
+                            /^\/review\s*$/i.test(chatInput.trimStart()) && (
+                              <ComposerPopover className="review-popover">
+                                <button
+                                  type="button"
+                                  role="option"
+                                  className="mention-row"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() =>
+                                    dispatchReview('/review', {
+                                      mode: 'uncommitted',
+                                    })
+                                  }
+                                >
+                                  <SquarePen size={14} />
+                                  <span className="mention-row-label">Review uncommitted changes</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  role="option"
+                                  className="mention-row"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => setChatInput('/review base ')}
+                                >
+                                  <GitBranch size={14} />
+                                  <span className="mention-row-label">Review against a base branch</span>
+                                </button>
+                              </ComposerPopover>
+                            )}
+                          {selectedAgentModel?.providerId === 'codex' &&
+                            /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
+                              <ComposerPopover className="review-popover">
+                                {(gitState?.branches ?? [])
+                                  .filter((branch) => !branch.current)
+                                  .slice(0, 12)
+                                  .map((branch) => (
+                                    <button
+                                      key={branch.name}
+                                      type="button"
+                                      role="option"
+                                      className="mention-row"
+                                      onMouseDown={(e) => e.preventDefault()}
+                                      onClick={() =>
+                                        dispatchReview(`/review base ${branch.name}`, {
+                                          mode: 'base',
+                                          base: branch.name,
+                                        })
+                                      }
+                                    >
+                                      <GitBranch size={14} />
+                                      <span className="mention-row-label">{branch.name}</span>
+                                    </button>
+                                  ))}
+                                {!(gitState?.branches ?? []).some((branch) => !branch.current) && (
+                                  <div className="mention-row" aria-disabled="true">
+                                    <GitBranch size={14} />
+                                    <span className="mention-row-label">No other branches — type a branch name</span>
+                                  </div>
+                                )}
+                              </ComposerPopover>
+                            )}
+                          {chatMentionOpen && (
+                            <ComposerPopover>
+                              {chatMentionCandidates.map((model, index) => {
+                                const ProviderIcon =
+                                  agentProviders.find((provider) => provider.id === model.providerId)?.icon ?? Play;
+                                return (
+                                  <button
+                                    key={model.id}
+                                    ref={index === chatMentionIndex ? chatMentionSelectedRef : null}
+                                    type="button"
+                                    role="option"
+                                    aria-selected={index === chatMentionIndex}
+                                    className={`mention-row ${index === chatMentionIndex ? 'selected' : ''}`}
+                                    onMouseEnter={() => setChatMentionIndex(index)}
+                                    // Keep the textarea focused so selection doesn't blur the composer.
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={() => insertChatMention(model)}
+                                    title={modelMentionToken(model, agentModels)}
+                                  >
+                                    <ProviderIcon size={16} />
+                                    <span className="mention-row-label">{model.label}</span>
+                                    <span className="mention-row-slug">{modelMentionToken(model, agentModels)}</span>
+                                  </button>
+                                );
+                              })}
+                            </ComposerPopover>
+                          )}
+                          <textarea
+                            ref={setChatInputRef}
+                            className="chat-input min-h-[52px]"
+                            disabled={isNativeSubagentThread || selectedThreadRiftUnavailable}
+                            placeholder={
+                              isNativeSubagentThread
+                                ? 'Read-only subagent transcript — steer from the parent thread.'
+                                : selectedThreadRiftUnavailable
+                                  ? selectedThreadRiftRemoving
+                                    ? 'Removing this epic’s rift workspace…'
+                                    : selectedThreadEpic?.riftRequest?.error
+                                      ? 'Rift setup needs attention — retry it from the epic view.'
+                                      : 'Creating this epic’s rift workspace — one moment…'
+                                  : isTerminalThread
+                                    ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
+                                    : isSending
+                                      ? steerSupported
+                                        ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
+                                        : 'Queue a follow-up — sends when the agent finishes (⏎)…'
+                                      : chatAttachments.length > 0
+                                        ? `Ask something about the attached ${chatAttachments.some(isVideoAttachment) ? 'media' : 'image'}...`
+                                        : hasPendingLinkedTasks
+                                          ? `Add details (optional) — send starts on the linked ${
+                                              pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
+                                            }...`
+                                          : 'Describe what you want the agent to do...'
+                            }
+                            value={chatInput}
+                            onChange={(e) => {
+                              setChatInput(e.target.value);
+                              updateChatMention(e.target.value, e.target.selectionStart);
+                            }}
+                            onKeyDown={handleChatKeyDown}
+                            // Caret moves without input still open/close the mention
+                            // dropdown. Dropdown-navigation keys are excluded so a
+                            // handled keydown can't immediately recompute the token.
+                            onKeyUp={(e) => {
+                              if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
+                                updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart);
+                              }
+                            }}
+                            onClick={(e) => updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart)}
+                            rows={2}
+                          />
+                          <div className="composer-controls">
+                            <div className="model-picker-anchor" ref={modelPickerRef}>
                               <button
-                                key={name}
-                                type="button"
-                                role="option"
-                                aria-selected={selected}
-                                className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                                  selected
-                                    ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                                    : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                                }`}
+                                className="model-trigger"
                                 onClick={() => {
-                                  setNewEpicRiftBaseBranch(
-                                    name === newEpicRiftBranches.currentBranch
-                                      ? null
-                                      : name
-                                  );
-                                  setCreateEpicRiftBranchPickerOpen(false);
+                                  if (!modelPickerOpen) {
+                                    const providerId = selectedAgentModel?.providerId;
+                                    if (providerId) setActiveProviderTab(providerId);
+                                  }
+                                  setModelPickerOpen(!modelPickerOpen);
                                 }}
+                                disabled={isSending}
                               >
-                                <span className="min-w-0 flex-1 truncate">{label}</span>
-                                {selected && <Check size={13} className="shrink-0" />}
+                                {selectedAgentModel &&
+                                  (() => {
+                                    const ProviderIcon =
+                                      agentProviders.find((provider) => provider.id === selectedAgentModel.providerId)
+                                        ?.icon ?? Play;
+                                    return <ProviderIcon size={15} />;
+                                  })()}
+                                <span>{selectedAgentModel?.label ?? 'Select model'}</span>
+                                <ChevronDown
+                                  size={14}
+                                  className={`model-trigger-chevron ${modelPickerOpen ? 'open' : ''}`}
+                                />
                               </button>
-                            );
-                          })}
+
+                              {modelPickerOpen && (
+                                <ModelPickerPopover
+                                  providers={agentProviders}
+                                  models={visibleAgentModels}
+                                  activeProviderId={activeProviderTab}
+                                  onActiveProviderChange={setActiveProviderTab}
+                                  search={modelSearch}
+                                  onSearchChange={setModelSearch}
+                                  selectedModelId={selectedThread.modelId}
+                                  onSelect={async (model) => {
+                                    if (
+                                      selectedThread.modelId === claudeCodeCliModelId &&
+                                      model.id !== claudeCodeCliModelId
+                                    ) {
+                                      try {
+                                        await window.orion?.terminalKill?.(selectedThread.id);
+                                      } catch (error) {
+                                        console.error('Could not stop Claude Code terminal', error);
+                                      }
+                                    }
+                                    updateThread(selectedThread.id, {
+                                      modelId: model.id,
+                                      ...(selectedThread.modelId === claudeCodeCliModelId &&
+                                      model.id !== claudeCodeCliModelId
+                                        ? { status: 'idle' as const }
+                                        : {}),
+                                    });
+                                    setModelPickerOpen(false);
+                                    setModelSearch('');
+                                    if (
+                                      model.providerId !== 'codex' &&
+                                      model.providerId !== 'claude' &&
+                                      model.providerId !== 'grok'
+                                    ) {
+                                      setCodexSettingsOpen(false);
+                                    }
+                                  }}
+                                  overlay={
+                                    activeProviderTab === 'claude' && claudeCodeCliModel ? (
+                                      <button
+                                        type="button"
+                                        className={`model-cli-overlay${
+                                          selectedThread.modelId === claudeCodeCliModelId ? ' selected' : ''
+                                        }`}
+                                        onClick={() => {
+                                          if (selectedThread.modelId !== claudeCodeCliModelId) {
+                                            updateThread(selectedThread.id, {
+                                              modelId: claudeCodeCliModelId,
+                                            });
+                                          }
+                                          setModelPickerOpen(false);
+                                          setModelSearch('');
+                                        }}
+                                        disabled={claudeCodeCliModel.available === false}
+                                        title={
+                                          claudeCodeCliModel.unavailableReason ??
+                                          'Open an interactive Claude Code terminal in this thread'
+                                        }
+                                      >
+                                        <span className="model-cli-overlay-glow" aria-hidden />
+                                        <Terminal size={14} strokeWidth={2.25} />
+                                        <span className="model-cli-overlay-label">Claude Code CLI</span>
+                                        {selectedThread.modelId === claudeCodeCliModelId && (
+                                          <Check size={13} strokeWidth={2.5} />
+                                        )}
+                                      </button>
+                                    ) : undefined
+                                  }
+                                />
+                              )}
+                            </div>
+
+                            {shouldShowAgentSettings && (
+                              <div className="codex-settings-anchor" ref={codexSettingsRef}>
+                                <button
+                                  className="codex-settings-trigger"
+                                  onClick={() => setCodexSettingsOpen((open) => !open)}
+                                  disabled={isSending}
+                                  title={
+                                    selectedAgentModel?.providerId === 'claude'
+                                      ? 'Claude reasoning and context window'
+                                      : selectedAgentModel?.providerId === 'grok'
+                                        ? 'Grok reasoning effort'
+                                        : 'Codex reasoning and service tier'
+                                  }
+                                >
+                                  <span>
+                                    {selectedAgentModel?.providerId === 'claude'
+                                      ? selectedClaudeReasoningLabel
+                                      : selectedAgentModel?.providerId === 'grok'
+                                        ? selectedGrokReasoningLabel
+                                        : selectedCodexReasoningLabel}
+                                  </span>
+                                  {selectedAgentModel?.providerId !== 'grok' && (
+                                    <>
+                                      <span className="control-dot">·</span>
+                                      <span>
+                                        {selectedAgentModel?.providerId === 'claude'
+                                          ? selectedClaudeContextWindowLabel
+                                          : selectedCodexServiceTierLabel}
+                                      </span>
+                                    </>
+                                  )}
+                                  <ChevronDown
+                                    size={14}
+                                    className={`model-trigger-chevron ${codexSettingsOpen ? 'open' : ''}`}
+                                  />
+                                </button>
+
+                                {codexSettingsOpen && (
+                                  <div className="codex-settings-popover">
+                                    {selectedAgentModel?.providerId === 'grok' ? (
+                                      <div className="codex-settings-section">
+                                        <div className="codex-settings-heading">Reasoning</div>
+                                        <div className="codex-settings-options">
+                                          {grokReasoningOptions.map((option) => {
+                                            const selected = selectedGrokReasoning === option.value;
+                                            return (
+                                              <button
+                                                key={option.value}
+                                                className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                                onClick={() =>
+                                                  updateThread(selectedThread.id, {
+                                                    grokReasoningEffort: option.value as GrokReasoningEffort,
+                                                  })
+                                                }
+                                              >
+                                                <span className="settings-check">
+                                                  {selected && <Check size={17} />}
+                                                </span>
+                                                <span>
+                                                  {option.label}
+                                                  {option.default ? ' (default)' : ''}
+                                                  {option.description && (
+                                                    <span className="codex-settings-row-description">
+                                                      {option.description}
+                                                    </span>
+                                                  )}
+                                                </span>
+                                              </button>
+                                            );
+                                          })}
+                                        </div>
+                                      </div>
+                                    ) : selectedAgentModel?.providerId === 'claude' ? (
+                                      <>
+                                        <div className="codex-settings-section">
+                                          <div className="codex-settings-heading">Reasoning</div>
+                                          <div className="codex-settings-options">
+                                            {claudeReasoningOptions.map((option) => {
+                                              const selected = selectedClaudeReasoning === option.value;
+                                              const isDefault = option.value === selectedClaudeDefaultReasoning;
+                                              return (
+                                                <button
+                                                  key={option.value}
+                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                                  onClick={() =>
+                                                    updateThread(selectedThread.id, {
+                                                      claudeReasoningEffort: option.value as ClaudeReasoningEffort,
+                                                    })
+                                                  }
+                                                >
+                                                  <span className="settings-check">
+                                                    {selected && <Check size={17} />}
+                                                  </span>
+                                                  <span>
+                                                    {option.label}
+                                                    {isDefault ? ' (default)' : ''}
+                                                  </span>
+                                                </button>
+                                              );
+                                            })}
+                                          </div>
+                                        </div>
+
+                                        <div className="codex-settings-divider" />
+
+                                        <div className="codex-settings-section">
+                                          <div className="codex-settings-heading">Context Window</div>
+                                          <div className="codex-settings-options">
+                                            {claudeContextWindowOptions.map((option) => {
+                                              const selected = effectiveClaudeContextWindow === option.value;
+                                              const oneMillionOnly =
+                                                !!selectedAgentModel &&
+                                                claudeOneMillionOnlyModelSlugs.has(selectedAgentModel.slug);
+                                              const disabled = oneMillionOnly && option.value === '200k';
+                                              return (
+                                                <button
+                                                  key={option.value}
+                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                                  onClick={() =>
+                                                    updateThread(selectedThread.id, {
+                                                      claudeContextWindow: option.value as ClaudeContextWindow,
+                                                    })
+                                                  }
+                                                  disabled={disabled}
+                                                  title={
+                                                    disabled && selectedAgentModel
+                                                      ? `${selectedAgentModel.label} always uses 1M context`
+                                                      : undefined
+                                                  }
+                                                >
+                                                  <span className="settings-check">
+                                                    {selected && <Check size={17} />}
+                                                  </span>
+                                                  <span>
+                                                    {option.label}
+                                                    {option.value === defaultClaudeContextWindow && !oneMillionOnly
+                                                      ? ' (default)'
+                                                      : ''}
+                                                  </span>
+                                                </button>
+                                              );
+                                            })}
+                                          </div>
+                                        </div>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <div className="codex-settings-section">
+                                          <div className="codex-settings-heading">Reasoning</div>
+                                          <div className="codex-settings-options">
+                                            {selectedCodexReasoningOptions.map((option) => {
+                                              const selected = selectedCodexReasoning === option.value;
+                                              return (
+                                                <button
+                                                  key={option.value}
+                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                                  onClick={() =>
+                                                    updateThread(selectedThread.id, {
+                                                      codexReasoningEffort: option.value as CodexReasoningEffort,
+                                                    })
+                                                  }
+                                                >
+                                                  <span className="settings-check">
+                                                    {selected && <Check size={17} />}
+                                                  </span>
+                                                  <span>
+                                                    {option.label}
+                                                    {option.default ? ' (default)' : ''}
+                                                    {option.description && (
+                                                      <span className="codex-settings-row-description">
+                                                        {option.description}
+                                                      </span>
+                                                    )}
+                                                  </span>
+                                                </button>
+                                              );
+                                            })}
+                                          </div>
+                                        </div>
+
+                                        <div className="codex-settings-divider" />
+
+                                        <div className="codex-settings-section">
+                                          <div className="codex-settings-heading">Service Tier</div>
+                                          <div className="codex-settings-options">
+                                            {codexServiceTierOptions.map((option) => {
+                                              const selected = selectedCodexServiceTier === option.value;
+                                              return (
+                                                <button
+                                                  key={option.value}
+                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                                  onClick={() =>
+                                                    updateThread(selectedThread.id, {
+                                                      codexServiceTier: option.value as CodexServiceTier,
+                                                    })
+                                                  }
+                                                >
+                                                  <span className="settings-check">
+                                                    {selected && <Check size={17} />}
+                                                  </span>
+                                                  <span>
+                                                    {option.label}
+                                                    {option.default ? ' (default)' : ''}
+                                                  </span>
+                                                </button>
+                                              );
+                                            })}
+                                          </div>
+                                        </div>
+                                      </>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            <div className="access-mode-anchor" ref={accessModeRef}>
+                              <button
+                                type="button"
+                                className="access-select"
+                                onClick={() => setAccessModeOpen((open) => !open)}
+                                disabled={isSending}
+                                title="Access level"
+                              >
+                                <Shield size={15} />
+                                <span>{selectedAccessModeLabel}</span>
+                                <ChevronDown
+                                  size={13}
+                                  className={`model-trigger-chevron ${accessModeOpen ? 'open' : ''}`}
+                                />
+                              </button>
+
+                              {accessModeOpen && !isSending && (
+                                <div className="access-mode-popover">
+                                  <div className="codex-settings-options">
+                                    {accessModeOptions.map((option) => {
+                                      const selected = selectedAccessMode === option.value;
+                                      return (
+                                        <button
+                                          key={option.value}
+                                          type="button"
+                                          className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                                          onClick={() => {
+                                            updateThread(selectedThread.id, {
+                                              accessMode: option.value,
+                                            });
+                                            setAccessModeOpen(false);
+                                          }}
+                                        >
+                                          <span className="settings-check">{selected && <Check size={17} />}</span>
+                                          <span>{option.label}</span>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+
+                            {!isTerminalThread && (
+                              <div className="task-picker-anchor" ref={taskPickerRef}>
+                                <button
+                                  className={`model-trigger task-link-trigger ${linkedTaskIds.length > 0 ? 'linked' : ''}`}
+                                  onClick={() => setTaskPickerOpen((open) => !open)}
+                                  title={linkedTasksLabel}
+                                  aria-label={linkedTasksLabel}
+                                >
+                                  <SquareKanban size={15} />
+                                  {linkedTaskIds.length > 1 && (
+                                    <span className="task-link-count">{linkedTaskIds.length}</span>
+                                  )}
+                                </button>
+                                {taskPickerOpen && (
+                                  <TaskPickerPopover
+                                    linkedTaskIds={linkedTaskIds}
+                                    authenticated={accountState.authenticated}
+                                    onSignIn={() => void handleStartAccountAuth()}
+                                    onPick={toggleTaskOnSelectedThread}
+                                  />
+                                )}
+                              </div>
+                            )}
+
+                            {isSending ? (
+                              <>
+                                {(chatInput.trim() || chatAttachments.length > 0) && (
+                                  <>
+                                    <button
+                                      className="send-button"
+                                      onClick={sendMessage}
+                                      title="Queue — sends when the current run finishes (⏎)"
+                                    >
+                                      <ListPlus size={15} />
+                                    </button>
+                                    {steerSupported && (
+                                      <button
+                                        className="send-button steer"
+                                        onClick={steerActiveAgent}
+                                        disabled={!steerReady}
+                                        title={
+                                          steerReady
+                                            ? 'Steer — interrupt the agent and redirect it now (⌘⏎)'
+                                            : 'Steer becomes available once the agent reports its session'
+                                        }
+                                      >
+                                        <Zap size={14} />
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                                <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
+                                  <Square size={14} fill="currentColor" />
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                className="send-button"
+                                onClick={sendMessage}
+                                disabled={
+                                  (!chatInput.trim() && chatAttachments.length === 0 && !hasPendingLinkedTasks) ||
+                                  selectedAgentModel?.available === false
+                                }
+                                title="Send"
+                              >
+                                <ArrowUp size={16} strokeWidth={2.5} />
+                              </button>
+                            )}
+                          </div>
                         </div>
-                      )}
+                      </div>
                     </div>
-                  </div>
+                  </>
                 )}
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="btn secondary"
-                  onClick={closeCreateEpicModal}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="btn"
-                  disabled={
-                    !newEpicName.trim() || (newEpicCreateRift && !newEpicProjectId)
-                  }
-                >
-                  Create epic
-                </button>
               </div>
-            </form>
-          </div>
+            </>
+          )}
+
+          {/* ========== CODE TAB ========== */}
+          {activeTab === 'code' && (
+            <CodeWorkspace
+              runningAgentCount={runningAgentCount}
+              turnRefreshTick={treeTurnRefreshTick}
+              sidebarFooterProps={sidebarFooterProps}
+            />
+          )}
         </div>
+      )}
+
+      {hasOpenDialog && (
+        <React.Suspense fallback={null}>
+          <AppDialogs model={appDialogsModel} />
+        </React.Suspense>
       )}
     </div>
   );
