@@ -36,6 +36,8 @@ export type EpicSettleDialogState = {
 export type RiftSweepDialogState = {
   entries: RiftStorageEntry[];
   runGc: boolean;
+  /** Unpublished-work overrides this confirmation is allowed to grant. */
+  forcePaths: string[];
 };
 
 export type GitBranchInfo = {
