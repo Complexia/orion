@@ -108,4 +108,12 @@ export type OrionAccountState = {
 };
 
 export type SettingsTab =
-  'account' | 'general' | 'providers' | 'orchestration' | 'computer-use' | 'storage' | 'cosmetics' | 'experimental';
+  | 'account'
+  | 'general'
+  | 'providers'
+  | 'orchestration'
+  | 'split-view'
+  | 'computer-use'
+  | 'storage'
+  | 'cosmetics'
+  | 'experimental';

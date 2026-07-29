@@ -20,6 +20,8 @@ type TerminalViewProps = {
   epicId?: string;
   projectPath: string;
   accessMode: 'read-only' | 'workspace-write' | 'full-access';
+  /** Whether this pane currently owns keyboard input. */
+  focused: boolean;
   /** Existing claude CLI session id for this thread; resumed on spawn. */
   resumeSessionId?: string;
   /** Fork the inherited resume session instead of appending to it in place. */
@@ -39,13 +41,17 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   epicId,
   projectPath,
   accessMode,
+  focused,
   resumeSessionId,
   forkSession = false,
 }) => {
   const hostRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
   const [exitInfo, setExitInfo] = useState<{ exitCode: number | null } | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Latest props for the mount-scoped effect and the overlay buttons.
+  const focusedRef = useRef(focused);
+  focusedRef.current = focused;
   const resumeSessionIdRef = useRef(resumeSessionId);
   resumeSessionIdRef.current = resumeSessionId;
   const ensureRef = useRef<
@@ -74,6 +80,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
+    terminalRef.current = term;
     try {
       fit.fit();
     } catch {
@@ -151,7 +158,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       if (exited) return;
       // The PTY may have spawned at a different size than the fitted view.
       void window.orion.terminalResize?.({ threadId, cols: term.cols, rows: term.rows });
-      term.focus();
+      if (focusedRef.current) term.focus();
     };
     ensureRef.current = (options) => void ensure(options);
     void ensure({ resumeSessionId: resumeSessionIdRef.current, forkSession });
@@ -177,9 +184,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       inputDisposable.dispose();
       offData?.();
       offExit?.();
+      if (terminalRef.current === term) terminalRef.current = null;
       term.dispose();
     };
   }, [threadId, epicId, projectPath, accessMode, forkSession]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (focused) terminal?.focus();
+    else terminal?.blur();
+  }, [focused]);
 
   if (!projectPath) {
     return (

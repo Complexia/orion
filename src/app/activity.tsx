@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { BookOpen, Bot, Check, ChevronDown, FilePen, Globe, ListChecks, Search, Terminal, Wrench, X } from 'lucide-react';
 import { type AgentActivity, type BtwExchange, type Message, type ThreadGoal, type TurnTokenStats } from '../store';
 
@@ -163,6 +163,7 @@ export const FloatingTasksCard: React.FC<{
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
+  const [hostMaxHeight, setHostMaxHeight] = useState<number | null>(null);
 
   const entries = activity.plan ?? [];
   const completed = entries.filter((entry) => entry.status === 'completed').length;
@@ -171,6 +172,32 @@ export const FloatingTasksCard: React.FC<{
   // A finished-but-incomplete plan is the interesting case: say the run ended
   // and keep pointing at the task it never got past.
   const endedLabel = !runRunning && !allDone ? endedRunLabel(runStatus) : null;
+
+  useLayoutEffect(() => {
+    const card = cardRef.current;
+    const host = card?.offsetParent as HTMLElement | null;
+    if (!card || !host) return undefined;
+
+    const clampToHost = () => {
+      const margin = 8;
+      const nextMaxHeight = Math.max(host.clientHeight - margin * 2, 0);
+      setHostMaxHeight((current) => (current === nextMaxHeight ? current : nextMaxHeight));
+      if (!position) return;
+      const maxX = Math.max(host.clientWidth - card.offsetWidth - margin, margin);
+      const maxY = Math.max(host.clientHeight - card.offsetHeight - margin, margin);
+      const next = {
+        x: Math.min(Math.max(position.x, margin), maxX),
+        y: Math.min(Math.max(position.y, margin), maxY),
+      };
+      if (next.x !== position.x || next.y !== position.y) onMove(next);
+    };
+
+    clampToHost();
+    const observer = new ResizeObserver(clampToHost);
+    observer.observe(host);
+    observer.observe(card);
+    return () => observer.disconnect();
+  }, [onMove, position]);
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -209,7 +236,10 @@ export const FloatingTasksCard: React.FC<{
       className={`tasks-float-card${collapsed ? ' collapsed' : ''}${dragging ? ' dragging' : ''}${
         endedLabel ? ' ended' : ''
       }${runStatus === 'error' ? ' failed' : ''}`}
-      style={position ? { left: position.x, top: position.y, right: 'auto' } : undefined}
+      style={{
+        ...(position ? { left: position.x, top: position.y, right: 'auto' } : {}),
+        ...(hostMaxHeight !== null ? { maxHeight: hostMaxHeight } : {}),
+      }}
     >
       <div
         className="tasks-float-header"

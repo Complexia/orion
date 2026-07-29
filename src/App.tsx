@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Plus,
   Trash2,
@@ -10,6 +11,7 @@ import {
   GitPullRequest,
   GitPullRequestClosed,
   ChevronDown,
+  Columns3,
   Ellipsis,
   SquarePen,
   Check,
@@ -37,6 +39,8 @@ import {
   SquareKanban,
   CircleCheck,
   FlaskConical,
+  Menu,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -48,6 +52,8 @@ import {
   defaultNotificationSettings,
   defaultEpicsSettings,
   defaultRiftsSettings,
+  isAgentsPanelVisible,
+  MAX_THREAD_PANES,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -92,7 +98,8 @@ import {
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
-import { AgentsSidebar, type AgentsSidebarModel } from './app/AgentsSidebar';
+import { AgentsSidebar, type AgentsSidebarModel, THREAD_DRAG_MIME } from './app/AgentsSidebar';
+import { ThreadPane } from './app/ThreadPane';
 import type { AppDialogsModel } from './app/AppDialogs';
 import { ProjectIcon } from './app/ProjectIcon';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
@@ -108,7 +115,13 @@ import {
   isVideoAttachment,
   isVideoFile,
 } from './app/attachments';
-import { AgentFamilySwitcher, type ChatScrollPosition, ChatTranscript, isProviderAuthErrorText } from './app/chat';
+import {
+  AgentFamilySwitcher,
+  type ChatScrollPosition,
+  ChatTranscript,
+  isProviderAuthErrorText,
+  type PaneChatRefs,
+} from './app/chat';
 import { InlineRenameInput } from './app/fileTree';
 import {
   claudeOneMillionOnlyModelSlugs,
@@ -220,6 +233,17 @@ type EpicGitBusyEntry = {
   kind: EpicGitBusyKind;
   workspaceKey?: string;
 };
+
+// Which group of the composer's overflow menu is expanded, when the controls
+// row is too narrow to show them as separate chips. One at a time.
+type ComposerMenuSection = 'agent' | 'access' | 'tasks' | null;
+
+// Width the composer controls need before they start colliding, estimated from
+// the labels they will render rather than measured: the collapsed row can't
+// measure the expanded one, and re-measuring after each switch would oscillate.
+// Deliberately generous — a chip that just fits looks cramped anyway.
+const estimateChipWidth = (label: string, perChar: number, fixed: number) =>
+  Math.ceil(label.length * perChar) + fixed;
 
 const UNCLAIMED_EPIC_GIT_WORKSPACE_KEY = 'git:unclaimed';
 
@@ -457,9 +481,20 @@ const App: React.FC = () => {
   const {
     activeTab,
     setActiveTab,
+    settingsOpen,
+    setSettingsOpen,
     projects,
     selectedProjectId,
     selectedThreadId,
+    paneThreadIds,
+    openThreadInSplit,
+    closeThreadPane,
+    savedViews,
+    activeSavedViewId,
+    openSavedView,
+    deleteSavedView,
+    splitViewSettings,
+    setSplitViewSettings,
     epics,
     selectedEpicId,
     epicsSettings,
@@ -512,9 +547,20 @@ const App: React.FC = () => {
     useShallow((state) => ({
       activeTab: state.activeTab,
       setActiveTab: state.setActiveTab,
+      settingsOpen: state.settingsOpen,
+      setSettingsOpen: state.setSettingsOpen,
       projects: state.projects,
       selectedProjectId: state.selectedProjectId,
       selectedThreadId: state.selectedThreadId,
+      paneThreadIds: state.paneThreadIds,
+      openThreadInSplit: state.openThreadInSplit,
+      closeThreadPane: state.closeThreadPane,
+      savedViews: state.savedViews,
+      activeSavedViewId: state.activeSavedViewId,
+      openSavedView: state.openSavedView,
+      deleteSavedView: state.deleteSavedView,
+      splitViewSettings: state.splitViewSettings,
+      setSplitViewSettings: state.setSplitViewSettings,
       epics: state.epics,
       selectedEpicId: state.selectedEpicId,
       epicsSettings: state.epicsSettings,
@@ -652,6 +698,7 @@ const App: React.FC = () => {
   const [pinnedAgentsOpen, setPinnedAgentsOpen] = useState(true);
   const [pinnedAgentsShowAll, setPinnedAgentsShowAll] = useState(false);
   const [epicsSectionOpen, setEpicsSectionOpen] = useState(true);
+  const [savedViewsSectionOpen, setSavedViewsSectionOpen] = useState(true);
   const [collapsedEpics, setCollapsedEpics] = useState<Record<string, boolean>>({});
   // Create-item modal (title + optional description).
   const [createEpicOpen, setCreateEpicOpen] = useState(false);
@@ -885,7 +932,6 @@ const App: React.FC = () => {
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
   const [authenticatingProviderId, setAuthenticatingProviderId] = useState<string | null>(null);
   const [accountState, setAccountState] = useState<OrionAccountState>({
@@ -955,10 +1001,30 @@ const App: React.FC = () => {
   const pendingTurnStartsRef = useRef(new Set<string>());
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
-  const chatEndRef = useRef<HTMLDivElement>(null);
-  const chatScrollRef = useRef<HTMLDivElement>(null);
-  const chatPinnedRef = useRef(true);
-  const chatScrollTopRef = useRef(0);
+  // Each pane scrolls its own transcript, so the DOM refs and the pinned/offset
+  // bookkeeping are per thread rather than per shell. Entries are plain objects
+  // created on demand — no hooks — so a pane opening mid-render is fine.
+  const paneChatRefsRef = useRef(new Map<string, PaneChatRefs>());
+  const paneChatRefs = useCallback((threadId: string): PaneChatRefs => {
+    const existing = paneChatRefsRef.current.get(threadId);
+    if (existing) return existing;
+    const created: PaneChatRefs = {
+      chatScrollRef: { current: null },
+      chatEndRef: { current: null },
+      chatPinnedRef: { current: true },
+      chatScrollTopRef: { current: 0 },
+    };
+    paneChatRefsRef.current.set(threadId, created);
+    return created;
+  }, []);
+  // Sending or receiving in a thread sticks its transcript to the bottom. Any
+  // pane showing that thread follows along, not just the focused one.
+  const pinThreadToBottom = useCallback(
+    (threadId: string) => {
+      paneChatRefs(threadId).chatPinnedRef.current = true;
+    },
+    [paneChatRefs]
+  );
   // Per-thread transcript positions, owned here so they survive ChatTranscript
   // unmounting (Code tab) and are shared by every thread the switcher can reach.
   const chatScrollPositionsRef = useRef(new Map<string, ChatScrollPosition>());
@@ -969,6 +1035,34 @@ const App: React.FC = () => {
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const accessModeRef = useRef<HTMLDivElement>(null);
+  // Composer controls collapse into one overflow menu when the row runs out of
+  // room (narrow split panes); see composerControlsCompact below.
+  const composerMenuRef = useRef<HTMLDivElement>(null);
+  const composerMenuPopoverRef = useRef<HTMLDivElement>(null);
+  const [composerMenuOpen, setComposerMenuOpen] = useState(false);
+  const [composerMenuSection, setComposerMenuSection] = useState<ComposerMenuSection>(null);
+  const [composerControlsWidth, setComposerControlsWidth] = useState<number | null>(null);
+  const composerControlsObserverRef = useRef<ResizeObserver | null>(null);
+  // A callback ref, not useEffect: the composer unmounts and remounts as panes
+  // take focus, and the row has to be re-measured each time.
+  const composerControlsRef = useCallback((node: HTMLDivElement | null) => {
+    composerControlsObserverRef.current?.disconnect();
+    composerControlsObserverRef.current = null;
+    if (!node) {
+      // Unmeasured means "assume there is room", so the full-width composer
+      // never flashes the compact menu on mount.
+      setComposerControlsWidth(null);
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[entries.length - 1]?.contentRect.width;
+      if (typeof width === 'number') setComposerControlsWidth(width);
+    });
+    observer.observe(node);
+    composerControlsObserverRef.current = observer;
+  }, []);
+
+  useEffect(() => () => composerControlsObserverRef.current?.disconnect(), []);
 
   // Autosize the composer to its content. The height lives as an inline style
   // on the textarea, so it is lost with the DOM node on every unmount.
@@ -1001,64 +1095,129 @@ const App: React.FC = () => {
   // the live thread set.
   useEffect(() => {
     const positions = chatScrollPositionsRef.current;
-    if (positions.size === 0) return;
+    const paneRefs = paneChatRefsRef.current;
+    if (positions.size === 0 && paneRefs.size === 0) return;
     const liveIds = new Set(threads.map((thread) => thread.id));
     for (const threadId of positions.keys()) {
       if (!liveIds.has(threadId)) positions.delete(threadId);
     }
+    for (const threadId of paneRefs.keys()) {
+      if (!liveIds.has(threadId)) paneRefs.delete(threadId);
+    }
   }, [threads]);
 
-  const selectedThread = threads.find((t) => t.id === selectedThreadId);
-  const selectedThreadProject = selectedThread ? projects.find((p) => p.id === selectedThread.projectId) : null;
-  // Candidate dirs for resolving relative media paths in agent markdown: the
-  // thread's project dir, plus the grok CLI's per-session dir — Grok Imagine
-  // saves generated images there (~/.grok/sessions/<encoded-cwd>/<session-id>/
-  // images/N.jpg) and references them relative to it, not to the project.
-  const selectedThreadEpic = selectedThread?.epicId
-    ? epics.find((epic) => epic.id === selectedThread.epicId)
-    : undefined;
-  const selectedThreadRiftPending = Boolean(selectedThread?.epicId && riftSetupEpicIds[selectedThread.epicId]);
-  const selectedThreadRiftRemoving = Boolean(
-    selectedThread &&
-    (riftRemovalThreadIds[selectedThread.id] || (selectedThread.epicId && riftRemovalEpicIds[selectedThread.epicId]))
+  // Everything the main view needs to render one thread. The split view shows
+  // up to MAX_THREAD_PANES threads at once, so this has to resolve per thread
+  // rather than only for the focused one.
+  const threadViewContext = useCallback(
+    (thread: Thread | undefined) => {
+      const project = thread ? (projects.find((p) => p.id === thread.projectId) ?? null) : null;
+      const epic = thread?.epicId ? epics.find((candidate) => candidate.id === thread.epicId) : undefined;
+      const riftPending = Boolean(thread?.epicId && riftSetupEpicIds[thread.epicId]);
+      const riftRemoving = Boolean(
+        thread && (riftRemovalThreadIds[thread.id] || (thread.epicId && riftRemovalEpicIds[thread.epicId]))
+      );
+      const riftUnavailable =
+        riftPending ||
+        riftRemoving ||
+        Boolean(epic?.riftRequest) ||
+        Boolean(epic?.riftCleanupPending) ||
+        // Released epic threads remain grouped in Recent agents, but their
+        // isolated workspace no longer exists. Never fall through to the source
+        // project while the epic is waiting for its Rift to be recreated.
+        Boolean(epic?.riftReleased) ||
+        Boolean(epic && !epic.riftPath && riftsSettings.enabled && riftStatus === null);
+      // Threads grouped under an epic with a rift work inside that rift workspace.
+      const projectPath = riftUnavailable
+        ? undefined
+        : epic?.riftPath
+          ? (epic.riftWorkingDir ?? epic.riftPath)
+          : project?.path;
+      // Candidate dirs for resolving relative media paths in agent markdown: the
+      // thread's project dir, plus the grok CLI's per-session dir — Grok Imagine
+      // saves generated images there (~/.grok/sessions/<encoded-cwd>/<session-id>/
+      // images/N.jpg) and references them relative to it, not to the project.
+      const grokSessionId = thread?.agentSessionIds?.grok;
+      const mediaBaseDirs = projectPath
+        ? grokSessionId
+          ? [projectPath, `~/.grok/sessions/${encodeURIComponent(projectPath)}/${grokSessionId}`]
+          : [projectPath]
+        : [];
+      return { project, epic, riftPending, riftRemoving, riftUnavailable, projectPath, mediaBaseDirs };
+    },
+    [epics, projects, riftRemovalEpicIds, riftRemovalThreadIds, riftSetupEpicIds, riftStatus, riftsSettings.enabled]
   );
-  const selectedThreadRiftUnavailable =
-    selectedThreadRiftPending ||
-    selectedThreadRiftRemoving ||
-    Boolean(selectedThreadEpic?.riftRequest) ||
-    Boolean(selectedThreadEpic?.riftCleanupPending) ||
-    // Released epic threads remain grouped in Recent agents, but their
-    // isolated workspace no longer exists. Never fall through to the source
-    // project while the epic is waiting for its Rift to be recreated.
-    Boolean(selectedThreadEpic?.riftReleased) ||
-    Boolean(selectedThreadEpic && !selectedThreadEpic.riftPath && riftsSettings.enabled && riftStatus === null);
-  // Threads grouped under an epic with a rift work inside that rift workspace.
-  const selectedThreadProjectPath = selectedThreadRiftUnavailable
-    ? undefined
-    : selectedThreadEpic?.riftPath
-      ? (selectedThreadEpic.riftWorkingDir ?? selectedThreadEpic.riftPath)
-      : selectedThreadProject?.path;
-  const selectedThreadGrokSessionId = selectedThread?.agentSessionIds?.grok;
-  const mediaBaseDirs = useMemo(() => {
-    if (!selectedThreadProjectPath) return [];
-    const dirs = [selectedThreadProjectPath];
-    if (selectedThreadGrokSessionId) {
-      dirs.push(`~/.grok/sessions/${encodeURIComponent(selectedThreadProjectPath)}/${selectedThreadGrokSessionId}`);
+
+  const selectedThread = threads.find((t) => t.id === selectedThreadId);
+  const selectedThreadContext = threadViewContext(selectedThread);
+  const selectedThreadProject = selectedThreadContext.project;
+  const selectedThreadEpic = selectedThreadContext.epic;
+  const selectedThreadRiftPending = selectedThreadContext.riftPending;
+  const selectedThreadRiftRemoving = selectedThreadContext.riftRemoving;
+  const selectedThreadRiftUnavailable = selectedThreadContext.riftUnavailable;
+  const selectedThreadProjectPath = selectedThreadContext.projectPath;
+  // threadViewContext returns a fresh array per call; every pane re-derives one
+  // on each render, which would defeat ChatTranscript's memo. Hand back the
+  // previous array whenever the dirs are unchanged so identity tracks content.
+  const mediaBaseDirsCacheRef = useRef(new Map<string, string[]>());
+  const stableMediaBaseDirs = useCallback((threadId: string, dirs: string[]) => {
+    const cached = mediaBaseDirsCacheRef.current.get(threadId);
+    if (cached && cached.length === dirs.length && cached.every((dir, index) => dir === dirs[index])) {
+      return cached;
     }
+    mediaBaseDirsCacheRef.current.set(threadId, dirs);
     return dirs;
-  }, [selectedThreadProjectPath, selectedThreadGrokSessionId]);
-  // The card's placement is shell-level so it survives switching to Code and
-  // back; only its plan lookup/rendering lives in the streaming chat boundary.
-  const [tasksCardPosition, setTasksCardPosition] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-  const [tasksCardCollapsed, setTasksCardCollapsed] = useState(false);
-  const [tasksCardDismissedFor, setTasksCardDismissedFor] = useState<string | null>(null);
-  const toggleTasksCard = useCallback(() => setTasksCardCollapsed((current) => !current), []);
-  const dismissTasksCard = useCallback((messageId: string) => {
-    setTasksCardDismissedFor(messageId);
   }, []);
+  // Card placement survives switching to Code and back, but each simultaneously
+  // mounted transcript owns an independent position, collapse state, and
+  // dismissed plan id.
+  type TasksCardState = {
+    position: { x: number; y: number } | null;
+    collapsed: boolean;
+    dismissedFor: string | null;
+  };
+  const [tasksCardStates, setTasksCardStates] = useState<Record<string, TasksCardState>>({});
+  const updateTasksCardState = useCallback(
+    (threadId: string, update: (current: TasksCardState) => TasksCardState) => {
+      setTasksCardStates((states) => {
+        const current = states[threadId] ?? {
+          position: null,
+          collapsed: false,
+          dismissedFor: null,
+        };
+        return { ...states, [threadId]: update(current) };
+      });
+    },
+    []
+  );
+  const moveTasksCard = useCallback(
+    (threadId: string, position: { x: number; y: number }) => {
+      updateTasksCardState(threadId, (current) => ({ ...current, position }));
+    },
+    [updateTasksCardState]
+  );
+  const toggleTasksCard = useCallback(
+    (threadId: string) => {
+      updateTasksCardState(threadId, (current) => ({ ...current, collapsed: !current.collapsed }));
+    },
+    [updateTasksCardState]
+  );
+  const dismissTasksCard = useCallback(
+    (threadId: string, messageId: string) => {
+      updateTasksCardState(threadId, (current) => ({ ...current, dismissedFor: messageId }));
+    },
+    [updateTasksCardState]
+  );
+  useEffect(() => {
+    const liveThreadIds = new Set(threads.map((thread) => thread.id));
+    setTasksCardStates((states) => {
+      const staleThreadIds = Object.keys(states).filter((threadId) => !liveThreadIds.has(threadId));
+      if (staleThreadIds.length === 0) return states;
+      const next = { ...states };
+      for (const threadId of staleThreadIds) delete next[threadId];
+      return next;
+    });
+  }, [threads]);
   const selectedProject = projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
   const latestThreadProjectId = useMemo(() => {
     let latestProjectId: string | null = null;
@@ -2538,9 +2697,9 @@ const App: React.FC = () => {
   );
 
   // Desktop notification when a thread finishes. Suppressed while the user is
-  // already looking at that thread (window focused + thread selected). Sound
-  // rides on the OS notification via `silent`, so there is no separate audio
-  // path to keep in sync.
+  // already looking at that thread in any visible pane. Sound rides on the OS
+  // notification via `silent`, so there is no separate audio path to keep in
+  // sync.
   const notifyThreadFinished = useCallback((threadId: string, outcome: 'done' | 'error') => {
     const state = useOrionStore.getState();
     const settings = {
@@ -2548,7 +2707,13 @@ const App: React.FC = () => {
       ...state.notificationSettings,
     };
     if (!settings.enabled) return;
-    if (document.hasFocus() && state.selectedThreadId === threadId) return;
+    if (
+      document.hasFocus() &&
+      isAgentsPanelVisible(state) &&
+      state.paneThreadIds.includes(threadId)
+    ) {
+      return;
+    }
     if (typeof Notification === 'undefined' || Notification.permission === 'denied') return;
     const thread = state.threads.find((t) => t.id === threadId);
     const notification = new Notification(outcome === 'error' ? 'Agent stopped with an error' : 'Agent finished', {
@@ -5693,7 +5858,7 @@ const App: React.FC = () => {
         void tryGenerateBetterTitle(threadId, titleSeed, resolveUtilityTurn(), workingDir, updateThread, thread.epicId);
       }
 
-      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+      pinThreadToBottom(threadId);
       addMessageToThread(threadId, {
         role: 'user',
         content: userContent,
@@ -6235,7 +6400,7 @@ const App: React.FC = () => {
       const exchangeId = addBtwExchange(threadId, question);
       const runId = crypto.randomUUID();
       btwRuns.current.set(runId, { threadId, exchangeId });
-      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+      pinThreadToBottom(threadId);
 
       void window.orion
         .runAgentTurn({
@@ -6373,7 +6538,7 @@ const App: React.FC = () => {
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
       updateThread(threadId, { status: 'running' });
-      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+      pinThreadToBottom(threadId);
 
       void window.orion
         .runAgentTurn({
@@ -6541,7 +6706,7 @@ const App: React.FC = () => {
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
       updateThread(threadId, { status: 'running' });
-      if (threadId === state.selectedThreadId) chatPinnedRef.current = true;
+      pinThreadToBottom(threadId);
 
       void window.orion
         .runAgentTurn({
@@ -7094,7 +7259,7 @@ const App: React.FC = () => {
 
     // Agent mid-run: hold the message; it dispatches when the current turn ends.
     if (isSending) {
-      chatPinnedRef.current = true;
+      pinThreadToBottom(selectedThreadId);
       queueMessageToThread(selectedThreadId, {
         text: promptText,
         attachments: chatAttachments,
@@ -7167,19 +7332,37 @@ const App: React.FC = () => {
       }
     >
   >(new Map());
-  const canSteerNow = () =>
-    !!selectedThreadId &&
-    !!activeRunId &&
-    steerReady &&
-    !!window.orion?.stopAgentTurn &&
-    !steeringRunsRef.current.has(activeRunId);
+  const steerTargetForThread = (threadId: string) => {
+    const runId = activeRunsByThreadRef.current[threadId];
+    const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+    const agentModel = thread
+      ? findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId)
+      : undefined;
+    if (
+      !runId ||
+      !thread ||
+      !agentModel ||
+      providerFollowUpSupport[agentModel.providerId]?.steer !== true ||
+      !thread.agentSessionIds?.[agentModel.providerId] ||
+      !window.orion?.stopAgentTurn ||
+      steeringRunsRef.current.has(runId)
+    ) {
+      return null;
+    }
+    return { runId };
+  };
+  const canSteerNow = () => !!selectedThreadId && !!steerTargetForThread(selectedThreadId);
 
-  const steerWithContent = async (promptText: string, attachments: ImageAttachment[]) => {
-    if (!canSteerNow() || !selectedThreadId || !activeRunId) return;
+  const steerWithContent = async (
+    threadId: string,
+    promptText: string,
+    attachments: ImageAttachment[]
+  ) => {
+    const target = steerTargetForThread(threadId);
+    if (!target) return;
     if (!promptText && attachments.length === 0) return;
 
-    const runId = activeRunId;
-    const threadId = selectedThreadId;
+    const { runId } = target;
     steeringRunsRef.current.add(runId);
     // Untrack the transcript message before killing so the dying process's
     // tail events can't write into it; the run itself stays in
@@ -7378,22 +7561,25 @@ const App: React.FC = () => {
     setChatInput('');
     setChatMention(null);
     setChatAttachments([]);
-    await steerWithContent(promptText, attachments);
+    if (!selectedThreadId) return;
+    await steerWithContent(selectedThreadId, promptText, attachments);
   };
 
   // "Steer now" on a queued transcript bubble: promote that message to an
   // immediate interrupt-and-resume instead of waiting for the turn to end.
-  const steerQueuedMessageRef = useRef<(queuedId: string) => Promise<void>>(async () => {});
-  steerQueuedMessageRef.current = async (queuedId: string) => {
-    if (!canSteerNow() || !selectedThreadId || !activeRunId) return;
-    const thread = useOrionStore.getState().threads.find((t) => t.id === selectedThreadId);
+  const steerQueuedMessageRef = useRef<(threadId: string, queuedId: string) => Promise<void>>(
+    async () => {}
+  );
+  steerQueuedMessageRef.current = async (threadId: string, queuedId: string) => {
+    if (!steerTargetForThread(threadId)) return;
+    const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
     const queued = thread?.queuedMessages?.find((q) => q.id === queuedId);
     if (!queued) return;
-    removeQueuedThreadMessage(selectedThreadId, queuedId);
-    await steerWithContent(queued.text, queued.attachments ?? []);
+    removeQueuedThreadMessage(threadId, queuedId);
+    await steerWithContent(threadId, queued.text, queued.attachments ?? []);
   };
-  const steerQueuedMessage = useCallback((queuedId: string) => {
-    void steerQueuedMessageRef.current(queuedId);
+  const steerQueuedMessage = useCallback((threadId: string, queuedId: string) => {
+    void steerQueuedMessageRef.current(threadId, queuedId);
   }, []);
 
   const stopActiveAgent = async () => {
@@ -7622,6 +7808,10 @@ const App: React.FC = () => {
     setTextGenerationSettings,
     setEpicsSettings,
     epicsSettings,
+    splitViewSettings,
+    setSplitViewSettings,
+    savedViews,
+    deleteSavedView,
     providerSettings,
     setProviderEnabled,
     setProviderOptions,
@@ -7781,11 +7971,25 @@ const App: React.FC = () => {
     []
   );
 
+  // Saved views hold ids only, so the sidebar reads its pane titles from here.
+  const threadTitlesById = useMemo(
+    () => new Map(threads.map((thread) => [thread.id, thread.title])),
+    [threads]
+  );
+
   const agentsSidebarModel: AgentsSidebarModel = {
     projects,
     selectThread,
     setActiveTab,
     selectedThreadId,
+    paneThreadIds,
+    savedViews,
+    activeSavedViewId,
+    threadTitlesById,
+    openSavedView,
+    deleteSavedView,
+    savedViewsSectionOpen,
+    setSavedViewsSectionOpen,
     updateThread,
     branchThread,
     selectedEpicId,
@@ -7853,6 +8057,997 @@ const App: React.FC = () => {
     sidebarFooterProps,
     epicPrStatus,
   };
+
+  // The main view's unit of display. paneThreadIds is authoritative; falling
+  // back to the selected thread only matters for a store written before the
+  // split view existed, or if a pane ever outlives its thread.
+  const threadPanes = useMemo(() => {
+    const ids = paneThreadIds.length > 0 ? paneThreadIds : selectedThreadId ? [selectedThreadId] : [];
+    return ids.flatMap((threadId) => {
+      const thread = threads.find((candidate) => candidate.id === threadId);
+      if (!thread) return [];
+      const context = threadViewContext(thread);
+      const agentModel = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      const paneSending = Boolean(activeRunsByThread[threadId]);
+      const paneSteerSupported =
+        paneSending && !!agentModel && providerFollowUpSupport[agentModel.providerId]?.steer === true;
+      const focused = threadId === selectedThreadId;
+      return [
+        {
+          thread,
+          focused,
+          project: context.project,
+          projectPath: context.projectPath,
+          riftUnavailable: context.riftUnavailable,
+          mediaBaseDirs: stableMediaBaseDirs(threadId, context.mediaBaseDirs),
+          isTerminal: agentModel?.id === claudeCodeCliModelId,
+          isSending: paneSending,
+          steerSupported: paneSteerSupported,
+          steerReady:
+            paneSteerSupported && !!agentModel && !!thread.agentSessionIds?.[agentModel.providerId],
+          // Retargeting an empty thread's project runs through the composer's
+          // handler, which only ever addresses the focused thread.
+          canChangeProject: focused && canChangeSelectedThreadProject,
+        },
+      ];
+    });
+  }, [
+    activeRunsByThread,
+    agentModels,
+    canChangeSelectedThreadProject,
+    paneThreadIds,
+    selectedThreadId,
+    stableMediaBaseDirs,
+    threadViewContext,
+    threads,
+  ]);
+  const splitFull = threadPanes.length >= MAX_THREAD_PANES;
+
+  // Threads dragged out of the sidebar land here as an extra pane. Other drags
+  // (image files, text) fall through to the shell's own handlers untouched.
+  const [threadDropActive, setThreadDropActive] = useState(false);
+  const isThreadDrag = (event: React.DragEvent) =>
+    Array.from(event.dataTransfer.types).includes(THREAD_DRAG_MIME);
+
+  const handleThreadDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!isThreadDrag(event)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = splitFull ? 'none' : 'copy';
+      setThreadDropActive(true);
+    },
+    [splitFull]
+  );
+
+  const handleThreadDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!isThreadDrag(event)) return;
+    // Moving between panes fires leave on the panel before enter on the child;
+    // ignore those so the hint doesn't strobe across the split.
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setThreadDropActive(false);
+  }, []);
+
+  const handleThreadDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!isThreadDrag(event)) return;
+      event.preventDefault();
+      setThreadDropActive(false);
+      const threadId = event.dataTransfer.getData(THREAD_DRAG_MIME);
+      if (threadId) openThreadInSplit(threadId);
+    },
+    [openThreadInSplit]
+  );
+
+  // Width every composer chip would take if they all stayed on the row. Depends
+  // only on the labels, so it never changes as a result of collapsing them —
+  // the compact row can't measure the full one, and a measured switch would
+  // oscillate at the boundary.
+  const composerControlsNeededWidth = (() => {
+    const widths: number[] = [
+      Math.min(260, estimateChipWidth(selectedAgentModel?.label ?? 'Select model', 6.6, 68)),
+    ];
+    if (shouldShowAgentSettings) {
+      widths.push(
+        estimateChipWidth(
+          selectedAgentModel?.providerId === 'grok'
+            ? selectedGrokReasoningLabel
+            : selectedAgentModel?.providerId === 'claude'
+              ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
+              : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`,
+          7.4,
+          52
+        )
+      );
+    }
+    widths.push(estimateChipWidth(selectedAccessModeLabel, 7.4, 60));
+    if (!isTerminalThread) widths.push(34);
+    widths.push(36); // Send, or stop while a run is in flight.
+    if (isSending && (chatInput.trim() || chatAttachments.length > 0)) {
+      widths.push(36); // Queue.
+      if (steerSupported) widths.push(36);
+    }
+    return widths.reduce((total, width) => total + width, 0) + (widths.length - 1) * 8;
+  })();
+
+  // Only a narrow pane ever trips this; a full-width composer has room to
+  // spare, so it keeps every control as its own chip exactly as before.
+  const composerControlsCompact =
+    composerControlsWidth !== null && composerControlsWidth < composerControlsNeededWidth;
+
+  useEffect(() => {
+    // The chips and the overflow menu own separate open state; whichever form
+    // just went away should not come back expanded.
+    if (composerControlsCompact) {
+      setCodexSettingsOpen(false);
+      setAccessModeOpen(false);
+      setTaskPickerOpen(false);
+    } else {
+      setComposerMenuOpen(false);
+      setComposerMenuSection(null);
+    }
+  }, [composerControlsCompact]);
+
+  useEffect(() => {
+    if (!composerMenuOpen) return undefined;
+
+    const close = () => {
+      setComposerMenuOpen(false);
+      setComposerMenuSection(null);
+    };
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        !composerMenuRef.current?.contains(target) &&
+        !composerMenuPopoverRef.current?.contains(target)
+      ) {
+        close();
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [composerMenuOpen]);
+
+  useLayoutEffect(() => {
+    if (!composerMenuOpen) return undefined;
+    const anchor = composerMenuRef.current;
+    const menu = composerMenuPopoverRef.current;
+    if (!anchor || !menu) return undefined;
+
+    const fit = () => {
+      const margin = 12;
+      const gap = 8;
+      const anchorRect = anchor.getBoundingClientRect();
+      const width = Math.min(300, window.innerWidth - margin * 2);
+      const roomAbove = Math.max(0, anchorRect.top - margin - gap);
+      const roomBelow = Math.max(0, window.innerHeight - anchorRect.bottom - margin - gap);
+      const placeAbove = roomAbove >= roomBelow;
+      const maxHeight = Math.min(520, placeAbove ? roomAbove : roomBelow);
+      const left = Math.min(
+        Math.max(anchorRect.right - width, margin),
+        Math.max(margin, window.innerWidth - margin - width)
+      );
+
+      menu.style.left = `${Math.round(left)}px`;
+      menu.style.width = `${Math.round(width)}px`;
+      menu.style.maxHeight = `${Math.floor(maxHeight)}px`;
+      if (placeAbove) {
+        menu.style.top = 'auto';
+        menu.style.bottom = `${Math.round(window.innerHeight - anchorRect.top + gap)}px`;
+      } else {
+        menu.style.top = `${Math.round(anchorRect.bottom + gap)}px`;
+        menu.style.bottom = 'auto';
+      }
+    };
+
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(anchor);
+    window.addEventListener('resize', fit);
+    window.addEventListener('scroll', fit, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', fit);
+      window.removeEventListener('scroll', fit, true);
+    };
+  }, [composerMenuOpen]);
+
+  // Popover bodies, lifted out of their chips so the overflow menu can show the
+  // same options inline instead of duplicating them.
+  const agentSettingsOptions = selectedThread && shouldShowAgentSettings ? (
+    selectedAgentModel?.providerId === 'grok' ? (
+      <div className="codex-settings-section">
+        <div className="codex-settings-heading">Reasoning</div>
+        <div className="codex-settings-options">
+          {grokReasoningOptions.map((option) => {
+            const selected = selectedGrokReasoning === option.value;
+            return (
+              <button
+                key={option.value}
+                className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                onClick={() =>
+                  updateThread(selectedThread.id, {
+                    grokReasoningEffort: option.value as GrokReasoningEffort,
+                  })
+                }
+              >
+                <span className="settings-check">{selected && <Check size={17} />}</span>
+                <span>
+                  {option.label}
+                  {option.default ? ' (default)' : ''}
+                  {option.description && (
+                    <span className="codex-settings-row-description">{option.description}</span>
+                  )}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    ) : selectedAgentModel?.providerId === 'claude' ? (
+      <>
+        <div className="codex-settings-section">
+          <div className="codex-settings-heading">Reasoning</div>
+          <div className="codex-settings-options">
+            {claudeReasoningOptions.map((option) => {
+              const selected = selectedClaudeReasoning === option.value;
+              const isDefault = option.value === selectedClaudeDefaultReasoning;
+              return (
+                <button
+                  key={option.value}
+                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                  onClick={() =>
+                    updateThread(selectedThread.id, {
+                      claudeReasoningEffort: option.value as ClaudeReasoningEffort,
+                    })
+                  }
+                >
+                  <span className="settings-check">{selected && <Check size={17} />}</span>
+                  <span>
+                    {option.label}
+                    {isDefault ? ' (default)' : ''}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="codex-settings-divider" />
+
+        <div className="codex-settings-section">
+          <div className="codex-settings-heading">Context Window</div>
+          <div className="codex-settings-options">
+            {claudeContextWindowOptions.map((option) => {
+              const selected = effectiveClaudeContextWindow === option.value;
+              const oneMillionOnly =
+                !!selectedAgentModel && claudeOneMillionOnlyModelSlugs.has(selectedAgentModel.slug);
+              const disabled = oneMillionOnly && option.value === '200k';
+              return (
+                <button
+                  key={option.value}
+                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                  onClick={() =>
+                    updateThread(selectedThread.id, {
+                      claudeContextWindow: option.value as ClaudeContextWindow,
+                    })
+                  }
+                  disabled={disabled}
+                  title={
+                    disabled && selectedAgentModel
+                      ? `${selectedAgentModel.label} always uses 1M context`
+                      : undefined
+                  }
+                >
+                  <span className="settings-check">{selected && <Check size={17} />}</span>
+                  <span>
+                    {option.label}
+                    {option.value === defaultClaudeContextWindow && !oneMillionOnly
+                      ? ' (default)'
+                      : ''}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </>
+    ) : (
+      <>
+        <div className="codex-settings-section">
+          <div className="codex-settings-heading">Reasoning</div>
+          <div className="codex-settings-options">
+            {selectedCodexReasoningOptions.map((option) => {
+              const selected = selectedCodexReasoning === option.value;
+              return (
+                <button
+                  key={option.value}
+                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                  onClick={() =>
+                    updateThread(selectedThread.id, {
+                      codexReasoningEffort: option.value as CodexReasoningEffort,
+                    })
+                  }
+                >
+                  <span className="settings-check">{selected && <Check size={17} />}</span>
+                  <span>
+                    {option.label}
+                    {option.default ? ' (default)' : ''}
+                    {option.description && (
+                      <span className="codex-settings-row-description">{option.description}</span>
+                    )}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="codex-settings-divider" />
+
+        <div className="codex-settings-section">
+          <div className="codex-settings-heading">Service Tier</div>
+          <div className="codex-settings-options">
+            {codexServiceTierOptions.map((option) => {
+              const selected = selectedCodexServiceTier === option.value;
+              return (
+                <button
+                  key={option.value}
+                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                  onClick={() =>
+                    updateThread(selectedThread.id, {
+                      codexServiceTier: option.value as CodexServiceTier,
+                    })
+                  }
+                >
+                  <span className="settings-check">{selected && <Check size={17} />}</span>
+                  <span>
+                    {option.label}
+                    {option.default ? ' (default)' : ''}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </>
+    )
+  ) : null;
+
+  const accessModeList = selectedThread ? (
+    <div className="codex-settings-options">
+      {accessModeOptions.map((option) => {
+        const selected = selectedAccessMode === option.value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            className={`codex-settings-row ${selected ? 'selected' : ''}`}
+            onClick={() => {
+              updateThread(selectedThread.id, { accessMode: option.value });
+              setAccessModeOpen(false);
+              setComposerMenuSection(null);
+            }}
+          >
+            <span className="settings-check">{selected && <Check size={17} />}</span>
+            <span>{option.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  ) : null;
+
+  const agentSettingsSummary =
+    selectedAgentModel?.providerId === 'grok'
+      ? selectedGrokReasoningLabel
+      : selectedAgentModel?.providerId === 'claude'
+        ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
+        : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`;
+
+  // The composer belongs to the focused pane: one thread takes input at a
+  // time and clicking any pane moves it there. Built once, outside the pane
+  // loop, so a six-way split never duplicates the picker/mention machinery.
+  const composerNode = selectedThread ? (
+    <div className="chat-input-area">
+      <AgentFamilySwitcher currentThread={selectedThread} threads={threads} onSelect={selectThread} />
+      <div className="composer-shell">
+        {chatAttachments.length > 0 && (
+          <div className="composer-attachments">
+            {chatAttachments.map((attachment) => (
+              <div key={attachment.id} className="composer-attachment" title={attachment.path}>
+                <AttachmentThumb attachment={attachment} />
+                <span className="composer-attachment-meta">
+                  <span className="composer-attachment-name">{attachment.name}</span>
+                  <span className="composer-attachment-size">
+                    {formatAttachmentSize(attachment.size)}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className="composer-attachment-remove"
+                  onClick={() => removeChatAttachment(attachment.id)}
+                  title="Remove attachment"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {hasPendingLinkedTasks && (
+          <div className="composer-task-row">
+            {pendingLinkedTasks.map((linkedTask) => (
+              <div
+                key={linkedTask.id}
+                className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
+                title={linkedTask.description || linkedTask.title}
+              >
+                <SquareKanban size={13} />
+                <span className="composer-task-title">{linkedTask.title}</span>
+                <span className="composer-task-status">
+                  {linkedTaskStatusLabel(linkedTask.lastStatus)}
+                </span>
+                {linkedTask.lastStatus !== 'done' && !isSending && (
+                  <button
+                    type="button"
+                    className="composer-task-action done"
+                    onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
+                    title="Mark the task as done on the board"
+                  >
+                    <CircleCheck size={13} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="composer-task-action"
+                  onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
+                  title="Unlink task"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {!isTerminalThread && /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
+          <div className="composer-btw-hint">
+            <SquarePen size={12} />
+            <span>
+              {selectedAgentModel?.providerId === 'codex'
+                ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
+                : '/review is only available on Codex agents.'}
+            </span>
+          </div>
+        )}
+        {!isTerminalThread && /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
+          <div className="composer-btw-hint">
+            <Target size={12} />
+            <span>
+              {selectedAgentModel?.providerId === 'codex'
+                ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
+                : '/goal is only available on Codex agents.'}
+            </span>
+          </div>
+        )}
+        {!isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
+          <div className="composer-btw-hint">
+            <Sparkles size={12} />
+            <span>
+              {selectedAgentModel?.providerId === 'claude' ||
+              (isOrionModelId(selectedThread.modelId) &&
+                findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)
+                  ?.providerId === 'claude')
+                ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
+                : '/btw is only available on Claude agents for now.'}
+            </span>
+          </div>
+        )}
+        {selectedAgentModel?.providerId === 'codex' &&
+          /^\/review\s*$/i.test(chatInput.trimStart()) && (
+            <ComposerPopover className="review-popover">
+              <button
+                type="button"
+                role="option"
+                className="mention-row"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() =>
+                  dispatchReview('/review', {
+                    mode: 'uncommitted',
+                  })
+                }
+              >
+                <SquarePen size={14} />
+                <span className="mention-row-label">Review uncommitted changes</span>
+              </button>
+              <button
+                type="button"
+                role="option"
+                className="mention-row"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setChatInput('/review base ')}
+              >
+                <GitBranch size={14} />
+                <span className="mention-row-label">Review against a base branch</span>
+              </button>
+            </ComposerPopover>
+          )}
+        {selectedAgentModel?.providerId === 'codex' &&
+          /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
+            <ComposerPopover className="review-popover">
+              {(gitState?.branches ?? [])
+                .filter((branch) => !branch.current)
+                .slice(0, 12)
+                .map((branch) => (
+                  <button
+                    key={branch.name}
+                    type="button"
+                    role="option"
+                    className="mention-row"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() =>
+                      dispatchReview(`/review base ${branch.name}`, {
+                        mode: 'base',
+                        base: branch.name,
+                      })
+                    }
+                  >
+                    <GitBranch size={14} />
+                    <span className="mention-row-label">{branch.name}</span>
+                  </button>
+                ))}
+              {!(gitState?.branches ?? []).some((branch) => !branch.current) && (
+                <div className="mention-row" aria-disabled="true">
+                  <GitBranch size={14} />
+                  <span className="mention-row-label">No other branches — type a branch name</span>
+                </div>
+              )}
+            </ComposerPopover>
+          )}
+        {chatMentionOpen && (
+          <ComposerPopover>
+            {chatMentionCandidates.map((model, index) => {
+              const ProviderIcon =
+                agentProviders.find((provider) => provider.id === model.providerId)?.icon ?? Play;
+              return (
+                <button
+                  key={model.id}
+                  ref={index === chatMentionIndex ? chatMentionSelectedRef : null}
+                  type="button"
+                  role="option"
+                  aria-selected={index === chatMentionIndex}
+                  className={`mention-row ${index === chatMentionIndex ? 'selected' : ''}`}
+                  onMouseEnter={() => setChatMentionIndex(index)}
+                  // Keep the textarea focused so selection doesn't blur the composer.
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => insertChatMention(model)}
+                  title={modelMentionToken(model, agentModels)}
+                >
+                  <ProviderIcon size={16} />
+                  <span className="mention-row-label">{model.label}</span>
+                  <span className="mention-row-slug">{modelMentionToken(model, agentModels)}</span>
+                </button>
+              );
+            })}
+          </ComposerPopover>
+        )}
+        <textarea
+          ref={setChatInputRef}
+          className="chat-input min-h-[52px]"
+          disabled={isNativeSubagentThread || selectedThreadRiftUnavailable}
+          placeholder={
+            isNativeSubagentThread
+              ? 'Read-only subagent transcript — steer from the parent thread.'
+              : selectedThreadRiftUnavailable
+                ? selectedThreadRiftRemoving
+                  ? 'Removing this epic’s rift workspace…'
+                  : selectedThreadEpic?.riftRequest?.error
+                    ? 'Rift setup needs attention — retry it from the epic view.'
+                    : 'Creating this epic’s rift workspace — one moment…'
+                : isTerminalThread
+                  ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
+                  : isSending
+                    ? steerSupported
+                      ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
+                      : 'Queue a follow-up — sends when the agent finishes (⏎)…'
+                    : chatAttachments.length > 0
+                      ? `Ask something about the attached ${chatAttachments.some(isVideoAttachment) ? 'media' : 'image'}...`
+                      : hasPendingLinkedTasks
+                        ? `Add details (optional) — send starts on the linked ${
+                            pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
+                          }...`
+                        : 'Describe what you want the agent to do...'
+          }
+          value={chatInput}
+          onChange={(e) => {
+            setChatInput(e.target.value);
+            updateChatMention(e.target.value, e.target.selectionStart);
+          }}
+          onKeyDown={handleChatKeyDown}
+          // Caret moves without input still open/close the mention
+          // dropdown. Dropdown-navigation keys are excluded so a
+          // handled keydown can't immediately recompute the token.
+          onKeyUp={(e) => {
+            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
+              updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart);
+            }
+          }}
+          onClick={(e) => updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart)}
+          rows={2}
+        />
+        <div
+          className={`composer-controls${composerControlsCompact ? ' compact' : ''}`}
+          ref={composerControlsRef}
+        >
+          <div className="model-picker-anchor" ref={modelPickerRef}>
+            <button
+              className="model-trigger"
+              onClick={() => {
+                if (!modelPickerOpen) {
+                  const providerId = selectedAgentModel?.providerId;
+                  if (providerId) setActiveProviderTab(providerId);
+                }
+                setModelPickerOpen(!modelPickerOpen);
+              }}
+              disabled={isSending}
+            >
+              {selectedAgentModel &&
+                (() => {
+                  const ProviderIcon =
+                    agentProviders.find((provider) => provider.id === selectedAgentModel.providerId)
+                      ?.icon ?? Play;
+                  return <ProviderIcon size={15} />;
+                })()}
+              <span>{selectedAgentModel?.label ?? 'Select model'}</span>
+              <ChevronDown
+                size={14}
+                className={`model-trigger-chevron ${modelPickerOpen ? 'open' : ''}`}
+              />
+            </button>
+
+            {modelPickerOpen && (
+              <ModelPickerPopover
+                providers={agentProviders}
+                models={visibleAgentModels}
+                activeProviderId={activeProviderTab}
+                onActiveProviderChange={setActiveProviderTab}
+                search={modelSearch}
+                onSearchChange={setModelSearch}
+                selectedModelId={selectedThread.modelId}
+                onSelect={async (model) => {
+                  if (
+                    selectedThread.modelId === claudeCodeCliModelId &&
+                    model.id !== claudeCodeCliModelId
+                  ) {
+                    try {
+                      await window.orion?.terminalKill?.(selectedThread.id);
+                    } catch (error) {
+                      console.error('Could not stop Claude Code terminal', error);
+                    }
+                  }
+                  updateThread(selectedThread.id, {
+                    modelId: model.id,
+                    ...(selectedThread.modelId === claudeCodeCliModelId &&
+                    model.id !== claudeCodeCliModelId
+                      ? { status: 'idle' as const }
+                      : {}),
+                  });
+                  setModelPickerOpen(false);
+                  setModelSearch('');
+                  if (
+                    model.providerId !== 'codex' &&
+                    model.providerId !== 'claude' &&
+                    model.providerId !== 'grok'
+                  ) {
+                    setCodexSettingsOpen(false);
+                  }
+                }}
+                overlay={
+                  activeProviderTab === 'claude' && claudeCodeCliModel ? (
+                    <button
+                      type="button"
+                      className={`model-cli-overlay${
+                        selectedThread.modelId === claudeCodeCliModelId ? ' selected' : ''
+                      }`}
+                      onClick={() => {
+                        if (selectedThread.modelId !== claudeCodeCliModelId) {
+                          updateThread(selectedThread.id, {
+                            modelId: claudeCodeCliModelId,
+                          });
+                        }
+                        setModelPickerOpen(false);
+                        setModelSearch('');
+                      }}
+                      disabled={claudeCodeCliModel.available === false}
+                      title={
+                        claudeCodeCliModel.unavailableReason ??
+                        'Open an interactive Claude Code terminal in this thread'
+                      }
+                    >
+                      <span className="model-cli-overlay-glow" aria-hidden />
+                      <Terminal size={14} strokeWidth={2.25} />
+                      <span className="model-cli-overlay-label">Claude Code CLI</span>
+                      {selectedThread.modelId === claudeCodeCliModelId && (
+                        <Check size={13} strokeWidth={2.5} />
+                      )}
+                    </button>
+                  ) : undefined
+                }
+              />
+            )}
+          </div>
+
+          {composerControlsCompact ? (
+            /* No room for a chip per control: everything but the model picker
+               folds into one menu whose groups expand in place. */
+            <div className="composer-menu-anchor" ref={composerMenuRef}>
+              <button
+                type="button"
+                className={`composer-menu-trigger${composerMenuOpen ? ' open' : ''}`}
+                onClick={() => {
+                  setComposerMenuOpen((open) => !open);
+                  setComposerMenuSection(null);
+                }}
+                aria-haspopup="menu"
+                aria-expanded={composerMenuOpen}
+                aria-label="Composer options"
+                title={`Options — ${agentSettingsSummary} · ${selectedAccessModeLabel}`}
+              >
+                <Menu size={16} />
+                {linkedTaskIds.length > 0 && (
+                  <span className="task-link-count">{linkedTaskIds.length}</span>
+                )}
+              </button>
+
+              {composerMenuOpen &&
+                createPortal(
+                  <div ref={composerMenuPopoverRef} className="composer-menu" role="menu">
+                    {shouldShowAgentSettings && (
+                      <div className="composer-menu-group">
+                        <button
+                          type="button"
+                          className={`composer-menu-row ${composerMenuSection === 'agent' ? 'open' : ''}`}
+                          onClick={() =>
+                            setComposerMenuSection((section) =>
+                              section === 'agent' ? null : 'agent'
+                            )
+                          }
+                          disabled={isSending}
+                        >
+                          <SlidersHorizontal size={14} />
+                          <span className="composer-menu-row-label">
+                            {selectedAgentModel?.providerId === 'claude'
+                              ? 'Reasoning & context'
+                              : selectedAgentModel?.providerId === 'grok'
+                                ? 'Reasoning'
+                                : 'Reasoning & tier'}
+                          </span>
+                          <span className="composer-menu-row-value">{agentSettingsSummary}</span>
+                          <ChevronDown
+                            size={13}
+                            className={`model-trigger-chevron ${
+                              composerMenuSection === 'agent' ? 'open' : ''
+                            }`}
+                          />
+                        </button>
+                        {composerMenuSection === 'agent' && (
+                          <div className="composer-menu-panel">{agentSettingsOptions}</div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="composer-menu-group">
+                      <button
+                        type="button"
+                        className={`composer-menu-row ${composerMenuSection === 'access' ? 'open' : ''}`}
+                        onClick={() =>
+                          setComposerMenuSection((section) =>
+                            section === 'access' ? null : 'access'
+                          )
+                        }
+                        disabled={isSending}
+                      >
+                        <Shield size={14} />
+                        <span className="composer-menu-row-label">Access</span>
+                        <span className="composer-menu-row-value">{selectedAccessModeLabel}</span>
+                        <ChevronDown
+                          size={13}
+                          className={`model-trigger-chevron ${
+                            composerMenuSection === 'access' ? 'open' : ''
+                          }`}
+                        />
+                      </button>
+                      {composerMenuSection === 'access' && (
+                        <div className="composer-menu-panel">{accessModeList}</div>
+                      )}
+                    </div>
+
+                    {!isTerminalThread && (
+                      <div className="composer-menu-group">
+                        <button
+                          type="button"
+                          className={`composer-menu-row ${composerMenuSection === 'tasks' ? 'open' : ''}`}
+                          onClick={() =>
+                            setComposerMenuSection((section) =>
+                              section === 'tasks' ? null : 'tasks'
+                            )
+                          }
+                          title={linkedTasksLabel}
+                        >
+                          <SquareKanban size={14} />
+                          <span className="composer-menu-row-label">Board tasks</span>
+                          <span className="composer-menu-row-value">
+                            {linkedTaskIds.length > 0 ? `${linkedTaskIds.length} linked` : 'None'}
+                          </span>
+                          <ChevronDown
+                            size={13}
+                            className={`model-trigger-chevron ${
+                              composerMenuSection === 'tasks' ? 'open' : ''
+                            }`}
+                          />
+                        </button>
+                        {composerMenuSection === 'tasks' && (
+                          <div className="composer-menu-panel embedded-picker">
+                            <TaskPickerPopover
+                              linkedTaskIds={linkedTaskIds}
+                              authenticated={accountState.authenticated}
+                              onSignIn={() => void handleStartAccountAuth()}
+                              onPick={toggleTaskOnSelectedThread}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>,
+                  document.body
+                )}
+            </div>
+          ) : (
+            <>
+              {shouldShowAgentSettings && (
+                <div className="codex-settings-anchor" ref={codexSettingsRef}>
+                  <button
+                    className="codex-settings-trigger"
+                    onClick={() => setCodexSettingsOpen((open) => !open)}
+                    disabled={isSending}
+                    title={
+                      selectedAgentModel?.providerId === 'claude'
+                        ? 'Claude reasoning and context window'
+                        : selectedAgentModel?.providerId === 'grok'
+                          ? 'Grok reasoning effort'
+                          : 'Codex reasoning and service tier'
+                    }
+                  >
+                    <span>
+                      {selectedAgentModel?.providerId === 'claude'
+                        ? selectedClaudeReasoningLabel
+                        : selectedAgentModel?.providerId === 'grok'
+                          ? selectedGrokReasoningLabel
+                          : selectedCodexReasoningLabel}
+                    </span>
+                    {selectedAgentModel?.providerId !== 'grok' && (
+                      <>
+                        <span className="control-dot">·</span>
+                        <span>
+                          {selectedAgentModel?.providerId === 'claude'
+                            ? selectedClaudeContextWindowLabel
+                            : selectedCodexServiceTierLabel}
+                        </span>
+                      </>
+                    )}
+                    <ChevronDown
+                      size={14}
+                      className={`model-trigger-chevron ${codexSettingsOpen ? 'open' : ''}`}
+                    />
+                  </button>
+
+                  {codexSettingsOpen && (
+                    <div className="codex-settings-popover">{agentSettingsOptions}</div>
+                  )}
+                </div>
+              )}
+
+              <div className="access-mode-anchor" ref={accessModeRef}>
+                <button
+                  type="button"
+                  className="access-select"
+                  onClick={() => setAccessModeOpen((open) => !open)}
+                  disabled={isSending}
+                  title="Access level"
+                >
+                  <Shield size={15} />
+                  <span>{selectedAccessModeLabel}</span>
+                  <ChevronDown
+                    size={13}
+                    className={`model-trigger-chevron ${accessModeOpen ? 'open' : ''}`}
+                  />
+                </button>
+
+                {accessModeOpen && !isSending && (
+                  <div className="access-mode-popover">{accessModeList}</div>
+                )}
+              </div>
+
+              {!isTerminalThread && (
+                <div className="task-picker-anchor" ref={taskPickerRef}>
+                  <button
+                    className={`model-trigger task-link-trigger ${linkedTaskIds.length > 0 ? 'linked' : ''}`}
+                    onClick={() => setTaskPickerOpen((open) => !open)}
+                    title={linkedTasksLabel}
+                    aria-label={linkedTasksLabel}
+                  >
+                    <SquareKanban size={15} />
+                    {linkedTaskIds.length > 1 && (
+                      <span className="task-link-count">{linkedTaskIds.length}</span>
+                    )}
+                  </button>
+                  {taskPickerOpen && (
+                    <TaskPickerPopover
+                      linkedTaskIds={linkedTaskIds}
+                      authenticated={accountState.authenticated}
+                      onSignIn={() => void handleStartAccountAuth()}
+                      onPick={toggleTaskOnSelectedThread}
+                    />
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
+          {isSending ? (
+            <>
+              {(chatInput.trim() || chatAttachments.length > 0) && (
+                <>
+                  <button
+                    className="send-button"
+                    onClick={sendMessage}
+                    title="Queue — sends when the current run finishes (⏎)"
+                  >
+                    <ListPlus size={15} />
+                  </button>
+                  {steerSupported && (
+                    <button
+                      className="send-button steer"
+                      onClick={steerActiveAgent}
+                      disabled={!steerReady}
+                      title={
+                        steerReady
+                          ? 'Steer — interrupt the agent and redirect it now (⌘⏎)'
+                          : 'Steer becomes available once the agent reports its session'
+                      }
+                    >
+                      <Zap size={14} />
+                    </button>
+                  )}
+                </>
+              )}
+              <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
+                <Square size={14} fill="currentColor" />
+              </button>
+            </>
+          ) : (
+            <button
+              className="send-button"
+              onClick={sendMessage}
+              disabled={
+                (!chatInput.trim() && chatAttachments.length === 0 && !hasPendingLinkedTasks) ||
+                selectedAgentModel?.available === false
+              }
+              title="Send"
+            >
+              <ArrowUp size={16} strokeWidth={2.5} />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  ) : null;
 
   return (
     <div
@@ -8382,8 +9577,25 @@ const App: React.FC = () => {
               <AgentsSidebar {...agentsSidebarModel} />
 
               {/* Main Panel: Thread view */}
-              <div className="panel agents-panel">
-                {!selectedThread && selectedEpic ? (
+              <div
+                className={`panel agents-panel${threadDropActive ? ' thread-drop-active' : ''}`}
+                onDragOver={handleThreadDragOver}
+                onDragLeave={handleThreadDragLeave}
+                onDrop={handleThreadDrop}
+              >
+                {threadDropActive && (
+                  <div className={`thread-drop-hint${splitFull ? ' full' : ''}`}>
+                    <Columns3 size={18} />
+                    <span>
+                      {splitFull
+                        ? `Split view is full — ${MAX_THREAD_PANES} panes is the limit`
+                        : threadPanes.length === 0
+                          ? 'Drop to open this thread'
+                          : 'Drop to open beside the current view'}
+                    </span>
+                  </div>
+                )}
+                {threadPanes.length === 0 && selectedEpic ? (
                   <div className="epic-view">
                     <div className="epic-view-header">
                       <div
@@ -8756,7 +9968,7 @@ const App: React.FC = () => {
                       )}
                     </div>
                   </div>
-                ) : !selectedThread ? (
+                ) : threadPanes.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-state-icon">
                       <Bot size={30} />
@@ -8773,718 +9985,77 @@ const App: React.FC = () => {
                     )}
                   </div>
                 ) : (
-                  <>
-                    <div className="panel-content">
-                      {isTerminalThread ? (
-                        // Mounting spawns the CLI: hold off until the epic's
-                        // rift exists so the terminal never opens in the source
-                        // repository and then has to move.
-                        selectedThreadRiftUnavailable ? (
-                          <div className="terminal-view" />
-                        ) : (
-                          <React.Suspense fallback={<div className="terminal-view" />}>
-                            <TerminalView
-                              key={selectedThread.id}
-                              threadId={selectedThread.id}
-                              epicId={selectedThread.epicId}
-                              projectPath={selectedThreadProjectPath ?? ''}
-                              accessMode={selectedThread.accessMode ?? 'full-access'}
-                              resumeSessionId={selectedThread.agentSessionIds?.claude}
-                              forkSession={selectedThread.pendingForkProviders?.includes('claude')}
-                            />
-                          </React.Suspense>
-                        )
-                      ) : (
-                        <>
-                          <ChatTranscript
-                            threadId={selectedThread.id}
-                            projectName={selectedThreadProject?.name}
-                            projects={projects}
-                            canChangeProject={canChangeSelectedThreadProject}
-                            onSelectProject={handleChangeSelectedThreadProject}
-                            onAddProject={handleAddProject}
-                            mediaBaseDirs={mediaBaseDirs}
-                            isSending={isSending}
-                            steerSupported={steerSupported}
-                            steerReady={steerReady}
-                            authenticatingProviderId={authenticatingProviderId}
-                            chatScrollRef={chatScrollRef}
-                            chatEndRef={chatEndRef}
-                            chatPinnedRef={chatPinnedRef}
-                            chatScrollTopRef={chatScrollTopRef}
-                            chatScrollPositionsRef={chatScrollPositionsRef}
-                            tasksCardPosition={tasksCardPosition}
-                            tasksCardCollapsed={tasksCardCollapsed}
-                            tasksCardDismissedFor={tasksCardDismissedFor}
-                            onMoveTasksCard={setTasksCardPosition}
-                            onToggleTasksCard={toggleTasksCard}
-                            onDismissTasksCard={dismissTasksCard}
-                            onMarkTaskDone={markLinkedTaskDone}
-                            onUnlinkTask={unlinkTaskFromThread}
-                            onDismissBtwExchange={dismissBtwExchange}
-                            onAuthenticateProvider={handleAuthenticateProvider}
-                            onSteerQueuedMessage={steerQueuedMessage}
-                          />
-                        </>
-                      )}
-
-                      <div className="chat-input-area">
-                        <AgentFamilySwitcher currentThread={selectedThread} threads={threads} onSelect={selectThread} />
-                        <div className="composer-shell">
-                          {chatAttachments.length > 0 && (
-                            <div className="composer-attachments">
-                              {chatAttachments.map((attachment) => (
-                                <div key={attachment.id} className="composer-attachment" title={attachment.path}>
-                                  <AttachmentThumb attachment={attachment} />
-                                  <span className="composer-attachment-meta">
-                                    <span className="composer-attachment-name">{attachment.name}</span>
-                                    <span className="composer-attachment-size">
-                                      {formatAttachmentSize(attachment.size)}
-                                    </span>
-                                  </span>
-                                  <button
-                                    type="button"
-                                    className="composer-attachment-remove"
-                                    onClick={() => removeChatAttachment(attachment.id)}
-                                    title="Remove attachment"
-                                  >
-                                    <X size={13} />
-                                  </button>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                          {hasPendingLinkedTasks && (
-                            <div className="composer-task-row">
-                              {pendingLinkedTasks.map((linkedTask) => (
-                                <div
-                                  key={linkedTask.id}
-                                  className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
-                                  title={linkedTask.description || linkedTask.title}
-                                >
-                                  <SquareKanban size={13} />
-                                  <span className="composer-task-title">{linkedTask.title}</span>
-                                  <span className="composer-task-status">
-                                    {linkedTaskStatusLabel(linkedTask.lastStatus)}
-                                  </span>
-                                  {linkedTask.lastStatus !== 'done' && !isSending && (
-                                    <button
-                                      type="button"
-                                      className="composer-task-action done"
-                                      onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
-                                      title="Mark the task as done on the board"
-                                    >
-                                      <CircleCheck size={13} />
-                                    </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    className="composer-task-action"
-                                    onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
-                                    title="Unlink task"
-                                  >
-                                    <X size={12} />
-                                  </button>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                          {!isTerminalThread && /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
-                            <div className="composer-btw-hint">
-                              <SquarePen size={12} />
-                              <span>
-                                {selectedAgentModel?.providerId === 'codex'
-                                  ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
-                                  : '/review is only available on Codex agents.'}
-                              </span>
-                            </div>
-                          )}
-                          {!isTerminalThread && /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
-                            <div className="composer-btw-hint">
-                              <Target size={12} />
-                              <span>
-                                {selectedAgentModel?.providerId === 'codex'
-                                  ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
-                                  : '/goal is only available on Codex agents.'}
-                              </span>
-                            </div>
-                          )}
-                          {!isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
-                            <div className="composer-btw-hint">
-                              <Sparkles size={12} />
-                              <span>
-                                {selectedAgentModel?.providerId === 'claude' ||
-                                (isOrionModelId(selectedThread.modelId) &&
-                                  findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)
-                                    ?.providerId === 'claude')
-                                  ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
-                                  : '/btw is only available on Claude agents for now.'}
-                              </span>
-                            </div>
-                          )}
-                          {selectedAgentModel?.providerId === 'codex' &&
-                            /^\/review\s*$/i.test(chatInput.trimStart()) && (
-                              <ComposerPopover className="review-popover">
-                                <button
-                                  type="button"
-                                  role="option"
-                                  className="mention-row"
-                                  onMouseDown={(e) => e.preventDefault()}
-                                  onClick={() =>
-                                    dispatchReview('/review', {
-                                      mode: 'uncommitted',
-                                    })
-                                  }
-                                >
-                                  <SquarePen size={14} />
-                                  <span className="mention-row-label">Review uncommitted changes</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  role="option"
-                                  className="mention-row"
-                                  onMouseDown={(e) => e.preventDefault()}
-                                  onClick={() => setChatInput('/review base ')}
-                                >
-                                  <GitBranch size={14} />
-                                  <span className="mention-row-label">Review against a base branch</span>
-                                </button>
-                              </ComposerPopover>
-                            )}
-                          {selectedAgentModel?.providerId === 'codex' &&
-                            /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
-                              <ComposerPopover className="review-popover">
-                                {(gitState?.branches ?? [])
-                                  .filter((branch) => !branch.current)
-                                  .slice(0, 12)
-                                  .map((branch) => (
-                                    <button
-                                      key={branch.name}
-                                      type="button"
-                                      role="option"
-                                      className="mention-row"
-                                      onMouseDown={(e) => e.preventDefault()}
-                                      onClick={() =>
-                                        dispatchReview(`/review base ${branch.name}`, {
-                                          mode: 'base',
-                                          base: branch.name,
-                                        })
-                                      }
-                                    >
-                                      <GitBranch size={14} />
-                                      <span className="mention-row-label">{branch.name}</span>
-                                    </button>
-                                  ))}
-                                {!(gitState?.branches ?? []).some((branch) => !branch.current) && (
-                                  <div className="mention-row" aria-disabled="true">
-                                    <GitBranch size={14} />
-                                    <span className="mention-row-label">No other branches — type a branch name</span>
-                                  </div>
-                                )}
-                              </ComposerPopover>
-                            )}
-                          {chatMentionOpen && (
-                            <ComposerPopover>
-                              {chatMentionCandidates.map((model, index) => {
-                                const ProviderIcon =
-                                  agentProviders.find((provider) => provider.id === model.providerId)?.icon ?? Play;
-                                return (
-                                  <button
-                                    key={model.id}
-                                    ref={index === chatMentionIndex ? chatMentionSelectedRef : null}
-                                    type="button"
-                                    role="option"
-                                    aria-selected={index === chatMentionIndex}
-                                    className={`mention-row ${index === chatMentionIndex ? 'selected' : ''}`}
-                                    onMouseEnter={() => setChatMentionIndex(index)}
-                                    // Keep the textarea focused so selection doesn't blur the composer.
-                                    onMouseDown={(e) => e.preventDefault()}
-                                    onClick={() => insertChatMention(model)}
-                                    title={modelMentionToken(model, agentModels)}
-                                  >
-                                    <ProviderIcon size={16} />
-                                    <span className="mention-row-label">{model.label}</span>
-                                    <span className="mention-row-slug">{modelMentionToken(model, agentModels)}</span>
-                                  </button>
-                                );
-                              })}
-                            </ComposerPopover>
-                          )}
-                          <textarea
-                            ref={setChatInputRef}
-                            className="chat-input min-h-[52px]"
-                            disabled={isNativeSubagentThread || selectedThreadRiftUnavailable}
-                            placeholder={
-                              isNativeSubagentThread
-                                ? 'Read-only subagent transcript — steer from the parent thread.'
-                                : selectedThreadRiftUnavailable
-                                  ? selectedThreadRiftRemoving
-                                    ? 'Removing this epic’s rift workspace…'
-                                    : selectedThreadEpic?.riftRequest?.error
-                                      ? 'Rift setup needs attention — retry it from the epic view.'
-                                      : 'Creating this epic’s rift workspace — one moment…'
-                                  : isTerminalThread
-                                    ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
-                                    : isSending
-                                      ? steerSupported
-                                        ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
-                                        : 'Queue a follow-up — sends when the agent finishes (⏎)…'
-                                      : chatAttachments.length > 0
-                                        ? `Ask something about the attached ${chatAttachments.some(isVideoAttachment) ? 'media' : 'image'}...`
-                                        : hasPendingLinkedTasks
-                                          ? `Add details (optional) — send starts on the linked ${
-                                              pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
-                                            }...`
-                                          : 'Describe what you want the agent to do...'
-                            }
-                            value={chatInput}
-                            onChange={(e) => {
-                              setChatInput(e.target.value);
-                              updateChatMention(e.target.value, e.target.selectionStart);
-                            }}
-                            onKeyDown={handleChatKeyDown}
-                            // Caret moves without input still open/close the mention
-                            // dropdown. Dropdown-navigation keys are excluded so a
-                            // handled keydown can't immediately recompute the token.
-                            onKeyUp={(e) => {
-                              if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
-                                updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart);
-                              }
-                            }}
-                            onClick={(e) => updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart)}
-                            rows={2}
-                          />
-                          <div className="composer-controls">
-                            <div className="model-picker-anchor" ref={modelPickerRef}>
-                              <button
-                                className="model-trigger"
-                                onClick={() => {
-                                  if (!modelPickerOpen) {
-                                    const providerId = selectedAgentModel?.providerId;
-                                    if (providerId) setActiveProviderTab(providerId);
-                                  }
-                                  setModelPickerOpen(!modelPickerOpen);
-                                }}
-                                disabled={isSending}
-                              >
-                                {selectedAgentModel &&
-                                  (() => {
-                                    const ProviderIcon =
-                                      agentProviders.find((provider) => provider.id === selectedAgentModel.providerId)
-                                        ?.icon ?? Play;
-                                    return <ProviderIcon size={15} />;
-                                  })()}
-                                <span>{selectedAgentModel?.label ?? 'Select model'}</span>
-                                <ChevronDown
-                                  size={14}
-                                  className={`model-trigger-chevron ${modelPickerOpen ? 'open' : ''}`}
-                                />
-                              </button>
-
-                              {modelPickerOpen && (
-                                <ModelPickerPopover
-                                  providers={agentProviders}
-                                  models={visibleAgentModels}
-                                  activeProviderId={activeProviderTab}
-                                  onActiveProviderChange={setActiveProviderTab}
-                                  search={modelSearch}
-                                  onSearchChange={setModelSearch}
-                                  selectedModelId={selectedThread.modelId}
-                                  onSelect={async (model) => {
-                                    if (
-                                      selectedThread.modelId === claudeCodeCliModelId &&
-                                      model.id !== claudeCodeCliModelId
-                                    ) {
-                                      try {
-                                        await window.orion?.terminalKill?.(selectedThread.id);
-                                      } catch (error) {
-                                        console.error('Could not stop Claude Code terminal', error);
-                                      }
-                                    }
-                                    updateThread(selectedThread.id, {
-                                      modelId: model.id,
-                                      ...(selectedThread.modelId === claudeCodeCliModelId &&
-                                      model.id !== claudeCodeCliModelId
-                                        ? { status: 'idle' as const }
-                                        : {}),
-                                    });
-                                    setModelPickerOpen(false);
-                                    setModelSearch('');
-                                    if (
-                                      model.providerId !== 'codex' &&
-                                      model.providerId !== 'claude' &&
-                                      model.providerId !== 'grok'
-                                    ) {
-                                      setCodexSettingsOpen(false);
-                                    }
-                                  }}
-                                  overlay={
-                                    activeProviderTab === 'claude' && claudeCodeCliModel ? (
-                                      <button
-                                        type="button"
-                                        className={`model-cli-overlay${
-                                          selectedThread.modelId === claudeCodeCliModelId ? ' selected' : ''
-                                        }`}
-                                        onClick={() => {
-                                          if (selectedThread.modelId !== claudeCodeCliModelId) {
-                                            updateThread(selectedThread.id, {
-                                              modelId: claudeCodeCliModelId,
-                                            });
-                                          }
-                                          setModelPickerOpen(false);
-                                          setModelSearch('');
-                                        }}
-                                        disabled={claudeCodeCliModel.available === false}
-                                        title={
-                                          claudeCodeCliModel.unavailableReason ??
-                                          'Open an interactive Claude Code terminal in this thread'
-                                        }
-                                      >
-                                        <span className="model-cli-overlay-glow" aria-hidden />
-                                        <Terminal size={14} strokeWidth={2.25} />
-                                        <span className="model-cli-overlay-label">Claude Code CLI</span>
-                                        {selectedThread.modelId === claudeCodeCliModelId && (
-                                          <Check size={13} strokeWidth={2.5} />
-                                        )}
-                                      </button>
-                                    ) : undefined
-                                  }
-                                />
-                              )}
-                            </div>
-
-                            {shouldShowAgentSettings && (
-                              <div className="codex-settings-anchor" ref={codexSettingsRef}>
-                                <button
-                                  className="codex-settings-trigger"
-                                  onClick={() => setCodexSettingsOpen((open) => !open)}
-                                  disabled={isSending}
-                                  title={
-                                    selectedAgentModel?.providerId === 'claude'
-                                      ? 'Claude reasoning and context window'
-                                      : selectedAgentModel?.providerId === 'grok'
-                                        ? 'Grok reasoning effort'
-                                        : 'Codex reasoning and service tier'
-                                  }
-                                >
-                                  <span>
-                                    {selectedAgentModel?.providerId === 'claude'
-                                      ? selectedClaudeReasoningLabel
-                                      : selectedAgentModel?.providerId === 'grok'
-                                        ? selectedGrokReasoningLabel
-                                        : selectedCodexReasoningLabel}
-                                  </span>
-                                  {selectedAgentModel?.providerId !== 'grok' && (
-                                    <>
-                                      <span className="control-dot">·</span>
-                                      <span>
-                                        {selectedAgentModel?.providerId === 'claude'
-                                          ? selectedClaudeContextWindowLabel
-                                          : selectedCodexServiceTierLabel}
-                                      </span>
-                                    </>
-                                  )}
-                                  <ChevronDown
-                                    size={14}
-                                    className={`model-trigger-chevron ${codexSettingsOpen ? 'open' : ''}`}
-                                  />
-                                </button>
-
-                                {codexSettingsOpen && (
-                                  <div className="codex-settings-popover">
-                                    {selectedAgentModel?.providerId === 'grok' ? (
-                                      <div className="codex-settings-section">
-                                        <div className="codex-settings-heading">Reasoning</div>
-                                        <div className="codex-settings-options">
-                                          {grokReasoningOptions.map((option) => {
-                                            const selected = selectedGrokReasoning === option.value;
-                                            return (
-                                              <button
-                                                key={option.value}
-                                                className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                                onClick={() =>
-                                                  updateThread(selectedThread.id, {
-                                                    grokReasoningEffort: option.value as GrokReasoningEffort,
-                                                  })
-                                                }
-                                              >
-                                                <span className="settings-check">
-                                                  {selected && <Check size={17} />}
-                                                </span>
-                                                <span>
-                                                  {option.label}
-                                                  {option.default ? ' (default)' : ''}
-                                                  {option.description && (
-                                                    <span className="codex-settings-row-description">
-                                                      {option.description}
-                                                    </span>
-                                                  )}
-                                                </span>
-                                              </button>
-                                            );
-                                          })}
-                                        </div>
-                                      </div>
-                                    ) : selectedAgentModel?.providerId === 'claude' ? (
-                                      <>
-                                        <div className="codex-settings-section">
-                                          <div className="codex-settings-heading">Reasoning</div>
-                                          <div className="codex-settings-options">
-                                            {claudeReasoningOptions.map((option) => {
-                                              const selected = selectedClaudeReasoning === option.value;
-                                              const isDefault = option.value === selectedClaudeDefaultReasoning;
-                                              return (
-                                                <button
-                                                  key={option.value}
-                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                                  onClick={() =>
-                                                    updateThread(selectedThread.id, {
-                                                      claudeReasoningEffort: option.value as ClaudeReasoningEffort,
-                                                    })
-                                                  }
-                                                >
-                                                  <span className="settings-check">
-                                                    {selected && <Check size={17} />}
-                                                  </span>
-                                                  <span>
-                                                    {option.label}
-                                                    {isDefault ? ' (default)' : ''}
-                                                  </span>
-                                                </button>
-                                              );
-                                            })}
-                                          </div>
-                                        </div>
-
-                                        <div className="codex-settings-divider" />
-
-                                        <div className="codex-settings-section">
-                                          <div className="codex-settings-heading">Context Window</div>
-                                          <div className="codex-settings-options">
-                                            {claudeContextWindowOptions.map((option) => {
-                                              const selected = effectiveClaudeContextWindow === option.value;
-                                              const oneMillionOnly =
-                                                !!selectedAgentModel &&
-                                                claudeOneMillionOnlyModelSlugs.has(selectedAgentModel.slug);
-                                              const disabled = oneMillionOnly && option.value === '200k';
-                                              return (
-                                                <button
-                                                  key={option.value}
-                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                                  onClick={() =>
-                                                    updateThread(selectedThread.id, {
-                                                      claudeContextWindow: option.value as ClaudeContextWindow,
-                                                    })
-                                                  }
-                                                  disabled={disabled}
-                                                  title={
-                                                    disabled && selectedAgentModel
-                                                      ? `${selectedAgentModel.label} always uses 1M context`
-                                                      : undefined
-                                                  }
-                                                >
-                                                  <span className="settings-check">
-                                                    {selected && <Check size={17} />}
-                                                  </span>
-                                                  <span>
-                                                    {option.label}
-                                                    {option.value === defaultClaudeContextWindow && !oneMillionOnly
-                                                      ? ' (default)'
-                                                      : ''}
-                                                  </span>
-                                                </button>
-                                              );
-                                            })}
-                                          </div>
-                                        </div>
-                                      </>
-                                    ) : (
-                                      <>
-                                        <div className="codex-settings-section">
-                                          <div className="codex-settings-heading">Reasoning</div>
-                                          <div className="codex-settings-options">
-                                            {selectedCodexReasoningOptions.map((option) => {
-                                              const selected = selectedCodexReasoning === option.value;
-                                              return (
-                                                <button
-                                                  key={option.value}
-                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                                  onClick={() =>
-                                                    updateThread(selectedThread.id, {
-                                                      codexReasoningEffort: option.value as CodexReasoningEffort,
-                                                    })
-                                                  }
-                                                >
-                                                  <span className="settings-check">
-                                                    {selected && <Check size={17} />}
-                                                  </span>
-                                                  <span>
-                                                    {option.label}
-                                                    {option.default ? ' (default)' : ''}
-                                                    {option.description && (
-                                                      <span className="codex-settings-row-description">
-                                                        {option.description}
-                                                      </span>
-                                                    )}
-                                                  </span>
-                                                </button>
-                                              );
-                                            })}
-                                          </div>
-                                        </div>
-
-                                        <div className="codex-settings-divider" />
-
-                                        <div className="codex-settings-section">
-                                          <div className="codex-settings-heading">Service Tier</div>
-                                          <div className="codex-settings-options">
-                                            {codexServiceTierOptions.map((option) => {
-                                              const selected = selectedCodexServiceTier === option.value;
-                                              return (
-                                                <button
-                                                  key={option.value}
-                                                  className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                                  onClick={() =>
-                                                    updateThread(selectedThread.id, {
-                                                      codexServiceTier: option.value as CodexServiceTier,
-                                                    })
-                                                  }
-                                                >
-                                                  <span className="settings-check">
-                                                    {selected && <Check size={17} />}
-                                                  </span>
-                                                  <span>
-                                                    {option.label}
-                                                    {option.default ? ' (default)' : ''}
-                                                  </span>
-                                                </button>
-                                              );
-                                            })}
-                                          </div>
-                                        </div>
-                                      </>
-                                    )}
-                                  </div>
-                                )}
-                              </div>
-                            )}
-
-                            <div className="access-mode-anchor" ref={accessModeRef}>
-                              <button
-                                type="button"
-                                className="access-select"
-                                onClick={() => setAccessModeOpen((open) => !open)}
-                                disabled={isSending}
-                                title="Access level"
-                              >
-                                <Shield size={15} />
-                                <span>{selectedAccessModeLabel}</span>
-                                <ChevronDown
-                                  size={13}
-                                  className={`model-trigger-chevron ${accessModeOpen ? 'open' : ''}`}
-                                />
-                              </button>
-
-                              {accessModeOpen && !isSending && (
-                                <div className="access-mode-popover">
-                                  <div className="codex-settings-options">
-                                    {accessModeOptions.map((option) => {
-                                      const selected = selectedAccessMode === option.value;
-                                      return (
-                                        <button
-                                          key={option.value}
-                                          type="button"
-                                          className={`codex-settings-row ${selected ? 'selected' : ''}`}
-                                          onClick={() => {
-                                            updateThread(selectedThread.id, {
-                                              accessMode: option.value,
-                                            });
-                                            setAccessModeOpen(false);
-                                          }}
-                                        >
-                                          <span className="settings-check">{selected && <Check size={17} />}</span>
-                                          <span>{option.label}</span>
-                                        </button>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-
-                            {!isTerminalThread && (
-                              <div className="task-picker-anchor" ref={taskPickerRef}>
-                                <button
-                                  className={`model-trigger task-link-trigger ${linkedTaskIds.length > 0 ? 'linked' : ''}`}
-                                  onClick={() => setTaskPickerOpen((open) => !open)}
-                                  title={linkedTasksLabel}
-                                  aria-label={linkedTasksLabel}
-                                >
-                                  <SquareKanban size={15} />
-                                  {linkedTaskIds.length > 1 && (
-                                    <span className="task-link-count">{linkedTaskIds.length}</span>
-                                  )}
-                                </button>
-                                {taskPickerOpen && (
-                                  <TaskPickerPopover
-                                    linkedTaskIds={linkedTaskIds}
-                                    authenticated={accountState.authenticated}
-                                    onSignIn={() => void handleStartAccountAuth()}
-                                    onPick={toggleTaskOnSelectedThread}
-                                  />
-                                )}
-                              </div>
-                            )}
-
-                            {isSending ? (
-                              <>
-                                {(chatInput.trim() || chatAttachments.length > 0) && (
-                                  <>
-                                    <button
-                                      className="send-button"
-                                      onClick={sendMessage}
-                                      title="Queue — sends when the current run finishes (⏎)"
-                                    >
-                                      <ListPlus size={15} />
-                                    </button>
-                                    {steerSupported && (
-                                      <button
-                                        className="send-button steer"
-                                        onClick={steerActiveAgent}
-                                        disabled={!steerReady}
-                                        title={
-                                          steerReady
-                                            ? 'Steer — interrupt the agent and redirect it now (⌘⏎)'
-                                            : 'Steer becomes available once the agent reports its session'
-                                        }
-                                      >
-                                        <Zap size={14} />
-                                      </button>
-                                    )}
-                                  </>
-                                )}
-                                <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
-                                  <Square size={14} fill="currentColor" />
-                                </button>
-                              </>
+                  <div className={`thread-panes count-${threadPanes.length}`}>
+                    {threadPanes.map((pane) => {
+                      const tasksCardState = tasksCardStates[pane.thread.id] ?? {
+                        position: null,
+                        collapsed: false,
+                        dismissedFor: null,
+                      };
+                      return (
+                        <ThreadPane
+                          key={pane.thread.id}
+                          thread={pane.thread}
+                          project={pane.project}
+                          focused={pane.focused}
+                          split={threadPanes.length > 1}
+                          onFocus={() => selectThread(pane.thread.id)}
+                          onClose={() => closeThreadPane(pane.thread.id)}
+                          statusDot={renderThreadStatusDot(pane.thread)}
+                        >
+                          {pane.isTerminal ? (
+                            // Mounting spawns the CLI: hold off until the epic's
+                            // rift exists so the terminal never opens in the source
+                            // repository and then has to move.
+                            pane.riftUnavailable ? (
+                              <div className="terminal-view" />
                             ) : (
-                              <button
-                                className="send-button"
-                                onClick={sendMessage}
-                                disabled={
-                                  (!chatInput.trim() && chatAttachments.length === 0 && !hasPendingLinkedTasks) ||
-                                  selectedAgentModel?.available === false
-                                }
-                                title="Send"
-                              >
-                                <ArrowUp size={16} strokeWidth={2.5} />
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </>
+                              <React.Suspense fallback={<div className="terminal-view" />}>
+                                <TerminalView
+                                  key={pane.thread.id}
+                                  threadId={pane.thread.id}
+                                  epicId={pane.thread.epicId}
+                                  projectPath={pane.projectPath ?? ''}
+                                  accessMode={pane.thread.accessMode ?? 'full-access'}
+                                  focused={pane.focused}
+                                  resumeSessionId={pane.thread.agentSessionIds?.claude}
+                                  forkSession={pane.thread.pendingForkProviders?.includes('claude')}
+                                />
+                              </React.Suspense>
+                            )
+                          ) : (
+                            <ChatTranscript
+                              threadId={pane.thread.id}
+                              projectName={pane.project?.name}
+                              projects={projects}
+                              canChangeProject={pane.canChangeProject}
+                              onSelectProject={handleChangeSelectedThreadProject}
+                              onAddProject={handleAddProject}
+                              mediaBaseDirs={pane.mediaBaseDirs}
+                              isSending={pane.isSending}
+                              steerSupported={pane.steerSupported}
+                              steerReady={pane.steerReady}
+                              authenticatingProviderId={authenticatingProviderId}
+                              {...paneChatRefs(pane.thread.id)}
+                              chatScrollPositionsRef={chatScrollPositionsRef}
+                              tasksCardPosition={tasksCardState.position}
+                              tasksCardCollapsed={tasksCardState.collapsed}
+                              tasksCardDismissedFor={tasksCardState.dismissedFor}
+                              onMoveTasksCard={moveTasksCard}
+                              onToggleTasksCard={toggleTasksCard}
+                              onDismissTasksCard={dismissTasksCard}
+                              onMarkTaskDone={markLinkedTaskDone}
+                              onUnlinkTask={unlinkTaskFromThread}
+                              onDismissBtwExchange={dismissBtwExchange}
+                              onAuthenticateProvider={handleAuthenticateProvider}
+                              onSteerQueuedMessage={steerQueuedMessage}
+                            />
+                          )}
+                          {pane.focused ? composerNode : null}
+                        </ThreadPane>
+                      );
+                    })}
+                  </div>
                 )}
               </div>
             </>

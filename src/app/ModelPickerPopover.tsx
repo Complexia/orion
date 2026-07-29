@@ -88,6 +88,120 @@ export const ModelPickerPopover = ({
     setFlipped(overflowsBelow && roomAbove >= rect.height);
   }, [placement]);
 
+  // The panel is several times wider than its trigger, so where the trigger
+  // sits inside a narrow, clipping box — the composer of a split pane, which
+  // hides its overflow — CSS placement either runs off the window or is cut off
+  // at the pane edge. In that case only, pin the panel to the window instead:
+  // `fixed` escapes the pane's clip, and the offsets keep it beside its trigger.
+  // A picker that already fits (full-width composer, Settings) is left exactly
+  // as its CSS placed it, inline styles and all untouched.
+  useLayoutEffect(() => {
+    const popover = popoverRef.current;
+    const anchor = popover?.parentElement;
+    if (!popover || !anchor) return undefined;
+
+    const fit = () => {
+      // Always measure the CSS placement, never a corrected one: a window
+      // resized back to roomy then drops the correction instead of drifting.
+      popover.style.position = '';
+      popover.style.left = '';
+      popover.style.right = '';
+      popover.style.top = '';
+      popover.style.bottom = '';
+      popover.style.width = '';
+      popover.style.minWidth = '';
+      popover.style.height = '';
+
+      const margin = 12;
+      // offsetWidth/offsetLeft, not the bounding rect: the open animation
+      // scales the box, so a rect read mid-animation measures short.
+      const width = popover.offsetWidth;
+      const height = popover.offsetHeight;
+      const anchorRect = anchor.getBoundingClientRect();
+      const naturalLeft = anchorRect.left + popover.offsetLeft;
+      const naturalTop = anchorRect.top + popover.offsetTop;
+
+      // How much horizontal room the panel actually has where it is: the window
+      // narrowed by every ancestor that hides its overflow.
+      let clipLeft = 0;
+      let clipRight = window.innerWidth;
+      let clipTop = 0;
+      let clipBottom = window.innerHeight;
+      for (let node = anchor; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        if (style.overflowX !== 'visible') {
+          clipLeft = Math.max(clipLeft, rect.left);
+          clipRight = Math.min(clipRight, rect.right);
+        }
+        if (style.overflowY !== 'visible') {
+          clipTop = Math.max(clipTop, rect.top);
+          clipBottom = Math.min(clipBottom, rect.bottom);
+        }
+      }
+
+      if (
+        naturalLeft >= clipLeft - 0.5 &&
+        naturalLeft + width <= clipRight + 0.5 &&
+        naturalTop >= clipTop - 0.5 &&
+        naturalTop + height <= clipBottom + 0.5
+      ) {
+        return;
+      }
+
+      const cappedWidth = Math.min(width, window.innerWidth - margin * 2);
+      const cappedHeight = Math.min(height, window.innerHeight - margin * 2);
+      const left = Math.min(
+        Math.max(naturalLeft, margin),
+        Math.max(margin, window.innerWidth - margin - cappedWidth)
+      );
+      const top = Math.min(
+        Math.max(naturalTop, margin),
+        Math.max(margin, window.innerHeight - margin - cappedHeight)
+      );
+
+      popover.style.position = 'fixed';
+      popover.style.left = `${Math.round(left)}px`;
+      popover.style.top = `${Math.round(top)}px`;
+      popover.style.right = 'auto';
+      popover.style.bottom = 'auto';
+      if (cappedWidth < width) {
+        popover.style.width = `${cappedWidth}px`;
+        // The CSS min-width would otherwise outrank the cap.
+        popover.style.minWidth = `${cappedWidth}px`;
+      }
+      if (cappedHeight < height) popover.style.height = `${cappedHeight}px`;
+    };
+
+    // Straight off the resize event, not a rAF: frames are throttled while the
+    // window is occluded, and a picker left open across that would sit at a
+    // stale offset. Resize fires per step of a drag, so each pass re-measures
+    // from the CSS placement and the last one wins.
+    fit();
+    window.addEventListener('resize', fit);
+    // Scroll events do not bubble, so capture them at the window to follow
+    // anchors inside Settings and any other scrolling pane.
+    window.addEventListener('scroll', fit, true);
+    // Split-grid changes move the trigger by resizing one of its ancestors.
+    // Watching that chain keeps a fixed picker attached even when no window
+    // resize or scroll event fires.
+    const resizeObserver = new ResizeObserver(fit);
+    for (let node: HTMLElement | null = anchor; node; node = node.parentElement) {
+      resizeObserver.observe(node);
+    }
+    const splitGrid = anchor.closest('.thread-panes');
+    const mutationObserver = splitGrid ? new MutationObserver(fit) : null;
+    if (splitGrid && mutationObserver) {
+      mutationObserver.observe(splitGrid, { attributes: true, childList: true });
+    }
+    return () => {
+      window.removeEventListener('resize', fit);
+      window.removeEventListener('scroll', fit, true);
+      resizeObserver.disconnect();
+      mutationObserver?.disconnect();
+    };
+  }, [flipped, placement]);
+
   return (
     <div
       ref={popoverRef}

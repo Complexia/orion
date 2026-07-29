@@ -603,6 +603,17 @@ export const AgentsWelcome: React.FC<{
 /** A thread's last transcript position: raw offset plus whether it sat at the end. */
 export type ChatScrollPosition = { top: number; pinned: boolean };
 
+/**
+ * Scroll state for one transcript. The split view mounts a transcript per pane,
+ * so each pane gets its own set instead of sharing one shell-wide group.
+ */
+export type PaneChatRefs = {
+  chatScrollRef: React.RefObject<HTMLDivElement | null>;
+  chatEndRef: React.RefObject<HTMLDivElement | null>;
+  chatPinnedRef: React.MutableRefObject<boolean>;
+  chatScrollTopRef: React.MutableRefObject<number>;
+};
+
 export type ChatTranscriptProps = {
   threadId: string;
   projectName?: string | null;
@@ -616,23 +627,24 @@ export type ChatTranscriptProps = {
   steerSupported: boolean;
   steerReady: boolean;
   authenticatingProviderId: string | null;
-  chatScrollRef: React.RefObject<HTMLDivElement | null>;
-  chatEndRef: React.RefObject<HTMLDivElement | null>;
-  chatPinnedRef: React.MutableRefObject<boolean>;
-  chatScrollTopRef: React.MutableRefObject<number>;
+  /** Scroll bookkeeping for the pane this transcript is mounted in. */
+  chatScrollRef: PaneChatRefs['chatScrollRef'];
+  chatEndRef: PaneChatRefs['chatEndRef'];
+  chatPinnedRef: PaneChatRefs['chatPinnedRef'];
+  chatScrollTopRef: PaneChatRefs['chatScrollTopRef'];
   /** Where each thread was left, so switching agents comes back to that spot. */
   chatScrollPositionsRef: React.MutableRefObject<Map<string, ChatScrollPosition>>;
   tasksCardPosition: { x: number; y: number } | null;
   tasksCardCollapsed: boolean;
   tasksCardDismissedFor: string | null;
-  onMoveTasksCard: (position: { x: number; y: number }) => void;
-  onToggleTasksCard: () => void;
-  onDismissTasksCard: (messageId: string) => void;
+  onMoveTasksCard: (threadId: string, position: { x: number; y: number }) => void;
+  onToggleTasksCard: (threadId: string) => void;
+  onDismissTasksCard: (threadId: string, messageId: string) => void;
   onMarkTaskDone: (threadId: string, taskId: string) => void;
   onUnlinkTask: (threadId: string, taskId: string) => void;
   onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
   onAuthenticateProvider: (providerId: string) => void;
-  onSteerQueuedMessage: (queuedId: string) => void;
+  onSteerQueuedMessage: (threadId: string, queuedId: string) => void;
 };
 
 /**
@@ -813,9 +825,17 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     (taskId: string) => onUnlinkTask(threadId, taskId),
     [onUnlinkTask, threadId]
   );
+  const handleMoveTasksCard = useCallback(
+    (position: { x: number; y: number }) => onMoveTasksCard(threadId, position),
+    [onMoveTasksCard, threadId]
+  );
+  const handleToggleTasksCard = useCallback(
+    () => onToggleTasksCard(threadId),
+    [onToggleTasksCard, threadId]
+  );
   const handleDismissTasksCard = useCallback(() => {
-    if (floatingPlan) onDismissTasksCard(floatingPlan.messageId);
-  }, [floatingPlan, onDismissTasksCard]);
+    if (floatingPlan) onDismissTasksCard(threadId, floatingPlan.messageId);
+  }, [floatingPlan, onDismissTasksCard, threadId]);
   const renderBtwAside = useCallback(
     (exchange: BtwExchange) => (
       <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
@@ -951,7 +971,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                     <button
                       type="button"
                       className="queued-message-action steer"
-                      onClick={() => onSteerQueuedMessage(queued.id)}
+                      onClick={() => onSteerQueuedMessage(threadId, queued.id)}
                       disabled={!steerReady}
                       title={
                         steerReady
@@ -989,9 +1009,9 @@ export const ChatTranscript = React.memo(function ChatTranscript({
             floatingPlan.runStatus === 'running' || thread.status === 'running'
           }
           position={tasksCardPosition}
-          onMove={onMoveTasksCard}
+          onMove={handleMoveTasksCard}
           collapsed={tasksCardCollapsed}
-          onToggleCollapsed={onToggleTasksCard}
+          onToggleCollapsed={handleToggleTasksCard}
           onDismiss={handleDismissTasksCard}
         />
       )}

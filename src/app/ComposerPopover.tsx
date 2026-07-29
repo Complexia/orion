@@ -3,9 +3,9 @@ import { ReactNode, useLayoutEffect, useRef, useState } from 'react';
 // Composer dropdowns (@-mentions, the /review pickers) hang off the composer
 // shell and prefer to open upward. A composer full of text can be tall enough
 // that there is no room left above it, which used to push the list off the top
-// of the window. Measure the anchor against the viewport instead: flip below
-// when there is more space that way, and cap the height so the list always
-// fits on screen.
+// of the window. Measure the anchor against its visible boundary (the pane in a
+// split, otherwise the viewport): flip below when there is more space that way,
+// and cap the height so every option remains reachable.
 const GAP = 8; // matches the popover's offset from the composer in CSS
 const VIEWPORT_MARGIN = 12;
 const MAX_HEIGHT = 320;
@@ -33,8 +33,18 @@ export const ComposerPopover = ({
       const anchor = el?.offsetParent as HTMLElement | null;
       if (!el || !anchor) return;
       const anchorRect = anchor.getBoundingClientRect();
-      const spaceAbove = anchorRect.top - GAP - VIEWPORT_MARGIN;
-      const spaceBelow = window.innerHeight - anchorRect.bottom - GAP - VIEWPORT_MARGIN;
+      const pane = el.closest<HTMLElement>('.thread-pane.split');
+      const paneRect = pane?.getBoundingClientRect();
+      const boundaryTop = Math.max(
+        VIEWPORT_MARGIN,
+        paneRect ? paneRect.top + VIEWPORT_MARGIN : VIEWPORT_MARGIN
+      );
+      const boundaryBottom = Math.min(
+        window.innerHeight - VIEWPORT_MARGIN,
+        paneRect ? paneRect.bottom - VIEWPORT_MARGIN : window.innerHeight - VIEWPORT_MARGIN
+      );
+      const spaceAbove = anchorRect.top - GAP - boundaryTop;
+      const spaceBelow = boundaryBottom - anchorRect.bottom - GAP;
       const style = window.getComputedStyle(el);
       const borderHeight =
         Number.parseFloat(style.borderTopWidth) + Number.parseFloat(style.borderBottomWidth);
@@ -69,6 +79,8 @@ export const ComposerPopover = ({
     if (el) observer.observe(el);
     const anchor = el?.offsetParent as HTMLElement | null;
     if (anchor) observer.observe(anchor);
+    const pane = el?.closest<HTMLElement>('.thread-pane.split');
+    if (pane) observer.observe(pane);
     window.addEventListener('resize', measure);
     return () => {
       observer.disconnect();
