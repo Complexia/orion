@@ -1349,6 +1349,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                         setRiftSweepDialog({
                           entries: riftSweepSelection,
                           runGc: true,
+                          forcePaths: riftSweepSelection
+                            .filter((entry) => entry.hasUncommittedChanges || entry.hasUnpushedCommits)
+                            .map((entry) => entry.riftPath),
                         })
                       }
                     >
@@ -1446,13 +1449,14 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                               type="button"
                               className="archived-epic-action danger"
                               title="Free this rift"
-                              disabled={
-                                riftStorageBusy || entry.status === 'active' || !entry.hasMarker || (blocked && !forced)
-                              }
+                              disabled={riftStorageBusy || entry.status === 'active' || !entry.hasMarker}
                               onClick={() =>
                                 setRiftSweepDialog({
                                   entries: [entry],
                                   runGc: true,
+                                  // For an individual row, the destructive modal
+                                  // itself is the one-time unpublished-work approval.
+                                  forcePaths: blocked ? [entry.riftPath] : [],
                                 })
                               }
                             >

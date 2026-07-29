@@ -7737,8 +7737,6 @@ const App: React.FC = () => {
     epicSettleDialog,
     setEpicSettleDialog,
     confirmEpicSettlement,
-    riftStorageForced,
-    setRiftStorageForced,
     riftSweepDialog,
     setRiftSweepDialog,
     dismissRiftSweepDialog,
