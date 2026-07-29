@@ -1,7 +1,14 @@
-import { type Thread } from '../store';
-
 export const isDefaultTitle = (title: string) =>
   /^Thread \d{1,2}:\d{2}/i.test(title) || /^New thread$/i.test(title.trim());
+
+export const getGoalTitleSeed = (
+  thread: { title: string; messages: unknown[] },
+  goalAction: { action: 'set' | 'resume'; objective?: string }
+): string | null => {
+  if (goalAction.action !== 'set' || !goalAction.objective) return null;
+  if (thread.messages.length > 0 || !isDefaultTitle(thread.title)) return null;
+  return goalAction.objective;
+};
 
 export const isPlausibleTitle = (title: string) => {
   if (!title) return false;
@@ -41,6 +48,8 @@ export const tryGenerateBetterTitle = async (
   turn: { modelId: string | null; reasoningEffort: string | null },
   projectPath: string,
   update: (id: string, updates: { title: string }) => void,
+  expectedTitle: string,
+  getCurrentTitle: (id: string) => string | undefined,
   epicId?: string
 ) => {
   if (!window.orion?.generateThreadTitle || !turn.modelId) return;
@@ -54,10 +63,11 @@ export const tryGenerateBetterTitle = async (
     });
     if (title && typeof title === 'string') {
       const cleaned = title.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '').trim().split(/[\n\r]/)[0].trim();
-      if (isPlausibleTitle(cleaned)) {
+      if (isPlausibleTitle(cleaned) && getCurrentTitle(threadId) === expectedTitle) {
         update(threadId, { title: cleaned });
       }
-      // if not plausible we simply keep the heuristic title set earlier
+      // If the title is no longer the heuristic we started with, the user
+      // renamed it while generation was pending, so preserve their choice.
     }
   } catch {
     // ignore failures, heuristic title remains
