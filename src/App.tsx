@@ -8508,7 +8508,12 @@ const App: React.FC = () => {
   // loop, so a six-way split never duplicates the picker/mention machinery.
   const composerNode = selectedThread ? (
     <div className="chat-input-area">
-      <AgentFamilySwitcher currentThread={selectedThread} threads={threads} onSelect={selectThread} />
+      <AgentFamilySwitcher
+        currentThread={selectedThread}
+        threads={threads}
+        onSelect={selectThread}
+        split={threadPanes.length > 1}
+      />
       <div className="composer-shell">
         {chatAttachments.length > 0 && (
           <div className="composer-attachments">

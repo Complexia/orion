@@ -2769,12 +2769,38 @@ body {
 
 .thread-pane.split .agent-switcher-wrap {
   flex-shrink: 0;
+  position: relative;
+}
+
+/* The open subagent list overlays the transcript instead of sitting in the
+   input column, so a long family can never squeeze the composer out of a
+   short pane. Height is capped inline (measured against the pane top) and
+   the list scrolls past the cap. */
+.thread-pane.split .agent-switcher {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 3;
+  max-height: 320px;
+  overflow-y: auto;
+  box-shadow: var(--shadow-lg);
+}
+
+/* Below the input area's stacking context, so the subagent overlay growing
+   up into the transcript passes over the floating Tasks card. */
+.thread-pane.split .tasks-float-card {
+  z-index: 1;
 }
 
 .thread-pane.split .composer-shell {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* The input area is a flex column, where the shell's auto side margins
+     would shrink it to fit its content; fill the pane like the block-layout
+     unsplit composer does (max-width still caps oversized panes). */
+  width: 100%;
 }
 
 .thread-pane.split .chat-input {

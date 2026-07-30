@@ -148,10 +148,38 @@ export const AgentFamilySwitcher: React.FC<{
   currentThread: Thread;
   threads: Thread[];
   onSelect: (threadId: string) => void;
-}> = ({ currentThread, threads, onSelect }) => {
+  /** True when the composer lives in a split pane. Panes are short on room,
+      so the strip starts collapsed and the open list overlays the transcript
+      (positioned by the pane CSS) rather than taking composer space. */
+  split?: boolean;
+}> = ({ currentThread, threads, onSelect, split = false }) => {
   const [expandedRootId, setExpandedRootId] = useState<string | null>(null);
   // Whole strip open/closed — independent of the "show N more" list truncation.
-  const [sectionOpen, setSectionOpen] = useState(true);
+  // null = untouched by the user: open in the full view, closed in a split pane.
+  const [sectionOpenState, setSectionOpenState] = useState<boolean | null>(null);
+  const sectionOpen = sectionOpenState ?? !split;
+
+  // In a split pane the open list overlays the transcript, growing upward from
+  // the strip. Cap it at the pane top so its own scrollbar can always reach
+  // the last row; remeasure when the pane or the composer changes height.
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [overlayMaxHeight, setOverlayMaxHeight] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (!split || !sectionOpen) return undefined;
+    const wrap = wrapRef.current;
+    const pane = wrap?.closest('.panel-content');
+    if (!wrap || !pane) return undefined;
+    const measure = () => {
+      setOverlayMaxHeight(
+        Math.max(0, wrap.getBoundingClientRect().top - pane.getBoundingClientRect().top - 12)
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(pane);
+    observer.observe(wrap.parentElement ?? wrap);
+    return () => observer.disconnect();
+  }, [split, sectionOpen]);
 
   // Walk up to the family root — subagents can themselves spawn subagents.
   const root = useMemo(() => {
@@ -252,11 +280,11 @@ export const AgentFamilySwitcher: React.FC<{
   };
 
   return (
-    <div className="agent-switcher-wrap">
+    <div className="agent-switcher-wrap" ref={wrapRef}>
       <button
         type="button"
         className="agent-switcher-label"
-        onClick={() => setSectionOpen((open) => !open)}
+        onClick={() => setSectionOpenState(!sectionOpen)}
         aria-expanded={sectionOpen}
         title={sectionOpen ? 'Collapse subagents' : 'Expand subagents'}
       >
@@ -266,9 +294,13 @@ export const AgentFamilySwitcher: React.FC<{
           aria-hidden="true"
         />
         Subagents
+        {split && ` (${subagents.length})`}
       </button>
       {sectionOpen && (
-        <div className={`agent-switcher${isExpanded ? ' expanded' : ''}`}>
+        <div
+          className={`agent-switcher${isExpanded ? ' expanded' : ''}`}
+          style={split && overlayMaxHeight != null ? { maxHeight: overlayMaxHeight } : undefined}
+        >
           {renderRow(root, true, 0)}
           {visibleSubagents.map(({ thread, depth }) => renderRow(thread, false, depth + 1))}
           {canToggleExpanded && (
