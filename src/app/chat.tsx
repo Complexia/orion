@@ -171,7 +171,7 @@ export const AgentFamilySwitcher: React.FC<{
     if (!wrap || !pane) return undefined;
     const measure = () => {
       setOverlayMaxHeight(
-        Math.max(96, wrap.getBoundingClientRect().top - pane.getBoundingClientRect().top - 12)
+        Math.max(0, wrap.getBoundingClientRect().top - pane.getBoundingClientRect().top - 12)
       );
     };
     measure();
