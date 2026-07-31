@@ -198,4 +198,13 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('account:changed', listener);
     return () => ipcRenderer.removeListener('account:changed', listener);
   },
+
+  workspaceSyncConfigure: (settings) => ipcRenderer.invoke('sync:configure', settings),
+  workspaceSyncNow: () => ipcRenderer.invoke('sync:now'),
+  workspaceSyncGetState: () => ipcRenderer.invoke('sync:getState'),
+  onWorkspaceSyncState: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('sync:state', listener);
+    return () => ipcRenderer.removeListener('sync:state', listener);
+  },
 });
