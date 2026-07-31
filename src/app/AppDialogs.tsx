@@ -55,6 +55,8 @@ export type AppDialogsModel = {
     options?: {
       runGc?: boolean;
       forcePaths?: string[];
+      manualPaths?: string[];
+      manualScanId?: string;
       queueIfBusy?: boolean;
     }
   ) => Promise<void>;
@@ -419,6 +421,22 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 </p>
               </div>
             )}
+            {riftSweepDialog.entries.some((entry) => entry.status === 'active') && (
+              <div className="epic-settle-warnings">
+                <p>
+                  This includes an active epic’s rift. Its agents must be stopped first, and the epic cannot run agents
+                  again until it is settled and restored to recreate the workspace.
+                </p>
+              </div>
+            )}
+            {riftSweepDialog.entries.some((entry) => !entry.hasMarker) && (
+              <div className="epic-settle-warnings">
+                <p>
+                  This includes an incomplete workspace without Rift metadata. It will move to the system Trash rather
+                  than Rift’s trash.
+                </p>
+              </div>
+            )}
             {riftSweepDialog.entries.length > 0 && (
               <label className="storage-sweep-option">
                 <input
@@ -442,9 +460,9 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 type="button"
                 className="btn danger"
                 onClick={() => {
-                  const { entries, runGc, forcePaths } = riftSweepDialog;
+                  const { entries, runGc, forcePaths, manualPaths, manualScanId } = riftSweepDialog;
                   dismissRiftSweepDialog();
-                  void releaseRiftStorage(entries, { runGc, forcePaths });
+                  void releaseRiftStorage(entries, { runGc, forcePaths, manualPaths, manualScanId });
                 }}
               >
                 <Trash2 size={14} />

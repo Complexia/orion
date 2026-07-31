@@ -1628,7 +1628,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                               type="button"
                               className="archived-epic-action danger"
                               title="Free this rift"
-                              disabled={riftStorageBusy || entry.status === 'active' || !entry.hasMarker}
+                              disabled={riftStorageBusy}
                               onClick={() =>
                                 setRiftSweepDialog({
                                   entries: [entry],
@@ -1636,6 +1636,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                                   // For an individual row, the destructive modal
                                   // itself is the one-time unpublished-work approval.
                                   forcePaths: blocked ? [entry.riftPath] : [],
+                                  // The row action is an explicit request to free
+                                  // this exact scan-listed Rift in any state.
+                                  manualPaths: [entry.riftPath],
+                                  manualScanId: riftStorageState?.scanId ?? undefined,
                                 })
                               }
                             >

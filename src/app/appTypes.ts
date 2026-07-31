@@ -38,6 +38,10 @@ export type RiftSweepDialogState = {
   runGc: boolean;
   /** Unpublished-work overrides this confirmation is allowed to grant. */
   forcePaths: string[];
+  /** Scan-listed paths the user selected individually, regardless of lifecycle or marker status. */
+  manualPaths?: string[];
+  /** Successful Storage scan whose rows this dialog displayed. */
+  manualScanId?: string;
 };
 
 export type GitBranchInfo = {

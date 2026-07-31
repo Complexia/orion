@@ -115,6 +115,57 @@ export const isRiftReleaseOwnerCurrent = (owner, expectedOwner) => {
   );
 };
 
+// A manual confirmation is scoped to the exact successful Storage scan the
+// dialog displayed. If a rescan completed while the dialog was open, do not
+// silently rebind its paths to replacement rows from the newer scan.
+export const collectCurrentManualRiftReleaseEntries = (
+  entries,
+  manualPaths,
+  currentScanId,
+  confirmedScanId
+) => {
+  if (
+    typeof confirmedScanId !== 'string' ||
+    !confirmedScanId ||
+    confirmedScanId !== currentScanId
+  ) {
+    return new Map();
+  }
+  const entriesByPath = new Map(
+    (Array.isArray(entries) ? entries : []).flatMap((entry) =>
+      typeof entry?.riftPath === 'string' && entry.riftPath
+        ? [[entry.riftPath, entry]]
+        : []
+    )
+  );
+  return new Map(
+    [...(manualPaths ?? [])].flatMap((riftPath) => {
+      const entry =
+        typeof riftPath === 'string' ? entriesByPath.get(riftPath) : undefined;
+      return entry ? [[riftPath, entry]] : [];
+    })
+  );
+};
+
+// A manual row confirmation may override lifecycle eligibility, but only for
+// the exact lifecycle identity shown by the scan. A replacement owner or a
+// same-Epic settle/restore transition must win over the stale confirmation.
+export const isManualRiftReleaseEntryCurrent = (entry, owner) => {
+  if (!entry) return false;
+  const ownerStatus = owner
+    ? owner.cleanupPending
+      ? 'cleanupPending'
+      : owner.settledAt
+        ? 'settled'
+        : 'active'
+    : 'orphan';
+  return (
+    (entry.epicId ?? null) === (owner?.epicId ?? null) &&
+    entry.status === ownerStatus &&
+    (entry.settledAt ?? null) === (owner?.settledAt ?? null)
+  );
+};
+
 // Active Epic deletion is renderer-owned, but restore-ref deletion and Rift
 // removal happen in main. Require the persisted store (the crash-recovery
 // source of truth) to prove the Epic is gone before crossing that boundary.

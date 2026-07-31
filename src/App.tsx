@@ -5545,8 +5545,16 @@ const App: React.FC = () => {
     {
       runGc = false,
       forcePaths = [],
+      manualPaths = [],
+      manualScanId,
       queueIfBusy = false,
-    }: { runGc?: boolean; forcePaths?: string[]; queueIfBusy?: boolean } = {}
+    }: {
+      runGc?: boolean;
+      forcePaths?: string[];
+      manualPaths?: string[];
+      manualScanId?: string;
+      queueIfBusy?: boolean;
+    } = {}
   ) => {
     if (!runGc && entries.length === 0) return Promise.resolve();
     // Storage controls are disabled during a sweep, but automatic cleanup can
@@ -5589,6 +5597,10 @@ const App: React.FC = () => {
             // this list. Automatic release-on-settle calls omit it and must pass
             // main's fresh unpublished-work guard.
             forcePaths,
+            // Individual Storage-row actions explicitly authorize any lifecycle
+            // state and markerless partial workspaces from the current scan.
+            manualPaths,
+            manualScanId,
             busyEpicIds,
             runtimeThreadIdsByEpic,
             runGc,

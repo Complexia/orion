@@ -50,6 +50,8 @@ export type RiftStorageEntry = {
 
 export type RiftStorageState = {
   scanning: boolean;
+  /** Opaque identity of the last successful scan. */
+  scanId: string | null;
   scannedAt: string | null;
   entries: RiftStorageEntry[];
   /** Total size of Rift's own trash directories, reclaimable only by `rift gc`. */
@@ -543,6 +545,10 @@ type OrionComputerUsePermissions = {
         riftPaths: string[];
         /** Paths the user explicitly chose to free despite uncommitted or unpushed work. */
         forcePaths?: string[];
+        /** Current scan entries individually confirmed for manual removal in any state. */
+        manualPaths?: string[];
+        /** Successful Storage scan whose rows the confirmation dialog displayed. */
+        manualScanId?: string;
         /** Epics with live agent runs or terminals, which the persisted store cannot show. */
         busyEpicIds?: string[];
         /** Every thread whose runtime is rooted in the owning epic's Rift. */
