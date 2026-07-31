@@ -1,4 +1,4 @@
-import React, { useContext } from 'react';
+import React, { useContext, useRef } from 'react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { localMediaSrc, videoFileNamePattern } from './attachments';
@@ -55,3 +55,92 @@ export const MarkdownContent: React.FC<{ content: string }> = React.memo(({ cont
     </ReactMarkdown>
   </div>
 ));
+
+// How large the live (re-parsed every render) tail of a streaming message may
+// grow before its stable prefix is frozen into a memoized segment.
+const STREAMING_FREEZE_THRESHOLD = 3000;
+
+// A boundary where `text` can be split into two independently rendered
+// markdown documents without changing what they render: after a blank line,
+// outside any code fence, where the next line opens a fresh top-level block —
+// not a list item, indented code, table row, or blockquote, all of which could
+// belong to the block above the blank line (splitting a loose list, for
+// example, would restart its numbering). Returns the index the second document
+// starts at, or -1 when the text holds no such point.
+const findStreamingCut = (text: string): number => {
+  const lines = text.split('\n');
+  let inFence = false;
+  let fenceChar = '';
+  let offset = 0;
+  let cut = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const fence = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fence) {
+      if (!inFence) {
+        inFence = true;
+        fenceChar = fence[1][0];
+      } else if (fence[1][0] === fenceChar) {
+        inFence = false;
+      }
+    }
+    if (!inFence && i > 0 && line.trim() === '') {
+      let next = i + 1;
+      while (next < lines.length && lines[next].trim() === '') next += 1;
+      // The final line may still be mid-stream; never cut directly before it.
+      if (next < lines.length - 1) {
+        const opener = lines[next];
+        const continuesPriorBlock = /^(\s{4,}|\s*([-*+]\s|\d{1,9}[.)]\s|>|\|))/.test(opener);
+        if (!continuesPriorBlock) {
+          let start = offset + line.length + 1;
+          for (let j = i + 1; j < next; j += 1) start += lines[j].length + 1;
+          cut = start;
+        }
+      }
+    }
+    offset += line.length + 1;
+  }
+  return cut;
+};
+
+type FrozenMarkdown = { segments: string[]; joined: string };
+
+/**
+ * Markdown for content that is still being appended to. Re-rendering a plain
+ * MarkdownContent re-parses the entire text on every streamed chunk — an
+ * O(transcript²) churn that grinds long turns and balloons the renderer's
+ * native memory (the cause of the runaway-memory crashes on long threads).
+ * This wrapper freezes the already-streamed prefix into memoized segments at
+ * safe block boundaries, so each update re-parses only a small live tail.
+ */
+export const StreamingMarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => {
+  const frozenRef = useRef<FrozenMarkdown>({ segments: [], joined: '' });
+  let frozen = frozenRef.current;
+  // Anything but a pure append (a different message's text after a key reuse,
+  // a segment re-split by a new activity anchor) invalidates the frozen
+  // prefix: start over from the new text.
+  if (frozen.joined && !content.startsWith(frozen.joined)) {
+    frozen = { segments: [], joined: '' };
+    frozenRef.current = frozen;
+  }
+  let tail = content.slice(frozen.joined.length);
+  if (tail.length > STREAMING_FREEZE_THRESHOLD) {
+    const cut = findStreamingCut(tail);
+    if (cut > 0) {
+      frozen = {
+        segments: [...frozen.segments, tail.slice(0, cut)],
+        joined: frozen.joined + tail.slice(0, cut),
+      };
+      frozenRef.current = frozen;
+      tail = content.slice(frozen.joined.length);
+    }
+  }
+  return (
+    <>
+      {frozen.segments.map((segment, index) => (
+        <MarkdownContent key={index} content={segment} />
+      ))}
+      {tail.trim() ? <MarkdownContent content={tail} /> : null}
+    </>
+  );
+});

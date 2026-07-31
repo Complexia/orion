@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { BookOpen, Bot, Check, ChevronDown, FilePen, Globe, ListChecks, Search, Terminal, Wrench, X } from 'lucide-react';
 import { type AgentActivity, type BtwExchange, type Message, type ThreadGoal, type TurnTokenStats } from '../store';
 
@@ -299,14 +299,156 @@ export const FloatingTasksCard: React.FC<{
 };
 
 export const collapsedDetailPreview = (activity: AgentActivity) => {
-  const flattened = (activity.detail ?? '').replace(/\s+/g, ' ').trim();
+  const detail = activity.detail ?? '';
+  // The preview shows at most a few hundred characters, but reasoning details
+  // grow to hundreds of KB over a long turn and this runs on every streamed
+  // update — flatten only the slice that can actually be shown.
+  const truncated = detail.length > 1200;
+  const window = activity.type === 'thought' ? detail.slice(-1200) : detail.slice(0, 1200);
+  const flattened = window.replace(/\s+/g, ' ').trim();
   // Thought streams show the tail so the card tracks what the agent is
-  // thinking now, not the opening words.
-  if (activity.type === 'thought' && flattened.length > 300) {
+  // thinking now, not the opening words. The collapsed row is a one-line
+  // ellipsized span, so the leading cap is invisible for other types.
+  if (activity.type === 'thought' && (flattened.length > 300 || truncated)) {
     return `…${flattened.slice(-300)}`;
   }
   return flattened;
 };
+
+// One step row, memoized so a live card only re-renders the row whose
+// activity object actually changed. During reasoning the tracker upserts one
+// activity several times a second, and before this split every row in an
+// expanded card re-rendered (and re-flattened its detail preview) on each
+// upsert — per-update work proportional to the whole step history.
+const AgentActivityRow: React.FC<{
+  activity: AgentActivity;
+  runRunning: boolean;
+  rowExpanded: boolean;
+  onToggle: (id: string) => void;
+}> = React.memo(({ activity, runRunning, rowExpanded, onToggle }) => {
+  const rowRunning = runRunning && activity.status === 'running';
+  const status =
+    !runRunning && (activity.status === 'running' || activity.status === 'waiting')
+      ? 'done'
+      : activity.status ?? 'done';
+  const expandable = isExpandableActivity(activity);
+  // Live terminal output shows a short tail while the tool runs so the user
+  // watches the command work; the full text sits behind the row's expand
+  // toggle.
+  const showOutput = !!activity.output && (rowExpanded || rowRunning);
+  const outputText =
+    rowExpanded || !activity.output
+      ? activity.output
+      : activity.output.slice(-400).replace(/^[^\n]*\n/, '');
+  // The detail line already previews a single-argument call (a path, a
+  // command); repeating it verbatim as the input block is noise.
+  const showInput = rowExpanded && !!activity.input && activity.input !== activity.detail;
+
+  if (activity.type === 'plan') {
+    return (
+      <div className={`agent-tool-row plan ${status}`}>
+        <span className="agent-tool-icon">
+          <AgentActivityIcon activity={activity} />
+        </span>
+        <span className="agent-tool-text">
+          <span className="agent-tool-title">{activity.title}</span>
+          <AgentPlanChecklist activity={activity} running={runRunning} />
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`agent-tool-row ${status}${expandable ? ' expandable' : ''}${rowExpanded ? ' open' : ''}`}
+      onClick={expandable ? () => onToggle(activity.id) : undefined}
+      onKeyDown={
+        expandable
+          ? (event) => {
+              if (event.target !== event.currentTarget) return;
+              if (event.key !== 'Enter' && event.key !== ' ') return;
+              event.preventDefault();
+              onToggle(activity.id);
+            }
+          : undefined
+      }
+      role={expandable ? 'button' : undefined}
+      tabIndex={expandable ? 0 : undefined}
+      aria-expanded={expandable ? rowExpanded : undefined}
+      title={
+        expandable
+          ? rowExpanded
+            ? 'Collapse this step'
+            : 'Expand to see the call and its output'
+          : undefined
+      }
+    >
+      <span className="agent-tool-icon">
+        <AgentActivityIcon activity={activity} />
+      </span>
+      <span className="agent-tool-text">
+        <span className="agent-tool-title-line">
+          <span className="agent-tool-title">{activity.title}</span>
+          {activity.diff && (
+            <span className="agent-tool-chip diff" title={activity.diff.path}>
+              <span className="diff-add">+{activity.diff.additions}</span>
+              <span className="diff-delete">−{activity.diff.deletions}</span>
+            </span>
+          )}
+          {typeof activity.exitCode === 'number' && activity.exitCode !== 0 && (
+            <span className="agent-tool-chip exit">exit {activity.exitCode}</span>
+          )}
+          {activity.status === 'waiting' && runRunning && (
+            <span className="agent-tool-chip waiting">needs approval</span>
+          )}
+        </span>
+        {activity.detail && (
+          <span className={`agent-tool-detail${rowExpanded ? ' expanded' : ''}`}>
+            {rowExpanded ? activity.detail : collapsedDetailPreview(activity)}
+          </span>
+        )}
+        {showInput && (
+          <div className="agent-tool-io" onClick={(event) => event.stopPropagation()}>
+            <span className="agent-tool-io-label">Called with</span>
+            <pre className="agent-tool-output input">{activity.input}</pre>
+          </div>
+        )}
+        {showOutput && outputText && (
+          <div
+            className="agent-tool-io"
+            onClick={rowExpanded ? (event) => event.stopPropagation() : undefined}
+          >
+            {rowExpanded && <span className="agent-tool-io-label">Output</span>}
+            <pre className="agent-tool-output">{outputText}</pre>
+          </div>
+        )}
+        {!!activity.sources?.length && (
+          <span className="agent-tool-sources">
+            {activity.sources.slice(0, 4).map((source) => (
+              <a
+                key={source.url}
+                href={source.url}
+                title={source.url}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  void window.orion?.openExternalUrl?.(source.url);
+                }}
+              >
+                {hostnameForUrl(source.url)}
+              </a>
+            ))}
+          </span>
+        )}
+      </span>
+      {expandable && (
+        <span className="agent-tool-chevron">
+          <ChevronDown size={13} />
+        </span>
+      )}
+    </div>
+  );
+});
 
 export const AgentActivityCard: React.FC<{
   activities: AgentActivity[];
@@ -319,13 +461,16 @@ export const AgentActivityCard: React.FC<{
   // is doing now, not what it did first.
   const visibleActivities = expanded ? activities : activities.slice(-4);
 
-  const toggleRow = (id: string) =>
-    setExpandedRows((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  const toggleRow = useCallback(
+    (id: string) =>
+      setExpandedRows((current) => {
+        const next = new Set(current);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      }),
+    []
+  );
 
   if (activities.length === 0) return null;
 
@@ -345,134 +490,15 @@ export const AgentActivityCard: React.FC<{
         </span>
       </button>
       <div className="agent-tools-list">
-        {visibleActivities.map((activity) => {
-          const rowRunning = runRunning && activity.status === 'running';
-          const status =
-            !runRunning &&
-            (activity.status === 'running' || activity.status === 'waiting')
-              ? 'done'
-              : activity.status ?? 'done';
-          const expandable = isExpandableActivity(activity);
-          const rowExpanded = expandable && expandedRows.has(activity.id);
-          // Live terminal output shows a short tail while the tool runs so
-          // the user watches the command work; the full text sits behind the
-          // row's expand toggle.
-          const showOutput = !!activity.output && (rowExpanded || rowRunning);
-          const outputText =
-            rowExpanded || !activity.output
-              ? activity.output
-              : activity.output.slice(-400).replace(/^[^\n]*\n/, '');
-          // The detail line already previews a single-argument call (a path, a
-          // command); repeating it verbatim as the input block is noise.
-          const showInput =
-            rowExpanded && !!activity.input && activity.input !== activity.detail;
-
-          if (activity.type === 'plan') {
-            return (
-              <div key={activity.id} className={`agent-tool-row plan ${status}`}>
-                <span className="agent-tool-icon">
-                  <AgentActivityIcon activity={activity} />
-                </span>
-                <span className="agent-tool-text">
-                  <span className="agent-tool-title">{activity.title}</span>
-                  <AgentPlanChecklist activity={activity} running={runRunning} />
-                </span>
-              </div>
-            );
-          }
-
-          return (
-            <div
-              key={activity.id}
-              className={`agent-tool-row ${status}${expandable ? ' expandable' : ''}${rowExpanded ? ' open' : ''}`}
-              onClick={expandable ? () => toggleRow(activity.id) : undefined}
-              onKeyDown={
-                expandable
-                  ? (event) => {
-                      if (event.target !== event.currentTarget) return;
-                      if (event.key !== 'Enter' && event.key !== ' ') return;
-                      event.preventDefault();
-                      toggleRow(activity.id);
-                    }
-                  : undefined
-              }
-              role={expandable ? 'button' : undefined}
-              tabIndex={expandable ? 0 : undefined}
-              aria-expanded={expandable ? rowExpanded : undefined}
-              title={
-                expandable
-                  ? rowExpanded
-                    ? 'Collapse this step'
-                    : 'Expand to see the call and its output'
-                  : undefined
-              }
-            >
-              <span className="agent-tool-icon">
-                <AgentActivityIcon activity={activity} />
-              </span>
-              <span className="agent-tool-text">
-                <span className="agent-tool-title-line">
-                  <span className="agent-tool-title">{activity.title}</span>
-                  {activity.diff && (
-                    <span className="agent-tool-chip diff" title={activity.diff.path}>
-                      <span className="diff-add">+{activity.diff.additions}</span>
-                      <span className="diff-delete">−{activity.diff.deletions}</span>
-                    </span>
-                  )}
-                  {typeof activity.exitCode === 'number' && activity.exitCode !== 0 && (
-                    <span className="agent-tool-chip exit">exit {activity.exitCode}</span>
-                  )}
-                  {activity.status === 'waiting' && runRunning && (
-                    <span className="agent-tool-chip waiting">needs approval</span>
-                  )}
-                </span>
-                {activity.detail && (
-                  <span className={`agent-tool-detail${rowExpanded ? ' expanded' : ''}`}>
-                    {rowExpanded ? activity.detail : collapsedDetailPreview(activity)}
-                  </span>
-                )}
-                {showInput && (
-                  <div className="agent-tool-io" onClick={(event) => event.stopPropagation()}>
-                    <span className="agent-tool-io-label">Called with</span>
-                    <pre className="agent-tool-output input">{activity.input}</pre>
-                  </div>
-                )}
-                {showOutput && outputText && (
-                  <div
-                    className="agent-tool-io"
-                    onClick={rowExpanded ? (event) => event.stopPropagation() : undefined}
-                  >
-                    {rowExpanded && <span className="agent-tool-io-label">Output</span>}
-                    <pre className="agent-tool-output">{outputText}</pre>
-                  </div>
-                )}
-                {!!activity.sources?.length && (
-                  <span className="agent-tool-sources">
-                    {activity.sources.slice(0, 4).map((source) => (
-                      <a
-                        key={source.url}
-                        href={source.url}
-                        title={source.url}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          void window.orion?.openExternalUrl?.(source.url);
-                        }}
-                      >
-                        {hostnameForUrl(source.url)}
-                      </a>
-                    ))}
-                  </span>
-                )}
-              </span>
-              {expandable && (
-                <span className="agent-tool-chevron">
-                  <ChevronDown size={13} />
-                </span>
-              )}
-            </div>
-          );
-        })}
+        {visibleActivities.map((activity) => (
+          <AgentActivityRow
+            key={activity.id}
+            activity={activity}
+            runRunning={runRunning}
+            rowExpanded={isExpandableActivity(activity) && expandedRows.has(activity.id)}
+            onToggle={toggleRow}
+          />
+        ))}
       </div>
     </div>
   );

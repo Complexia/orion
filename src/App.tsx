@@ -2641,8 +2641,23 @@ const App: React.FC = () => {
 
   // Streamed chunks can arrive many times per second; buffer them briefly so
   // each token doesn't trigger a full store update (and a store persist).
-  const chunkBuffers = useRef(new Map<string, { threadId: string; messageId: string; text: string }>());
+  const chunkBuffers = useRef(
+    new Map<string, { threadId: string; messageId: string; text: string; baseLen: number }>()
+  );
   const chunkFlushTimer = useRef<number | null>(null);
+
+  // Every flush re-renders the transcript, and rendering a message touches its
+  // whole content string — V8 materializes an O(length) copy each time. At a
+  // fixed 60ms cadence that alone balloons the renderer's memory on long turns
+  // (hundreds of MB/s of churn by the time a transcript reaches a few MB), so
+  // large messages flush progressively less often. Values are a compromise
+  // between streaming smoothness and that per-flush cost.
+  const chunkFlushDelay = (contentLen: number) => {
+    if (contentLen < 128_000) return 60;
+    if (contentLen < 512_000) return 250;
+    if (contentLen < 2_000_000) return 600;
+    return 1500;
+  };
 
   // --- Linked board tasks (Orion web kanban) -----------------------------------
 
@@ -3169,7 +3184,32 @@ const App: React.FC = () => {
         if (!target) return;
 
         if (event.type === 'subagent-chunk' && event.chunk) {
-          appendToThreadMessage(target.threadId, target.messageId, event.chunk);
+          // Same buffered flush as main-run chunks: subagent transcripts tail
+          // per-line and a mounted child transcript pays the same O(content)
+          // render cost per update as the main one.
+          const bufferKey = `sub:${target.threadId}:${target.messageId}`;
+          let buffer = chunkBuffers.current.get(bufferKey);
+          if (buffer) {
+            buffer.text += event.chunk;
+          } else {
+            buffer = {
+              threadId: target.threadId,
+              messageId: target.messageId,
+              text: event.chunk,
+              baseLen:
+                useOrionStore
+                  .getState()
+                  .threads.find((t) => t.id === target.threadId)
+                  ?.messages.find((m) => m.id === target.messageId)?.content.length ?? 0,
+            };
+            chunkBuffers.current.set(bufferKey, buffer);
+          }
+          if (chunkFlushTimer.current === null) {
+            chunkFlushTimer.current = window.setTimeout(
+              flushChunkBuffers,
+              chunkFlushDelay(buffer.baseLen + buffer.text.length)
+            );
+          }
         } else if (event.type === 'subagent-activity' && event.activity) {
           addActivityToThreadMessage(target.threadId, target.messageId, event.activity);
         } else if (info) {
@@ -3295,18 +3335,27 @@ const App: React.FC = () => {
       }
 
       if (event.type === 'chunk' && event.chunk) {
-        const buffer = chunkBuffers.current.get(event.runId);
+        let buffer = chunkBuffers.current.get(event.runId);
         if (buffer) {
           buffer.text += event.chunk;
         } else {
-          chunkBuffers.current.set(event.runId, {
+          buffer = {
             threadId: tracked.threadId,
             messageId: tracked.messageId,
             text: event.chunk,
-          });
+            baseLen:
+              useOrionStore
+                .getState()
+                .threads.find((t) => t.id === tracked.threadId)
+                ?.messages.find((m) => m.id === tracked.messageId)?.content.length ?? 0,
+          };
+          chunkBuffers.current.set(event.runId, buffer);
         }
         if (chunkFlushTimer.current === null) {
-          chunkFlushTimer.current = window.setTimeout(flushChunkBuffers, 60);
+          chunkFlushTimer.current = window.setTimeout(
+            flushChunkBuffers,
+            chunkFlushDelay(buffer.baseLen + buffer.text.length)
+          );
         }
       }
 

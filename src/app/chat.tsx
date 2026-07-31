@@ -6,7 +6,7 @@ import { agentProviders } from '../agentCatalog';
 import { ProjectIcon } from './ProjectIcon';
 import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, formatTurnStats, PinnedRunStatus, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
-import { MarkdownBaseDirContext, MarkdownContent } from './markdown';
+import { MarkdownBaseDirContext, MarkdownContent, StreamingMarkdownContent } from './markdown';
 import { linkedTaskStatusLabel } from './promptContext';
 
 export const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ text, className }) => {
@@ -439,7 +439,7 @@ export const ChatMessage = React.memo(function ChatMessage({
               {renderBtwAside?.(segment.exchange)}
             </React.Fragment>
           ) : segment.text.trim() ? (
-            <MarkdownContent key={`text-${index}`} content={segment.text} />
+            <StreamingMarkdownContent key={`text-${index}`} content={segment.text} />
           ) : null
         )}
         {!hasContent &&
@@ -465,7 +465,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   return (
     <div className={`message ${message.role}`}>
       {message.role === 'agent' ? (
-        <MarkdownContent content={message.content} />
+        <StreamingMarkdownContent content={message.content} />
       ) : (
         <>
           {messageTasks.map((messageTask) => {
@@ -905,7 +905,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
         )}
         {exchange.answer && (
           <div className="btw-aside-answer">
-            <MarkdownContent content={exchange.answer} />
+            <StreamingMarkdownContent content={exchange.answer} />
           </div>
         )}
         {exchange.status === 'error' &&
