@@ -229,6 +229,27 @@ type OrionAccountState = {
   expiresAt: string | null;
 };
 
+type OrionWorkspaceSyncSettings = {
+  enabled: boolean;
+  syncCode: boolean;
+};
+
+type OrionWorkspaceSyncStatus = {
+  enabled: boolean;
+  authenticated: boolean;
+  syncing: boolean;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  backfillDone: boolean;
+  counts: {
+    projects: number;
+    epics: number;
+    threads: number;
+    transcriptsUploaded: number;
+    codePushes: number;
+  } | null;
+};
+
 declare global {
 type OrionComputerUsePermissionKind = 'accessibility' | 'screen-recording' | 'automation';
 
@@ -905,6 +926,12 @@ type OrionComputerUsePermissions = {
         }) => void
       ) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;
+      workspaceSyncConfigure?: (
+        settings: OrionWorkspaceSyncSettings
+      ) => Promise<OrionWorkspaceSyncStatus>;
+      workspaceSyncNow?: () => Promise<OrionWorkspaceSyncStatus>;
+      workspaceSyncGetState?: () => Promise<OrionWorkspaceSyncStatus>;
+      onWorkspaceSyncState?: (cb: (state: OrionWorkspaceSyncStatus) => void) => () => void;
     };
   }
 }

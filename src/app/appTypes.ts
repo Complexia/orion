@@ -109,8 +109,29 @@ export type OrionAccountState = {
   expiresAt: string | null;
 };
 
+/**
+ * Workspace sync engine status pushed from main (sync:state). Null until the
+ * first status arrives; the engine is inert while the setting is off.
+ */
+export type WorkspaceSyncStatus = {
+  enabled: boolean;
+  authenticated: boolean;
+  syncing: boolean;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  backfillDone: boolean;
+  counts: {
+    projects: number;
+    epics: number;
+    threads: number;
+    transcriptsUploaded: number;
+    codePushes: number;
+  } | null;
+};
+
 export type SettingsTab =
   | 'account'
+  | 'cloud-sync'
   | 'general'
   | 'providers'
   | 'orchestration'

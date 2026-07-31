@@ -163,6 +163,7 @@ import type {
   ProviderUpdateState,
   RiftSweepDialogState,
   SettingsTab,
+  WorkspaceSyncStatus,
 } from './app/appTypes';
 
 // Lazy-loaded so xterm (and the TerminalView code) is split into its own
@@ -174,6 +175,25 @@ const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
 const AppDialogs = React.lazy(() => import('./app/AppDialogs'));
 
 const normalizeRepositoryPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
+
+const dispatchedModelIdForProvider = (
+  thread: Thread,
+  providerId: string,
+  preferredMessageId?: string
+) => {
+  const matchesProvider = (message: Message) =>
+    message.kind === 'agent-run' && message.modelId?.split(':', 1)[0] === providerId;
+  const preferred = preferredMessageId
+    ? thread.messages.find((message) => message.id === preferredMessageId)
+    : undefined;
+  if (preferred && matchesProvider(preferred)) return preferred.modelId;
+  return [...thread.messages].reverse().find(matchesProvider)?.modelId;
+};
+
+const qualifyProviderModelId = (providerId: string, modelId?: string) => {
+  if (!modelId) return undefined;
+  return modelId.includes(':') ? modelId : `${providerId}:${modelId}`;
+};
 
 /**
  * Sizes come from block accounting, which counts a copy-on-write clone's
@@ -509,6 +529,8 @@ const App: React.FC = () => {
     epicsSettings,
     riftsSettings,
     setRiftsSettings,
+    workspaceSyncSettings,
+    setWorkspaceSyncSettings,
     addProject,
     removeProject,
     renameProject,
@@ -575,6 +597,8 @@ const App: React.FC = () => {
       epicsSettings: state.epicsSettings,
       riftsSettings: state.riftsSettings,
       setRiftsSettings: state.setRiftsSettings,
+      workspaceSyncSettings: state.workspaceSyncSettings,
+      setWorkspaceSyncSettings: state.setWorkspaceSyncSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
@@ -2204,6 +2228,22 @@ const App: React.FC = () => {
     };
   }, []);
 
+  // Workspace sync engine lives in main; push the opt-in settings to it on
+  // hydration and every change, and mirror its status for the settings panel.
+  const [workspaceSyncStatus, setWorkspaceSyncStatus] = useState<WorkspaceSyncStatus | null>(null);
+  useEffect(() => {
+    void window.orion?.workspaceSyncConfigure?.(workspaceSyncSettings);
+  }, [workspaceSyncSettings]);
+  useEffect(() => {
+    const unsubscribe = window.orion?.onWorkspaceSyncState?.((state) => {
+      setWorkspaceSyncStatus(state);
+    });
+    return () => unsubscribe?.();
+  }, []);
+  const handleWorkspaceSyncNow = useCallback(() => {
+    void window.orion?.workspaceSyncNow?.();
+  }, []);
+
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
 
@@ -3103,6 +3143,13 @@ const App: React.FC = () => {
         const runThread = state.threads.find((t) => t.id === event.threadId);
         if (!runThread) return;
         const providerId = (info?.providerId ?? event.providerId ?? runThread.modelId.split(':')[0]) as ProviderId;
+        const trackedRun = runOutputMessages.current.get(event.runId);
+        const dispatchedModelId = dispatchedModelIdForProvider(
+          runThread,
+          providerId,
+          trackedRun?.threadId === runThread.id ? trackedRun.messageId : undefined
+        );
+        const nativeModelId = qualifyProviderModelId(providerId, info?.model) ?? dispatchedModelId;
         const key = `${event.threadId}:${providerId}:${subagentId}`;
         const familyThreadIds = descendantThreadIds(state.threads, runThread.id);
         const findFamilySubagent = (providerSubagentId: string) =>
@@ -3134,7 +3181,7 @@ const App: React.FC = () => {
           const parent = (info.parentSubagentId && findFamilySubagent(info.parentSubagentId)) || runThread;
           const childThreadId = state.createThread(parent.projectId, info.title || info.kind || 'Subagent', {
             parentThreadId: parent.id,
-            modelId: parent.modelId,
+            modelId: nativeModelId ?? parent.modelId,
             hiddenFromRecent: true,
             accessMode: parent.accessMode,
             epicId: parent.epicId,
@@ -3161,6 +3208,7 @@ const App: React.FC = () => {
             statusText: 'Subagent working…',
             startedAt: new Date(info.startedAt ?? Date.now()).toISOString(),
             activities: [],
+            ...(nativeModelId ? { modelId: nativeModelId } : {}),
           });
           updateThread(childThreadId, { status: 'running' });
           target = { threadId: childThreadId, messageId };
@@ -3249,6 +3297,13 @@ const App: React.FC = () => {
         if (event.type === 'started' && event.background) {
           const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
           if (!thread) return;
+          const backgroundModelId =
+            dispatchedModelIdForProvider(thread, 'claude') ??
+            agentModelsRef.current.find(
+              (model) =>
+                model.providerId === 'claude' &&
+                Boolean(event.command?.includes(`--model ${model.slug}`))
+            )?.id;
           const messageId = addMessageToThread(event.threadId, {
             role: 'agent',
             content: '',
@@ -3258,6 +3313,7 @@ const App: React.FC = () => {
             command: event.command,
             startedAt: new Date().toISOString(),
             activities: [],
+            ...(backgroundModelId ? { modelId: backgroundModelId } : {}),
           });
           runOutputMessages.current.set(event.runId, {
             threadId: event.threadId,
@@ -5907,6 +5963,7 @@ const App: React.FC = () => {
         statusText: "I'm working on this now.",
         startedAt: new Date().toISOString(),
         activities: [],
+        modelId: model.id,
       });
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
@@ -6578,6 +6635,7 @@ const App: React.FC = () => {
         statusText: 'Pursuing the goal.',
         startedAt: new Date().toISOString(),
         activities: [],
+        modelId: model.id,
       });
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
@@ -6747,6 +6805,7 @@ const App: React.FC = () => {
         statusText: 'Reviewing changes.',
         startedAt: new Date().toISOString(),
         activities: [],
+        modelId: model.id,
       });
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
@@ -7870,6 +7929,10 @@ const App: React.FC = () => {
     setOrchestrationGeneralInstructions,
     riftsSettings,
     setRiftsSettings,
+    workspaceSyncSettings,
+    setWorkspaceSyncSettings,
+    workspaceSyncStatus,
+    handleWorkspaceSyncNow,
     setUtilityModelPickerOpen,
     utilityModelPickerOpen,
     setUtilityModelSearch,

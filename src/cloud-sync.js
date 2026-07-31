@@ -35,28 +35,31 @@ async function git(gitRoot, args, options = {}) {
   return stdout.trim();
 }
 
-async function objectExists(gitRoot, oid) {
+async function objectExists(gitRoot, oid, signal) {
   try {
-    await git(gitRoot, ['cat-file', '-e', oid]);
+    await git(gitRoot, ['cat-file', '-e', oid], { signal });
     return true;
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return false;
   }
 }
 
-async function isAncestor(gitRoot, ancestor, descendant) {
+async function isAncestor(gitRoot, ancestor, descendant, signal) {
   try {
-    await git(gitRoot, ['merge-base', '--is-ancestor', ancestor, descendant]);
+    await git(gitRoot, ['merge-base', '--is-ancestor', ancestor, descendant], { signal });
     return true;
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return false;
   }
 }
 
-async function currentBranch(gitRoot) {
+async function currentBranch(gitRoot, signal) {
   try {
-    return (await git(gitRoot, ['symbolic-ref', '--short', '-q', 'HEAD'])) || null;
-  } catch {
+    return (await git(gitRoot, ['symbolic-ref', '--short', '-q', 'HEAD'], { signal })) || null;
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
 }
@@ -94,11 +97,12 @@ async function api(baseUrl, token, apiPath, options = {}) {
   return data;
 }
 
-async function uploadTo(url, body, contentType = 'application/octet-stream') {
+async function uploadTo(url, body, contentType = 'application/octet-stream', signal) {
   const response = await fetch(url, {
     method: 'PUT',
     headers: { 'content-type': contentType },
     body,
+    signal,
   });
   if (!response.ok) {
     throw new Error(`Upload failed (${response.status}).`);
@@ -155,12 +159,12 @@ export async function clearCloudRepoLink(gitRoot) {
 
 // --- Local repo inspection ----------------------------------------------------
 
-async function readLocalBranches(gitRoot) {
+async function readLocalBranches(gitRoot, signal) {
   const output = await git(gitRoot, [
     'for-each-ref',
     'refs/heads',
     '--format=%(refname) %(objectname)',
-  ]);
+  ], { signal });
   if (!output) return [];
   return output.split('\n').map((line) => {
     const [name, oid] = line.trim().split(' ');
@@ -168,9 +172,13 @@ async function readLocalBranches(gitRoot) {
   });
 }
 
-async function buildManifest(gitRoot, commitOid) {
-  const rootTree = await git(gitRoot, ['rev-parse', `${commitOid}^{tree}`]);
-  const raw = await git(gitRoot, ['ls-tree', '-r', '-t', '-l', '-z', '--full-tree', commitOid]);
+async function buildManifest(gitRoot, commitOid, signal) {
+  const rootTree = await git(gitRoot, ['rev-parse', `${commitOid}^{tree}`], { signal });
+  const raw = await git(
+    gitRoot,
+    ['ls-tree', '-r', '-t', '-l', '-z', '--full-tree', commitOid],
+    { signal }
+  );
   const entries = [];
   for (const record of raw.split('\0')) {
     if (!record) continue;
@@ -184,10 +192,13 @@ async function buildManifest(gitRoot, commitOid) {
 }
 
 // Streams blob contents out of git without one process per blob.
-async function* catFileBatch(gitRoot, oids) {
+async function* catFileBatch(gitRoot, oids, signal) {
+  signal?.throwIfAborted();
   const child = spawn('git', ['-C', gitRoot, 'cat-file', '--batch'], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  const abort = () => child.kill();
+  signal?.addEventListener('abort', abort, { once: true });
   child.stdin.write(oids.join('\n') + '\n');
   child.stdin.end();
 
@@ -215,6 +226,7 @@ async function* catFileBatch(gitRoot, oids) {
 
   try {
     for (let index = 0; index < oids.length; index += 1) {
+      signal?.throwIfAborted();
       const header = await readLine();
       const [oid, type, sizeText] = header.split(' ');
       if (type === 'missing' || sizeText === undefined) {
@@ -226,20 +238,29 @@ async function* catFileBatch(gitRoot, oids) {
       yield { oid, type, content };
     }
   } finally {
+    signal?.removeEventListener('abort', abort);
     child.kill();
   }
 }
 
 // --- Push ---------------------------------------------------------------------
 
-export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = () => {} }) {
-  const branches = await readLocalBranches(gitRoot);
+export async function pushRepo({
+  gitRoot,
+  repoId,
+  baseUrl,
+  token,
+  onProgress = () => {},
+  signal,
+}) {
+  signal?.throwIfAborted();
+  const branches = await readLocalBranches(gitRoot, signal);
   if (branches.length === 0) {
     return { ok: false, error: 'Nothing to push yet — create a commit first.' };
   }
 
   onProgress('Checking cloud state…');
-  const state = await api(baseUrl, token, `/api/git/repos/${repoId}`);
+  const state = await api(baseUrl, token, `/api/git/repos/${repoId}`, { signal });
   const serverRefs = new Map(state.refs.map((ref) => [ref.name, ref.oid]));
 
   const refUpdates = [];
@@ -248,8 +269,9 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
     const serverOid = serverRefs.get(branch.name) ?? null;
     if (serverOid === branch.oid) continue;
     if (serverOid) {
-      const known = await objectExists(gitRoot, serverOid);
-      const fastForward = known && (await isAncestor(gitRoot, serverOid, branch.oid));
+      const known = await objectExists(gitRoot, serverOid, signal);
+      signal?.throwIfAborted();
+      const fastForward = known && (await isAncestor(gitRoot, serverOid, branch.oid, signal));
       if (!fastForward) {
         skipped.push({
           branch: branch.branch,
@@ -274,7 +296,8 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
   onProgress('Packing objects…');
   const haves = [];
   for (const oid of serverRefs.values()) {
-    if (await objectExists(gitRoot, oid)) haves.push(oid);
+    signal?.throwIfAborted();
+    if (await objectExists(gitRoot, oid, signal)) haves.push(oid);
   }
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-push-'));
@@ -285,7 +308,7 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
     const packPromise = execFileAsync(
       'git',
       ['-C', gitRoot, 'pack-objects', '--revs', '-q', path.join(tmpDir, 'orion')],
-      { maxBuffer: MAX_GIT_BUFFER }
+      { maxBuffer: MAX_GIT_BUFFER, signal }
     );
     packPromise.child.stdin.write(revListInput);
     packPromise.child.stdin.end();
@@ -304,7 +327,8 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
     const manifests = new Map();
     const blobSizes = new Map();
     for (const commit of manifestCommits) {
-      const manifest = await buildManifest(gitRoot, commit);
+      signal?.throwIfAborted();
+      const manifest = await buildManifest(gitRoot, commit, signal);
       manifests.set(commit, manifest);
       for (const entry of manifest.entries) {
         if (entry.type === 'blob') blobSizes.set(entry.oid, entry.size ?? 0);
@@ -314,6 +338,7 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
     onProgress('Preparing upload…');
     const prepared = await api(baseUrl, token, `/api/git/repos/${repoId}/push/prepare`, {
       method: 'POST',
+      signal,
       body: JSON.stringify({
         packName: hasPack ? packName : null,
         manifestCommits,
@@ -323,15 +348,17 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
 
     if (hasPack) {
       onProgress(`Uploading pack (${Math.round(packData.length / 1024)} KB)…`);
-      await uploadTo(prepared.packPutUrl, packData);
-      await uploadTo(prepared.packIdxPutUrl, idxData);
+      await uploadTo(prepared.packPutUrl, packData, 'application/octet-stream', signal);
+      await uploadTo(prepared.packIdxPutUrl, idxData, 'application/octet-stream', signal);
     }
 
     for (const commit of manifestCommits) {
+      signal?.throwIfAborted();
       await uploadTo(
         prepared.manifestPutUrls[commit],
         JSON.stringify(manifests.get(commit)),
-        'application/json'
+        'application/json',
+        signal
       );
     }
 
@@ -342,17 +369,24 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
         const batch = missing.slice(index, index + BLOB_URL_BATCH);
         const { urls } = await api(baseUrl, token, `/api/git/repos/${repoId}/push/blob-urls`, {
           method: 'POST',
+          signal,
           body: JSON.stringify({ oids: batch }),
         });
         // Upload while streaming out of git so at most UPLOAD_CONCURRENCY
         // blobs are held in memory at once.
         const inFlight = new Set();
         try {
-          for await (const blob of catFileBatch(gitRoot, batch)) {
+          for await (const blob of catFileBatch(gitRoot, batch, signal)) {
+            signal?.throwIfAborted();
             if (blob.missing) continue;
             const url = urls[blob.oid];
             if (!url) continue;
-            const promise = uploadTo(url, blob.content).finally(() => inFlight.delete(promise));
+            const promise = uploadTo(
+              url,
+              blob.content,
+              'application/octet-stream',
+              signal
+            ).finally(() => inFlight.delete(promise));
             inFlight.add(promise);
             if (inFlight.size >= UPLOAD_CONCURRENCY) await Promise.race(inFlight);
           }
@@ -366,6 +400,7 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
     onProgress('Finishing push…');
     const completed = await api(baseUrl, token, `/api/git/repos/${repoId}/push/complete`, {
       method: 'POST',
+      signal,
       body: JSON.stringify({
         refUpdates,
         pack: hasPack ? { name: packName, size: packData.length } : null,
@@ -374,8 +409,11 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
     });
 
     for (const update of refUpdates) {
+      signal?.throwIfAborted();
       const branch = update.name.slice('refs/heads/'.length);
-      await git(gitRoot, ['update-ref', `refs/remotes/orion/${branch}`, update.newOid]);
+      await git(gitRoot, ['update-ref', `refs/remotes/orion/${branch}`, update.newOid], {
+        signal,
+      });
     }
 
     return {
@@ -400,15 +438,31 @@ export async function pushRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
   }
 }
 
-export async function publishRepo({ gitRoot, name, baseUrl, token, onProgress = () => {} }) {
-  const branch = (await currentBranch(gitRoot)) ?? 'main';
+export async function publishRepo({
+  gitRoot,
+  name,
+  baseUrl,
+  token,
+  onProgress = () => {},
+  signal,
+}) {
+  signal?.throwIfAborted();
+  const branch = (await currentBranch(gitRoot, signal)) ?? 'main';
   onProgress('Creating cloud repository…');
   const created = await api(baseUrl, token, '/api/git/repos', {
     method: 'POST',
+    signal,
     body: JSON.stringify({ name, defaultBranch: branch }),
   });
   await setCloudRepoLink(gitRoot, { repoId: created.repo.id, repoName: created.repo.name });
-  const result = await pushRepo({ gitRoot, repoId: created.repo.id, baseUrl, token, onProgress });
+  const result = await pushRepo({
+    gitRoot,
+    repoId: created.repo.id,
+    baseUrl,
+    token,
+    onProgress,
+    signal,
+  });
   return { ...result, repo: created.repo };
 }
 

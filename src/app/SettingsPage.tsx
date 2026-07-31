@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   ChevronDown,
+  Cloud,
   Columns2,
   FlaskConical,
   GitPullRequest,
@@ -36,6 +37,7 @@ import {
   type SavedView,
   type SplitViewSettings,
   type TextGenerationSettings,
+  type WorkspaceSyncSettings,
 } from '../store';
 import {
   agentProviders,
@@ -57,6 +59,7 @@ import type {
   ProviderUpdateState,
   RiftSweepDialogState,
   SettingsTab,
+  WorkspaceSyncStatus,
 } from './appTypes';
 
 // Settings remains controlled by App because its asynchronous account, update,
@@ -79,6 +82,10 @@ export type SettingsPageProps = {
   setOrchestrationGeneralInstructions: (text: string) => void;
   riftsSettings: RiftsSettings;
   setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
+  workspaceSyncSettings: WorkspaceSyncSettings;
+  setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
+  workspaceSyncStatus: WorkspaceSyncStatus | null;
+  handleWorkspaceSyncNow: () => void;
   setUtilityModelPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
   utilityModelPickerOpen: boolean;
   setUtilityModelSearch: React.Dispatch<React.SetStateAction<string>>;
@@ -186,6 +193,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setOrchestrationGeneralInstructions,
     riftsSettings,
     setRiftsSettings,
+    workspaceSyncSettings,
+    setWorkspaceSyncSettings,
+    workspaceSyncStatus,
+    handleWorkspaceSyncNow,
     setUtilityModelPickerOpen,
     utilityModelPickerOpen,
     setUtilityModelSearch,
@@ -306,6 +317,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         <div className="settings-nav">
           {[
             { id: 'account', label: 'Account', Icon: UserRound },
+            { id: 'cloud-sync', label: 'Cloud Sync', Icon: Cloud },
             { id: 'general', label: 'General', Icon: Settings },
             { id: 'providers', label: 'Providers', Icon: Plug },
             { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
@@ -340,6 +352,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
       <div className="settings-content">
         <div className="settings-content-header">
           {settingsTab === 'account' && 'ACCOUNT'}
+          {settingsTab === 'cloud-sync' && 'CLOUD SYNC'}
           {settingsTab === 'general' && 'GENERAL'}
           {settingsTab === 'providers' && 'PROVIDERS'}
           {settingsTab === 'orchestration' && 'ORCHESTRATION'}
@@ -433,6 +446,95 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   >
                     <LogIn size={13} />
                     {accountBusy ? 'Opening...' : 'Sign in'}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+
+          {settingsTab === 'cloud-sync' && (
+            <>
+              <div className="setting-row">
+                <div className="setting-label">
+                  <div className="setting-label-title">Sync workspace to Orion Web</div>
+                  <div className="setting-label-desc">
+                    Off by default. When enabled, your projects, epics, threads (full transcripts
+                    including every agent step and tool call), and token usage sync to your Orion
+                    account so you can browse them at Orion Web → Usage. The first enable backfills
+                    everything in the background.
+                    {!accountState.authenticated &&
+                      (workspaceSyncSettings.enabled
+                        ? ' Sync is paused while signed out. You can turn it off now or sign in to resume.'
+                        : ' Sign in on the Account tab to enable.')}
+                  </div>
+                </div>
+                <label
+                  className="provider-toggle"
+                  title={
+                    accountState.authenticated
+                      ? 'Sync projects, threads, and usage to Orion Web'
+                      : workspaceSyncSettings.enabled
+                        ? 'Turn off workspace sync'
+                        : 'Sign in to your Orion account first'
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={workspaceSyncSettings.enabled}
+                    disabled={!accountState.authenticated && !workspaceSyncSettings.enabled}
+                    onChange={(e) => setWorkspaceSyncSettings({ enabled: e.target.checked })}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              <div className="setting-row">
+                <div className="setting-label">
+                  <div className="setting-label-title">Sync code</div>
+                  <div className="setting-label-desc">
+                    Publish each git project as a private Orion Cloud repo and push new commits
+                    automatically, keeping the full history and diffs.
+                  </div>
+                </div>
+                <label className="provider-toggle" title="Auto-publish and push git projects">
+                  <input
+                    type="checkbox"
+                    checked={workspaceSyncSettings.syncCode}
+                    disabled={!accountState.authenticated || !workspaceSyncSettings.enabled}
+                    onChange={(e) => setWorkspaceSyncSettings({ syncCode: e.target.checked })}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              {workspaceSyncSettings.enabled && accountState.authenticated && (
+                <div className="setting-row">
+                  <div className="setting-label">
+                    <div className="setting-label-title">Status</div>
+                    <div className="setting-label-desc">
+                      {workspaceSyncStatus?.lastError
+                        ? `Last sync failed: ${workspaceSyncStatus.lastError}`
+                        : workspaceSyncStatus?.syncing
+                          ? workspaceSyncStatus.backfillDone
+                            ? 'Syncing…'
+                            : 'Backfilling existing projects and threads…'
+                          : workspaceSyncStatus?.lastSyncAt
+                            ? `Synced ${formatCheckedTime(workspaceSyncStatus.lastSyncAt)}${
+                                workspaceSyncStatus.counts
+                                  ? ` — ${workspaceSyncStatus.counts.threads} threads, ${workspaceSyncStatus.counts.projects} projects`
+                                  : ''
+                              }`
+                            : 'Waiting for first sync.'}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="provider-auth-button"
+                    onClick={handleWorkspaceSyncNow}
+                    disabled={Boolean(workspaceSyncStatus?.syncing)}
+                  >
+                    <RefreshCw size={13} />
+                    {workspaceSyncStatus?.syncing ? 'Syncing…' : 'Sync now'}
                   </button>
                 </div>
               )}
