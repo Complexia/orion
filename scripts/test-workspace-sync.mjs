@@ -18,9 +18,10 @@ import {
   workspaceSyncNow,
 } from '../src/main/workspace-sync.js';
 
-const orionNextDir =
-  process.env.ORION_NEXT_DIR ??
-  '/Users/complexia/Desktop/projects/.rifts/orion-web/analytics-b2c95bcdae7adb2c35c73f0d/orion-next';
+const orionNextDir = process.env.ORION_NEXT_DIR;
+if (!orionNextDir) {
+  throw new Error('Set ORION_NEXT_DIR to the related orion-next checkout (see the header comment).');
+}
 const BASE_URL = new URL(process.env.ORION_WEB_URL ?? 'http://localhost:3000');
 const OWNER = 'user_desktop_e2e';
 

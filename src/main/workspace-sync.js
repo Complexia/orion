@@ -21,6 +21,7 @@ const THREAD_SYNC_BATCH = 50;
 const SYNC_DEBOUNCE_MS = 15_000;
 const CODE_POLL_MS = 60_000;
 const MIN_SYNC_GAP_MS = 5_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 // Injected by main.js at startup so this module needs no knowledge of Electron
 // state: { getWebUrl, readSession, readStoreState, readThreadsFile, broadcast }.
@@ -40,7 +41,8 @@ let status = {
 let syncTimer = null;
 let codePollTimer = null;
 let syncInFlight = null;
-let syncQueued = false;
+let syncQueuedOptions = null;
+let scheduledSyncOptions = null;
 let syncGeneration = 0;
 let activeSyncController = null;
 let lastSyncStartedAt = 0;
@@ -68,8 +70,26 @@ const setStatus = (updates) => {
   broadcastStatus();
 };
 
+const fetchForSync = async (input, options = {}) => {
+  const timeoutController = new AbortController();
+  const timeout = setTimeout(() => {
+    const error = new Error('Workspace sync request timed out.');
+    error.name = 'TimeoutError';
+    timeoutController.abort(error);
+  }, REQUEST_TIMEOUT_MS);
+  timeout.unref?.();
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, timeoutController.signal])
+    : timeoutController.signal;
+  try {
+    return await fetch(input, { ...options, signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const api = async (token, apiPath, options = {}) => {
-  const response = await fetch(new URL(apiPath, deps.getWebUrl()), {
+  const response = await fetchForSync(new URL(apiPath, deps.getWebUrl()), {
     ...options,
     headers: {
       authorization: `Bearer ${token}`,
@@ -125,7 +145,8 @@ const ensureCurrentSync = (generation, signal) => {
 
 const invalidateActiveSync = () => {
   syncGeneration += 1;
-  syncQueued = false;
+  syncQueuedOptions = null;
+  scheduledSyncOptions = null;
   activeSyncController?.abort();
 };
 
@@ -350,7 +371,7 @@ const syncThreads = async (token, threads, { generation, signal }) => {
     for (const upload of uploads) {
       const entry = byThreadId.get(upload?.threadId);
       if (!entry || !upload?.url) continue;
-      const put = await fetch(upload.url, {
+      const put = await fetchForSync(upload.url, {
         method: 'PUT',
         body: entry.serialized,
         signal,
@@ -595,7 +616,7 @@ const runSyncPass = async (
 
 const runSync = (options) => {
   if (syncInFlight) {
-    syncQueued = true;
+    syncQueuedOptions = { ...(syncQueuedOptions ?? {}), ...(options ?? {}) };
     return syncInFlight;
   }
   const generation = syncGeneration;
@@ -605,22 +626,28 @@ const runSync = (options) => {
   syncInFlight = runSyncPass(options, { generation, signal: controller.signal }).finally(() => {
     syncInFlight = null;
     if (activeSyncController === controller) activeSyncController = null;
-    if (syncQueued) {
-      syncQueued = false;
-      scheduleSync(SYNC_DEBOUNCE_MS);
+    if (syncQueuedOptions) {
+      const queuedOptions = syncQueuedOptions;
+      syncQueuedOptions = null;
+      scheduleSync(SYNC_DEBOUNCE_MS, queuedOptions);
     }
   });
   return syncInFlight;
 };
 
-const scheduleSync = (delayMs = SYNC_DEBOUNCE_MS) => {
+const scheduleSync = (delayMs = SYNC_DEBOUNCE_MS, options) => {
   if (!settings.enabled) return;
+  if (options) {
+    scheduledSyncOptions = { ...(scheduledSyncOptions ?? {}), ...options };
+  }
   if (syncTimer) clearTimeout(syncTimer);
   const sinceLast = Date.now() - lastSyncStartedAt;
   const delay = Math.max(delayMs, MIN_SYNC_GAP_MS - sinceLast);
   syncTimer = setTimeout(() => {
     syncTimer = null;
-    void runSync();
+    const nextOptions = scheduledSyncOptions;
+    scheduledSyncOptions = null;
+    void runSync(nextOptions ?? undefined);
   }, delay);
   // Don't hold the process open for a pending sync.
   syncTimer.unref?.();
@@ -638,6 +665,7 @@ const startCodePoll = () => {
 const stopTimers = () => {
   if (syncTimer) clearTimeout(syncTimer);
   syncTimer = null;
+  scheduledSyncOptions = null;
   if (codePollTimer) clearInterval(codePollTimer);
   codePollTimer = null;
 };

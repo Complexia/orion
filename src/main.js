@@ -269,6 +269,7 @@ const retryOrphanedRiftCleanup = () =>
 
 let pendingDesktopAuth = null;
 let inMemoryAccountSession = null;
+let lastPublishedAccountAuthenticated = null;
 let storageSaveQueue = Promise.resolve();
 let threadsSaveQueue = Promise.resolve();
 // The quit-time synchronous threads flush jumps the async save queue; the
@@ -499,8 +500,16 @@ const publishAccountState = async (session) => {
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('account:changed', account);
   }
-  // Sign-in/out flips the workspace sync engine's authentication gate.
-  notifyWorkspaceSyncAccountChanged();
+  // Only real sign-in/out transitions invalidate account-scoped sync state.
+  // Startup restoration and OAuth validation refreshes still update renderers
+  // without forcing a full workspace backfill.
+  if (
+    lastPublishedAccountAuthenticated !== null &&
+    lastPublishedAccountAuthenticated !== account.authenticated
+  ) {
+    notifyWorkspaceSyncAccountChanged();
+  }
+  lastPublishedAccountAuthenticated = account.authenticated;
   return account;
 };
 
