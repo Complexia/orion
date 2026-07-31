@@ -59,11 +59,13 @@ import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, h
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
 import { listRiftTrashPaths, riftBinaryPath, riftCreate, riftGc, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
 import {
+  collectCurrentManualRiftReleaseEntries,
   collectPendingRiftOwnersByPath,
   createRiftRemovalCoordinator,
   deleteRiftRestoreRef,
   guardedEpicIdsForRiftReleaseJournal,
   isEpicDeletionPersisted,
+  isManualRiftReleaseEntryCurrent,
   isRiftReleaseOwnerCurrent,
   isRetainedRiftOwnerEligible,
   preserveRiftHeadForRestore,
@@ -3393,6 +3395,7 @@ ipcMain.handle('epic:deleteRiftRestoreRef', async (_event, input) => {
 
 let riftStorageState = {
   scanning: false,
+  scanId: null,
   scannedAt: null,
   entries: [],
   trashBytes: null,
@@ -3648,9 +3651,10 @@ const scanRiftStorage = async ({ remeasure = false } = {}) => {
       else status = 'active';
     }
 
-    // Active rifts are never sweep candidates, so skip the git work for them.
-    const workState =
-      status === 'active' ? null : await readRiftWorkState(riftPath);
+    // Individual row actions can manually free a Rift in any lifecycle state,
+    // so every row needs an accurate unpublished-work warning and override.
+    // The bulk/automatic candidate filters remain stricter.
+    const workState = await readRiftWorkState(riftPath);
 
     return {
       riftPath,
@@ -3691,6 +3695,7 @@ const runRiftStorageScan = ({ remeasure = false } = {}) => {
         const { entries, trashBytes } = await scanRiftStorage({ remeasure });
         publishRiftStorageState({
           scanning: false,
+          scanId: crypto.randomUUID(),
           scannedAt: new Date().toISOString(),
           entries,
           trashBytes,
@@ -3740,6 +3745,12 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
     return { ok: false, error: 'No rifts were selected.' };
   }
   const forcedPaths = new Set(Array.isArray(input?.forcePaths) ? input.forcePaths : []);
+  const manuallyRequestedPaths = new Set(
+    (Array.isArray(input?.manualPaths) ? input.manualPaths : []).filter(
+      (value) => typeof value === 'string' && value
+    )
+  );
+  const manualScanId = typeof input?.manualScanId === 'string' ? input.manualScanId : null;
   // The renderer knows about live runs the persisted store cannot show.
   const busyEpicIds = new Set(Array.isArray(input?.busyEpicIds) ? input.busyEpicIds : []);
   const runtimeThreadIdsByEpic =
@@ -3783,6 +3794,16 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
     unacknowledgedRifts,
     pendingRiftCreations
   );
+  // Manual overrides are accepted only for exact paths main published in the
+  // scan the confirmation dialog displayed. Resolve them after taking the
+  // destructive-operation queue so a rescan cannot silently substitute a
+  // newer row while this request waits.
+  const manuallyConfirmedEntries = collectCurrentManualRiftReleaseEntries(
+    riftStorageState.entries,
+    manuallyRequestedPaths,
+    riftStorageState.scanId,
+    manualScanId
+  );
   const trashPaths = new Set(runGc ? listRiftTrashPaths() : []);
   if (runGc) {
     for (const riftRoot of await collectRiftRoots(persistedState)) {
@@ -3808,6 +3829,8 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
   const results = [];
   for (const riftPath of requested) {
     const reject = (reason) => results.push({ riftPath, ok: false, reason });
+    const manuallyConfirmedEntry = manuallyConfirmedEntries.get(riftPath);
+    const manuallyConfirmed = Boolean(manuallyConfirmedEntry);
     if (typeof riftPath !== 'string' || !riftPath) {
       reject('unsafe-path');
       continue;
@@ -3819,10 +3842,20 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
       reject('epic-active');
       continue;
     }
+    const owner = owners.get(riftPath);
+    if (manuallyRequestedPaths.has(riftPath) && !manuallyConfirmedEntry) {
+      reject(owner && !owner.settledAt && !owner.cleanupPending ? 'epic-active' : 'ownership-changed');
+      continue;
+    }
+    if (manuallyConfirmedEntry && !isManualRiftReleaseEntryCurrent(manuallyConfirmedEntry, owner)) {
+      // A row confirmation authorizes the lifecycle identity the user saw,
+      // not a replacement owner or a same-Epic restore that raced the dialog.
+      reject(owner && !owner.settledAt && !owner.cleanupPending ? 'epic-active' : 'ownership-changed');
+      continue;
+    }
     if (!existsSync(riftPath)) {
       // Already gone; let the renderer clear the epic's pointer anyway.
       await forgetRiftCleanup(riftPath);
-      const owner = owners.get(riftPath);
       if (owner) {
         try {
           await Promise.all(
@@ -3855,19 +3888,24 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
       results.push({ riftPath, ok: true, skipped: true, epicId: owner?.epicId ?? null });
       continue;
     }
-    // Only ever remove something shaped exactly like an Orion-created rift
-    // that still carries Rift's own marker. Markerless removal stays reserved
-    // for the pre-create journal in `epic:removeRift`.
+    // Only ever remove something shaped exactly like an Orion-created rift.
+    // The marker remains mandatory for automatic cleanup; an individually
+    // confirmed path from main's current scan may also be an incomplete
+    // markerless destination left by an interrupted create.
     if (!isRiftDirectoryPath(riftPath)) {
       reject('unsafe-path');
       continue;
     }
-    if (!(await riftHasMarker(riftPath))) {
+    const hasMarker = await riftHasMarker(riftPath);
+    if (manuallyConfirmedEntry && hasMarker !== manuallyConfirmedEntry.hasMarker) {
+      reject('ownership-changed');
+      continue;
+    }
+    if (!hasMarker && !manuallyConfirmed) {
       reject('missing-marker');
       continue;
     }
-    const owner = owners.get(riftPath);
-    if (owner && !owner.settledAt && !owner.cleanupPending) {
+    if (owner && !owner.settledAt && !owner.cleanupPending && !manuallyConfirmed) {
       reject('epic-active');
       continue;
     }
@@ -4009,7 +4047,15 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
       continue;
     }
     try {
-      await riftRemove(riftPath);
+      if (hasMarker) {
+        await riftRemove(riftPath);
+      } else {
+        // Markerless rows are incomplete Orion destinations rather than
+        // registered Rift workspaces. The scan allowlist plus the strict path
+        // shape above authorize this exact directory, and system Trash keeps
+        // the manual removal recoverable.
+        await shell.trashItem(riftPath);
+      }
     } catch (error) {
       if (owner) {
         try {

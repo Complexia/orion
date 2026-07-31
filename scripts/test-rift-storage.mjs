@@ -6,11 +6,13 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 import {
+  collectCurrentManualRiftReleaseEntries,
   collectPendingRiftOwnersByPath,
   createRiftRemovalCoordinator,
   deleteRiftRestoreRef,
   guardedEpicIdsForRiftReleaseJournal,
   isEpicDeletionPersisted,
+  isManualRiftReleaseEntryCurrent,
   isRiftReleaseOwnerCurrent,
   isRetainedRiftOwnerEligible,
   preserveRiftHeadForRestore,
@@ -193,7 +195,82 @@ const manualOwner = {
   settledAt: '2026-07-19T00:00:00.000Z',
   cleanupPending: false,
 };
+const confirmedManualEntry = {
+  riftPath: '/rift/manual',
+  epicId: manualOwner.epicId,
+  status: 'settled',
+  settledAt: manualOwner.settledAt,
+  hasMarker: true,
+};
 assert.equal(isRiftReleaseOwnerCurrent(manualOwner, manualOwner), true);
+assert.equal(
+  isManualRiftReleaseEntryCurrent(confirmedManualEntry, manualOwner),
+  true,
+  'manual confirmation should accept the lifecycle identity shown by the scan'
+);
+assert.equal(
+  isManualRiftReleaseEntryCurrent(
+    { epicId: null, status: 'orphan', settledAt: null },
+    undefined
+  ),
+  true,
+  'an orphan row should remain manually eligible while it is still unowned'
+);
+assert.equal(
+  isManualRiftReleaseEntryCurrent(
+    { epicId: manualOwner.epicId, status: 'active', settledAt: null },
+    { ...manualOwner, settledAt: null }
+  ),
+  true,
+  'an explicitly confirmed active row should be manually eligible'
+);
+assert.equal(
+  isManualRiftReleaseEntryCurrent(
+    { epicId: null, status: 'orphan', settledAt: null },
+    {
+      ...manualOwner,
+      settledAt: null,
+    }
+  ),
+  false,
+  'a newly claimed Rift must win over a stale orphan-row confirmation'
+);
+assert.equal(
+  isManualRiftReleaseEntryCurrent(
+    confirmedManualEntry,
+    { ...manualOwner, settledAt: null }
+  ),
+  false,
+  'restoring an Epic must win over a stale settled-row confirmation'
+);
+assert.equal(
+  isManualRiftReleaseEntryCurrent(
+    confirmedManualEntry,
+    { ...manualOwner, settledAt: '2026-07-22T00:00:00.000Z' }
+  ),
+  false,
+  're-settling an Epic must not revive an older manual confirmation'
+);
+assert.equal(
+  collectCurrentManualRiftReleaseEntries(
+    [confirmedManualEntry],
+    [confirmedManualEntry.riftPath],
+    'scan-current',
+    'scan-current'
+  ).get(confirmedManualEntry.riftPath),
+  confirmedManualEntry,
+  'manual confirmation should retain the row from the scan the user saw'
+);
+assert.equal(
+  collectCurrentManualRiftReleaseEntries(
+    [{ ...confirmedManualEntry, status: 'active', settledAt: null }],
+    [confirmedManualEntry.riftPath],
+    'scan-new',
+    'scan-old'
+  ).size,
+  0,
+  'a completed rescan must not rebind a stale path confirmation to its replacement row'
+);
 assert.equal(
   isRiftReleaseOwnerCurrent({ ...manualOwner, settledAt: null }, manualOwner),
   false,
