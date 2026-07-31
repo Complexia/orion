@@ -46,6 +46,15 @@ import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvi
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { emitAgentEvent, sendToAllWindows } from './main/events.js';
+import {
+  configureWorkspaceSync,
+  getWorkspaceSyncStatus,
+  initWorkspaceSync,
+  notifyAccountChanged as notifyWorkspaceSyncAccountChanged,
+  notifyWorkspaceChanged,
+  shutdownWorkspaceSync,
+  workspaceSyncNow,
+} from './main/workspace-sync.js';
 import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
 import { listRiftTrashPaths, riftBinaryPath, riftCreate, riftGc, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
@@ -260,6 +269,7 @@ const retryOrphanedRiftCleanup = () =>
 
 let pendingDesktopAuth = null;
 let inMemoryAccountSession = null;
+let lastPublishedAccountAuthenticated = null;
 let storageSaveQueue = Promise.resolve();
 let threadsSaveQueue = Promise.resolve();
 // The quit-time synchronous threads flush jumps the async save queue; the
@@ -490,6 +500,16 @@ const publishAccountState = async (session) => {
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('account:changed', account);
   }
+  // Only real sign-in/out transitions invalidate account-scoped sync state.
+  // Startup restoration and OAuth validation refreshes still update renderers
+  // without forcing a full workspace backfill.
+  if (
+    lastPublishedAccountAuthenticated !== null &&
+    lastPublishedAccountAuthenticated !== account.authenticated
+  ) {
+    notifyWorkspaceSyncAccountChanged();
+  }
+  lastPublishedAccountAuthenticated = account.authenticated;
   return account;
 };
 
@@ -769,6 +789,43 @@ app.whenReady().then(async () => {
   startShellPathSync();
   startLegacyMcpCleanup();
 
+  // Workspace sync (opt-in, contract in orion-web/docs/workspace-sync.md).
+  // Seed the engine from the persisted store so an enabled sync resumes after
+  // restart without waiting for the renderer to hydrate; the renderer re-pushes
+  // the settings over sync:configure on hydration and every change.
+  initWorkspaceSync({
+    getWebUrl: () => getOrionWebUrl(),
+    readSession: () => readAccountSession(),
+    readStoreState: () => readPersistedStoreState(),
+    readThreadsFile: async () => {
+      let value;
+      try {
+        value = await fs.readFile(getThreadsFilePath(), 'utf-8');
+      } catch (error) {
+        // No split transcript file yet is a legitimate empty workspace. Any
+        // other read failure is ambiguous, so reject the pass before it can
+        // publish a complete empty snapshot and remove every remote thread.
+        if (error?.code === 'ENOENT') return { threads: [] };
+        throw new Error('Could not read workspace transcripts for sync.', { cause: error });
+      }
+      try {
+        const parsed = JSON.parse(value);
+        if (!Array.isArray(parsed?.threads)) {
+          throw new Error('Transcript file does not contain a threads array.');
+        }
+        return parsed;
+      } catch (error) {
+        throw new Error('Could not parse workspace transcripts for sync.', { cause: error });
+      }
+    },
+    broadcast: (channel, payload) => sendToAllWindows(channel, payload),
+  });
+  void readPersistedStoreState().then((state) => {
+    if (state?.workspaceSyncSettings) {
+      configureWorkspaceSync(state.workspaceSyncSettings);
+    }
+  });
+
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({
       applicationName: 'Orion',
@@ -1031,6 +1088,7 @@ const waitForPendingQuitWork = () =>
     .then(() => threadsSaveQueue.catch(() => {}));
 
 app.on('will-quit', (event) => {
+  shutdownWorkspaceSync();
   disposeForQuit();
   if (quitBarrierSatisfied) return;
 
@@ -1097,6 +1155,8 @@ ipcMain.handle('storage:save', async (_event, value) => {
 
   try {
     await save;
+    // Projects/epics/settings changed — nudge the (opt-in) workspace sync.
+    notifyWorkspaceChanged();
     return true;
   } catch (error) {
     console.error('storage:save error', error);
@@ -1129,6 +1189,12 @@ ipcMain.handle('storage:loadThreads', async () => {
     return { ok: false };
   }
 });
+
+// Workspace sync surface. Configure carries the renderer's persisted opt-in
+// settings; the engine itself no-ops while disabled or signed out.
+ipcMain.handle('sync:configure', (_event, value) => configureWorkspaceSync(value));
+ipcMain.handle('sync:now', () => workspaceSyncNow());
+ipcMain.handle('sync:getState', () => getWorkspaceSyncStatus());
 
 ipcMain.handle('storage:saveThreads', async (_event, value) => {
   // Same settled-queue chaining as storage:save above.
@@ -1163,6 +1229,9 @@ ipcMain.handle('storage:saveThreads', async (_event, value) => {
 
   try {
     await save;
+    // The threads file just changed on disk — let the (opt-in) workspace sync
+    // engine schedule a debounced pass. Inert while sync is disabled.
+    notifyWorkspaceChanged();
     return true;
   } catch (error) {
     console.error('storage:saveThreads error', error);

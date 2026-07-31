@@ -159,6 +159,25 @@ export const defaultRiftsSettings: RiftsSettings = {
   retentionDays: null,
 };
 
+/**
+ * Opt-in workspace sync to Orion Web (docs in orion-web/docs/workspace-sync.md):
+ * projects, epics, threads (full transcripts), token usage, and — when
+ * syncCode is on — code as Orion Cloud repos with full git history. Disabled
+ * by default; while disabled (or signed out) the desktop makes no sync calls
+ * of any kind and captures nothing extra.
+ */
+export type WorkspaceSyncSettings = {
+  /** Master switch; requires a signed-in Orion account to take effect. */
+  enabled: boolean;
+  /** Auto-publish git projects as cloud repos and auto-push new commits. */
+  syncCode: boolean;
+};
+
+export const defaultWorkspaceSyncSettings: WorkspaceSyncSettings = {
+  enabled: false,
+  syncCode: true,
+};
+
 const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
 
 /**
@@ -268,6 +287,12 @@ export type Message = {
   changedFiles?: ChangedFileSummary[];
   /** Per-turn token usage, when the provider reports it (grok ACP). */
   stats?: TurnTokenStats;
+  /**
+   * Model the turn was dispatched with ("<providerId>:<slug>"), stamped when
+   * the run starts. Thread.modelId is mutable (and lies for orchestrator
+   * threads), so per-message attribution needs this frozen copy.
+   */
+  modelId?: string;
   /** Board-task chips shown on the user message whose turn sent those tasks to the agent. */
   linkedTasks?: Array<Pick<LinkedBoardTask, 'id' | 'title' | 'description'>>;
 };
@@ -576,6 +601,7 @@ interface OrionState {
   selectedEpicId: string | null;
   epicsSettings: EpicsSettings;
   riftsSettings: RiftsSettings;
+  workspaceSyncSettings: WorkspaceSyncSettings;
 
   // Code tab workspace
   workspacePath: string | null;
@@ -623,6 +649,7 @@ interface OrionState {
   selectEpic: (id: string | null) => void;
   setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
   setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
+  setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
 
   createThread: (
     projectId: string,
@@ -1117,6 +1144,7 @@ export const useOrionStore = create<OrionState>()(
       selectedEpicId: null,
       epicsSettings: defaultEpicsSettings,
       riftsSettings: defaultRiftsSettings,
+      workspaceSyncSettings: defaultWorkspaceSyncSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -1472,6 +1500,15 @@ export const useOrionStore = create<OrionState>()(
           riftsSettings: {
             ...defaultRiftsSettings,
             ...state.riftsSettings,
+            ...updates,
+          },
+        })),
+
+      setWorkspaceSyncSettings: (updates) =>
+        set((state) => ({
+          workspaceSyncSettings: {
+            ...defaultWorkspaceSyncSettings,
+            ...state.workspaceSyncSettings,
             ...updates,
           },
         })),
@@ -2059,6 +2096,10 @@ export const useOrionStore = create<OrionState>()(
         riftsSettings: {
           ...defaultRiftsSettings,
           ...state.riftsSettings,
+        },
+        workspaceSyncSettings: {
+          ...defaultWorkspaceSyncSettings,
+          ...state.workspaceSyncSettings,
         },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
