@@ -270,6 +270,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
         {openFiles.length > 0 && (
           <div className="editor-tabs" role="tablist" aria-label="Open files">
             {openFiles.map((file) => {
+              if (!file?.path) return null;
               const fileName = file.path.split(/[\\/]/).pop() || file.path;
               const isActive = file.path === activeFilePath;
               return (

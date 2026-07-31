@@ -83,6 +83,44 @@ export type RiftStorageReleaseResult = {
   epicId?: string | null;
 };
 
+/**
+ * One agent skill directory under ~/.claude/skills (active) or
+ * ~/.claude/skills-disabled (deactivated by Orion). The filesystem is the only
+ * source of truth — nothing about skills is persisted in the Orion store.
+ */
+export type SkillEntry = {
+  /** Directory name; mutations also carry `path` and `enabled` to identify duplicate IDs exactly. */
+  id: string;
+  /** Frontmatter `name`, falling back to the directory name. */
+  name: string;
+  description: string;
+  version: string | null;
+  license: string | null;
+  path: string;
+  /** Absolute path of the skill's SKILL.md — always present. */
+  skillFile: string;
+  enabled: boolean;
+  scope: 'user';
+  bytes: number;
+  files: number;
+  updatedAt: string | null;
+};
+
+export type SkillsListResult = {
+  ok: boolean;
+  skills: SkillEntry[];
+  skillsPath: string;
+  disabledPath: string;
+  error?: string;
+};
+
+export type SkillImportResult = {
+  id: string;
+  name: string;
+  status: 'imported' | 'replaced' | 'skipped' | 'error';
+  error?: string;
+};
+
 // A running orchestrator agent asked main to spawn a subagent; the renderer
 // resolves the model fuzzily (id, slug, or label), creates a child thread,
 // runs it, and reports back via reportSubagentResult.
@@ -558,6 +596,21 @@ type OrionComputerUsePermissions = {
         releasedEpicIds: string[];
         error?: string;
       }>;
+      listSkills?: () => Promise<SkillsListResult>;
+      /** Omit `paths` to let the user pick folders, SKILL.md files, or .zip archives. */
+      importSkills?: (input?: { paths?: string[] }) => Promise<{
+        ok: boolean;
+        cancelled?: boolean;
+        results: SkillImportResult[];
+      }>;
+      setSkillEnabled?: (input: { id: string; enabled: boolean }) => Promise<{ ok: boolean; error?: string }>;
+      deleteSkill?: (input: { id: string; path: string; enabled: boolean; confirm?: boolean }) => Promise<{
+        ok: boolean;
+        cancelled?: boolean;
+        error?: string;
+      }>;
+      revealSkill?: (input: { id: string; path: string; enabled: boolean }) => Promise<{ ok: boolean; error?: string }>;
+      openSkillsFolder?: () => Promise<{ ok: boolean; error?: string }>;
       getPathForFile?: (file: File) => string;
       saveImageAttachment: (input: {
         name: string;
