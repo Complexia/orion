@@ -340,8 +340,19 @@ const extractArchive = async (archivePath) => {
   if (process.platform === 'win32') {
     await execFileAsync(
       'powershell.exe',
-      ['-NoProfile', '-Command', `Expand-Archive -LiteralPath "${archivePath}" -DestinationPath "${workingDir}" -Force`],
-      { timeout: 60000 }
+      [
+        '-NoProfile',
+        '-Command',
+        'Expand-Archive -LiteralPath $env:ORION_SKILL_ARCHIVE -DestinationPath $env:ORION_SKILL_DEST -Force',
+      ],
+      {
+        timeout: 60000,
+        env: {
+          ...process.env,
+          ORION_SKILL_ARCHIVE: archivePath,
+          ORION_SKILL_DEST: workingDir,
+        },
+      }
     );
   } else {
     await execFileAsync('unzip', ['-q', '-o', archivePath, '-d', workingDir], { timeout: 60000 });
