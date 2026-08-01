@@ -69,6 +69,7 @@ import {
   type Epic,
 } from './store';
 import type { RiftStorageEntry, RiftStorageState } from './types';
+import { inheritedSubagentResumeContext } from './thread-branching';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
@@ -400,6 +401,7 @@ const threadShellSignature = (thread: Thread): string => {
     JSON.stringify(thread.agentSessionIds ?? null),
     JSON.stringify(thread.pendingForkProviders ?? null),
     JSON.stringify(thread.subagent ?? null),
+    JSON.stringify(thread.inheritedSubagent ?? null),
     JSON.stringify(thread.goal ?? null),
     JSON.stringify(thread.linkedTasks ?? null),
   ].join('\u0000');
@@ -6003,6 +6005,17 @@ const App: React.FC = () => {
             injectedIds.has(task.id) ? { ...task, injected: true } : task
           ),
         });
+      }
+      // Inherited children normally fork their own provider session. If the
+      // user picks another model/provider (or the native provider exposed no
+      // independently resumable session), carry the visible child transcript
+      // into this first fresh turn. The branched parent still does not absorb
+      // every child transcript.
+      const inheritedResumeContext = inheritedSubagentResumeContext(thread, model.providerId);
+      if (inheritedResumeContext) {
+        agentPrompt = agentPrompt
+          ? `${inheritedResumeContext}\n\n${agentPrompt}`
+          : inheritedResumeContext;
       }
       // @-model mentions in the user's original text: tell the agent which
       // models were referenced so it can delegate to them. Works on any
