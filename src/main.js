@@ -44,6 +44,7 @@ import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
 import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents, stringifySummary } from './main/stream-adapters.js';
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
+import { deleteSkill, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { emitAgentEvent, sendToAllWindows } from './main/events.js';
 import {
@@ -6996,6 +6997,37 @@ ipcMain.handle('openWith:open', async (_event, input) => {
     return { ok: false, error: error?.message ?? 'Failed to open' };
   }
 });
+
+// --- Agent skills (Settings → Skills) -----------------------------------------
+
+ipcMain.handle('skills:list', async () => listSkills());
+
+ipcMain.handle('skills:import', async (event, input) =>
+  importSkills({
+    window: BrowserWindow.fromWebContents(event.sender),
+    paths: input?.paths,
+  })
+);
+
+ipcMain.handle('skills:setEnabled', async (_event, input) =>
+  setSkillEnabled({ id: input?.id, enabled: input?.enabled })
+);
+
+ipcMain.handle('skills:delete', async (event, input) =>
+  deleteSkill({
+    window: BrowserWindow.fromWebContents(event.sender),
+    id: input?.id,
+    skillPath: input?.path,
+    enabled: input?.enabled,
+    confirm: input?.confirm !== false,
+  })
+);
+
+ipcMain.handle('skills:reveal', async (_event, input) =>
+  revealSkill({ id: input?.id, skillPath: input?.path, enabled: input?.enabled })
+);
+
+ipcMain.handle('skills:openFolder', async () => openSkillsFolder());
 
 ipcMain.handle('path:basename', (_e, p) => path.basename(p));
 ipcMain.handle('path:dirname', (_e, p) => path.dirname(p));

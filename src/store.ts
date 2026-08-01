@@ -2012,6 +2012,9 @@ export const useOrionStore = create<OrionState>()(
       setWorkspacePath: (path) => set({ workspacePath: path }),
 
       openFile: (path, content) => {
+        // A tab without a path can never be rendered, closed, or saved — refuse
+        // it here rather than letting it break the whole editor.
+        if (!path) return;
         const existing = get().openFiles.find((f) => f.path === path);
         if (existing) {
           set({ activeFilePath: path });

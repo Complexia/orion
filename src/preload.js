@@ -68,6 +68,14 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('riftStorage:released', listener);
   },
 
+  // Agent skills (Settings > Skills)
+  listSkills: () => ipcRenderer.invoke('skills:list'),
+  importSkills: (input) => ipcRenderer.invoke('skills:import', input),
+  setSkillEnabled: (input) => ipcRenderer.invoke('skills:setEnabled', input),
+  deleteSkill: (input) => ipcRenderer.invoke('skills:delete', input),
+  revealSkill: (input) => ipcRenderer.invoke('skills:reveal', input),
+  openSkillsFolder: () => ipcRenderer.invoke('skills:openFolder'),
+
   // Agent runtime
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),

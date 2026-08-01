@@ -3584,6 +3584,53 @@ const App: React.FC = () => {
     [addProject, createThread, repositoryOperationBusy, setActiveTab, setWorkspacePath]
   );
 
+  // Settings → Skills hands a skill to the Code tab: its folder becomes the
+  // explorer root (references/, scripts/ and all) with SKILL.md already open.
+  // Deliberately not routed through handleSetActiveTab, which would snap the
+  // workspace back to the active thread's working directory.
+  const handleOpenSkillInEditor = useCallback(
+    async (skill: { path: string; skillFile?: string; name: string }) => {
+      if (!window.orion) return;
+      if (activeRiftUnavailable) {
+        toast.error('Wait for the epic’s rift workspace to become available');
+        return;
+      }
+      if (!skill?.path) {
+        toast.error(`Could not locate ${skill?.name ?? 'that skill'} on disk`);
+        return;
+      }
+      // A main process that predates the skillFile field (main is not
+      // hot-reloaded) sends the folder only — derive the file rather than
+      // opening an undefined path.
+      const separator = skill.path.includes('\\') && !skill.path.includes('/') ? '\\' : '/';
+      const skillFile = skill.skillFile || `${skill.path}${separator}SKILL.md`;
+      let content: string;
+      try {
+        content = await window.orion.readFile(skillFile);
+      } catch (error) {
+        toast.error(`Could not open ${skill.name}/SKILL.md`, {
+          description: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      const dirtyFiles = useOrionStore.getState().openFiles.filter((file) => file.isDirty);
+      if (
+        dirtyFiles.length > 0 &&
+        !confirm(
+          `Open ${skill.name} and discard unsaved changes in ${dirtyFiles.length} file${dirtyFiles.length === 1 ? '' : 's'}?`
+        )
+      ) {
+        return;
+      }
+      setWorkspacePath(skill.path);
+      closeAllFiles();
+      useOrionStore.getState().openFile(skillFile, content);
+      setSettingsOpen(false);
+      setActiveTab('code');
+    },
+    [activeRiftUnavailable, closeAllFiles, setActiveTab, setSettingsOpen, setWorkspacePath]
+  );
+
   const handleSetActiveTab = (tab: 'agents' | 'code') => {
     // Open the directory the agents are actually editing: a rift workspace
     // when the current thread's epic has one, else the project.
@@ -8017,6 +8064,7 @@ const App: React.FC = () => {
     setSettingsOpen,
     settingsTab,
     setSettingsTab,
+    handleOpenSkillInEditor,
     authenticatingProviderId,
     accountState,
     accountLoading,

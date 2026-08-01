@@ -139,6 +139,7 @@ export type SettingsTab =
   | 'general'
   | 'providers'
   | 'orchestration'
+  | 'skills'
   | 'split-view'
   | 'computer-use'
   | 'storage'

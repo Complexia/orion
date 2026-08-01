@@ -14,6 +14,7 @@ import {
   Plug,
   RefreshCw,
   Settings,
+  Sparkles,
   SquareArrowOutUpRight,
   SquareKanban,
   Trash2,
@@ -49,6 +50,7 @@ import {
 import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
+import SkillsSettings from './SkillsSettings';
 import { orchestrationRoleMeta } from './promptContext';
 import { formatShortTime } from './time';
 import type {
@@ -129,6 +131,8 @@ export type SettingsPageProps = {
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>;
   settingsTab: SettingsTab;
   setSettingsTab: React.Dispatch<React.SetStateAction<SettingsTab>>;
+  /** Opens a skill's folder in the Code tab with its SKILL.md active. */
+  handleOpenSkillInEditor: (skill: { path: string; skillFile?: string; name: string }) => void;
   authenticatingProviderId: string | null;
   accountState: OrionAccountState;
   accountLoading: boolean;
@@ -220,6 +224,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setSettingsOpen,
     settingsTab,
     setSettingsTab,
+    handleOpenSkillInEditor,
     authenticatingProviderId,
     accountState,
     accountLoading,
@@ -321,6 +326,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             { id: 'general', label: 'General', Icon: Settings },
             { id: 'providers', label: 'Providers', Icon: Plug },
             { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
+            { id: 'skills', label: 'Skills', Icon: Sparkles },
             { id: 'split-view', label: 'Split View', Icon: Columns2 },
             {
               id: 'computer-use',
@@ -356,6 +362,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'general' && 'GENERAL'}
           {settingsTab === 'providers' && 'PROVIDERS'}
           {settingsTab === 'orchestration' && 'ORCHESTRATION'}
+          {settingsTab === 'skills' && 'SKILLS'}
           {settingsTab === 'split-view' && 'SPLIT VIEW'}
           {settingsTab === 'computer-use' && 'COMPUTER USE'}
           {settingsTab === 'storage' && 'STORAGE'}
@@ -364,7 +371,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         </div>
 
         <div
-          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' ? ' settings-panel-grouped' : ''}`}
+          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' || settingsTab === 'skills' ? ' settings-panel-grouped' : ''}`}
         >
           {settingsTab === 'account' && (
             <>
@@ -1188,6 +1195,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 />
               </div>
             </>
+          )}
+
+          {settingsTab === 'skills' && (
+            <SkillsSettings formatBytes={formatBytes} onOpenInEditor={handleOpenSkillInEditor} />
           )}
 
           {settingsTab === 'split-view' && (
