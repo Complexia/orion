@@ -458,6 +458,8 @@ export type OpenFile = {
 
 export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'opencode';
 
+export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
+
 // Per-provider harness capabilities, passed through to the CLI invocation.
 export type ProviderRuntimeOptions = {
   /** claude: extra tools auto-approved outside Full Access (--allowedTools) */
@@ -466,6 +468,16 @@ export type ProviderRuntimeOptions = {
   networkAccess?: boolean;
   /** codex: enable the web search tool */
   webSearch?: boolean;
+  /** codex: inherit, enable, or disable local memory use and generation */
+  codexMemoryMode?: CodexSettingMode;
+  /** codex: inherit, enable, or disable Chronicle integration */
+  codexChronicleMode?: CodexSettingMode;
+  /** codex: allow or exclude MCP/web/tool-search chats from memory generation */
+  codexMemoryExternalContextMode?: CodexSettingMode;
+  /** codex: per-Orion personality override */
+  codexPersonality?: 'inherit' | 'none' | 'friendly' | 'pragmatic';
+  /** codex: additional developer instructions for Orion-launched sessions */
+  codexDeveloperInstructions?: string;
   /** grok: enable cross-session memory (--experimental-memory) */
   experimentalMemory?: boolean;
   /** claude: browser control via the Claude Chrome extension (--chrome) */

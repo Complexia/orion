@@ -1081,6 +1081,12 @@ body {
   border-color: rgb(77 141 255 / 45%);
 }
 
+.provider-option-textarea {
+  min-height: 88px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
 .provider-left {
   display: flex;
   align-items: flex-start;

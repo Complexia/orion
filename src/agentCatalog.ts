@@ -154,6 +154,11 @@ export type ProviderOptionDef = {
     | 'allowedTools'
     | 'networkAccess'
     | 'webSearch'
+    | 'codexMemoryMode'
+    | 'codexChronicleMode'
+    | 'codexMemoryExternalContextMode'
+    | 'codexPersonality'
+    | 'codexDeveloperInstructions'
     | 'experimentalMemory'
     | 'chrome'
     | 'browserControl'
@@ -161,8 +166,9 @@ export type ProviderOptionDef = {
     | 'extraArgs';
   label: string;
   description: string;
-  type: 'boolean' | 'string';
+  type: 'boolean' | 'string' | 'select' | 'textarea';
   placeholder?: string;
+  options?: Array<{ value: string; label: string }>;
 };
 
 const extraArgsOption = (command: string): ProviderOptionDef => ({
@@ -197,6 +203,63 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
     extraArgsOption('claude'),
   ],
   codex: [
+    {
+      key: 'codexDeveloperInstructions',
+      label: 'Custom instructions',
+      description:
+        'Additional instructions and context for Codex chats launched from Orion. Leave blank to use only your normal Codex configuration and AGENTS.md guidance.',
+      type: 'textarea',
+      placeholder: 'Add your custom instructions…',
+    },
+    {
+      key: 'codexMemoryMode',
+      label: 'Local memories',
+      description:
+        'Use locally stored Codex context across Orion chats and allow eligible Orion chats to contribute to future memories. Inherit follows $CODEX_HOME/config.toml.',
+      type: 'select',
+      options: [
+        { value: 'inherit', label: 'Inherit Codex setting' },
+        { value: 'enabled', label: 'Enabled in Orion' },
+        { value: 'disabled', label: 'Disabled in Orion' },
+      ],
+    },
+    {
+      key: 'codexChronicleMode',
+      label: 'Chronicle memories',
+      description:
+        'Let Codex use Chronicle screen-context memories in Orion when the ChatGPT desktop recorder is running. Chronicle is a macOS ChatGPT Pro research preview; Orion does not start or capture the recorder itself.',
+      type: 'select',
+      options: [
+        { value: 'inherit', label: 'Inherit Codex setting' },
+        { value: 'enabled', label: 'Enabled in Orion' },
+        { value: 'disabled', label: 'Disabled in Orion' },
+      ],
+    },
+    {
+      key: 'codexMemoryExternalContextMode',
+      label: 'Tool-assisted chat memories',
+      description:
+        'Choose whether chats that used MCP tools, web search, or tool search may generate local memories. Inherit keeps the host Codex privacy setting.',
+      type: 'select',
+      options: [
+        { value: 'inherit', label: 'Inherit Codex setting' },
+        { value: 'enabled', label: 'Allow generation' },
+        { value: 'disabled', label: 'Exclude these chats' },
+      ],
+    },
+    {
+      key: 'codexPersonality',
+      label: 'Personality',
+      description:
+        'Default communication style for Codex models that support personality. Inherit uses your normal Codex setting.',
+      type: 'select',
+      options: [
+        { value: 'inherit', label: 'Inherit Codex setting' },
+        { value: 'none', label: 'None' },
+        { value: 'friendly', label: 'Friendly' },
+        { value: 'pragmatic', label: 'Pragmatic' },
+      ],
+    },
     {
       key: 'networkAccess',
       label: 'Network access in sandbox',

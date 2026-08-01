@@ -31,6 +31,7 @@ import {
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
+import { codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
@@ -6653,6 +6654,11 @@ const runOneShotAgentText = async (
     prompt,
     projectPath: cwd,
     accessMode: 'read-only',
+    // Utility turns generate disposable metadata. Never let them consume local
+    // or Chronicle memories, or become source material for future memories.
+    ...(model.providerId === 'codex'
+      ? { providerOptions: codexUtilityPrivacyOptions }
+      : {}),
     ...(model.providerId === 'codex' ? { codexReasoningEffort: effort } : {}),
     ...(model.providerId === 'claude' ? { claudeReasoningEffort: effort } : {}),
     ...(model.providerId === 'grok' ? { grokReasoningEffort: effort } : {}),
