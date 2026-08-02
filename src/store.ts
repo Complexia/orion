@@ -1579,15 +1579,17 @@ export const useOrionStore = create<OrionState>()(
         const state = get();
         const family = createThreadBranchFamily(state.threads, sourceThreadId);
         if (!family) return null;
-        const newThread = family.threads[0];
-        set((state) => ({
-          threads: [...family.threads, ...state.threads],
-          selectedProjectId: newThread.projectId,
-          ...syncSavedView(state, panesForSelection(state, newThread.id), {
-            threads: [...family.threads, ...state.threads],
-          }),
-          selectedEpicId: newThread.epicId ?? null,
-        }));
+        const newThread = family.threads.find((thread) => thread.id === family.rootId);
+        if (!newThread) return null;
+        set((state) => {
+          const threads = [...family.threads, ...state.threads];
+          return {
+            threads,
+            selectedProjectId: newThread.projectId,
+            ...syncSavedView(state, panesForSelection(state, newThread.id), { threads }),
+            selectedEpicId: newThread.epicId ?? null,
+          };
+        });
         return family.rootId;
       },
 

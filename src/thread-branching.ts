@@ -1,5 +1,9 @@
 import type { Message, NativeSubagentInfo, ProviderId, Thread } from './store';
 
+const INHERITED_SUBAGENT_CLOSE_TAG = '</inherited_subagent_transcript>';
+const NEUTRALIZED_INHERITED_SUBAGENT_CLOSE_TAG = '<\u200b/inherited_subagent_transcript>';
+export const INHERITED_SUBAGENT_TRANSCRIPT_MAX_CHARS = 80_000;
+
 const cloneMessages = (messages: Message[]): Message[] =>
   messages.map((message) => ({
     ...message,
@@ -60,6 +64,8 @@ const branchCopy = (
     // hidden child (or had previously been removed from Recent).
     hiddenFromRecent: parentThreadId ? true : undefined,
     messages: cloneMessages(source.messages),
+    // Goals live in a provider session, and /btw answers are detached asides,
+    // so both intentionally reset just as they did for a single-thread branch.
     agentSessionIds: pendingForkProviders.length ? agentSessionIds : undefined,
     pendingForkProviders: pendingForkProviders.length ? pendingForkProviders : undefined,
     branchedFromThreadId: source.id,
@@ -91,9 +97,12 @@ export const inheritedSubagentResumeContext = (
   );
   if (!isInheritedChild || thread.agentSessionIds?.[providerId]) return null;
 
-  const transcript = thread.messages
+  let transcript = thread.messages
     .map((message) => {
-      const content = message.content.trim();
+      const content = message.content
+        .trim()
+        .split(INHERITED_SUBAGENT_CLOSE_TAG)
+        .join(NEUTRALIZED_INHERITED_SUBAGENT_CLOSE_TAG);
       if (!content) return null;
       const role = message.role === 'agent' ? 'Assistant' : message.role === 'user' ? 'User' : 'System';
       return `${role}: ${content}`;
@@ -101,13 +110,29 @@ export const inheritedSubagentResumeContext = (
     .filter((entry): entry is string => entry !== null)
     .join('\n\n');
   if (!transcript) return null;
+  if (transcript.length > INHERITED_SUBAGENT_TRANSCRIPT_MAX_CHARS) {
+    const truncationNote = 'Earlier transcript content was omitted to fit the context limit.\n\n';
+    transcript = `${truncationNote}${transcript.slice(
+      -(INHERITED_SUBAGENT_TRANSCRIPT_MAX_CHARS - truncationNote.length)
+    )}`;
+  }
 
   return [
     'This is the preserved conversation from a completed subagent instance inherited by a thread branch. Continue from this work using the new instruction after the transcript.',
     '<inherited_subagent_transcript>',
     transcript,
-    '</inherited_subagent_transcript>',
+    INHERITED_SUBAGENT_CLOSE_TAG,
   ].join('\n');
+};
+
+export const prependInheritedSubagentResumeContext = (
+  thread: Thread,
+  providerId: ProviderId,
+  prompt: string
+): string => {
+  const inheritedContext = inheritedSubagentResumeContext(thread, providerId);
+  if (!inheritedContext) return prompt;
+  return prompt ? `${inheritedContext}\n\n${prompt}` : inheritedContext;
 };
 
 /**
