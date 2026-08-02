@@ -1112,6 +1112,54 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                             }
 
                             const value = optionValues[option.key];
+                            if (option.type === 'select') {
+                              return (
+                                <div key={option.key} className="provider-option">
+                                  <span className="provider-option-text">
+                                    <span className="provider-option-label">{option.label}</span>
+                                    <span className="provider-option-description">{option.description}</span>
+                                  </span>
+                                  <SelectMenu
+                                    label={option.label}
+                                    value={typeof value === 'string' ? value : 'inherit'}
+                                    options={option.options ?? []}
+                                    onChange={(nextValue) => {
+                                      setProviderOptions(
+                                        provider.id as ProviderId,
+                                        {
+                                          [option.key]: nextValue,
+                                        } as Partial<ProviderRuntimeOptions>
+                                      );
+                                    }}
+                                  />
+                                </div>
+                              );
+                            }
+
+                            if (option.type === 'textarea') {
+                              return (
+                                <div key={option.key} className="provider-option column">
+                                  <span className="provider-option-text">
+                                    <span className="provider-option-label">{option.label}</span>
+                                    <span className="provider-option-description">{option.description}</span>
+                                  </span>
+                                  <textarea
+                                    className="provider-option-input provider-option-textarea"
+                                    placeholder={option.placeholder}
+                                    value={typeof value === 'string' ? value : ''}
+                                    onChange={(event) => {
+                                      setProviderOptions(
+                                        provider.id as ProviderId,
+                                        {
+                                          [option.key]: event.target.value,
+                                        } as Partial<ProviderRuntimeOptions>
+                                      );
+                                    }}
+                                  />
+                                </div>
+                              );
+                            }
+
                             return (
                               <div key={option.key} className="provider-option column">
                                 <span className="provider-option-text">
