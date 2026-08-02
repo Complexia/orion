@@ -255,7 +255,7 @@ export const AgentFamilySwitcher: React.FC<{
     const active = thread.id === currentThread.id;
     const name = isMain
       ? 'main'
-      : thread.subagent?.kind ?? thread.modelId.split(':')[1] ?? 'agent';
+      : thread.subagent?.kind ?? thread.inheritedSubagent?.kind ?? thread.modelId.split(':')[1] ?? 'agent';
     const detail = thread.title;
     return (
       <button

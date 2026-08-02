@@ -421,6 +421,9 @@ export const createCodexAppServerDriver = ({
       sandbox,
       approvalPolicy: 'never',
       config: codexAppServerConfig(model, input),
+      ...(typeof input.codexInitialContext === 'string' && input.codexInitialContext.trim()
+        ? { developerInstructions: input.codexInitialContext }
+        : {}),
     };
 
     let resolvedThreadId = null;

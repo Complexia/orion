@@ -803,6 +803,8 @@ type OrionComputerUsePermissions = {
         aside?: boolean;
         /** Codex goal run (/goal): drive the turn over `codex app-server` and pursue the goal across turns. */
         codexGoal?: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number };
+        /** Preserved branch context used only when starting a fresh Codex goal thread. */
+        codexInitialContext?: string;
         /** Codex code review (/review): run review/start inline on the current Codex session. */
         codexReview?: {
           mode: 'uncommitted' | 'base' | 'commit' | 'custom';

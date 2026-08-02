@@ -69,6 +69,10 @@ import {
   type Epic,
 } from './store';
 import type { RiftStorageEntry, RiftStorageState } from './types';
+import {
+  inheritedSubagentResumeContext,
+  prependInheritedSubagentResumeContext,
+} from './thread-branching';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
@@ -400,6 +404,7 @@ const threadShellSignature = (thread: Thread): string => {
     JSON.stringify(thread.agentSessionIds ?? null),
     JSON.stringify(thread.pendingForkProviders ?? null),
     JSON.stringify(thread.subagent ?? null),
+    JSON.stringify(thread.inheritedSubagent ?? null),
     JSON.stringify(thread.goal ?? null),
     JSON.stringify(thread.linkedTasks ?? null),
   ].join('\u0000');
@@ -6004,6 +6009,12 @@ const App: React.FC = () => {
           ),
         });
       }
+      // Inherited children normally fork their own provider session. If the
+      // user picks another model/provider (or the native provider exposed no
+      // independently resumable session), carry the visible child transcript
+      // into this first fresh turn. The branched parent still does not absorb
+      // every child transcript.
+      agentPrompt = prependInheritedSubagentResumeContext(thread, model.providerId, agentPrompt);
       // @-model mentions in the user's original text: tell the agent which
       // models were referenced so it can delegate to them. Works on any
       // thread, not just Orion ones.
@@ -6711,6 +6722,7 @@ const App: React.FC = () => {
       if (!window.orion?.runAgentTurn) {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
+      const inheritedResumeContext = inheritedSubagentResumeContext(thread, 'codex');
 
       // Goal commands bypass the normal send flow, so seed the title here
       // from the objective before the first transcript messages are added.
@@ -6765,6 +6777,10 @@ const App: React.FC = () => {
           providerOptions: normalizedProviderSettings.codex?.options,
           codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
           codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
+          // Goal runs do not consume the ordinary prompt field. Seed a fresh
+          // app-server thread with the inherited child transcript without
+          // folding that transcript into the persisted goal objective.
+          ...(inheritedResumeContext ? { codexInitialContext: inheritedResumeContext } : {}),
           codexGoal: goalAction,
         })
         .then((result) => {
@@ -7369,6 +7385,9 @@ const App: React.FC = () => {
         text = text
           ? `${buildLinkedTaskContext(tasksToInject, true)}\n\n${text}`
           : buildLinkedTaskContext(tasksToInject, false);
+      }
+      if (currentThread) {
+        text = prependInheritedSubagentResumeContext(currentThread, 'claude', text);
       }
       if (!text) {
         restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
