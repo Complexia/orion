@@ -991,6 +991,10 @@ const App: React.FC = () => {
   const epicMenuRef = useRef<HTMLDivElement>(null);
   const epicRepoPickerRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
+  // Latest real turn generation observed for each thread. Suggestions carry
+  // their owning run id, so a late result from an older generation can never
+  // repopulate a card after foreground or harness-initiated continuation.
+  const latestTurnRunIdsRef = useRef(new Map<string, string>());
   // Startup IPC resolves long before a normal turn ends. Retain its result for
   // a short grace window so a steer whose stop lands just after startup failed
   // can distinguish that failure from a run that completed naturally.
@@ -3112,6 +3116,34 @@ const App: React.FC = () => {
         return;
       }
 
+      // Every real turn supersedes the prior suggestion, including turns the
+      // persistent Claude harness initiates when background work completes.
+      if (event.type === 'started') {
+        latestTurnRunIdsRef.current.set(event.threadId, event.runId);
+        updateThread(event.threadId, { suggestedTask: undefined });
+      }
+
+      // The harness's predicted next prompt for this thread, emitted after
+      // the turn's result. Accept it only while that exact turn remains the
+      // latest generation; a later start may have happened before this
+      // out-of-band event reached the renderer.
+      if (event.type === 'suggestion') {
+        if (
+          !event.suggestion ||
+          latestTurnRunIdsRef.current.get(event.threadId) !== event.runId
+        ) {
+          return;
+        }
+        updateThread(event.threadId, {
+          suggestedTask: {
+            text: event.suggestion,
+            createdAt: new Date().toISOString(),
+            turnRunId: event.runId,
+          },
+        });
+        return;
+      }
+
       // A claude session's background work settled with no re-invocation
       // coming (task killed/failed, notification suppressed, or the session
       // itself was disposed): flip a thread left "working — waiting on
@@ -3363,7 +3395,7 @@ const App: React.FC = () => {
             ...current,
             [event.threadId]: event.runId,
           }));
-          updateThread(event.threadId, { status: 'running' });
+          updateThread(event.threadId, { status: 'running', suggestedTask: undefined });
           pushLinkedTaskStatus(event.threadId, 'running');
         }
         return;
@@ -4129,7 +4161,7 @@ const App: React.FC = () => {
   // Creates the epic's copy-on-write rift workspace and its feature branch
   // (named by the epic message model), then binds them to the epic. Runs in
   // the background after the create modal closes.
-  const setupRiftForEpic = async (epicId: string) => {
+  const setupRiftForEpic = useCallback(async (epicId: string) => {
     if (riftSetupEpicIdsRef.current[epicId]) return;
     const state = useOrionStore.getState();
     const epic = state.epics.find((candidate) => candidate.id === epicId);
@@ -4271,7 +4303,7 @@ const App: React.FC = () => {
     } finally {
       if (!keepSetupLocked) markRiftSetup(epicId, false);
     }
-  };
+  }, [markRiftSetup, persistAndAcknowledgeRift, resolveUtilityTurn, updateEpic]);
 
   const handleCreateEpic = () => {
     const trimmed = newEpicName.trim();
@@ -4387,6 +4419,56 @@ const App: React.FC = () => {
     setActiveTab('agents');
     return id;
   };
+
+  // "Start in a rift" on a suggested-task card: spin the suggestion off into
+  // its own epic — the same flow as the create-epic modal — and open a fresh
+  // thread under it with the suggested prompt pre-filled in the composer,
+  // ready to send once the rift workspace is ready.
+  const handleStartSuggestedTask = useCallback((threadId: string) => {
+    if (!epicsEnabled) {
+      toast.error('Enable Epics in Settings before starting a suggested task');
+      return;
+    }
+    const state = useOrionStore.getState();
+    const thread = state.threads.find((candidate) => candidate.id === threadId);
+    const suggestion = thread?.suggestedTask;
+    if (!thread || !suggestion || suggestion.startedEpicId) return;
+    const project = state.projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    const createRift = riftsActive && riftsSettings.autoCreateForEpics && Boolean(project);
+    const epicId = addEpic(deriveTitle(suggestion.text), {
+      description: suggestion.text,
+      ...(project ? { repositoryProjectId: project.id } : {}),
+      ...(createRift && project
+        ? { riftRequest: { projectId: project.id, projectPath: project.path } }
+        : {}),
+    });
+    updateThread(threadId, { suggestedTask: { ...suggestion, startedEpicId: epicId } });
+    if (createRift) void setupRiftForEpic(epicId);
+    if (project) {
+      // Pre-fill the new thread's composer with the suggested prompt; the
+      // draft-swap effect loads it once the thread becomes selected.
+      const newThreadId = createThread(project.id, undefined, { epicId });
+      composerDraftsRef.current.set(newThreadId, { text: suggestion.text, attachments: [] });
+    }
+    setActiveTab('agents');
+    setEpicsSectionOpen(true);
+    toast.success(
+      createRift ? 'Suggested task started — creating its rift' : 'Suggested task started as an epic'
+    );
+  }, [
+    addEpic,
+    createThread,
+    epicsEnabled,
+    riftsActive,
+    riftsSettings.autoCreateForEpics,
+    setActiveTab,
+    setupRiftForEpic,
+    updateThread,
+  ]);
+
+  const handleDismissSuggestedTask = useCallback((threadId: string) => {
+    updateThread(threadId, { suggestedTask: undefined });
+  }, [updateThread]);
 
   // Shared setup for the epic git handlers: the directory the epic's git
   // actions act on. The rift workspace wins when one exists; otherwise the
@@ -6060,7 +6142,10 @@ const App: React.FC = () => {
             }
           : {}),
       });
-      updateThread(threadId, { status: 'running' });
+      // A suggestion describes the state after the previous foreground turn.
+      // Invalidate it as soon as a validated next turn starts so failures,
+      // provider changes, or modes that emit no replacement cannot revive it.
+      updateThread(threadId, { status: 'running', suggestedTask: undefined });
       pushLinkedTaskStatus(threadId, 'running');
 
       const messageId = addMessageToThread(threadId, {
@@ -6074,6 +6159,7 @@ const App: React.FC = () => {
         modelId: model.id,
       });
       const runId = crypto.randomUUID();
+      latestTurnRunIdsRef.current.set(threadId, runId);
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
 
@@ -6746,9 +6832,10 @@ const App: React.FC = () => {
         modelId: model.id,
       });
       const runId = crypto.randomUUID();
+      latestTurnRunIdsRef.current.set(threadId, runId);
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
-      updateThread(threadId, { status: 'running' });
+      updateThread(threadId, { status: 'running', suggestedTask: undefined });
       pinThreadToBottom(threadId);
 
       void window.orion
@@ -6916,9 +7003,10 @@ const App: React.FC = () => {
         modelId: model.id,
       });
       const runId = crypto.randomUUID();
+      latestTurnRunIdsRef.current.set(threadId, runId);
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
-      updateThread(threadId, { status: 'running' });
+      updateThread(threadId, { status: 'running', suggestedTask: undefined });
       pinThreadToBottom(threadId);
 
       void window.orion
@@ -7396,6 +7484,8 @@ const App: React.FC = () => {
         toast.error(result?.error ?? 'The Claude Code terminal is not running.');
         return;
       }
+      latestTurnRunIdsRef.current.set(submittedThreadId, crypto.randomUUID());
+      updateThread(submittedThreadId, { suggestedTask: undefined });
       if (tasksToInject.length > 0) {
         const injectedIds = new Set(tasksToInject.map((task) => task.id));
         const currentLinkedTasks =
@@ -10278,6 +10368,10 @@ const App: React.FC = () => {
                               onDismissBtwExchange={dismissBtwExchange}
                               onAuthenticateProvider={handleAuthenticateProvider}
                               onSteerQueuedMessage={steerQueuedMessage}
+                              suggestedTaskUsesRift={riftsActive && riftsSettings.autoCreateForEpics}
+                              suggestedTaskCanStart={epicsEnabled}
+                              onStartSuggestedTask={handleStartSuggestedTask}
+                              onDismissSuggestedTask={handleDismissSuggestedTask}
                             />
                           )}
                           {pane.focused ? composerNode : null}

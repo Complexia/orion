@@ -901,9 +901,11 @@ type OrionComputerUsePermissions = {
       onAgentTurnEvent?: (cb: (event: {
         runId: string;
         threadId: string;
-        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'subagent' | 'subagent-chunk' | 'subagent-activity';
+        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'suggestion' | 'subagent' | 'subagent-chunk' | 'subagent-activity';
         /** started events only: the persistent claude session opened this turn itself (background task finished). */
         background?: boolean;
+        /** suggestion events only: the harness's predicted next user prompt for this thread. */
+        suggestion?: string;
         /** subagent events: lifecycle upsert for a provider-native subagent of this thread's run. */
         subagent?: {
           id: string;

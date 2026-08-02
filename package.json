@@ -15,6 +15,7 @@
     "test:skills": "electron scripts/test-skills.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",
+    "test:suggested-tasks": "node scripts/test-suggested-tasks.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",
     "postinstall": "node -e \"const fs=require('fs');try{for(const d of fs.readdirSync('node_modules/node-pty/prebuilds')){try{fs.chmodSync('node_modules/node-pty/prebuilds/'+d+'/spawn-helper',0o755)}catch{}}}catch{};try{for(const d of fs.readdirSync('node_modules/rift-snapshot/prebuilds')){for(const b of ['rift','rift.exe']){try{fs.chmodSync('node_modules/rift-snapshot/prebuilds/'+d+'/'+b,0o755)}catch{}}}}catch{}\""

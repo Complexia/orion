@@ -389,6 +389,19 @@ export type LinkedBoardTask = {
   lastStatus?: string;
 };
 
+// The harness's predicted next prompt for a thread (Claude's promptSuggestions
+// stream message), surfaced as a "Suggested task" card the user can spin off
+// into its own epic + rift. At most one per thread; each new one replaces it.
+export type SuggestedTask = {
+  /** The suggested prompt, verbatim from the harness. */
+  text: string;
+  createdAt: string;
+  /** Run generation that produced this suggestion. */
+  turnRunId: string;
+  /** Epic created from this suggestion, once the user started it. */
+  startedEpicId?: string;
+};
+
 export type Thread = {
   id: string;
   projectId: string;
@@ -448,6 +461,8 @@ export type Thread = {
   goal?: ThreadGoal | null;
   /** Sidebar epic this thread belongs to, if any. */
   epicId?: string;
+  /** Latest harness-suggested next task for this thread, if any. */
+  suggestedTask?: SuggestedTask;
 };
 
 export type OpenFile = {
