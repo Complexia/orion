@@ -108,6 +108,25 @@ export const buildPromptWithAttachments = (prompt: string, attachments: ImageAtt
   return trimmedPrompt ? `${trimmedPrompt}\n\n${attachmentText}` : attachmentText;
 };
 
+// Files dragged from transient sources resolve to OS temp locations that
+// outlive the drop only briefly and — on macOS — are often unreadable by any
+// process other than the one that accepted the drag. The screen-recording
+// thumbnail is the canonical case: it drops a path under
+// /var/folders/.../T/TemporaryItems/NSIRD_screencaptureui_*/ that agent
+// subprocesses get EPERM on. Such files must be copied into Orion's own
+// attachment dir (via the File bytes, which the renderer can always read)
+// instead of being referenced by path.
+const ephemeralDropPathPatterns = [
+  /\/TemporaryItems\//i,
+  /\/NSIRD_/,
+  /^\/(?:private\/)?var\/folders\/[^/]+\/[^/]+\/T\//,
+  /^\/(?:private\/)?tmp\//,
+  /[\\/]AppData[\\/]Local[\\/]Temp[\\/]/i,
+];
+
+export const isEphemeralDropPath = (path: string) =>
+  ephemeralDropPathPatterns.some((pattern) => pattern.test(path));
+
 export const getDroppedFilePath = (file: File) => {
   const bridgePath = window.orion?.getPathForFile?.(file);
   if (bridgePath) return bridgePath;

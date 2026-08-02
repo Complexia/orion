@@ -115,6 +115,7 @@ import {
   buildPromptWithAttachments,
   formatAttachmentSize,
   getDroppedFilePath,
+  isEphemeralDropPath,
   isMediaFile,
   isVideoAttachment,
   isVideoFile,
@@ -5843,7 +5844,7 @@ const App: React.FC = () => {
       for (const file of mediaFiles) {
         const fallbackMimeType = isVideoFile(file) ? 'video/*' : 'image/*';
         const droppedPath = getDroppedFilePath(file);
-        if (droppedPath) {
+        if (droppedPath && !isEphemeralDropPath(droppedPath)) {
           savedAttachments.push({
             id: crypto.randomUUID(),
             name: file.name || droppedPath.split(/[\\/]/).pop() || 'file',
