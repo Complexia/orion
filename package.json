@@ -16,6 +16,7 @@
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",
+    "test:suggested-tasks": "node scripts/test-suggested-tasks.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",

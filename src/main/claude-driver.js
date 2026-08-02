@@ -526,6 +526,10 @@ export const updateClaudeBackgroundSettle = (session) => {
 export const finalizeClaudeTurn = async (session, resultMessage) => {
   const turn = session.activeTurns.shift();
   if (!turn) return;
+  // prompt_suggestion is emitted after this result, when the turn is no
+  // longer in activeTurns. Retain the exact owner so the renderer can reject
+  // it if another foreground or harness-initiated turn starts first.
+  session.pendingSuggestionRunId = turn.runId;
   // The turn is forgotten but its terminal event still awaits git
   // summarization below — advertise the gap so a racing steer can wait for
   // the real outcome (agent:isRunFinalizing).
@@ -621,6 +625,24 @@ export const handleClaudeSessionMessage = async (session, message) => {
     }
   }
   if (message?.type === 'system' && message.subtype === 'init') session.sawInit = true;
+
+  // The harness's predicted next user prompt (promptSuggestions). It arrives
+  // after the turn's result — the turn is already finalized — so retain and
+  // forward the completed turn's run id as its generation owner.
+  if (message?.type === 'prompt_suggestion') {
+    const suggestion = typeof message.suggestion === 'string' ? message.suggestion.trim() : '';
+    const runId = session.pendingSuggestionRunId;
+    session.pendingSuggestionRunId = null;
+    if (suggestion && runId) {
+      emitAgentEvent(session.sender, {
+        runId,
+        threadId: session.threadId,
+        type: 'suggestion',
+        suggestion,
+      });
+    }
+    return;
+  }
 
   // Track the harness's live background tasks so a turn that ends while
   // subagents are still running doesn't read as Finished. skip_transcript
@@ -736,6 +758,7 @@ export const handleClaudeSessionMessage = async (session, message) => {
     // The harness re-invoked the model between user turns (a background
     // subagent finished). Open a synthetic turn; the renderer adds a message.
     turn = createClaudeTurnState(crypto.randomUUID(), session.lastTurnEndSnapshot);
+    session.pendingSuggestionRunId = null;
     session.activeTurns.push(turn);
     // The CLI owes this harness-initiated turn a result message of its own.
     session.resultsOwed += 1;
@@ -968,6 +991,10 @@ export const createClaudeSdkSession = ({
     sawInit: false,
     firstPrompt: null,
     activeTurns: [],
+    // The completed turn whose out-of-band prompt suggestion may still
+    // arrive. Cleared whenever another turn starts, so ownership is never
+    // guessed from whichever turn happens to be active later.
+    pendingSuggestionRunId: null,
     // Task notifications that arrived while no turn was active; flushed as
     // activities into the next turn that opens.
     pendingTaskNotifications: [],
@@ -1039,6 +1066,12 @@ export const createClaudeSdkSession = ({
         model: sdkOptions.model,
         effort: sdkOptions.effort,
         includePartialMessages: true,
+        // Predicted next user prompt after each turn (drives the suggested
+        // task card). Emitted out-of-band after the result message off the
+        // turn's prompt cache — it never touches the agent's own context or
+        // system prompt. Users can opt out globally via settings.json
+        // (promptSuggestionEnabled) or CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION.
+        promptSuggestions: true,
         // Match the CLI's behavior: the SDK defaults to a minimal/empty
         // system prompt, which drops Claude Code's narration + progress-update
         // guidance (runs go silent between tool calls without it).
@@ -1175,6 +1208,7 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
     return { ok: true, runId };
   }
   const turn = createClaudeTurnState(runId, snapshot);
+  session.pendingSuggestionRunId = null;
   session.activeTurns.push(turn);
   updateClaudeBackgroundSettle(session); // a live turn cancels any pending settle
   emitAgentEvent(sender, {
