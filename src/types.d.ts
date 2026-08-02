@@ -816,6 +816,11 @@ type OrionComputerUsePermissions = {
           allowedTools?: string;
           networkAccess?: boolean;
           webSearch?: boolean;
+          codexMemoryMode?: 'inherit' | 'enabled' | 'disabled';
+          codexChronicleMode?: 'inherit' | 'enabled' | 'disabled';
+          codexMemoryExternalContextMode?: 'inherit' | 'enabled' | 'disabled';
+          codexPersonality?: 'inherit' | 'none' | 'friendly' | 'pragmatic';
+          codexDeveloperInstructions?: string;
           experimentalMemory?: boolean;
           chrome?: boolean;
           browserControl?: boolean;
