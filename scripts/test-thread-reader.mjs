@@ -1,0 +1,137 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+import { app } from 'electron';
+
+const testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-thread-reader-'));
+app.setPath('userData', testDataDir);
+
+try {
+  const { getStorageFilePath, getThreadsFilePath } = await import('../src/main/paths.js');
+  const { readThreadForAgent } = await import('../src/main/thread-reader.js');
+  const thread = {
+    id: 'thread-12345678-abcd',
+    projectId: 'project-1',
+    title: 'Pagination regression',
+    status: 'idle',
+    modelId: 'codex:test',
+    createdAt: '2026-08-02T00:00:00.000Z',
+    messages: [
+      { role: 'user', content: 'first' },
+      { role: 'agent', content: 'second' },
+    ],
+  };
+
+  await fs.writeFile(
+    getThreadsFilePath(),
+    JSON.stringify({ version: 1, threads: [thread] }),
+    'utf8'
+  );
+  await fs.writeFile(
+    getStorageFilePath(),
+    JSON.stringify({ state: { projects: [{ id: 'project-1', name: 'Orion', path: '/tmp/orion' }] } }),
+    'utf8'
+  );
+
+  const finalPage = await readThreadForAgent({ thread_id: thread.id, offset: 2, limit: 1 });
+  assert.match(finalPage, /Showing messages 2–2 of 2/);
+  assert.match(finalPage, /second/);
+
+  const afterEnd = await readThreadForAgent({ thread_id: thread.id, offset: 3, limit: 1 });
+  assert.match(afterEnd, /Requested offset 3 is past the end of this transcript \(2 messages\)/);
+  assert.doesNotMatch(afterEnd, /### Message 2\/2/);
+  assert.doesNotMatch(afterEnd, /second/);
+
+  thread.messages = [
+    {
+      role: 'agent',
+      status: 'stopped',
+      content: 'Tool evidence follows.',
+      activities: [
+        {
+          title: 'Read source file',
+          detail: '/tmp/example.txt',
+          input: `path=/tmp/example.txt\n${'i'.repeat(2500)}`,
+          output: `essential persisted result\n${'o'.repeat(4500)}`,
+        },
+      ],
+    },
+  ];
+  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  const toolEvidence = await readThreadForAgent({ thread_id: thread.id });
+  assert.match(toolEvidence, /Input:\n    path=\/tmp\/example\.txt/);
+  assert.match(toolEvidence, /Output:\n    essential persisted result/);
+  assert.match(toolEvidence, /\[activity input truncated\]/);
+  assert.match(toolEvidence, /\[activity output truncated\]/);
+
+  thread.messages = [
+    {
+      role: 'user',
+      content: '',
+      linkedTasks: [
+        {
+          id: 'task-1',
+          title: 'Preserve linked task prompts',
+          description: 'Make linked-task-only turns readable from another thread.',
+        },
+        {
+          id: 'task-2',
+          title: 'Keep the second task visible',
+          description: 'Include every originating task title and description.',
+        },
+      ],
+    },
+  ];
+  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  const linkedTaskPrompt = await readThreadForAgent({ thread_id: thread.id });
+  assert.match(linkedTaskPrompt, /Linked board tasks \(2\):/);
+  assert.match(linkedTaskPrompt, /Preserve linked task prompts/);
+  assert.match(linkedTaskPrompt, /Make linked-task-only turns readable from another thread\./);
+  assert.match(linkedTaskPrompt, /Keep the second task visible/);
+  assert.match(linkedTaskPrompt, /Include every originating task title and description\./);
+  assert.doesNotMatch(linkedTaskPrompt, /\(empty message\)/);
+
+  thread.messages = [
+    {
+      role: 'agent',
+      content: 'Large metadata page',
+      changedFiles: Array.from({ length: 2000 }, (_, index) => ({
+        path: `/tmp/${index}-${'x'.repeat(80)}.txt`,
+        status: 'modified',
+      })),
+    },
+  ];
+  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  const cappedPage = await readThreadForAgent({ thread_id: thread.id, limit: 1 });
+  assert.ok(cappedPage.length <= 48_000, `reply exceeded cap: ${cappedPage.length}`);
+  assert.match(cappedPage, /\[message truncated to fit reply budget\]/);
+
+  thread.messages = Array.from({ length: 12 }, (_, index) => ({
+    role: index % 2 === 0 ? 'user' : 'agent',
+    content: `page marker ${index + 1}\n${'x'.repeat(5900)}`,
+  }));
+  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  const oversizedPage = await readThreadForAgent({ thread_id: thread.id, offset: 1, limit: 12 });
+  const recoveryHint = oversizedPage.match(
+    /(\d+) messages of this page were dropped[^\n]+offset=(\d+), limit=(\d+)/
+  );
+  assert.ok(recoveryHint, 'an oversized page should identify its omitted range');
+  const droppedCount = Number(recoveryHint[1]);
+  assert.ok(droppedCount > 0 && droppedCount < 12, 'the recovery limit should be smaller than the original page');
+  assert.equal(Number(recoveryHint[2]), 1, 'recovery must begin at the original page offset');
+  assert.equal(Number(recoveryHint[3]), droppedCount, 'recovery limit must cover exactly the omitted range');
+  const recoveredBeginning = await readThreadForAgent({
+    thread_id: thread.id,
+    offset: Number(recoveryHint[2]),
+    limit: Number(recoveryHint[3]),
+  });
+  assert.match(recoveredBeginning, /### Message 1\/12/);
+  assert.match(recoveredBeginning, /page marker 1/);
+
+  console.log('Thread reader regression checks passed.');
+} finally {
+  await fs.rm(testDataDir, { recursive: true, force: true });
+  app.quit();
+}

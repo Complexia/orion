@@ -644,6 +644,7 @@ type OrionComputerUsePermissions = {
         available: boolean;
         unavailableReason?: string;
       }>>;
+      supportsThreadReader: (providerId: string) => Promise<boolean>;
       getProviderStatus: () => Promise<{
         checkedAt: string;
         updatesAvailable: number;
@@ -830,6 +831,8 @@ type OrionComputerUsePermissions = {
         };
         /** @-mentioned models the agent may delegate to directly. */
         mentions?: Array<{ modelId: string; providerId: string; slug: string; label: string }>;
+        /** True when prompt context contains resolvable @thread references and requires read_thread. */
+        hasThreadMentions?: boolean;
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
       stopAgentTurn: (
         runId: string,
