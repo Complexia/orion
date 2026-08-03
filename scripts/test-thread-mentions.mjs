@@ -13,6 +13,42 @@ import {
   requiresRegisteredThreadReaderBridge,
 } from '../src/main/thread-reader-routing.js';
 import { withThreadStartReservation } from '../src/app/turnStart.ts';
+import { resolveOrionMainDriverModel } from '../src/app/orionDriver.ts';
+
+const defaultDriver = { id: 'grok:grok-4.5', providerId: 'grok' };
+const configuredDriver = { id: 'codex:configured', providerId: 'codex' };
+const pseudoDriver = { id: 'orion:orchestrator', providerId: 'orion' };
+const terminalDriver = { id: 'claude:claude-code-cli', providerId: 'claude' };
+assert.equal(
+  resolveOrionMainDriverModel(
+    [defaultDriver, configuredDriver, pseudoDriver, terminalDriver],
+    configuredDriver.id,
+    defaultDriver.id,
+    terminalDriver.id
+  ),
+  configuredDriver,
+  'the configured real main driver should be used for both composer capability checks and dispatch'
+);
+assert.equal(
+  resolveOrionMainDriverModel(
+    [pseudoDriver, terminalDriver, defaultDriver, configuredDriver],
+    pseudoDriver.id,
+    defaultDriver.id,
+    terminalDriver.id
+  ),
+  defaultDriver,
+  'a pseudo main driver should use the shared default-model fallback'
+);
+assert.equal(
+  resolveOrionMainDriverModel(
+    [pseudoDriver, terminalDriver, configuredDriver],
+    terminalDriver.id,
+    defaultDriver.id,
+    terminalDriver.id
+  ),
+  configuredDriver,
+  'an unusable main driver should fall back to the first real model when the default is absent'
+);
 
 const pendingThreadStarts = new Set();
 let releasePreflight;

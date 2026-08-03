@@ -106,7 +106,48 @@ try {
   await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
   const cappedPage = await readThreadForAgent({ thread_id: thread.id, limit: 1 });
   assert.ok(cappedPage.length <= 48_000, `reply exceeded cap: ${cappedPage.length}`);
-  assert.match(cappedPage, /\[message truncated to fit reply budget\]/);
+  assert.match(cappedPage, /Changed files \(2000\):/);
+  assert.match(cappedPage, /…1950 more changed files omitted/);
+
+  thread.messages = [
+    {
+      role: 'agent',
+      content: 'Bound every repeated metadata collection.',
+      linkedTasks: Array.from({ length: 12 }, (_, index) => ({
+        title: `Task ${index + 1}`,
+        description: `Description ${index + 1}`,
+      })),
+      attachments: Array.from({ length: 25 }, (_, index) => ({
+        name: `attachment-${index + 1}.png`,
+        path: `/tmp/attachment-${index + 1}.png`,
+      })),
+      changedFiles: Array.from({ length: 60 }, (_, index) => ({
+        path: `/tmp/file-${index + 1}.txt`,
+        status: 'modified',
+      })),
+    },
+  ];
+  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  const boundedCollections = await readThreadForAgent({ thread_id: thread.id });
+  assert.match(boundedCollections, /…2 more linked tasks omitted/);
+  assert.match(boundedCollections, /…5 more attachments omitted/);
+  assert.match(boundedCollections, /…10 more changed files omitted/);
+
+  thread.messages = [
+    {
+      role: 'agent',
+      content: 'x'.repeat(6000),
+      activities: Array.from({ length: 12 }, (_, index) => ({
+        title: `Large activity ${index + 1}`,
+        input: 'i'.repeat(2000),
+        output: 'o'.repeat(4000),
+      })),
+    },
+  ];
+  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  const boundedMessage = await readThreadForAgent({ thread_id: thread.id });
+  assert.match(boundedMessage, /\[message details truncated\]/);
+  assert.ok(boundedMessage.length <= 48_000, `bounded message exceeded reply cap: ${boundedMessage.length}`);
 
   thread.messages = Array.from({ length: 12 }, (_, index) => ({
     role: index % 2 === 0 ? 'user' : 'agent',

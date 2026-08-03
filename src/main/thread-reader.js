@@ -9,11 +9,15 @@ export const READ_THREAD_DEFAULT_LIMIT = 30;
 export const READ_THREAD_MAX_LIMIT = 200;
 // Per-message and whole-reply caps so one giant transcript page can't blow
 // out the calling model's context. Dropped content is always announced.
-const MAX_MESSAGE_CHARS = 6000;
+const MAX_MESSAGE_CONTENT_CHARS = 6000;
+const MAX_FORMATTED_MESSAGE_CHARS = 12_000;
 const MAX_OUTPUT_CHARS = 48_000;
 const MAX_ACTIVITIES_SHOWN = 12;
 const MAX_ACTIVITY_INPUT_CHARS = 2000;
 const MAX_ACTIVITY_OUTPUT_CHARS = 4000;
+const MAX_LINKED_TASKS_SHOWN = 10;
+const MAX_ATTACHMENTS_SHOWN = 20;
+const MAX_CHANGED_FILES_SHOWN = 50;
 
 const readJson = async (filePath) => {
   try {
@@ -65,18 +69,21 @@ const formatMessage = (message, index, total) => {
   const content = typeof message.content === 'string' ? message.content.trim() : '';
   if (content) {
     lines.push(
-      content.length > MAX_MESSAGE_CHARS
-        ? `${content.slice(0, MAX_MESSAGE_CHARS)}\n…[message truncated]`
+      content.length > MAX_MESSAGE_CONTENT_CHARS
+        ? `${content.slice(0, MAX_MESSAGE_CONTENT_CHARS)}\n…[message truncated]`
         : content
     );
   }
   const linkedTasks = Array.isArray(message.linkedTasks) ? message.linkedTasks : [];
   if (linkedTasks.length > 0) {
     lines.push(`Linked board ${linkedTasks.length === 1 ? 'task' : `tasks (${linkedTasks.length})`}:`);
-    for (const task of linkedTasks) {
+    for (const task of linkedTasks.slice(0, MAX_LINKED_TASKS_SHOWN)) {
       lines.push(`- ${truncate(task?.title || '(untitled task)', 500)}`);
       const description = truncateBlock(task?.description, 4000, 'task description');
       if (description) lines.push(indentBlock(description));
+    }
+    if (linkedTasks.length > MAX_LINKED_TASKS_SHOWN) {
+      lines.push(`- …${linkedTasks.length - MAX_LINKED_TASKS_SHOWN} more linked tasks omitted`);
     }
   }
   const activities = Array.isArray(message.activities) ? message.activities : [];
@@ -104,16 +111,29 @@ const formatMessage = (message, index, total) => {
   }
   const attachments = Array.isArray(message.attachments) ? message.attachments : [];
   if (attachments.length > 0) {
-    lines.push(
-      `Attachments: ${attachments.map((a) => `${a?.name ?? 'file'} (${a?.path ?? 'no path'})`).join(', ')}`
-    );
+    lines.push(`Attachments (${attachments.length}):`);
+    for (const attachment of attachments.slice(0, MAX_ATTACHMENTS_SHOWN)) {
+      lines.push(`- ${truncate(attachment?.name ?? 'file', 200)} (${truncate(attachment?.path ?? 'no path', 500)})`);
+    }
+    if (attachments.length > MAX_ATTACHMENTS_SHOWN) {
+      lines.push(`- …${attachments.length - MAX_ATTACHMENTS_SHOWN} more attachments omitted`);
+    }
   }
   const changedFiles = Array.isArray(message.changedFiles) ? message.changedFiles : [];
   if (changedFiles.length > 0) {
-    lines.push(`Changed files: ${changedFiles.map((f) => `${f?.path} (${f?.status})`).join(', ')}`);
+    lines.push(`Changed files (${changedFiles.length}):`);
+    for (const file of changedFiles.slice(0, MAX_CHANGED_FILES_SHOWN)) {
+      lines.push(`- ${truncate(file?.path ?? '(unknown path)', 500)} (${truncate(file?.status ?? 'unknown', 100)})`);
+    }
+    if (changedFiles.length > MAX_CHANGED_FILES_SHOWN) {
+      lines.push(`- …${changedFiles.length - MAX_CHANGED_FILES_SHOWN} more changed files omitted`);
+    }
   }
   if (lines.length === 1) lines.push('(empty message)');
-  return lines.join('\n');
+  const formatted = lines.join('\n');
+  if (formatted.length <= MAX_FORMATTED_MESSAGE_CHARS) return formatted;
+  const notice = '\n…[message details truncated]';
+  return `${formatted.slice(0, MAX_FORMATTED_MESSAGE_CHARS - notice.length)}${notice}`;
 };
 
 // Always resolves to readable text (never rejects) so every caller — the
@@ -179,10 +199,10 @@ export const readThreadForAgent = async (args = {}) => {
   const formatted = page.map((message, index) => formatMessage(message, startIndex + index, total));
   // Trim oldest entries in the page if it still exceeds the reply budget.
   let dropped = 0;
-  const buildReply = () => {
+  const buildRangeLines = (shownCount) => {
     const shownStart = startIndex + dropped;
-    const rangeLines = [
-      `Showing messages ${shownStart + 1}–${shownStart + formatted.length} of ${total} (oldest first).`,
+    return [
+      `Showing messages ${shownStart + 1}–${shownStart + shownCount} of ${total} (oldest first).`,
       ...(dropped > 0
         ? [
             `${dropped} messages of this page were dropped to fit the reply budget; re-request the omitted range with offset=${startIndex + 1}, limit=${dropped}.`,
@@ -191,26 +211,31 @@ export const readThreadForAgent = async (args = {}) => {
       ...(shownStart > 0 && dropped === 0
         ? [`Earlier messages exist — call read_thread with offset (1-based message index) to read them, e.g. offset=${Math.max(1, shownStart + 1 - limit)}, limit=${limit}.`]
         : []),
-      ...(shownStart + formatted.length < total
-        ? [`Later messages exist — call read_thread with offset=${shownStart + formatted.length + 1} to continue.`]
+      ...(shownStart + shownCount < total
+        ? [`Later messages exist — call read_thread with offset=${shownStart + shownCount + 1} to continue.`]
         : []),
     ];
-    return [...header, '', ...rangeLines, '', formatted.join('\n\n')].join('\n');
   };
+  const buildReplyPrefix = (shownCount) =>
+    `${[...header, '', ...buildRangeLines(shownCount), ''].join('\n')}\n`;
 
-  let reply = buildReply();
-  while (formatted.length > 1 && reply.length > MAX_OUTPUT_CHARS) {
-    formatted.shift();
+  let shownCount = formatted.length;
+  let bodyLength = formatted.reduce((sum, entry) => sum + entry.length, 0) +
+    Math.max(0, formatted.length - 1) * 2;
+  let prefix = buildReplyPrefix(shownCount);
+  while (shownCount > 1 && prefix.length + bodyLength > MAX_OUTPUT_CHARS) {
+    bodyLength -= formatted[dropped].length + 2;
     dropped += 1;
-    reply = buildReply();
+    shownCount -= 1;
+    prefix = buildReplyPrefix(shownCount);
   }
-  if (reply.length > MAX_OUTPUT_CHARS) {
+  const shownEntries = formatted.slice(dropped);
+  if (prefix.length + bodyLength > MAX_OUTPUT_CHARS) {
     const notice = '\n…[message truncated to fit reply budget]';
-    const excess = reply.length - MAX_OUTPUT_CHARS;
-    const keep = Math.max(0, formatted[0].length - excess - notice.length);
-    formatted[0] = `${formatted[0].slice(0, keep)}${notice}`;
-    reply = buildReply();
+    const keep = Math.max(0, MAX_OUTPUT_CHARS - prefix.length - notice.length);
+    shownEntries[0] = `${shownEntries[0].slice(0, keep)}${notice}`;
   }
+  const reply = `${prefix}${shownEntries.join('\n\n')}`;
   // Defensive final cap for unexpectedly large thread metadata in the header.
   if (reply.length > MAX_OUTPUT_CHARS) {
     const notice = '\n…[reply truncated to fit reply budget]';

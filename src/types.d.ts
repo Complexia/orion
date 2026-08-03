@@ -644,7 +644,7 @@ type OrionComputerUsePermissions = {
         available: boolean;
         unavailableReason?: string;
       }>>;
-      supportsThreadReader: (providerId: string) => Promise<boolean>;
+      supportsThreadReader?: (providerId: string) => Promise<boolean>;
       getProviderStatus: () => Promise<{
         checkedAt: string;
         updatesAvailable: number;

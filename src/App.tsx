@@ -128,6 +128,7 @@ import {
   getDefaultClaudeReasoningEffort,
   getEffectiveClaudeContextWindow,
 } from './app/modelPrefs';
+import { resolveOrionMainDriverModel } from './app/orionDriver';
 import {
   accessModeOptions,
   buildLinkedTaskContext,
@@ -725,6 +726,10 @@ const App: React.FC = () => {
   // Start offset of a token dismissed with Escape, so it stays closed until
   // the user begins a new mention.
   const chatMentionDismissRef = useRef<number | null>(null);
+  const chatMentionRef = useRef<typeof chatMention>(null);
+  useEffect(() => {
+    chatMentionRef.current = chatMention;
+  }, [chatMention]);
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [accessModeOpen, setAccessModeOpen] = useState(false);
@@ -1435,17 +1440,12 @@ const App: React.FC = () => {
   );
   const threadReaderModel = useMemo(() => {
     if (selectedAgentModel?.providerId !== 'orion') return selectedAgentModel;
-    let driverModel = agentModels.find(
-      (candidate) => candidate.id === normalizedOrchestrationSettings.models.mainDriver
+    return resolveOrionMainDriverModel(
+      agentModels,
+      normalizedOrchestrationSettings.models.mainDriver,
+      defaultAgentModelId,
+      claudeCodeCliModelId
     );
-    if (!driverModel || driverModel.providerId === 'orion' || driverModel.id === claudeCodeCliModelId) {
-      driverModel =
-        agentModels.find((candidate) => candidate.id === defaultAgentModelId) ??
-        agentModels.find(
-          (candidate) => candidate.providerId !== 'orion' && candidate.id !== claudeCodeCliModelId
-        );
-    }
-    return driverModel;
   }, [agentModels, normalizedOrchestrationSettings.models.mainDriver, selectedAgentModel]);
   const threadReaderProviderId = isTerminalThread ? null : (threadReaderModel?.providerId ?? null);
   useEffect(() => {
@@ -6005,8 +6005,8 @@ const App: React.FC = () => {
       attachments: ImageAttachment[]
     ): Promise<{ ok: boolean; error?: string }> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
-      const state = useOrionStore.getState();
-      const thread = state.threads.find((t) => t.id === threadId);
+      let state = useOrionStore.getState();
+      let thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       if (thread.subagent) {
         return {
@@ -6084,13 +6084,12 @@ const App: React.FC = () => {
         };
         const generalInstructions =
           state.orchestrationSettings?.generalInstructions ?? defaultOrchestrationSettings.generalInstructions;
-        let driverModel = agentModels.find((candidate) => candidate.id === roleModels.mainDriver);
-        if (!driverModel || driverModel.providerId === 'orion' || driverModel.id === claudeCodeCliModelId) {
-          // Misconfigured/pseudo driver: fall back to a real agent model.
-          driverModel =
-            agentModels.find((candidate) => candidate.id === defaultAgentModelId) ??
-            agentModels.find((candidate) => candidate.providerId !== 'orion' && candidate.id !== claudeCodeCliModelId);
-        }
+        const driverModel = resolveOrionMainDriverModel(
+          agentModels,
+          roleModels.mainDriver,
+          defaultAgentModelId,
+          claudeCodeCliModelId
+        );
         if (!driverModel || driverModel.providerId === 'orion' || driverModel.id === claudeCodeCliModelId) {
           return {
             ok: false,
@@ -6132,18 +6131,6 @@ const App: React.FC = () => {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
 
-      // First turn carrying linked board tasks: the tasks themselves are the
-      // prompt, so an empty draft is fine — their titles and descriptions
-      // become the agent context (later turns resume the same session, so the
-      // agent already has them). The chips move onto this turn's user message.
-      const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
-      if (!promptText && attachments.length === 0 && tasksToInject.length === 0) {
-        return { ok: false, error: 'Type a message first' };
-      }
-
-      const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
-      const turnAttachments = [...taskMediaAttachments, ...attachments];
-      const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
       const mentionedThreads = promptText
         ? parseThreadMentions(promptText, state.threads, threadId)
         : [];
@@ -6170,7 +6157,26 @@ const App: React.FC = () => {
             error: 'Referenced threads could not be saved before starting this turn',
           };
         }
+        // Capability probing and persistence both yield. Continue from the
+        // current source thread so edits made during preflight are preserved.
+        state = useOrionStore.getState();
+        const refreshedThread = state.threads.find((candidate) => candidate.id === threadId);
+        if (!refreshedThread) return { ok: false, error: 'Thread no longer exists' };
+        thread = refreshedThread;
       }
+
+      // First turn carrying linked board tasks: the tasks themselves are the
+      // prompt, so an empty draft is fine — their titles and descriptions
+      // become the agent context (later turns resume the same session, so the
+      // agent already has them). Derive this after asynchronous preflight so
+      // newly linked tasks are neither omitted nor overwritten.
+      const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
+      if (!promptText && attachments.length === 0 && tasksToInject.length === 0) {
+        return { ok: false, error: 'Type a message first' };
+      }
+      const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
+      const turnAttachments = [...taskMediaAttachments, ...attachments];
+      const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
       let agentPrompt = buildPromptWithAttachments(promptText, attachments);
       if (tasksToInject.length > 0) {
         agentPrompt = agentPrompt
@@ -8102,26 +8108,29 @@ const App: React.FC = () => {
   // stops a completed "@thread:… " token from reopening the dropdown while
   // the rest of the message is typed.
   const updateChatMention = useCallback((value: string, caret: number | null) => {
-    setChatMention((prev) => {
-      let next: { start: number; query: string; mode?: 'model' | 'thread' } | null = null;
-      if (caret !== null) {
-        const beforeCaret = value.slice(0, caret);
-        const atIndex = beforeCaret.lastIndexOf('@');
-        if (atIndex !== -1) {
-          const charBefore = atIndex > 0 ? beforeCaret[atIndex - 1] : '';
-          const query = beforeCaret.slice(atIndex + 1);
-          const mode = prev && prev.start === atIndex ? prev.mode : undefined;
-          const queryAllowed = mode === 'thread' ? !/[\r\n]/.test(query) : !/\s/.test(query);
-          if ((!charBefore || /\s/.test(charBefore)) && queryAllowed) {
-            next = { start: atIndex, query, ...(mode ? { mode } : {}) };
-          }
+    const prev = chatMentionRef.current;
+    let next: { start: number; query: string; mode?: 'model' | 'thread' } | null = null;
+    if (caret !== null) {
+      const beforeCaret = value.slice(0, caret);
+      const atIndex = beforeCaret.lastIndexOf('@');
+      if (atIndex !== -1) {
+        const charBefore = atIndex > 0 ? beforeCaret[atIndex - 1] : '';
+        const query = beforeCaret.slice(atIndex + 1);
+        const mode = prev && prev.start === atIndex ? prev.mode : undefined;
+        const queryAllowed = mode === 'thread' ? !/[\r\n]/.test(query) : !/\s/.test(query);
+        if ((!charBefore || /\s/.test(charBefore)) && queryAllowed) {
+          next = { start: atIndex, query, ...(mode ? { mode } : {}) };
         }
       }
-      // A token dismissed with Escape stays closed until a new '@' is typed.
-      if (next && chatMentionDismissRef.current === next.start) return null;
+    }
+    // A token dismissed with Escape stays closed until a new '@' is typed.
+    if (next && chatMentionDismissRef.current === next.start) {
+      next = null;
+    } else {
       chatMentionDismissRef.current = null;
-      return next;
-    });
+    }
+    chatMentionRef.current = next;
+    setChatMention(next);
   }, []);
 
   // Selecting a kind at the dropdown's root level clears anything typed after
