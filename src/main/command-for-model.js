@@ -1,5 +1,6 @@
 import { app } from 'electron';
 import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, parseExtraArgs } from './models.js';
+import { codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
 
 export const commandForModel = (model, input) => {
   const prompt =
@@ -37,6 +38,7 @@ export const commandForModel = (model, input) => {
       'model_reasoning_summary="detailed"',
       '--config',
       `service_tier="${serviceTier}"`,
+      ...codexConfigArgs(codexPersonalizationConfig(options)),
     ];
     if (options.networkAccess) configArgs.push('--config', 'sandbox_workspace_write.network_access=true');
     if (options.webSearch) configArgs.push('--config', 'tools.web_search=true');

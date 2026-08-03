@@ -2,6 +2,7 @@ import { app, protocol } from 'electron';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
+import { codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
@@ -23,6 +24,7 @@ export const codexAppServerConfig = (model, input) => {
     // Same override as the exec paths: 5.6 models default summaries to none.
     model_reasoning_summary: 'detailed',
     service_tier: input.codexServiceTier || defaultCodexServiceTier,
+    ...codexPersonalizationConfig(options),
   };
   if (options.networkAccess) config['sandbox_workspace_write.network_access'] = true;
   if (options.webSearch) config['tools.web_search'] = true;
@@ -419,6 +421,9 @@ export const createCodexAppServerDriver = ({
       sandbox,
       approvalPolicy: 'never',
       config: codexAppServerConfig(model, input),
+      ...(typeof input.codexInitialContext === 'string' && input.codexInitialContext.trim()
+        ? { developerInstructions: input.codexInitialContext }
+        : {}),
     };
 
     let resolvedThreadId = null;

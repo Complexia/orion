@@ -41,17 +41,6 @@ export const mergeSynchronouslyTrackedRuns = (
   return merged;
 };
 
-export const reserveThreadStart = (pendingThreadIds: Set<string>, threadId: string) => {
-  if (pendingThreadIds.has(threadId)) return null;
-  pendingThreadIds.add(threadId);
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    pendingThreadIds.delete(threadId);
-  };
-};
-
 export const claimRemoteSideEffect = async (
   canPrepare: () => boolean,
   claim: () => Promise<boolean>

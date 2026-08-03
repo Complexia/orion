@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware';
+import { createThreadBranchFamily } from './thread-branching';
 
 export type Project = {
   id: string;
@@ -418,6 +419,19 @@ export type LinkedBoardTask = {
   lastStatus?: string;
 };
 
+// The harness's predicted next prompt for a thread (Claude's promptSuggestions
+// stream message), surfaced as a "Suggested task" card the user can spin off
+// into its own epic + rift. At most one per thread; each new one replaces it.
+export type SuggestedTask = {
+  /** The suggested prompt, verbatim from the harness. */
+  text: string;
+  createdAt: string;
+  /** Run generation that produced this suggestion. */
+  turnRunId: string;
+  /** Epic created from this suggestion, once the user started it. */
+  startedEpicId?: string;
+};
+
 export type Thread = {
   id: string;
   projectId: string;
@@ -459,6 +473,8 @@ export type Thread = {
   parentThreadId?: string;
   /** Set when this thread is a provider-native subagent's live transcript (read-only). */
   subagent?: NativeSubagentInfo;
+  /** Native subagent metadata retained by an editable branch copy. */
+  inheritedSubagent?: NativeSubagentInfo;
   /** Latest start, prompt, or exit observed from an embedded terminal. */
   terminalActivityAt?: string;
   /**
@@ -477,6 +493,8 @@ export type Thread = {
   goal?: ThreadGoal | null;
   /** Sidebar epic this thread belongs to, if any. */
   epicId?: string;
+  /** Latest harness-suggested next task for this thread, if any. */
+  suggestedTask?: SuggestedTask;
 };
 
 export type OpenFile = {
@@ -487,6 +505,8 @@ export type OpenFile = {
 
 export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'opencode';
 
+export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
+
 // Per-provider harness capabilities, passed through to the CLI invocation.
 export type ProviderRuntimeOptions = {
   /** claude: extra tools auto-approved outside Full Access (--allowedTools) */
@@ -495,6 +515,16 @@ export type ProviderRuntimeOptions = {
   networkAccess?: boolean;
   /** codex: enable the web search tool */
   webSearch?: boolean;
+  /** codex: inherit, enable, or disable local memory use and generation */
+  codexMemoryMode?: CodexSettingMode;
+  /** codex: inherit, enable, or disable Chronicle integration */
+  codexChronicleMode?: CodexSettingMode;
+  /** codex: allow or exclude MCP/web/tool-search chats from memory generation */
+  codexMemoryExternalContextMode?: CodexSettingMode;
+  /** codex: per-Orion personality override */
+  codexPersonality?: 'inherit' | 'none' | 'friendly' | 'pragmatic';
+  /** codex: additional developer instructions for Orion-launched sessions */
+  codexDeveloperInstructions?: string;
   /** grok: enable cross-session memory (--experimental-memory) */
   experimentalMemory?: boolean;
   /** claude: browser control via the Claude Chrome extension (--chrome) */
@@ -1614,47 +1644,21 @@ export const useOrionStore = create<OrionState>()(
       },
 
       branchThread: (sourceThreadId) => {
-        const source = get().threads.find((t) => t.id === sourceThreadId);
-        if (!source) return null;
-
-        const sessionIds = { ...source.agentSessionIds };
-        const inheritedProviders = Object.keys(sessionIds) as ProviderId[];
-        const newThread: Thread = {
-          id: crypto.randomUUID(),
-          projectId: source.projectId,
-          title: `${source.title} (branch)`,
-          status: 'idle',
-          modelId: source.modelId,
-          accessMode: source.accessMode,
-          codexReasoningEffort: source.codexReasoningEffort,
-          codexServiceTier: source.codexServiceTier,
-          claudeReasoningEffort: source.claudeReasoningEffort,
-          claudeContextWindow: source.claudeContextWindow,
-          createdAt: new Date().toISOString(),
-          // Copy the transcript for display; the agent's context comes from
-          // forking the CLI-side session (pendingForkProviders), not from
-          // replaying these messages.
-          messages: source.messages.map((message) => ({
-            ...message,
-            status: message.status === 'running' ? 'stopped' : message.status,
-            attachments: message.attachments?.map((a) => ({ ...a })),
-            activities: message.activities?.map((a) => ({ ...a })),
-            changedFiles: message.changedFiles?.map((f) => ({ ...f })),
-          })),
-          agentSessionIds: inheritedProviders.length ? sessionIds : undefined,
-          pendingForkProviders: inheritedProviders.length ? inheritedProviders : undefined,
-          branchedFromThreadId: source.id,
-          epicId: source.epicId,
-        };
-        set((state) => ({
-          threads: [newThread, ...state.threads],
-          selectedProjectId: source.projectId,
-          ...syncSavedView(state, panesForSelection(state, newThread.id), {
-            threads: [newThread, ...state.threads],
-          }),
-          selectedEpicId: source.epicId ?? null,
-        }));
-        return newThread.id;
+        const state = get();
+        const family = createThreadBranchFamily(state.threads, sourceThreadId);
+        if (!family) return null;
+        const newThread = family.threads.find((thread) => thread.id === family.rootId);
+        if (!newThread) return null;
+        set((state) => {
+          const threads = [...family.threads, ...state.threads];
+          return {
+            threads,
+            selectedProjectId: newThread.projectId,
+            ...syncSavedView(state, panesForSelection(state, newThread.id), { threads }),
+            selectedEpicId: newThread.epicId ?? null,
+          };
+        });
+        return family.rootId;
       },
 
       selectProject: (id) =>

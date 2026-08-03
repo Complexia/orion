@@ -664,14 +664,16 @@ export const createKimiAcpDriver = ({
       known?.kind ??
       KIMI_TOOL_KINDS[typeof toolCall.title === 'string' ? toolCall.title : ''];
     const readOnly = kind === 'read' || kind === 'search' || kind === 'fetch' || kind === 'think';
-    // Orion's own spawn_subagent/stop_subagent MCP tools are safe in every
-    // mode: the spawned subthread runs with the driver thread's access mode,
-    // never more, and stopping one only halts Orion's own child run. Kimi's
-    // initial ACP tool_call records the qualified MCP identity in toolName;
-    // permission titles are presentation fields and must not grant access.
+    // Orion's own MCP tools are safe in every mode: the spawned subthread
+    // runs with the driver thread's access mode, never more; stopping one
+    // only halts Orion's own child run; read_thread only reads persisted
+    // transcripts. Kimi's initial ACP tool_call records the qualified MCP
+    // identity in toolName; permission titles are presentation fields and
+    // must not grant access.
     const isOrionSpawn =
       known?.toolName === 'mcp__orion__spawn_subagent' ||
-      known?.toolName === 'mcp__orion__stop_subagent';
+      known?.toolName === 'mcp__orion__stop_subagent' ||
+      known?.toolName === 'mcp__orion__read_thread';
     let allow;
     let denialDetail = "mode doesn't permit this tool.";
     if (isOrionSpawn) {

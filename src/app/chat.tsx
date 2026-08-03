@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, Plus, Sparkles, SquareKanban, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type Thread, useOrionStore } from '../store';
+import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type SuggestedTask, type Thread, useOrionStore } from '../store';
 import { agentProviders } from '../agentCatalog';
+import { deriveTitle } from './titles';
 import { ProjectIcon } from './ProjectIcon';
 import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, formatTurnStats, PinnedRunStatus, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
@@ -38,6 +39,51 @@ export const CopyMessageButton: React.FC<{ text: string; className?: string }> =
     </button>
   );
 };
+
+// Harness-suggested next task for a thread (Claude's predicted next prompt,
+// emitted after each turn). Starting it spins the suggestion off into its own
+// epic — rift-backed when rifts are active — instead of continuing here.
+export const SuggestedTaskCard: React.FC<{
+  suggestion: SuggestedTask;
+  usesRift: boolean;
+  canStart: boolean;
+  onStart: () => void;
+  onDismiss: () => void;
+}> = ({ suggestion, usesRift, canStart, onStart, onDismiss }) => (
+  <div className="suggested-task-card">
+    <div className="btw-aside-bar">
+      <span className="btw-aside-badge">
+        <Sparkles size={11} />
+        Suggested task
+      </span>
+      <button
+        type="button"
+        className="btw-aside-dismiss"
+        onClick={onDismiss}
+        title="Dismiss this suggestion"
+      >
+        <X size={12} />
+      </button>
+    </div>
+    <div className="suggested-task-title">{deriveTitle(suggestion.text)}</div>
+    <div className="suggested-task-text">{suggestion.text}</div>
+    <div className="suggested-task-actions">
+      {suggestion.startedEpicId ? (
+        <span className="suggested-task-started">
+          <CircleCheck size={13} />
+          Started as an epic — find it in the sidebar
+        </span>
+      ) : canStart ? (
+        <button type="button" className="suggested-task-start" onClick={onStart}>
+          <Zap size={13} />
+          {usesRift ? 'Start in a rift' : 'Start as epic'}
+        </button>
+      ) : (
+        <span className="suggested-task-started">Enable Epics in Settings to start this task</span>
+      )}
+    </div>
+  </div>
+);
 
 export const changedFileStatusLabels: Record<ChangedFileSummary['status'], string> = {
   added: 'A',
@@ -255,7 +301,7 @@ export const AgentFamilySwitcher: React.FC<{
     const active = thread.id === currentThread.id;
     const name = isMain
       ? 'main'
-      : thread.subagent?.kind ?? thread.modelId.split(':')[1] ?? 'agent';
+      : thread.subagent?.kind ?? thread.inheritedSubagent?.kind ?? thread.modelId.split(':')[1] ?? 'agent';
     const detail = thread.title;
     return (
       <button
@@ -677,6 +723,11 @@ export type ChatTranscriptProps = {
   onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
   onAuthenticateProvider: (providerId: string) => void;
   onSteerQueuedMessage: (threadId: string, queuedId: string) => void;
+  /** Suggested-task card: starting creates a rift-backed epic when true. */
+  suggestedTaskUsesRift: boolean;
+  suggestedTaskCanStart: boolean;
+  onStartSuggestedTask: (threadId: string) => void;
+  onDismissSuggestedTask: (threadId: string) => void;
 };
 
 /**
@@ -712,6 +763,10 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   onDismissBtwExchange,
   onAuthenticateProvider,
   onSteerQueuedMessage,
+  suggestedTaskUsesRift,
+  suggestedTaskCanStart,
+  onStartSuggestedTask,
+  onDismissSuggestedTask,
 }: ChatTranscriptProps) {
   const { thread, removeQueuedThreadMessage } = useOrionStore(
     useShallow((state) => ({
@@ -847,6 +902,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     thread?.messages,
     thread?.queuedMessages,
     thread?.btwExchanges,
+    thread?.suggestedTask,
   ]);
 
   const handleMarkTaskDone = useCallback(
@@ -1028,6 +1084,15 @@ export const ChatTranscript = React.memo(function ChatTranscript({
             ))}
 
             {trailingBtwAsides.map(renderBtwAside)}
+            {thread.suggestedTask && thread.status !== 'running' && !isSending && (
+              <SuggestedTaskCard
+                suggestion={thread.suggestedTask}
+                usesRift={suggestedTaskUsesRift}
+                canStart={suggestedTaskCanStart}
+                onStart={() => onStartSuggestedTask(threadId)}
+                onDismiss={() => onDismissSuggestedTask(threadId)}
+              />
+            )}
             <div ref={chatEndRef} />
           </div>
         </MarkdownBaseDirContext.Provider>

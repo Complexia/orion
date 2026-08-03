@@ -9,8 +9,8 @@ import {
   remoteControlIsAuthenticated,
   remoteThreadRunError,
   remoteThreadRuntime,
-  reserveThreadStart,
 } from '../src/app/remote-control-policy.ts';
+import { withThreadStartReservation } from '../src/app/turnStart.ts';
 
 assert.equal(parseRemotePortDraft('47615'), 47615);
 assert.equal(parseRemotePortDraft(' 2048 '), 2048);
@@ -91,30 +91,31 @@ assert.equal(synchronouslyTrackedRuns.get('just-started-thread'), 'just-started-
 console.log('ok  remote Stop sees runs registered before React publishes its active-run ref');
 
 const pendingStarts = new Set();
-const releaseFirstStart = reserveThreadStart(pendingStarts, 'shared-thread');
-assert.ok(releaseFirstStart);
 let finishClaim;
 const claimPending = new Promise((resolve) => {
   finishClaim = resolve;
 });
-const firstStart = (async () => {
-  try {
+const firstStart = withThreadStartReservation(
+  pendingStarts,
+  'shared-thread',
+  async () => {
     await claimPending;
     assert.equal(pendingStarts.has('shared-thread'), true, 'the reservation must span the claim await');
-  } finally {
-    releaseFirstStart();
+    return true;
   }
-})();
-assert.equal(
-  reserveThreadStart(pendingStarts, 'shared-thread'),
-  null,
+);
+assert.deepEqual(
+  await withThreadStartReservation(pendingStarts, 'shared-thread', async () => true),
+  { acquired: false },
   'a concurrent start must be refused while command claiming is pending'
 );
 finishClaim();
-await firstStart;
-const releaseNextStart = reserveThreadStart(pendingStarts, 'shared-thread');
-assert.ok(releaseNextStart, 'the reservation should release when startup exits');
-releaseNextStart();
+assert.deepEqual(await firstStart, { acquired: true, value: true });
+assert.deepEqual(
+  await withThreadStartReservation(pendingStarts, 'shared-thread', async () => true),
+  { acquired: true, value: true },
+  'the reservation should release when startup exits'
+);
 console.log('ok  per-thread start reservation spans remote command claiming');
 
 let claims = 0;

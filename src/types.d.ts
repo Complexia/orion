@@ -747,6 +747,7 @@ type OrionComputerUsePermissions = {
         available: boolean;
         unavailableReason?: string;
       }>>;
+      supportsThreadReader?: (providerId: string) => Promise<boolean>;
       getProviderStatus: () => Promise<{
         checkedAt: string;
         updatesAvailable: number;
@@ -906,6 +907,8 @@ type OrionComputerUsePermissions = {
         aside?: boolean;
         /** Codex goal run (/goal): drive the turn over `codex app-server` and pursue the goal across turns. */
         codexGoal?: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number };
+        /** Preserved branch context used only when starting a fresh Codex goal thread. */
+        codexInitialContext?: string;
         /** Codex code review (/review): run review/start inline on the current Codex session. */
         codexReview?: {
           mode: 'uncommitted' | 'base' | 'commit' | 'custom';
@@ -919,6 +922,11 @@ type OrionComputerUsePermissions = {
           allowedTools?: string;
           networkAccess?: boolean;
           webSearch?: boolean;
+          codexMemoryMode?: 'inherit' | 'enabled' | 'disabled';
+          codexChronicleMode?: 'inherit' | 'enabled' | 'disabled';
+          codexMemoryExternalContextMode?: 'inherit' | 'enabled' | 'disabled';
+          codexPersonality?: 'inherit' | 'none' | 'friendly' | 'pragmatic';
+          codexDeveloperInstructions?: string;
           experimentalMemory?: boolean;
           chrome?: boolean;
           browserControl?: boolean;
@@ -933,6 +941,8 @@ type OrionComputerUsePermissions = {
         };
         /** @-mentioned models the agent may delegate to directly. */
         mentions?: Array<{ modelId: string; providerId: string; slug: string; label: string }>;
+        /** True when prompt context contains resolvable @thread references and requires read_thread. */
+        hasThreadMentions?: boolean;
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
       stopAgentTurn: (
         runId: string,
@@ -1004,9 +1014,11 @@ type OrionComputerUsePermissions = {
       onAgentTurnEvent?: (cb: (event: {
         runId: string;
         threadId: string;
-        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'subagent' | 'subagent-chunk' | 'subagent-activity';
+        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'suggestion' | 'subagent' | 'subagent-chunk' | 'subagent-activity';
         /** started events only: the persistent claude session opened this turn itself (background task finished). */
         background?: boolean;
+        /** suggestion events only: the harness's predicted next user prompt for this thread. */
+        suggestion?: string;
         /** subagent events: lifecycle upsert for a provider-native subagent of this thread's run. */
         subagent?: {
           id: string;

@@ -1081,6 +1081,12 @@ body {
   border-color: rgb(77 141 255 / 45%);
 }
 
+.provider-option-textarea {
+  min-height: 88px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
 .provider-left {
   display: flex;
   align-items: flex-start;
@@ -3184,6 +3190,69 @@ body {
 
 .btw-aside-answer {
   color: var(--text-secondary);
+}
+
+.suggested-task-card {
+  align-self: stretch;
+  max-width: 100%;
+  padding: 12px 16px;
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  font-size: 13.5px;
+  line-height: 1.55;
+  animation: message-in 320ms var(--ease-out) both;
+}
+
+.suggested-task-title {
+  margin-bottom: 4px;
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow-wrap: break-word;
+}
+
+.suggested-task-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.suggested-task-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.suggested-task-start {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.suggested-task-start:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.suggested-task-started {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .composer-btw-hint {

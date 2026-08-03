@@ -31,11 +31,13 @@ import {
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
+import { codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
-import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, registerMcpBridgeForRun, startLegacyMcpCleanup } from './main/mcp-bridge.js';
+import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup } from './main/mcp-bridge.js';
+import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import { getAgentModels, invalidateAgentModelsCache } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, getThreadsFilePath, storageFileName, threadsFileName } from './main/paths.js';
@@ -5056,6 +5058,10 @@ ipcMain.handle('agent:listModels', async (_event, input) => {
   });
 });
 
+ipcMain.handle('agent:supportsThreadReader', async (_event, providerId) =>
+  providerSupportsThreadReader(providerId)
+);
+
 ipcMain.handle('providers:getStatus', async () => getProviderStatuses());
 
 ipcMain.handle('providers:checkUpdates', async (_event, input) => checkProviderUpdates(input));
@@ -5359,9 +5365,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // spawn_subagent for non-Claude drivers: hand the CLI the bridge shim as
     // an `orion` MCP server. One token per runTurn call — a resume-fallback
     // reattempt reuses it; the last attempt's finalizeRun releases it.
-    const bridgeProvider = ['codex', 'cursor', 'grok', 'kimi', 'opencode'].includes(
-      model.providerId
-    );
+    const bridgeProvider = isMcpBridgeProvider(model.providerId);
     const supportsRunPlugin =
       bridgeProvider && (await providerSupportsRunPlugin(model.providerId));
     const orionMcp =
@@ -5374,6 +5378,34 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             providerId: model.providerId,
             accessMode: input.accessMode || 'full-access',
           });
+    const openCodeConfig =
+      model.providerId === 'opencode'
+        ? openCodeMcpConfigContent(orionMcp, process.env.OPENCODE_CONFIG_CONTENT)
+        : null;
+    // The renderer's capability probe only establishes that this provider can
+    // accept the bridge. A referenced-thread turn also needs this run's shim,
+    // socket token, and provider-specific plugin/config registration to have
+    // succeeded. OpenCode registration is not effective unless its inline MCP
+    // config could also be merged and passed to the child.
+    const effectiveThreadReaderBridgeReady = isEffectiveThreadReaderBridgeReady(
+      model.providerId,
+      Boolean(orionMcp),
+      Boolean(openCodeConfig)
+    );
+    if (
+      isRequiredThreadReaderBridgeMissing(
+        model.providerId,
+        input.hasThreadMentions,
+        effectiveThreadReaderBridgeReady
+      )
+    ) {
+      orionMcp?.release();
+      return {
+        ok: false,
+        error:
+          'Orion could not make read_thread available for this run. Try the referenced-thread turn again.',
+      };
+    }
     const startAttempt = (resumeSessionId) => {
     const args = commandForModel(model, {
       ...input,
@@ -5383,10 +5415,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       orionMcp,
     });
     const commandString = args.map(shellQuote).join(' ');
-    const openCodeConfig =
-      model.providerId === 'opencode'
-        ? openCodeMcpConfigContent(orionMcp, process.env.OPENCODE_CONFIG_CONTENT)
-        : null;
     const child = spawn(loginShell, ['-lc', commandString], {
       cwd: input.projectPath,
       env: {
@@ -6881,6 +6909,11 @@ const runOneShotAgentText = async (
     prompt,
     projectPath: cwd,
     accessMode: 'read-only',
+    // Utility turns generate disposable metadata. Never let them consume local
+    // or Chronicle memories, or become source material for future memories.
+    ...(model.providerId === 'codex'
+      ? { providerOptions: codexUtilityPrivacyOptions }
+      : {}),
     ...(model.providerId === 'codex' ? { codexReasoningEffort: effort } : {}),
     ...(model.providerId === 'claude' ? { claudeReasoningEffort: effort } : {}),
     ...(model.providerId === 'grok' ? { grokReasoningEffort: effort } : {}),
