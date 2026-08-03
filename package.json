@@ -15,6 +15,7 @@
     "test:skills": "electron scripts/test-skills.mjs",
     "test:thread-mentions": "node --no-warnings --experimental-strip-types scripts/test-thread-mentions.mjs",
     "test:thread-reader": "electron scripts/test-thread-reader.mjs",
+    "test:epic-threads": "node --no-warnings --experimental-strip-types scripts/test-epic-threads.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",
