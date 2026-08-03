@@ -138,40 +138,16 @@ const endedRunLabel = (status?: Message['status']) => {
   return 'Ended';
 };
 
-// Floating, movable "Tasks" card pinned over the chat area. Only rendered
-// when the current agent turn streamed a plan (grok ACP task list) — simple
-// turns that never emit tasks never show it. Mirrors the same plan activity
-// that lives inside the Agent steps card, so it needs no extra plumbing.
-export const FloatingTasksCard: React.FC<{
-  activity: AgentActivity;
-  runStatus?: Message['status'];
-  runRunning: boolean;
-  position: { x: number; y: number } | null;
-  onMove: (position: { x: number; y: number }) => void;
-  collapsed: boolean;
-  onToggleCollapsed: () => void;
-  onDismiss: () => void;
-}> = ({
-  activity,
-  runStatus,
-  runRunning,
-  position,
-  onMove,
-  collapsed,
-  onToggleCollapsed,
-  onDismiss,
-}) => {
+// Drag + clamp behavior shared by the floating cards pinned over the chat
+// area (Tasks, Suggested task). Keeps the card inside its positioned host
+// while it is dragged and when the host resizes.
+export const useFloatingCardDrag = (
+  position: { x: number; y: number } | null,
+  onMove: (position: { x: number; y: number }) => void
+) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
   const [hostMaxHeight, setHostMaxHeight] = useState<number | null>(null);
-
-  const entries = activity.plan ?? [];
-  const completed = entries.filter((entry) => entry.status === 'completed').length;
-  const allDone = entries.length > 0 && completed === entries.length;
-  const activeEntry = entries.find((entry) => entry.status === 'in_progress');
-  // A finished-but-incomplete plan is the interesting case: say the run ended
-  // and keep pointing at the task it never got past.
-  const endedLabel = !runRunning && !allDone ? endedRunLabel(runStatus) : null;
 
   useLayoutEffect(() => {
     const card = cardRef.current;
@@ -229,6 +205,45 @@ export const FloatingTasksCard: React.FC<{
     window.addEventListener('pointermove', handleMove);
     window.addEventListener('pointerup', handleUp);
   };
+
+  return { cardRef, dragging, hostMaxHeight, handlePointerDown };
+};
+
+// Floating, movable "Tasks" card pinned over the chat area. Only rendered
+// when the current agent turn streamed a plan (grok ACP task list) — simple
+// turns that never emit tasks never show it. Mirrors the same plan activity
+// that lives inside the Agent steps card, so it needs no extra plumbing.
+export const FloatingTasksCard: React.FC<{
+  activity: AgentActivity;
+  runStatus?: Message['status'];
+  runRunning: boolean;
+  position: { x: number; y: number } | null;
+  onMove: (position: { x: number; y: number }) => void;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+  onDismiss: () => void;
+}> = ({
+  activity,
+  runStatus,
+  runRunning,
+  position,
+  onMove,
+  collapsed,
+  onToggleCollapsed,
+  onDismiss,
+}) => {
+  const { cardRef, dragging, hostMaxHeight, handlePointerDown } = useFloatingCardDrag(
+    position,
+    onMove
+  );
+
+  const entries = activity.plan ?? [];
+  const completed = entries.filter((entry) => entry.status === 'completed').length;
+  const allDone = entries.length > 0 && completed === entries.length;
+  const activeEntry = entries.find((entry) => entry.status === 'in_progress');
+  // A finished-but-incomplete plan is the interesting case: say the run ended
+  // and keep pointing at the task it never got past.
+  const endedLabel = !runRunning && !allDone ? endedRunLabel(runStatus) : null;
 
   return (
     <div

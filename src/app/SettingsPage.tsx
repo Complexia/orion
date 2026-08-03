@@ -67,6 +67,8 @@ import type {
   WorkspaceSyncStatus,
 } from './appTypes';
 
+const ARCHIVED_EPICS_COLLAPSED_LIMIT = 5;
+
 // Settings remains controlled by App because its asynchronous account, update,
 // and Rift operations are shared with the shell. Keeping that integration in a
 // single view model avoids creating a second set of store subscriptions here.
@@ -277,6 +279,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     formatBytes,
     epicPrStatus,
   } = props;
+  const [archivedEpicsExpanded, setArchivedEpicsExpanded] = React.useState(false);
+  const visibleArchivedEpics = archivedEpicsExpanded
+    ? archivedEpics
+    : archivedEpics.slice(0, ARCHIVED_EPICS_COLLAPSED_LIMIT);
+  const hiddenArchivedEpicCount = Math.max(0, archivedEpics.length - ARCHIVED_EPICS_COLLAPSED_LIMIT);
   const appUpdatePercent = Math.max(0, Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0)));
   const appUpdateStatus =
     appUpdateState?.status === 'checking'
@@ -846,61 +853,81 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                       </div>
                     </div>
                     <div className="archived-epics-list">
-                      {archivedEpics.map((epic) => {
-                        const prStatus = epicPrStatus(epic);
-                        return (
-                          <div key={epic.id} className="archived-epic-row">
-                            <SquareKanban
-                              size={13}
-                              className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
-                            />
-                            <span className="archived-epic-name truncate" title={epic.name}>
-                              {epic.name}
-                            </span>
-                            <span className="archived-epic-date">
-                              Settled {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
-                            </span>
-                            {epic.riftReleased && (
-                              <span
-                                className="provider-status-chip"
-                                title="Its rift was freed to reclaim disk. Restoring recreates it on the same branch."
-                              >
-                                Rift freed
+                      <div id="settings-archived-epics-list" className="archived-epics-items">
+                        {visibleArchivedEpics.map((epic) => {
+                          const prStatus = epicPrStatus(epic);
+                          return (
+                            <div key={epic.id} className="archived-epic-row">
+                              <SquareKanban
+                                size={13}
+                                className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
+                              />
+                              <span className="archived-epic-name truncate" title={epic.name}>
+                                {epic.name}
                               </span>
-                            )}
-                            {epic.prUrl && (
+                              <span className="archived-epic-date">
+                                Settled {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
+                              </span>
+                              {epic.riftReleased && (
+                                <span
+                                  className="provider-status-chip"
+                                  title="Its rift was freed to reclaim disk. Restoring recreates it on the same branch."
+                                >
+                                  Rift freed
+                                </span>
+                              )}
+                              {epic.prUrl && (
+                                <button
+                                  type="button"
+                                  className="archived-epic-action"
+                                  title="Open the pull request"
+                                  onClick={() => openEpicPrUrl(epic.prUrl as string)}
+                                >
+                                  <GitPullRequest size={13} />
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 className="archived-epic-action"
-                                title="Open the pull request"
-                                onClick={() => openEpicPrUrl(epic.prUrl as string)}
+                                title={
+                                  epic.riftReleased
+                                    ? 'Restore to the sidebar and recreate its rift'
+                                    : 'Restore to the sidebar'
+                                }
+                                onClick={() => handleRestoreEpic(epic)}
                               >
-                                <GitPullRequest size={13} />
+                                <RefreshCw size={13} />
                               </button>
-                            )}
-                            <button
-                              type="button"
-                              className="archived-epic-action"
-                              title={
-                                epic.riftReleased
-                                  ? 'Restore to the sidebar and recreate its rift'
-                                  : 'Restore to the sidebar'
-                              }
-                              onClick={() => handleRestoreEpic(epic)}
-                            >
-                              <RefreshCw size={13} />
-                            </button>
-                            <button
-                              type="button"
-                              className="archived-epic-action danger"
-                              title="Delete epic"
-                              onClick={() => handleDeleteEpic(epic)}
-                            >
-                              <Trash2 size={13} />
-                            </button>
-                          </div>
-                        );
-                      })}
+                              <button
+                                type="button"
+                                className="archived-epic-action danger"
+                                title="Delete epic"
+                                onClick={() => handleDeleteEpic(epic)}
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {archivedEpics.length > ARCHIVED_EPICS_COLLAPSED_LIMIT && (
+                        <button
+                          type="button"
+                          className="archived-epics-toggle"
+                          aria-expanded={archivedEpicsExpanded}
+                          aria-controls="settings-archived-epics-list"
+                          onClick={() => setArchivedEpicsExpanded((expanded) => !expanded)}
+                        >
+                          <span>
+                            {archivedEpicsExpanded ? 'Show less' : `Show ${hiddenArchivedEpicCount} more`}
+                          </span>
+                          <ChevronDown
+                            size={13}
+                            className={archivedEpicsExpanded ? 'open' : ''}
+                            aria-hidden="true"
+                          />
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}

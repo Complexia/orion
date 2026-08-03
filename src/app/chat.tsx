@@ -5,7 +5,7 @@ import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type M
 import { agentProviders } from '../agentCatalog';
 import { deriveTitle } from './titles';
 import { ProjectIcon } from './ProjectIcon';
-import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, formatTurnStats, PinnedRunStatus, useRunTicker } from './activity';
+import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, formatTurnStats, PinnedRunStatus, useFloatingCardDrag, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
 import { MarkdownBaseDirContext, MarkdownContent, StreamingMarkdownContent } from './markdown';
 import { linkedTaskStatusLabel } from './promptContext';
@@ -41,49 +41,143 @@ export const CopyMessageButton: React.FC<{ text: string; className?: string }> =
 };
 
 // Harness-suggested next task for a thread (Claude's predicted next prompt,
-// emitted after each turn). Starting it spins the suggestion off into its own
-// epic — rift-backed when rifts are active — instead of continuing here.
-export const SuggestedTaskCard: React.FC<{
+// emitted after each turn). Presented as a floating, draggable card over the
+// chat area — the same shell as the Tasks card, spawning just below it when
+// both are visible. Starting it spins the suggestion off into its own epic —
+// rift-backed when rifts are active — instead of continuing here.
+export const FloatingSuggestedTaskCard: React.FC<{
   suggestion: SuggestedTask;
   usesRift: boolean;
   canStart: boolean;
+  position: { x: number; y: number } | null;
+  onMove: (position: { x: number; y: number }) => void;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
   onStart: () => void;
   onDismiss: () => void;
-}> = ({ suggestion, usesRift, canStart, onStart, onDismiss }) => (
-  <div className="suggested-task-card">
-    <div className="btw-aside-bar">
-      <span className="btw-aside-badge">
-        <Sparkles size={11} />
-        Suggested task
-      </span>
-      <button
-        type="button"
-        className="btw-aside-dismiss"
-        onClick={onDismiss}
-        title="Dismiss this suggestion"
+}> = ({
+  suggestion,
+  usesRift,
+  canStart,
+  position,
+  onMove,
+  collapsed,
+  onToggleCollapsed,
+  onStart,
+  onDismiss,
+}) => {
+  const { cardRef, dragging, hostMaxHeight, handlePointerDown } = useFloatingCardDrag(
+    position,
+    onMove
+  );
+  // Until the user drags the card somewhere, it prefers to sit under the Tasks
+  // card, moves above it when necessary, and always stays inside the host.
+  const [defaultTop, setDefaultTop] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (position) return undefined;
+    const card = cardRef.current;
+    const host = card?.offsetParent as HTMLElement | null;
+    if (!card || !host) return undefined;
+    const tasksCard = host?.querySelector<HTMLElement>('.tasks-float-card:not(.suggested)') ?? null;
+    const measure = () => {
+      const margin = 8;
+      const gap = 10;
+      const maxCardHeight = Math.max(host.clientHeight - margin * 2, 0);
+      const cardHeight = Math.min(card.offsetHeight, maxCardHeight);
+      let preferredTop = 14;
+
+      if (tasksCard) {
+        const belowTop = tasksCard.offsetTop + tasksCard.offsetHeight + gap;
+        const fitsBelow = belowTop + cardHeight <= host.clientHeight - margin;
+        preferredTop = fitsBelow
+          ? belowTop
+          : tasksCard.offsetTop - cardHeight - gap;
+      }
+
+      const maxTop = Math.max(host.clientHeight - cardHeight - margin, margin);
+      const nextTop = Math.min(Math.max(preferredTop, margin), maxTop);
+      setDefaultTop((current) => (current === nextTop ? current : nextTop));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(host);
+    observer.observe(card);
+    if (tasksCard) observer.observe(tasksCard);
+    return () => observer.disconnect();
+    // Re-run after parent renders too: dragging the Tasks card changes its
+    // inline position without triggering ResizeObserver.
+  });
+
+  const title = deriveTitle(suggestion.text);
+
+  return (
+    <div
+      ref={cardRef}
+      className={`tasks-float-card suggested${collapsed ? ' collapsed' : ''}${
+        dragging ? ' dragging' : ''
+      }`}
+      style={{
+        ...(position
+          ? { left: position.x, top: position.y, right: 'auto' }
+          : defaultTop !== null
+            ? { top: defaultTop }
+            : {}),
+        ...(hostMaxHeight !== null ? { maxHeight: hostMaxHeight } : {}),
+      }}
+    >
+      <div
+        className="tasks-float-header"
+        onPointerDown={handlePointerDown}
+        onDoubleClick={onToggleCollapsed}
+        title="Drag to move · double-click to collapse"
       >
-        <X size={12} />
-      </button>
-    </div>
-    <div className="suggested-task-title">{deriveTitle(suggestion.text)}</div>
-    <div className="suggested-task-text">{suggestion.text}</div>
-    <div className="suggested-task-actions">
-      {suggestion.startedEpicId ? (
-        <span className="suggested-task-started">
-          <CircleCheck size={13} />
-          Started as an epic — find it in the sidebar
+        <span className="tasks-float-title">
+          <Sparkles size={13} />
+          <span>Suggested task</span>
         </span>
-      ) : canStart ? (
-        <button type="button" className="suggested-task-start" onClick={onStart}>
-          <Zap size={13} />
-          {usesRift ? 'Start in a rift' : 'Start as epic'}
-        </button>
+        <span className="tasks-float-actions">
+          <button
+            type="button"
+            onClick={onToggleCollapsed}
+            title={collapsed ? 'Expand suggestion' : 'Collapse suggestion'}
+          >
+            <ChevronDown size={13} />
+          </button>
+          <button type="button" onClick={onDismiss} title="Dismiss this suggestion">
+            <X size={13} />
+          </button>
+        </span>
+      </div>
+      {collapsed ? (
+        <div className="tasks-float-current">
+          <span className="tasks-float-current-text">{title}</span>
+        </div>
       ) : (
-        <span className="suggested-task-started">Enable Epics in Settings to start this task</span>
+        <div className="tasks-float-body">
+          <div className="suggested-task-title">{title}</div>
+          <div className="suggested-task-text">{suggestion.text}</div>
+          <div className="suggested-task-actions">
+            {suggestion.startedEpicId ? (
+              <span className="suggested-task-started">
+                <CircleCheck size={13} />
+                Started as an epic — find it in the sidebar
+              </span>
+            ) : canStart ? (
+              <button type="button" className="suggested-task-start" onClick={onStart}>
+                <Zap size={13} />
+                {usesRift ? 'Start in a rift' : 'Start as epic'}
+              </button>
+            ) : (
+              <span className="suggested-task-started">
+                Enable Epics in Settings to start this task
+              </span>
+            )}
+          </div>
+        </div>
       )}
     </div>
-  </div>
-);
+  );
+};
 
 export const changedFileStatusLabels: Record<ChangedFileSummary['status'], string> = {
   added: 'A',
@@ -726,6 +820,10 @@ export type ChatTranscriptProps = {
   /** Suggested-task card: starting creates a rift-backed epic when true. */
   suggestedTaskUsesRift: boolean;
   suggestedTaskCanStart: boolean;
+  suggestedCardPosition: { x: number; y: number } | null;
+  suggestedCardCollapsed: boolean;
+  onMoveSuggestedCard: (threadId: string, position: { x: number; y: number }) => void;
+  onToggleSuggestedCard: (threadId: string) => void;
   onStartSuggestedTask: (threadId: string) => void;
   onDismissSuggestedTask: (threadId: string) => void;
 };
@@ -765,6 +863,10 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   onSteerQueuedMessage,
   suggestedTaskUsesRift,
   suggestedTaskCanStart,
+  suggestedCardPosition,
+  suggestedCardCollapsed,
+  onMoveSuggestedCard,
+  onToggleSuggestedCard,
   onStartSuggestedTask,
   onDismissSuggestedTask,
 }: ChatTranscriptProps) {
@@ -902,7 +1004,6 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     thread?.messages,
     thread?.queuedMessages,
     thread?.btwExchanges,
-    thread?.suggestedTask,
   ]);
 
   const handleMarkTaskDone = useCallback(
@@ -924,6 +1025,14 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   const handleDismissTasksCard = useCallback(() => {
     if (floatingPlan) onDismissTasksCard(threadId, floatingPlan.messageId);
   }, [floatingPlan, onDismissTasksCard, threadId]);
+  const handleMoveSuggestedCard = useCallback(
+    (position: { x: number; y: number }) => onMoveSuggestedCard(threadId, position),
+    [onMoveSuggestedCard, threadId]
+  );
+  const handleToggleSuggestedCard = useCallback(
+    () => onToggleSuggestedCard(threadId),
+    [onToggleSuggestedCard, threadId]
+  );
   const renderBtwAside = useCallback(
     (exchange: BtwExchange) => (
       <div key={exchange.id} className={`btw-aside ${exchange.status}`}>
@@ -1084,15 +1193,6 @@ export const ChatTranscript = React.memo(function ChatTranscript({
             ))}
 
             {trailingBtwAsides.map(renderBtwAside)}
-            {thread.suggestedTask && thread.status !== 'running' && !isSending && (
-              <SuggestedTaskCard
-                suggestion={thread.suggestedTask}
-                usesRift={suggestedTaskUsesRift}
-                canStart={suggestedTaskCanStart}
-                onStart={() => onStartSuggestedTask(threadId)}
-                onDismiss={() => onDismissSuggestedTask(threadId)}
-              />
-            )}
             <div ref={chatEndRef} />
           </div>
         </MarkdownBaseDirContext.Provider>
@@ -1110,6 +1210,20 @@ export const ChatTranscript = React.memo(function ChatTranscript({
           collapsed={tasksCardCollapsed}
           onToggleCollapsed={handleToggleTasksCard}
           onDismiss={handleDismissTasksCard}
+        />
+      )}
+
+      {thread.suggestedTask && thread.status !== 'running' && !isSending && (
+        <FloatingSuggestedTaskCard
+          suggestion={thread.suggestedTask}
+          usesRift={suggestedTaskUsesRift}
+          canStart={suggestedTaskCanStart}
+          position={suggestedCardPosition}
+          onMove={handleMoveSuggestedCard}
+          collapsed={suggestedCardCollapsed}
+          onToggleCollapsed={handleToggleSuggestedCard}
+          onStart={() => onStartSuggestedTask(threadId)}
+          onDismiss={() => onDismissSuggestedTask(threadId)}
         />
       )}
 

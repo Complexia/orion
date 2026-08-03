@@ -20,13 +20,13 @@ const autoScrollEffect = section(
   'useEffect(() => {\n    if (!chatPinnedRef.current) return;',
   '  const handleMarkTaskDone'
 );
-assert.match(
+assert.doesNotMatch(
   autoScrollEffect,
   /thread\?\.suggestedTask/,
-  'Pinned transcripts must scroll when the suggestion card arrives'
+  'The floating suggestion card must not drive transcript auto-scroll'
 );
 
-const startTurn = section(appSource, '  const startTurnForThread = useCallback(', '  useEffect(() => {\n    startTurnForThreadRef.current');
+const startTurn = section(appSource, '  const startTurnForThreadUnlocked = useCallback(', '  const startTurnForThread = useCallback(');
 assert.match(
   startTurn,
   /updateThread\(threadId, \{ status: 'running', suggestedTask: undefined \}\);/,
@@ -134,13 +134,33 @@ assert.ok(
 
 const suggestedTaskCard = section(
   chatSource,
-  'export const SuggestedTaskCard:',
+  'export const FloatingSuggestedTaskCard:',
   'export const changedFileStatusLabels'
 );
 assert.match(
   suggestedTaskCard,
   /canStart \? \(/,
   'The suggested-task card must hide its start action while Epics is disabled'
+);
+assert.match(
+  suggestedTaskCard,
+  /useFloatingCardDrag\(/,
+  'The suggested-task card must stay draggable via the shared floating-card hook'
+);
+assert.match(
+  suggestedTaskCard,
+  /const fitsBelow = belowTop \+ cardHeight <= host\.clientHeight - margin;[\s\S]*tasksCard\.offsetTop - cardHeight - gap/,
+  'The suggested-task card must move above the Tasks card when the lower stack would overflow'
+);
+assert.match(
+  suggestedTaskCard,
+  /const maxTop = Math\.max\(host\.clientHeight - cardHeight - margin, margin\);[\s\S]*Math\.min\(Math\.max\(preferredTop, margin\), maxTop\)/,
+  'The suggested-task default position must be clamped inside its host'
+);
+assert.match(
+  suggestedTaskCard,
+  /observer\.observe\(host\);[\s\S]*observer\.observe\(card\);[\s\S]*observer\.observe\(tasksCard\)/,
+  'The suggested-task stack must be remeasured when its host or either card resizes'
 );
 assert.match(
   appSource,

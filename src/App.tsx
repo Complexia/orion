@@ -108,6 +108,7 @@ import {
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
+import { epicThreadRows } from './app/epicThreads';
 import { AgentsSidebar, type AgentsSidebarModel, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { ThreadPane } from './app/ThreadPane';
 import type { AppDialogsModel } from './app/AppDialogs';
@@ -1317,15 +1318,48 @@ const App: React.FC = () => {
     },
     [updateTasksCardState]
   );
+  // The floating Suggested-task card shares the Tasks card's shell but needs no
+  // dismissed id — dismissing clears the suggestion off the thread itself.
+  type SuggestedCardState = {
+    position: { x: number; y: number } | null;
+    collapsed: boolean;
+  };
+  const [suggestedCardStates, setSuggestedCardStates] = useState<Record<string, SuggestedCardState>>({});
+  const updateSuggestedCardState = useCallback(
+    (threadId: string, update: (current: SuggestedCardState) => SuggestedCardState) => {
+      setSuggestedCardStates((states) => {
+        const current = states[threadId] ?? { position: null, collapsed: false };
+        return { ...states, [threadId]: update(current) };
+      });
+    },
+    []
+  );
+  const moveSuggestedCard = useCallback(
+    (threadId: string, position: { x: number; y: number }) => {
+      updateSuggestedCardState(threadId, (current) => ({ ...current, position }));
+    },
+    [updateSuggestedCardState]
+  );
+  const toggleSuggestedCard = useCallback(
+    (threadId: string) => {
+      updateSuggestedCardState(threadId, (current) => ({
+        ...current,
+        collapsed: !current.collapsed,
+      }));
+    },
+    [updateSuggestedCardState]
+  );
   useEffect(() => {
     const liveThreadIds = new Set(threads.map((thread) => thread.id));
-    setTasksCardStates((states) => {
+    const dropStale = <T,>(states: Record<string, T>) => {
       const staleThreadIds = Object.keys(states).filter((threadId) => !liveThreadIds.has(threadId));
       if (staleThreadIds.length === 0) return states;
       const next = { ...states };
       for (const threadId of staleThreadIds) delete next[threadId];
       return next;
-    });
+    };
+    setTasksCardStates(dropStale);
+    setSuggestedCardStates(dropStale);
   }, [threads]);
   const selectedProject = projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
   const latestThreadProjectId = useMemo(() => {
@@ -1981,7 +2015,10 @@ const App: React.FC = () => {
     }
   }, [activeRiftUnavailable, activeWorkingDir, activeTab, setActiveTab]);
 
-  const selectedEpicThreads = selectedEpic ? (threadsByEpic.get(selectedEpic.id) ?? []) : [];
+  const selectedEpicThreadRows = useMemo(
+    () => (selectedEpic ? epicThreadRows(threads, selectedEpic.id) : []),
+    [selectedEpic, threads]
+  );
   const selectedEpicHasRunningAgents = selectedEpic ? runningAgentEpicIds.has(selectedEpic.id) : false;
   const selectedEpicRepositoryProject = selectedEpic?.repositoryProjectId
     ? (projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null)
@@ -10571,7 +10608,9 @@ const App: React.FC = () => {
                             </span>
                           )}
                           <span>
-                            {selectedEpicThreads.length === 1 ? '1 thread' : `${selectedEpicThreads.length} threads`}
+                            {selectedEpicThreadRows.length === 1
+                              ? '1 thread'
+                              : `${selectedEpicThreadRows.length} threads`}
                           </span>
                           <span>Created {formatShortTime(new Date(selectedEpic.createdAt))}</span>
                         </div>
@@ -10887,14 +10926,24 @@ const App: React.FC = () => {
                           <Plus size={14} />
                         </button>
                       </div>
-                      {selectedEpicThreads.length === 0 ? (
+                      {selectedEpicThreadRows.length === 0 ? (
                         <div className="epic-view-empty">No threads yet — spawn one to start working this epic.</div>
                       ) : (
                         <div className="threads-list epic-view-threads-list">
-                          {selectedEpicThreads.map((thread) => (
-                            <div key={thread.id} className="thread-item" onClick={() => selectThread(thread.id)}>
+                          {selectedEpicThreadRows.map(({ thread, depth }) => (
+                            <div
+                              key={thread.id}
+                              className={`thread-item${depth > 0 ? ' epic-view-thread-child' : ''}`}
+                              style={depth > 0 ? { paddingLeft: 8 + Math.min(depth, 6) * 16 } : undefined}
+                              onClick={() => selectThread(thread.id)}
+                            >
                               {renderThreadStatusDot(thread)}
                               <span className="thread-title">
+                                {depth > 0 && (
+                                  <span className="epic-view-thread-branch" title="Child thread" aria-label="Child thread">
+                                    <GitBranch size={11} aria-hidden />
+                                  </span>
+                                )}
                                 {renderThreadCliBadge(thread)}
                                 <span className="thread-title-text">{thread.title}</span>
                               </span>
@@ -10933,6 +10982,10 @@ const App: React.FC = () => {
                         position: null,
                         collapsed: false,
                         dismissedFor: null,
+                      };
+                      const suggestedCardState = suggestedCardStates[pane.thread.id] ?? {
+                        position: null,
+                        collapsed: false,
                       };
                       return (
                         <ThreadPane
@@ -10993,6 +11046,10 @@ const App: React.FC = () => {
                               onSteerQueuedMessage={steerQueuedMessage}
                               suggestedTaskUsesRift={riftsActive && riftsSettings.autoCreateForEpics}
                               suggestedTaskCanStart={epicsEnabled}
+                              suggestedCardPosition={suggestedCardState.position}
+                              suggestedCardCollapsed={suggestedCardState.collapsed}
+                              onMoveSuggestedCard={moveSuggestedCard}
+                              onToggleSuggestedCard={toggleSuggestedCard}
                               onStartSuggestedTask={handleStartSuggestedTask}
                               onDismissSuggestedTask={handleDismissSuggestedTask}
                             />
