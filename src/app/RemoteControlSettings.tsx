@@ -204,6 +204,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
   };
 
   const handleDisconnectMachine = async (machineId: string) => {
+    setBusyId(machineId);
     setError(null);
     try {
       const result = await window.orion?.remoteDisconnectMachine?.({ machineId });
@@ -214,6 +215,8 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
       if (mountedRef.current) {
         setError(remoteControlErrorMessage(cause, 'Could not disconnect this machine.'));
       }
+    } finally {
+      if (mountedRef.current) setBusyId(null);
     }
   };
 
@@ -473,6 +476,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                     type="button"
                     className="archived-epic-action"
                     title="Disconnect"
+                    disabled={busyId === machine.id}
                     onClick={() => void handleDisconnectMachine(machine.id)}
                   >
                     <Unplug size={13} />

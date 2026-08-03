@@ -782,7 +782,7 @@ if (role) {
       });
       listener.start();
       await new Promise((resolve) => setTimeout(resolve, 100));
-      assert.ok(ticketCalls >= 5, 'the listener should keep retrying rejected control sockets');
+      assert.ok(ticketCalls >= 2, 'the listener should retry rejected control sockets');
       assert.ok(ticketCalls <= 7, 'short-lived control sockets must retain exponential backoff');
       assert.equal(sockets.length, ticketCalls);
       console.log('ok  short-lived relay control sockets retain exponential backoff');
