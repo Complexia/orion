@@ -68,7 +68,13 @@ import {
   type TurnTokenStats,
   type Epic,
 } from './store';
-import type { RiftStorageEntry, RiftStorageState } from './types';
+import type {
+  RemoteCommandRequest,
+  RemoteControlState,
+  RemoteMachineEntry,
+  RiftStorageEntry,
+  RiftStorageState,
+} from './types';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
@@ -106,6 +112,15 @@ import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
 import { ModelPickerPopover } from './app/ModelPickerPopover';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
+import {
+  claimRemoteSideEffect,
+  mergeSynchronouslyTrackedRuns,
+  persistSuccessfulRemoteCommand,
+  remoteControlIsAuthenticated,
+  remoteThreadRunError,
+  remoteThreadRuntime,
+  reserveThreadStart,
+} from './app/remote-control-policy';
 import {
   AttachmentThumb,
   buildPromptWithAttachments,
@@ -173,8 +188,15 @@ import type {
 const TerminalView = React.lazy(() => import('./TerminalView'));
 const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
 const AppDialogs = React.lazy(() => import('./app/AppDialogs'));
+// Remote control is opt-in and rarely on screen; keep its view out of the
+// startup chunk like the settings page.
+const RemoteMachineView = React.lazy(() => import('./app/RemoteMachineView'));
 
 const normalizeRepositoryPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
+
+// Stable empty list so the memoized sidebar doesn't re-render while remote
+// control is off (a fresh [] every render would defeat React.memo).
+const EMPTY_REMOTE_MACHINES: RemoteMachineEntry[] = [];
 
 const dispatchedModelIdForProvider = (
   thread: Thread,
@@ -531,6 +553,8 @@ const App: React.FC = () => {
     setRiftsSettings,
     workspaceSyncSettings,
     setWorkspaceSyncSettings,
+    remoteControlSettings,
+    setRemoteControlSettings,
     addProject,
     removeProject,
     renameProject,
@@ -599,6 +623,8 @@ const App: React.FC = () => {
       setRiftsSettings: state.setRiftsSettings,
       workspaceSyncSettings: state.workspaceSyncSettings,
       setWorkspaceSyncSettings: state.setWorkspaceSyncSettings,
+      remoteControlSettings: state.remoteControlSettings,
+      setRemoteControlSettings: state.setRemoteControlSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
@@ -1023,7 +1049,8 @@ const App: React.FC = () => {
     | ((
         threadId: string,
         promptText: string,
-        attachments: ImageAttachment[]
+        attachments: ImageAttachment[],
+        claimStart?: () => Promise<boolean>
       ) => Promise<{ ok: boolean; error?: string }>)
     | null
   >(null);
@@ -2243,6 +2270,103 @@ const App: React.FC = () => {
   const handleWorkspaceSyncNow = useCallback(() => {
     void window.orion?.workspaceSyncNow?.();
   }, []);
+
+  // Remote control engine lives in main; push the persisted opt-in settings on
+  // hydration and every change, and mirror its state for the sidebar Machines
+  // section (the settings tab keeps its own subscription while mounted).
+  const [remoteControlState, setRemoteControlState] = useState<RemoteControlState | null>(null);
+  const [machinesSectionOpen, setMachinesSectionOpen] = useState(true);
+  const [activeRemoteMachineId, setActiveRemoteMachineId] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let unsubscribeHydration = () => {};
+    let finishHydrationWait = () => {};
+    const configure = async () => {
+      if (!useOrionStore.persist.hasHydrated()) {
+        await new Promise<void>((resolve) => {
+          let finished = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            unsubscribeHydration();
+            resolve();
+          };
+          finishHydrationWait = finish;
+          unsubscribeHydration = useOrionStore.persist.onFinishHydration(finish);
+          if (useOrionStore.persist.hasHydrated()) finish();
+        });
+      }
+      if (cancelled) return;
+      // The effect may have mounted with defaults; after the await, read the
+      // hydrated store rather than sending that stale closure to main.
+      await window.orion?.remoteControlConfigure?.(useOrionStore.getState().remoteControlSettings);
+      if (cancelled) return;
+      const state = await window.orion?.remoteControlGetState?.();
+      if (!cancelled) setRemoteControlState(state ?? null);
+    };
+    void configure();
+    return () => {
+      cancelled = true;
+      finishHydrationWait();
+    };
+  }, [remoteControlSettings]);
+  useEffect(() => {
+    const unsubscribe = window.orion?.onRemoteState?.((state) => setRemoteControlState(state));
+    return () => unsubscribe?.();
+  }, []);
+  const selectRemoteMachine = useCallback((machineId: string | null) => {
+    setActiveRemoteMachineId(machineId);
+  }, []);
+  // Sidebar navigation always returns to this machine — including re-clicking
+  // the already-selected thread/project/epic, which the deselection effect
+  // below (it only sees value changes) would otherwise miss.
+  const selectThreadFromSidebar = useCallback(
+    (id: string | null) => {
+      setActiveRemoteMachineId(null);
+      selectThread(id);
+    },
+    [selectThread]
+  );
+  const selectProjectFromSidebar = useCallback(
+    (id: string | null) => {
+      setActiveRemoteMachineId(null);
+      selectProject(id);
+    },
+    [selectProject]
+  );
+  const selectEpicFromSidebar = useCallback(
+    (id: string | null) => {
+      setActiveRemoteMachineId(null);
+      selectEpic(id);
+    },
+    [selectEpic]
+  );
+  const openSavedViewFromSidebar = useCallback(
+    (id: string) => {
+      setActiveRemoteMachineId(null);
+      openSavedView(id);
+    },
+    [openSavedView]
+  );
+  const remoteMachines = remoteControlState?.machines ?? EMPTY_REMOTE_MACHINES;
+  const remoteMachinesVisible = Boolean(
+    remoteControlSettings.enabled &&
+      remoteControlIsAuthenticated(accountState.authenticated, remoteControlState?.authenticated)
+  );
+  const activeRemoteMachine =
+    remoteMachinesVisible && activeRemoteMachineId
+      ? (remoteMachines.find((machine) => machine.id === activeRemoteMachineId) ?? null)
+      : null;
+  // Turning remote control off (or signing out) hides the Machines section;
+  // the remote view must not stay open behind it.
+  useEffect(() => {
+    if (!remoteMachinesVisible) setActiveRemoteMachineId(null);
+  }, [remoteMachinesVisible]);
+  // Local navigation leaves the remote view: picking a thread, project, epic,
+  // or saved view on this machine means the user is done with the remote one.
+  useEffect(() => {
+    setActiveRemoteMachineId(null);
+  }, [selectedThreadId, selectedProjectId, selectedEpicId, activeSavedViewId]);
 
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
@@ -5842,17 +5966,18 @@ const App: React.FC = () => {
     async (
       threadId: string,
       promptText: string,
-      attachments: ImageAttachment[]
+      attachments: ImageAttachment[],
+      claimStart?: () => Promise<boolean>
     ): Promise<{ ok: boolean; error?: string }> => {
-      if (pendingTurnStartsRef.current.has(threadId)) {
+      const releaseStartReservation = reserveThreadStart(pendingTurnStartsRef.current, threadId);
+      if (!releaseStartReservation) {
         return { ok: false, error: 'An agent turn is already starting' };
       }
-      pendingTurnStartsRef.current.add(threadId);
       try {
         await refreshLinkedTasksBeforeDispatch(threadId);
-      } finally {
-        pendingTurnStartsRef.current.delete(threadId);
-      }
+        if (claimStart && !(await claimStart())) {
+          return { ok: false, error: 'The remote command expired before the turn started.' };
+        }
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
@@ -5965,6 +6090,13 @@ const App: React.FC = () => {
         });
         orchestration = { isOrchestrator: true, roles, generalInstructions };
         model = driverModel;
+      }
+
+      // Embedded Claude Code owns a persistent PTY and must never reach the
+      // one-shot agent IPC below. Keep this guard ahead of every transcript
+      // mutation even though current local and remote callers route it first.
+      if (model.id === claudeCodeCliModelId) {
+        return { ok: false, error: 'Claude Code CLI threads use the embedded terminal runtime.' };
       }
 
       if (normalizedProviderSettings[model.providerId]?.enabled === false) {
@@ -6149,7 +6281,13 @@ const App: React.FC = () => {
         }
       });
 
-      return { ok: true };
+        return { ok: true };
+      } finally {
+        // Keep admission closed across linked-task refresh and the claim IPC.
+        // The synchronous run registry is installed before a successful return,
+        // so releasing here cannot expose a gap to another remote command.
+        releaseStartReservation();
+      }
     },
     [
       agentModels,
@@ -7800,37 +7938,59 @@ const App: React.FC = () => {
     void steerQueuedMessageRef.current(threadId, queuedId);
   }, []);
 
-  const stopActiveAgent = async () => {
-    if (!activeRunId || !window.orion?.stopAgentTurn) return;
-    // Stop means "halt everything": queued follow-ups return to the composer
-    // instead of auto-dispatching against the stopped run's session.
+  const stopThreadTree = async ({
+    rootThreadId,
+    stoppedText,
+    spawnStoppedText,
+    restoreRootQueueToComposer = false,
+  }: {
+    rootThreadId: string;
+    stoppedText: string;
+    spawnStoppedText: string;
+    restoreRootQueueToComposer?: boolean;
+  }): Promise<boolean> => {
+    if (!window.orion?.stopAgentTurn) return false;
     const state = useOrionStore.getState();
-    const thread = state.threads.find((t) => t.id === selectedThreadId);
-    const queued = thread?.queuedMessages ?? [];
-    if (thread && queued.length > 0) {
-      updateThread(thread.id, { queuedMessages: [] });
+    const rootThread = state.threads.find((thread) => thread.id === rootThreadId);
+    if (!rootThread) return false;
+    const threadIds = descendantThreadIds(state.threads, rootThread.id);
+    const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
+    const runsByThread = mergeSynchronouslyTrackedRuns(
+      activeRunsByThreadRef.current,
+      runOutputMessages.current
+    );
+    const runsToStop: Array<{ threadId: string; runId: string }> = [];
+    for (const candidate of stoppedThreads) {
+      const runId = runsByThread.get(candidate.id);
+      if (runId) runsToStop.push({ threadId: candidate.id, runId });
+    }
+    if (runsToStop.length === 0) return false;
+
+    // Stop means "halt everything": clear every queued follow-up before any
+    // active mapping is released, otherwise the queue-dispatch effect can
+    // immediately start another turn. A local button restores only the root
+    // queue to its visible composer; remote Stop has no local composer target
+    // and deliberately discards it along with descendant queues.
+    const queued = rootThread.queuedMessages ?? [];
+    if (queued.length > 0) {
+      updateThread(rootThread.id, { queuedMessages: [] });
+    }
+    if (restoreRootQueueToComposer && queued.length > 0) {
       setChatInput((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
       setChatAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
     }
-    const threadIds = new Set(thread ? [thread.id] : []);
-    let foundChild = true;
-    while (foundChild) {
-      foundChild = false;
-      for (const candidate of state.threads) {
-        if (candidate.parentThreadId && threadIds.has(candidate.parentThreadId) && !threadIds.has(candidate.id)) {
-          threadIds.add(candidate.id);
-          foundChild = true;
-        }
+    const pendingSpawnIds: string[] = [];
+
+    for (const stoppedThread of stoppedThreads) {
+      if (stoppedThread.status === 'running') updateThread(stoppedThread.id, { status: 'idle' });
+      if (stoppedThread.id !== rootThread.id && (stoppedThread.queuedMessages?.length ?? 0) > 0) {
+        updateThread(stoppedThread.id, { queuedMessages: [] });
+      }
+      if (stoppedThread.spawnId) {
+        updateThread(stoppedThread.id, { spawnId: undefined });
+        pendingSpawnIds.push(stoppedThread.spawnId);
       }
     }
-
-    const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
-    const runsToStop: Array<{ threadId: string; runId: string }> = [];
-    for (const candidate of stoppedThreads) {
-      const runId = activeRunsByThread[candidate.id];
-      if (runId) runsToStop.push({ threadId: candidate.id, runId });
-    }
-    const pendingSpawnIds: string[] = [];
 
     // Untrack and mark every run in the subtree stopped BEFORE the IPC calls:
     // interrupted result events can otherwise race in and mark them Finished.
@@ -7839,27 +7999,14 @@ const App: React.FC = () => {
       runOutputMessages.current.delete(runId);
       clearActiveRun(runId);
       if (tracked) {
-        appendToThreadMessage(tracked.threadId, tracked.messageId, '\n\nStopped by user.');
+        appendToThreadMessage(tracked.threadId, tracked.messageId, `\n\n${stoppedText}`);
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'stopped',
           completedAt: new Date().toISOString(),
-          statusText: 'Stopped by user.',
+          statusText: stoppedText,
         });
       } else {
-        markUntrackedRunStopped(runThreadId, 'Stopped by user.');
-      }
-    }
-    for (const stoppedThread of stoppedThreads) {
-      if (stoppedThread.status === 'running') updateThread(stoppedThread.id, { status: 'idle' });
-      // Descendant follow-ups must not auto-dispatch as soon as their active
-      // run is cleared. Only the selected/root thread's queue is restored to
-      // the visible composer above.
-      if (stoppedThread.id !== thread?.id && (stoppedThread.queuedMessages?.length ?? 0) > 0) {
-        updateThread(stoppedThread.id, { queuedMessages: [] });
-      }
-      if (stoppedThread.spawnId) {
-        updateThread(stoppedThread.id, { spawnId: undefined });
-        pendingSpawnIds.push(stoppedThread.spawnId);
+        markUntrackedRunStopped(runThreadId, stoppedText);
       }
     }
     flushChunkBuffers();
@@ -7869,17 +8016,178 @@ const App: React.FC = () => {
     await Promise.all(runsToStop.map(({ runId }) => window.orion.stopAgentTurn(runId, { terminateBackground: true })));
     await Promise.all(
       stoppedThreads
-        .filter((candidate) => candidate.id !== thread?.id)
+        .filter((candidate) => candidate.id !== rootThread.id)
         .map((candidate) => disposeThreadRuntime(candidate.id))
     );
     for (const spawnId of pendingSpawnIds) {
       void window.orion?.reportSubagentResult?.({
         spawnId,
         ok: false,
-        result: 'Subagent run was stopped by the user before completing.',
+        result: spawnStoppedText,
       });
     }
+    return true;
   };
+
+  const stopActiveAgent = async () => {
+    if (!activeRunId || !selectedThreadId) return;
+    await stopThreadTree({
+      rootThreadId: selectedThreadId,
+      stoppedText: 'Stopped by user.',
+      spawnStoppedText: 'Subagent run was stopped by the user before completing.',
+      restoreRootQueueToComposer: true,
+    });
+  };
+
+  // Remote runTurn/stopTurn commands from paired controllers (host side of
+  // remote control). Executed exactly like local user actions so this
+  // machine's UI and store remain authoritative; the outcome is reported back
+  // to unblock the controller's pending request. Ref-forwarded (like
+  // steerQueuedMessageRef) so the mount-once subscription always sees the
+  // committed render's closures.
+  const remoteCommandHandlerRef = useRef<
+    (
+      command: RemoteCommandRequest['command'],
+      canPrepare: () => boolean,
+      claimStart: () => Promise<boolean>
+    ) => Promise<{ ok: boolean; threadId?: string; error?: string }>
+  >(async () => ({ ok: false, error: 'Remote commands are unavailable.' }));
+  useLayoutEffect(() => {
+    remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
+      const state = useOrionStore.getState();
+      if (command.kind === 'runTurn') {
+        const promptText = (command.prompt ?? '').trim();
+        if (!promptText) return { ok: false, error: 'Empty prompt.' };
+        let threadId: string;
+        let createdThread = false;
+        if (command.threadId) {
+          const thread = state.threads.find((candidate) => candidate.id === command.threadId);
+          if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+          const unsupportedError = remoteThreadRunError(thread.modelId);
+          if (unsupportedError) return { ok: false, threadId: thread.id, error: unsupportedError };
+          // React publishes activeRunsByThreadRef only after a render. The
+          // output registry and pending-start set are updated synchronously,
+          // so they close admission before a concurrent remote request can
+          // launch a second process for the same thread.
+          const synchronouslyTracked =
+            pendingTurnStartsRef.current.has(thread.id) ||
+            [...runOutputMessages.current.values()].some((tracked) => tracked.threadId === thread.id);
+          if (
+            synchronouslyTracked ||
+            Boolean(activeRunsByThreadRef.current[thread.id])
+          ) {
+            return { ok: false, error: 'That thread is already running a turn.' };
+          }
+          threadId = thread.id;
+        } else {
+          const project = state.projects.find((candidate) => candidate.id === command.projectId);
+          if (!project) return { ok: false, error: 'Project not found on this machine.' };
+          threadId = state.createThread(project.id, undefined, {
+            ...(command.epicId && state.epics.some((epic) => epic.id === command.epicId)
+              ? { epicId: command.epicId }
+              : {}),
+            ...(command.modelId && agentModelsRef.current.some((model) => model.id === command.modelId)
+              ? { modelId: command.modelId }
+              : {}),
+            select: false,
+          });
+          createdThread = true;
+        }
+        const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        const unsupportedError = thread ? remoteThreadRunError(thread.modelId) : null;
+        if (unsupportedError) {
+          if (createdThread) useOrionStore.getState().deleteThread(threadId);
+          return { ok: false, ...(createdThread ? {} : { threadId }), error: unsupportedError };
+        }
+        const start = thread
+          ? startTurnForThreadRef.current?.(threadId, promptText, [], claimStart)
+          : undefined;
+        if (!start) {
+          if (createdThread) useOrionStore.getState().deleteThread(threadId);
+          return { ok: false, error: 'The agent turn could not start.' };
+        }
+        let result: { ok: boolean; error?: string };
+        try {
+          result = await start;
+        } catch (error) {
+          if (createdThread) useOrionStore.getState().deleteThread(threadId);
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : 'The agent turn could not start.',
+          };
+        }
+        if (!result.ok && createdThread) useOrionStore.getState().deleteThread(threadId);
+        return result.ok
+          ? { ok: true, threadId }
+          : { ok: false, ...(createdThread ? {} : { threadId }), error: result.error };
+      }
+      if (command.kind === 'stopTurn') {
+        const threadId = command.threadId ?? '';
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The remote Stop command expired or was cancelled.' };
+        }
+        // Claiming yields to main, so resolve the thread again only after main
+        // has atomically confirmed that this command is still authorized.
+        const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        if (thread && remoteThreadRuntime(thread.modelId) === 'terminal') {
+          if (thread.status !== 'running') {
+            return { ok: false, error: 'No running turn on that thread.' };
+          }
+          if (!window.orion?.terminalKill) {
+            return { ok: false, error: 'The Claude Code terminal runtime is unavailable.' };
+          }
+          const stopped = await window.orion.terminalKill(threadId);
+          if (!stopped) return { ok: false, error: 'No running turn on that thread.' };
+          updateThread(threadId, { status: 'idle' });
+          return { ok: true, threadId };
+        }
+        const stoppedText = `Stopped remotely${
+          command.source?.machineName ? ` from ${command.source.machineName}` : ''
+        }.`;
+        const stopped = await stopThreadTree({
+          rootThreadId: threadId,
+          stoppedText,
+          spawnStoppedText: 'Subagent run was stopped by a paired remote machine before completing.',
+        });
+        if (!stopped) return { ok: false, error: 'No running turn on that thread.' };
+        return { ok: true, threadId };
+      }
+      return { ok: false, error: 'Unsupported remote command.' };
+    };
+  });
+  useEffect(() => {
+    if (!window.orion?.onRemoteCommandRequest) return undefined;
+    const unsubscribe = window.orion.onRemoteCommandRequest((request) => {
+      void (async () => {
+        let outcome: { ok: boolean; threadId?: string; error?: string };
+        const canPrepare = () => Date.now() < request.expiresAt;
+        let claimPromise: Promise<boolean> | null = null;
+        const claimStart = () => {
+          if (!canPrepare()) return Promise.resolve(false);
+          claimPromise ??=
+            window.orion
+              ?.remoteClaimCommand?.({ commandId: request.commandId })
+              .then((result) => result.ok)
+              .catch(() => false) ?? Promise.resolve(false);
+          return claimPromise;
+        };
+        try {
+          outcome = await remoteCommandHandlerRef.current(request.command, canPrepare, claimStart);
+          // Main serves remote snapshots and transcripts from disk. Do not
+          // expose a successful mutation until the exact thread state the
+          // controller will immediately read has crossed that boundary.
+          outcome = await persistSuccessfulRemoteCommand(outcome, flushOrionThreadsSave);
+        } catch (error) {
+          outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+        void window.orion?.reportRemoteCommandResult?.({ commandId: request.commandId, ...outcome });
+      })();
+    });
+    // Main dispatches only after this subscription exists. Reload/navigation
+    // clears readiness in main until this effect mounts again.
+    void window.orion.remoteRendererReady?.();
+    return () => unsubscribe?.();
+  }, []);
 
   // Track the composer's active @-mention token: the last '@' at/before the
   // caret whose preceding character is start-of-text or whitespace, with no
@@ -8039,6 +8347,8 @@ const App: React.FC = () => {
     setRiftsSettings,
     workspaceSyncSettings,
     setWorkspaceSyncSettings,
+    remoteControlSettings,
+    setRemoteControlSettings,
     workspaceSyncStatus,
     handleWorkspaceSyncNow,
     setUtilityModelPickerOpen,
@@ -8203,14 +8513,14 @@ const App: React.FC = () => {
 
   const agentsSidebarModel: AgentsSidebarModel = {
     projects,
-    selectThread,
+    selectThread: selectThreadFromSidebar,
     setActiveTab,
     selectedThreadId,
     paneThreadIds,
     savedViews,
     activeSavedViewId,
     threadTitlesById,
-    openSavedView,
+    openSavedView: openSavedViewFromSidebar,
     deleteSavedView,
     savedViewsSectionOpen,
     setSavedViewsSectionOpen,
@@ -8218,9 +8528,9 @@ const App: React.FC = () => {
     branchThread,
     selectedEpicId,
     renameEpic,
-    selectEpic,
+    selectEpic: selectEpicFromSidebar,
     renameProject,
-    selectProject,
+    selectProject: selectProjectFromSidebar,
     threadSearchOpen,
     setThreadSearchOpen,
     threadSearchQuery,
@@ -8280,6 +8590,13 @@ const App: React.FC = () => {
     renderThreadStatusDot,
     sidebarFooterProps,
     epicPrStatus,
+    remoteMachinesVisible,
+    machinesSectionOpen,
+    setMachinesSectionOpen,
+    remoteMachines,
+    activeRemoteMachineId,
+    selectRemoteMachine,
+    localMachineName: remoteControlState?.machineName ?? 'This machine',
   };
 
   // The main view's unit of display. paneThreadIds is authoritative; falling
@@ -9805,9 +10122,23 @@ const App: React.FC = () => {
               {/* Sidebar: Projects + Threads */}
               <AgentsSidebar {...agentsSidebarModel} />
 
+              {/* Remote machine view (remote control): replaces the local
+                  thread panel while a paired machine is selected. The local
+                  panel stays mounted (hidden) so its state survives. */}
+              {activeRemoteMachine && (
+                <React.Suspense fallback={<div className="panel agents-panel" />}>
+                  <RemoteMachineView
+                    machineId={activeRemoteMachine.id}
+                    machineName={activeRemoteMachine.name}
+                    status={activeRemoteMachine.status}
+                    onBack={() => setActiveRemoteMachineId(null)}
+                  />
+                </React.Suspense>
+              )}
+
               {/* Main Panel: Thread view */}
               <div
-                className={`panel agents-panel${threadDropActive ? ' thread-drop-active' : ''}`}
+                className={`panel agents-panel${threadDropActive ? ' thread-drop-active' : ''}${activeRemoteMachine ? ' hidden-for-remote' : ''}`}
                 onDragOver={handleThreadDragOver}
                 onDragLeave={handleThreadDragLeave}
                 onDrop={handleThreadDrop}

@@ -23,6 +23,11 @@
 - Browse and edit the code on Orion Web (Monaco); web edits are real git commits you pull back
 - See [docs/orion-cloud-repos.md](docs/orion-cloud-repos.md)
 
+### Remote control
+- Pair two Orion instances and drive one from the other's sidebar (Machines section)
+- Direct, end-to-end encrypted connection between the machines; both must be signed in to the same account
+- See [docs/remote-control.md](docs/remote-control.md)
+
 ### Architecture
 - Electron + Vite + React + TypeScript
 - IPC bridge for secure filesystem access (main process)

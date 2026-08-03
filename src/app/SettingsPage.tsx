@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  Cast,
   ChevronDown,
   Cloud,
   Columns2,
@@ -34,6 +35,7 @@ import {
   type ProviderId,
   type ProviderRuntimeOptions,
   type ProviderSettings,
+  type RemoteControlSettings as RemoteControlSettingsValue,
   type RiftsSettings,
   type SavedView,
   type SplitViewSettings,
@@ -51,6 +53,7 @@ import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
 import SkillsSettings from './SkillsSettings';
+import RemoteControlSettings from './RemoteControlSettings';
 import { orchestrationRoleMeta } from './promptContext';
 import { formatShortTime } from './time';
 import type {
@@ -86,6 +89,8 @@ export type SettingsPageProps = {
   setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
   workspaceSyncSettings: WorkspaceSyncSettings;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
+  remoteControlSettings: RemoteControlSettingsValue;
+  setRemoteControlSettings: (updates: Partial<RemoteControlSettingsValue>) => void;
   workspaceSyncStatus: WorkspaceSyncStatus | null;
   handleWorkspaceSyncNow: () => void;
   setUtilityModelPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -199,6 +204,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setRiftsSettings,
     workspaceSyncSettings,
     setWorkspaceSyncSettings,
+    remoteControlSettings,
+    setRemoteControlSettings,
     workspaceSyncStatus,
     handleWorkspaceSyncNow,
     setUtilityModelPickerOpen,
@@ -323,6 +330,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {[
             { id: 'account', label: 'Account', Icon: UserRound },
             { id: 'cloud-sync', label: 'Cloud Sync', Icon: Cloud },
+            { id: 'remote-control', label: 'Remote Control', Icon: Cast },
             { id: 'general', label: 'General', Icon: Settings },
             { id: 'providers', label: 'Providers', Icon: Plug },
             { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
@@ -359,6 +367,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         <div className="settings-content-header">
           {settingsTab === 'account' && 'ACCOUNT'}
           {settingsTab === 'cloud-sync' && 'CLOUD SYNC'}
+          {settingsTab === 'remote-control' && 'REMOTE CONTROL'}
           {settingsTab === 'general' && 'GENERAL'}
           {settingsTab === 'providers' && 'PROVIDERS'}
           {settingsTab === 'orchestration' && 'ORCHESTRATION'}
@@ -371,7 +380,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         </div>
 
         <div
-          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' || settingsTab === 'skills' ? ' settings-panel-grouped' : ''}`}
+          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' || settingsTab === 'skills' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
         >
           {settingsTab === 'account' && (
             <>
@@ -1199,6 +1208,15 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
 
           {settingsTab === 'skills' && (
             <SkillsSettings formatBytes={formatBytes} onOpenInEditor={handleOpenSkillInEditor} />
+          )}
+
+          {settingsTab === 'remote-control' && (
+            <RemoteControlSettings
+              remoteControlSettings={remoteControlSettings}
+              setRemoteControlSettings={setRemoteControlSettings}
+              accountState={accountState}
+              formatCheckedTime={formatCheckedTime}
+            />
           )}
 
           {settingsTab === 'split-view' && (

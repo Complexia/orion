@@ -136,6 +136,7 @@ export type WorkspaceSyncStatus = {
 export type SettingsTab =
   | 'account'
   | 'cloud-sync'
+  | 'remote-control'
   | 'general'
   | 'providers'
   | 'orchestration'
