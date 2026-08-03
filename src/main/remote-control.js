@@ -64,6 +64,11 @@ const HANDSHAKE_FRAME_BYTES = 4096;
 // each chunk by a third; 4 MiB leaves ample room for the response envelope and
 // authenticated-encryption overhead under MAX_FRAME_BYTES.
 const THREAD_CHUNK_BYTES = 4 * 1024 * 1024;
+// Remote transcript pulls are intentionally bounded even after authentication.
+// A paired host controls threadBytes, and the controller accumulates chunks
+// before parsing them, so accepting an arbitrary total would permit unbounded
+// memory growth and request loops.
+const MAX_THREAD_TRANSFER_BYTES = 64 * 1024 * 1024;
 // Retain at most one serialized transcript per authenticated host session, and
 // release it if a controller abandons the pull transfer.
 const THREAD_TRANSFER_TTL_MS = 2 * 60 * 1000;
@@ -302,6 +307,7 @@ const writePersistedState = async () => {
   // pairings appear to succeed and silently vanish.
   requirePairingPersistence();
   const filePath = getRemoteStateFilePath();
+  const tempPath = `${filePath}.${process.pid}.tmp`;
   const payload = {
     version: 1,
     machineId: identity.machineId,
@@ -330,8 +336,14 @@ const writePersistedState = async () => {
   // Orion instance. Callers serialize this together with the state mutation.
   try {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    const tempPath = `${filePath}.${process.pid}.tmp`;
-    await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf-8', mode: 0o600 });
+    const handle = await fs.open(tempPath, 'w', 0o600);
+    try {
+      await handle.chmod(0o600);
+      await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf-8' });
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await fs.rename(tempPath, filePath);
     // A transient EIO must not pin an error banner for the rest of the
     // process; a recovered write clears it.
@@ -340,6 +352,7 @@ const writePersistedState = async () => {
       publishState();
     }
   } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
     console.error('remote-control: save error', error);
     stateError = 'Could not save remote control pairings.';
     publishState();
@@ -538,6 +551,8 @@ const relayEnabled = () => settings.connectionMode === 'relay' && relaySupported
 const ensureRelayRegistration = async (signal) => {
   if (!currentUserId) throw new Error('Sign in to your Orion account first.');
   if (relayRegisteredFor === currentUserId) return;
+  const registrationUserId = currentUserId;
+  const registrationGeneration = accountGeneration;
   if (typeof deps?.registerRelayDevice === 'function') {
     await deps.registerRelayDevice({
       machineId: identity.machineId,
@@ -548,7 +563,13 @@ const ensureRelayRegistration = async (signal) => {
     });
   }
   if (signal?.aborted) throw new Error('The relay registration request was cancelled.');
-  relayRegisteredFor = currentUserId;
+  if (
+    registrationGeneration !== accountGeneration ||
+    registrationUserId !== currentUserId
+  ) {
+    throw new Error('The Orion account changed during relay registration.');
+  }
+  relayRegisteredFor = registrationUserId;
 };
 
 /**
@@ -836,6 +857,7 @@ const stopServer = () => {
 };
 
 const teardownForAccountChange = () => {
+  relayRegisteredFor = null;
   stopServer();
   stopRelayListener();
   cancelOutboundPairingAttempts('The Orion account changed.');
@@ -1064,13 +1086,7 @@ const handleInboundConnection = (transport, { ip = null } = {}) => {
       if (!psk) psk = crypto.randomBytes(32);
 
       session.eph = createEphemeralKeyPair();
-      let peerPublicDer;
-      try {
-        peerPublicDer = Buffer.from(message.pub, 'base64');
-      } catch {
-        channel.destroy();
-        return;
-      }
+      const peerPublicDer = Buffer.from(message.pub, 'base64');
       const ackRaw = channel.send({
         t: 'helloAck',
         v: REMOTE_PROTOCOL_VERSION,
@@ -1356,6 +1372,7 @@ const requestRendererCommand = (command, timeoutMs, session, onClaim = null) => 
         });
       }
     }, timeoutMs);
+    timer.unref?.();
     const pending = {
       resolve,
       timer,
@@ -1484,8 +1501,10 @@ const retainThreadTransfer = (session, threadId, serialized) => {
   return transfer;
 };
 
-const responseFitsFrame = (reqId, payload) =>
-  Buffer.byteLength(JSON.stringify({ t: 'res', reqId, ...payload }), 'utf8') +
+const threadResponseFitsFrame = (reqId, serialized) =>
+  Buffer.byteLength(JSON.stringify({ t: 'res', reqId, ok: true, thread: null }), 'utf8') -
+    Buffer.byteLength('null', 'utf8') +
+    serialized.length +
     ENCRYPTED_FRAME_OVERHEAD_BYTES <=
   MAX_FRAME_BYTES;
 
@@ -1551,11 +1570,16 @@ const handleHostRequest = async (session, message) => {
         }
         let threadsFile = { threads: [] };
         try {
-          threadsFile = await deps.readThreadsFile();
+          threadsFile = await deps.readThreadsFile({ threadId });
         } catch {}
         const thread = (threadsFile?.threads ?? []).find((candidate) => candidate?.id === threadId);
         if (!thread) {
           respond({ ok: false, error: 'Thread not found on the host (it may not be saved yet).' });
+          return;
+        }
+        const serialized = Buffer.from(JSON.stringify(thread), 'utf8');
+        if (serialized.length > MAX_THREAD_TRANSFER_BYTES) {
+          respond({ ok: false, error: 'This thread is too large to transfer safely.' });
           return;
         }
         const directPayload = { ok: true, thread };
@@ -1563,7 +1587,7 @@ const handleHostRequest = async (session, message) => {
         // controllers. Oversized transcripts use a pull-based byte transfer:
         // the controller requests the next chunk only after receiving this
         // one, so the host never queues the entire transcript to a slow peer.
-        if (message?.threadOffset === undefined && responseFitsFrame(reqId, directPayload)) {
+        if (message?.threadOffset === undefined && threadResponseFitsFrame(reqId, serialized)) {
           respond(directPayload);
           return;
         }
@@ -1574,7 +1598,6 @@ const handleHostRequest = async (session, message) => {
           });
           return;
         }
-        const serialized = Buffer.from(JSON.stringify(thread), 'utf8');
         const transfer = retainThreadTransfer(session, threadId, serialized);
         const end = Math.min(serialized.length, THREAD_CHUNK_BYTES);
         respond({
@@ -2391,6 +2414,7 @@ export const fetchRemoteThread = async ({ machineId, threadId } = {}) => {
         typeof response.threadVersion !== 'string' ||
         !Number.isSafeInteger(response.threadBytes) ||
         response.threadBytes <= 0 ||
+        response.threadBytes > MAX_THREAD_TRANSFER_BYTES ||
         (expectedVersion !== undefined && response.threadVersion !== expectedVersion) ||
         (expectedBytes !== undefined && response.threadBytes !== expectedBytes)
       ) {

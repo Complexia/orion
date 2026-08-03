@@ -33,6 +33,9 @@ const remoteStatusLabel: Record<Thread['status'], string> = {
   error: 'Error',
 };
 
+const remoteMachineErrorMessage = (cause: unknown, fallback: string) =>
+  cause instanceof Error && cause.message ? cause.message : fallback;
+
 const RemoteMachineView = React.memo(function RemoteMachineView({
   machineId,
   machineName,
@@ -53,7 +56,6 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
   const [collapsedProjects, setCollapsedProjects] = React.useState<Record<string, boolean>>({});
   const mountedRef = React.useRef(true);
   const activeMachineIdRef = React.useRef(machineId);
-  const previousMachineIdRef = React.useRef(machineId);
   const selectedThreadIdRef = React.useRef<string | null>(null);
   const snapshotGateRef = React.useRef(createLatestOperationGate());
   const threadGateRef = React.useRef(createLatestOperationGate());
@@ -71,51 +73,67 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
     };
   }, []);
 
-  if (previousMachineIdRef.current !== machineId) {
-    previousMachineIdRef.current = machineId;
+  React.useLayoutEffect(() => {
+    activeMachineIdRef.current = machineId;
     snapshotGateRef.current.invalidate();
     threadGateRef.current.invalidate();
     commandGateRef.current.invalidate();
-  }
-  activeMachineIdRef.current = machineId;
-  selectedThreadIdRef.current = selectedThreadId;
+  }, [machineId]);
+
+  React.useEffect(() => {
+    selectedThreadIdRef.current = selectedThreadId;
+  }, [selectedThreadId]);
 
   const refreshSnapshot = React.useCallback(async () => {
     const requestedMachineId = machineId;
     const operation = snapshotGateRef.current.begin();
-    const result = await window.orion?.remoteFetchSnapshot?.({ machineId });
-    if (
-      !mountedRef.current ||
-      activeMachineIdRef.current !== requestedMachineId ||
-      !snapshotGateRef.current.isCurrent(operation)
-    ) return;
-    if (result?.ok && result.snapshot) {
-      setSnapshot(result.snapshot);
-      setSnapshotError(null);
-    } else {
-      setSnapshotError(result?.error ?? 'Could not load the remote workspace.');
+    const isCurrent = () =>
+      mountedRef.current &&
+      activeMachineIdRef.current === requestedMachineId &&
+      snapshotGateRef.current.isCurrent(operation);
+    try {
+      const result = await window.orion?.remoteFetchSnapshot?.({ machineId });
+      if (!isCurrent()) return;
+      if (result?.ok && result.snapshot) {
+        setSnapshot(result.snapshot);
+        setSnapshotError(null);
+      } else {
+        setSnapshotError(result?.error ?? 'Could not load the remote workspace.');
+      }
+    } catch (cause) {
+      if (isCurrent()) {
+        setSnapshotError(remoteMachineErrorMessage(cause, 'Could not load the remote workspace.'));
+      }
+    } finally {
+      if (isCurrent()) setLoading(false);
     }
-    setLoading(false);
   }, [machineId]);
 
   const refreshThread = React.useCallback(
     async (threadId: string) => {
       const requestedMachineId = machineId;
       const operation = threadGateRef.current.begin();
-      const result = await window.orion?.remoteFetchThread?.({ machineId, threadId });
-      if (
-        !mountedRef.current ||
-        activeMachineIdRef.current !== requestedMachineId ||
-        selectedThreadIdRef.current !== threadId ||
-        !threadGateRef.current.isCurrent(operation)
-      ) return;
-      if (result?.ok && result.thread) {
-        setThread(result.thread);
-        setThreadError(null);
-      } else {
-        setThreadError(result?.error ?? 'Could not load this thread.');
+      const isCurrent = () =>
+        mountedRef.current &&
+        activeMachineIdRef.current === requestedMachineId &&
+        selectedThreadIdRef.current === threadId &&
+        threadGateRef.current.isCurrent(operation);
+      try {
+        const result = await window.orion?.remoteFetchThread?.({ machineId, threadId });
+        if (!isCurrent()) return;
+        if (result?.ok && result.thread) {
+          setThread(result.thread);
+          setThreadError(null);
+        } else {
+          setThreadError(result?.error ?? 'Could not load this thread.');
+        }
+      } catch (cause) {
+        if (isCurrent()) {
+          setThreadError(remoteMachineErrorMessage(cause, 'Could not load this thread.'));
+        }
+      } finally {
+        if (isCurrent()) setThreadLoading(false);
       }
-      setThreadLoading(false);
     },
     [machineId]
   );
@@ -140,15 +158,22 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
     setLoading(true);
     setSnapshotError(null);
     const requestedMachineId = machineId;
-    void window.orion?.remoteConnectMachine?.({ machineId }).then((result) => {
-      if (!mountedRef.current || activeMachineIdRef.current !== requestedMachineId) return;
-      if (result?.ok) {
-        void refreshSnapshot();
-      } else {
-        setSnapshotError(result?.error ?? 'Could not connect to this machine.');
+    void (async () => {
+      try {
+        const result = await window.orion?.remoteConnectMachine?.({ machineId });
+        if (!mountedRef.current || activeMachineIdRef.current !== requestedMachineId) return;
+        if (result?.ok) {
+          void refreshSnapshot();
+        } else {
+          setSnapshotError(result?.error ?? 'Could not connect to this machine.');
+          setLoading(false);
+        }
+      } catch (cause) {
+        if (!mountedRef.current || activeMachineIdRef.current !== requestedMachineId) return;
+        setSnapshotError(remoteMachineErrorMessage(cause, 'Could not connect to this machine.'));
         setLoading(false);
       }
-    });
+    })();
   }, [machineId, refreshSnapshot]);
 
   // Host push events: workspace changes refresh both the snapshot and the open
@@ -252,6 +277,14 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
       } else {
         setActionError(result?.error ?? 'The remote machine could not start the turn.');
       }
+    } catch (cause) {
+      if (
+        mountedRef.current &&
+        activeMachineIdRef.current === requestedMachineId &&
+        commandGateRef.current.isCurrent(operation)
+      ) {
+        setActionError(remoteMachineErrorMessage(cause, 'The remote machine could not start the turn.'));
+      }
     } finally {
       if (
         mountedRef.current &&
@@ -267,17 +300,27 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
     const requestedThreadId = selectedThreadId;
     const operation = commandGateRef.current.begin();
     setActionError(null);
-    const result = await window.orion?.remoteStopTurn?.({
-      machineId: requestedMachineId,
-      threadId: requestedThreadId,
-    });
-    if (
-      !mountedRef.current ||
-      activeMachineIdRef.current !== requestedMachineId ||
-      !commandGateRef.current.isCurrent(operation)
-    ) return;
-    if (!result?.ok) setActionError(result?.error ?? 'Could not stop the remote turn.');
-    else void refreshThread(requestedThreadId);
+    try {
+      const result = await window.orion?.remoteStopTurn?.({
+        machineId: requestedMachineId,
+        threadId: requestedThreadId,
+      });
+      if (
+        !mountedRef.current ||
+        activeMachineIdRef.current !== requestedMachineId ||
+        !commandGateRef.current.isCurrent(operation)
+      ) return;
+      if (!result?.ok) setActionError(result?.error ?? 'Could not stop the remote turn.');
+      else void refreshThread(requestedThreadId);
+    } catch (cause) {
+      if (
+        mountedRef.current &&
+        activeMachineIdRef.current === requestedMachineId &&
+        commandGateRef.current.isCurrent(operation)
+      ) {
+        setActionError(remoteMachineErrorMessage(cause, 'Could not stop the remote turn.'));
+      }
+    }
   };
 
   const projects = snapshot?.projects ?? [];
@@ -362,18 +405,24 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
                 <div className="remote-project-header-row">
                   <button
                     type="button"
-                    className={`remote-project-header${selectedProjectId === project.id ? ' selected' : ''}`}
-                    title={project.path}
-                    onClick={() => selectProject(project.id)}
+                    className="project-collapse-toggle"
+                    title={collapsed ? 'Expand threads' : 'Collapse threads'}
+                    aria-expanded={!collapsed}
+                    onClick={() => {
+                      setCollapsedProjects((prev) => ({ ...prev, [project.id]: !collapsed }));
+                    }}
                   >
                     <ChevronRight
                       size={12}
                       className={`sidebar-section-chevron ${collapsed ? '' : 'open'}`}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setCollapsedProjects((prev) => ({ ...prev, [project.id]: !collapsed }));
-                      }}
                     />
+                  </button>
+                  <button
+                    type="button"
+                    className={`remote-project-header${selectedProjectId === project.id ? ' selected' : ''}`}
+                    title={project.path}
+                    onClick={() => selectProject(project.id)}
+                  >
                     <Folder size={13} />
                     <span className="truncate">{project.name}</span>
                     <span className="sidebar-section-count">{projectThreads.length}</span>

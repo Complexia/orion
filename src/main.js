@@ -557,7 +557,8 @@ const mintRelayTicket = async ({ role, machineId, signal }) => {
     typeof data?.relayUrl === 'string' && data.relayUrl.trim() ? data.relayUrl.trim() : getOrionRelayUrl();
   try {
     const parsed = new URL(relayUrl);
-    if (!['ws:', 'wss:', 'http:', 'https:'].includes(parsed.protocol)) throw new Error();
+    const allowedProtocols = app.isPackaged ? ['wss:', 'https:'] : ['ws:', 'wss:', 'http:', 'https:'];
+    if (!allowedProtocols.includes(parsed.protocol)) throw new Error();
   } catch {
     throw new Error('Orion Cloud returned an invalid relay address.');
   }
@@ -969,15 +970,16 @@ app.whenReady().then(async () => {
       if (error?.code === 'ENOENT') return { threads: [] };
       throw new Error('Could not read workspace transcripts for sync.', { cause: error });
     }
+    let parsed;
     try {
-      const parsed = JSON.parse(value);
-      if (!Array.isArray(parsed?.threads)) {
-        throw new Error('Transcript file does not contain a threads array.');
-      }
-      return parsed;
+      parsed = JSON.parse(value);
     } catch (error) {
       throw new Error('Could not parse workspace transcripts for sync.', { cause: error });
     }
+    if (!Array.isArray(parsed?.threads)) {
+      throw new Error('Transcript file does not contain a threads array.');
+    }
+    return parsed;
   };
   initWorkspaceSync({
     getWebUrl: () => getOrionWebUrl(),
@@ -1007,11 +1009,13 @@ app.whenReady().then(async () => {
     getAppVersion: () => app.getVersion(),
   });
   addAgentEventListener((event) => forwardAgentEventToRemote(event));
-  void readPersistedStoreState().then((state) => {
-    if (state?.remoteControlSettings) {
-      void configureRemoteControl(state.remoteControlSettings);
-    }
-  });
+  void readPersistedStoreState()
+    .then((state) =>
+      state?.remoteControlSettings ? configureRemoteControl(state.remoteControlSettings) : undefined
+    )
+    .catch((error) => {
+      console.error('Could not restore remote control settings', error);
+    });
 
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({
@@ -1418,7 +1422,9 @@ ipcMain.handle('remote:claimCommand', (event, input) =>
 );
 // The host renderer reports a remote command's outcome here, unblocking the
 // controller's pending request (mirrors orchestration:subagentResult).
-ipcMain.handle('remote:commandResult', (_event, payload) => resolveRemoteCommand(payload));
+ipcMain.handle('remote:commandResult', (event, payload) =>
+  event.sender === remoteCommandRenderer ? resolveRemoteCommand(payload) : { ok: false }
+);
 
 ipcMain.handle('storage:saveThreads', async (_event, value) => {
   // Same settled-queue chaining as storage:save above.

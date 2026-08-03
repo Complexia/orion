@@ -154,7 +154,7 @@ mirrors host state locally, so the two can't diverge.
 
 ## Tests
 
-```
+```sh
 npm run test:remote-crypto    # handshake, encryption, replay/tamper rejection
 npm run test:remote-control   # two real processes over TCP: pairing, sessions,
                               # revocation races, code-burning, flood resistance

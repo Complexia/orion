@@ -7443,6 +7443,18 @@ body {
   margin-bottom: 6px;
 }
 
+.remote-project-header-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.remote-project-header-row .remote-project-header {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
 .remote-project-header {
   display: flex;
   align-items: center;
@@ -7599,7 +7611,7 @@ body {
   line-height: 1.5;
   color: var(--text-primary);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .remote-composer {

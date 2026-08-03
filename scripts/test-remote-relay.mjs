@@ -30,16 +30,21 @@ if (role) {
   const engine = await import('../src/main/remote-control.js');
 
   const userId = process.env.ORION_REMOTE_TEST_USER ?? 'user_test_1';
-  const testSessionToken = `test-token:${userId}`;
+  let activeSessionUserId = userId;
+  const activeSession = () =>
+    activeSessionUserId
+      ? { token: `test-token:${activeSessionUserId}`, user: { id: activeSessionUserId } }
+      : null;
   const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
   // Stand-ins for the orion-next endpoints main.js calls. They count calls so
   // the direct-mode test can assert the engine never reaches for the relay.
-  const relayCalls = { register: 0, ticket: 0 };
+  const relayCalls = { register: 0, ticket: 0, registeredUsers: [] };
   let markRelayTicketStarted = null;
   const relayDeps = {
     registerRelayDevice: async () => {
       relayCalls.register += 1;
+      relayCalls.registeredUsers.push(activeSessionUserId);
       return { ok: true };
     },
     mintRelayTicket: async ({ role: ticketRole, machineId, signal }) => {
@@ -54,7 +59,7 @@ if (role) {
       }
       return {
         ticket: Buffer.from(
-          JSON.stringify({ sub: userId, role: ticketRole, machineId, exp: Date.now() + 120_000 })
+          JSON.stringify({ sub: activeSessionUserId ?? userId, role: ticketRole, machineId, exp: Date.now() + 120_000 })
         ).toString('base64url'),
         relayUrl: process.env.ORION_RELAY_TEST_URL,
       };
@@ -117,7 +122,7 @@ if (role) {
   }
 
   await engine.initRemoteControl({
-    readSession: async () => ({ token: testSessionToken, user: { id: userId } }),
+    readSession: async () => activeSession(),
     readStoreState: async () => ({
       projects: [{ id: 'p1', name: 'orion', path: '/tmp/orion' }],
       epics: [{ id: 'e1', name: 'Remote epic', description: '', createdAt: '2026-08-01T09:00:00.000Z' }],
@@ -203,6 +208,24 @@ if (role) {
 
     engine.shutdownRemoteControl();
     send({ kind: 'relayApiCancelled', connectionResult, pairingResult, relayCalls });
+    process.exit(0);
+  }
+
+  if (role === 'relay-reregister') {
+    await engine.configureRemoteControl({
+      enabled: true,
+      allowIncoming: true,
+      port: Number(process.env.ORION_RELAY_TEST_PORT),
+      connectionMode: 'relay',
+    });
+    await waitForRelayOnline();
+    activeSessionUserId = null;
+    engine.notifyRemoteControlAccountChanged(null);
+    activeSessionUserId = userId;
+    engine.notifyRemoteControlAccountChanged(activeSession());
+    await waitForRelayOnline();
+    engine.shutdownRemoteControl();
+    send({ kind: 'relayReregistered', relayCalls });
     process.exit(0);
   }
 
@@ -611,21 +634,22 @@ if (role) {
         this.readyState = 3;
       }
     }
-    globalThis.WebSocket = MockWebSocket;
     const pendingTickets = [];
     let ticketCalls = 0;
-    const listener = createRelayListener({
-      relayUrl: 'ws://fallback.invalid',
-      getTicket: async () => {
-        ticketCalls += 1;
-        if (ticketCalls === 1) {
-          return { ticket: 'control-ticket', relayUrl: 'ws://ticket-control.test/base' };
-        }
-        return new Promise((resolve, reject) => pendingTickets.push({ resolve, reject }));
-      },
-      onStream: () => {},
-    });
+    let listener = null;
     try {
+      globalThis.WebSocket = MockWebSocket;
+      listener = createRelayListener({
+        relayUrl: 'ws://fallback.invalid',
+        getTicket: async () => {
+          ticketCalls += 1;
+          if (ticketCalls === 1) {
+            return { ticket: 'control-ticket', relayUrl: 'ws://ticket-control.test/base' };
+          }
+          return new Promise((resolve, reject) => pendingTickets.push({ resolve, reject }));
+        },
+        onStream: () => {},
+      });
       listener.start();
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(sockets.length, 1, 'the control socket should be created');
@@ -656,7 +680,7 @@ if (role) {
       assert.equal(sockets[0].readyState, 3, 'malformed control input must close the control socket');
       console.log('ok  relay dial floods cannot exceed the pending stream cap');
     } finally {
-      listener.stop();
+      listener?.stop();
       globalThis.WebSocket = originalWebSocket;
     }
   }
@@ -682,23 +706,88 @@ if (role) {
         this.readyState = 3;
       }
     }
-    globalThis.WebSocket = StalledWebSocket;
-    const listener = createRelayListener({
-      relayUrl: 'ws://stalled.test',
-      getTicket: async () => ({ ticket: 'ticket', relayUrl: 'ws://stalled.test' }),
-      onStream: () => {},
-      openTimeoutMs: 8,
-      reconnectBaseMs: 4,
-      reconnectMaxMs: 4,
-    });
+    let listener = null;
     try {
+      globalThis.WebSocket = StalledWebSocket;
+      listener = createRelayListener({
+        relayUrl: 'ws://stalled.test',
+        getTicket: async () => ({ ticket: 'ticket', relayUrl: 'ws://stalled.test' }),
+        onStream: () => {},
+        openTimeoutMs: 8,
+        reconnectBaseMs: 4,
+        reconnectMaxMs: 4,
+      });
       listener.start();
       await new Promise((resolve) => setTimeout(resolve, 25));
       assert.equal(sockets[0].readyState, 3, 'the stalled control attempt must be closed');
       assert.ok(sockets.length >= 2, 'clearing the exact stalled socket must allow a reconnect');
       console.log('ok  stalled relay control upgrades time out and reconnect');
     } finally {
-      listener.stop();
+      listener?.stop();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  }
+
+  // A relay that accepts control sockets only to reject them immediately must
+  // retain exponential backoff. Merely reaching `open` is not evidence that the
+  // connection is healthy, or every retry would reset to the shortest delay.
+  {
+    const { createRelayListener } = await import('../src/main/remote-transport.js');
+    const originalWebSocket = globalThis.WebSocket;
+    const sockets = [];
+    class RejectingWebSocket {
+      constructor() {
+        this.readyState = 0;
+        this.listeners = new Map();
+        sockets.push(this);
+        setImmediate(() => {
+          if (this.readyState !== 0) return;
+          this.readyState = 1;
+          this.emit('open');
+          setImmediate(() => {
+            if (this.readyState === 1) {
+              this.emit('message', { data: JSON.stringify({ t: 'unsupported' }) });
+            }
+          });
+        });
+      }
+      addEventListener(type, handler) {
+        const handlers = this.listeners.get(type) ?? [];
+        handlers.push(handler);
+        this.listeners.set(type, handlers);
+      }
+      emit(type, event = {}) {
+        for (const handler of this.listeners.get(type) ?? []) handler(event);
+      }
+      send() {}
+      close() {
+        this.readyState = 3;
+      }
+    }
+    let listener = null;
+    let ticketCalls = 0;
+    try {
+      globalThis.WebSocket = RejectingWebSocket;
+      listener = createRelayListener({
+        relayUrl: 'ws://rejecting.test',
+        getTicket: async () => {
+          ticketCalls += 1;
+          return { ticket: `ticket-${ticketCalls}`, relayUrl: 'ws://rejecting.test' };
+        },
+        onStream: () => {},
+        healthyConnectionMs: 1000,
+        reconnectBaseMs: 8,
+        reconnectMaxMs: 64,
+        reconnectRandom: () => 0,
+      });
+      listener.start();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.ok(ticketCalls >= 5, 'the listener should keep retrying rejected control sockets');
+      assert.ok(ticketCalls <= 7, 'short-lived control sockets must retain exponential backoff');
+      assert.equal(sockets.length, ticketCalls);
+      console.log('ok  short-lived relay control sockets retain exponential backoff');
+    } finally {
+      listener?.stop();
       globalThis.WebSocket = originalWebSocket;
     }
   }
@@ -815,9 +904,20 @@ if (role) {
     console.log('ok  disabling remote control aborts stalled relay API requests');
   }
 
+  {
+    const reregistered = spawnRole('relay-reregister', {
+      ORION_RELAY_TEST_PORT: String(basePort + 2),
+    });
+    const result = await reregistered.waitFor('relayReregistered');
+    assert.equal(result.relayCalls.register, 2);
+    assert.deepEqual(result.relayCalls.registeredUsers, ['user_test_1', 'user_test_1']);
+    console.log('ok  signing back in re-registers relay presence for the account');
+  }
+
   // 1. 'direct' must be inert with respect to the relay: no registration, no
   // ticket, no socket. This is the whole promise of the default mode.
   {
+    const upgradesBeforeDirect = relay.stats.upgrades;
     const direct = spawnRole('direct-mode', {
       ORION_RELAY_TEST_PORT: String(basePort + 1),
     });
@@ -831,14 +931,15 @@ if (role) {
     assert.match(result.byMachineId.error, /Over the internet/i);
     assert.equal(result.relayCalls.register, 0, 'direct mode must not register with the relay');
     assert.equal(result.relayCalls.ticket, 0, 'direct mode must not mint relay tickets');
-    assert.equal(relay.stats.upgrades, 0, 'direct mode must not open a relay socket');
+    assert.equal(relay.stats.upgrades, upgradesBeforeDirect, 'direct mode must not open a relay socket');
     console.log('ok  direct mode makes zero relay calls');
   }
 
+  const hostSocketsBeforeHost = relay.stats.hostSockets;
   const host = spawnRole('host');
   const ready = await host.waitFor('ready');
   assert.match(ready.code, /^[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$/);
-  assert.equal(relay.stats.hostSockets, 1, 'the host holds exactly one control socket');
+  assert.equal(relay.stats.hostSockets, hostSocketsBeforeHost + 1, 'the host opens one control socket');
   console.log('ok  host registers and holds the relay control socket');
 
   // 2. The full flow, addressed by machine id instead of host:port.

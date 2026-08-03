@@ -20,6 +20,9 @@ export type RemoteControlSettingsProps = {
   formatCheckedTime: (iso: string) => string;
 };
 
+const remoteControlErrorMessage = (cause: unknown, fallback: string) =>
+  cause instanceof Error && cause.message ? cause.message : fallback;
+
 const RemoteControlSettings = React.memo(function RemoteControlSettings({
   remoteControlSettings,
   setRemoteControlSettings,
@@ -46,9 +49,15 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
   }, []);
 
   React.useEffect(() => {
-    void window.orion?.remoteControlGetState?.().then((state) => {
-      if (mountedRef.current) setRemoteState(state);
-    });
+    void window.orion?.remoteControlGetState?.()
+      .then((state) => {
+        if (mountedRef.current) setRemoteState(state);
+      })
+      .catch((cause) => {
+        if (mountedRef.current) {
+          setError(remoteControlErrorMessage(cause, 'Could not load remote control state.'));
+        }
+      });
     const unsubscribe = window.orion?.onRemoteState?.((state) => {
       if (mountedRef.current) setRemoteState(state);
     });
@@ -96,18 +105,30 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
 
   const handleStartPairing = async () => {
     setError(null);
-    const result = await window.orion?.remoteStartPairing?.();
-    if (!result?.ok) setError(result?.error ?? 'Could not create a pairing code.');
+    try {
+      const result = await window.orion?.remoteStartPairing?.();
+      if (!mountedRef.current) return;
+      if (!result?.ok) setError(result?.error ?? 'Could not create a pairing code.');
+    } catch (cause) {
+      if (mountedRef.current) {
+        setError(remoteControlErrorMessage(cause, 'Could not create a pairing code.'));
+      }
+    }
   };
 
   const handlePair = async () => {
     setError(null);
+    const directPort = overInternet ? null : parseRemotePortDraft(pairPort);
+    if (!overInternet && directPort === null) {
+      setError('Enter a port from 1024 to 65535.');
+      return;
+    }
     setPairing(true);
     try {
       const result = await window.orion?.remotePair?.(
         overInternet
           ? { machineId: pairMachineId.trim(), code: pairCode }
-          : { host: pairHost.trim(), port: Number(pairPort), code: pairCode }
+          : { host: pairHost.trim(), port: directPort as number, code: pairCode }
       );
       if (!mountedRef.current) return;
       if (result?.ok) {
@@ -120,6 +141,8 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
       } else {
         setError(result?.error ?? 'Pairing failed.');
       }
+    } catch (cause) {
+      if (mountedRef.current) setError(remoteControlErrorMessage(cause, 'Pairing failed.'));
     } finally {
       if (mountedRef.current) setPairing(false);
     }
@@ -130,6 +153,10 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
     try {
       const result = await window.orion?.remoteRevokeDevice?.({ deviceId });
       if (!result?.ok && mountedRef.current) setError(result?.error ?? 'Could not revoke this device.');
+    } catch (cause) {
+      if (mountedRef.current) {
+        setError(remoteControlErrorMessage(cause, 'Could not revoke this device.'));
+      }
     } finally {
       if (mountedRef.current) setBusyId(null);
     }
@@ -140,6 +167,10 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
     try {
       const result = await window.orion?.remoteRemoveMachine?.({ machineId });
       if (!result?.ok && mountedRef.current) setError(result?.error ?? 'Could not remove this machine.');
+    } catch (cause) {
+      if (mountedRef.current) {
+        setError(remoteControlErrorMessage(cause, 'Could not remove this machine.'));
+      }
     } finally {
       if (mountedRef.current) setBusyId(null);
     }
@@ -151,8 +182,38 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
     try {
       const result = await window.orion?.remoteConnectMachine?.({ machineId });
       if (!result?.ok && mountedRef.current) setError(result?.error ?? 'Could not connect.');
+    } catch (cause) {
+      if (mountedRef.current) setError(remoteControlErrorMessage(cause, 'Could not connect.'));
     } finally {
       if (mountedRef.current) setBusyId(null);
+    }
+  };
+
+  const handleCancelPairing = async () => {
+    setError(null);
+    try {
+      const result = await window.orion?.remoteCancelPairing?.();
+      if (!result?.ok && mountedRef.current) {
+        setError('Could not cancel the pairing code.');
+      }
+    } catch (cause) {
+      if (mountedRef.current) {
+        setError(remoteControlErrorMessage(cause, 'Could not cancel the pairing code.'));
+      }
+    }
+  };
+
+  const handleDisconnectMachine = async (machineId: string) => {
+    setError(null);
+    try {
+      const result = await window.orion?.remoteDisconnectMachine?.({ machineId });
+      if (!result?.ok && mountedRef.current) {
+        setError('Could not disconnect this machine.');
+      }
+    } catch (cause) {
+      if (mountedRef.current) {
+        setError(remoteControlErrorMessage(cause, 'Could not disconnect this machine.'));
+      }
     }
   };
 
@@ -319,7 +380,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                 {activePairing && <div className="remote-pairing-code">{activePairing.code}</div>}
               </div>
               {activePairing ? (
-                <button type="button" className="btn secondary small" onClick={() => void window.orion?.remoteCancelPairing?.()}>
+                <button type="button" className="btn secondary small" onClick={() => void handleCancelPairing()}>
                   Cancel
                 </button>
               ) : (
@@ -412,7 +473,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                     type="button"
                     className="archived-epic-action"
                     title="Disconnect"
-                    onClick={() => void window.orion?.remoteDisconnectMachine?.({ machineId: machine.id })}
+                    onClick={() => void handleDisconnectMachine(machine.id)}
                   >
                     <Unplug size={13} />
                   </button>

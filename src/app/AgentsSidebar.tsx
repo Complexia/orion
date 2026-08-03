@@ -371,7 +371,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                       type="button"
                       className="thread-item-select"
                       onClick={() => selectRemoteMachine(machine.id)}
-                      title={`${machine.name} (${machine.host ? `${machine.host}:${machine.port}` : 'over the internet'})${machine.error ? ` — ${machine.error}` : ''}`}
+                      title={`${machine.name} (${machine.host ? `${machine.host}:${machine.port}` : 'over the internet'}) — ${machine.status}${machine.error ? ` — ${machine.error}` : ''}`}
                     >
                       <MonitorSmartphone size={13} className="machine-item-icon" />
                       <span className="thread-title">

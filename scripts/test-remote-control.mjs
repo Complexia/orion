@@ -681,7 +681,7 @@ if (
           },
         }
       : remoteAccountProofDeps;
-  let threadFileReads = 0;
+  let largeThreadMutated = false;
   await engine.initRemoteControl({
     readSession: async () => {
       const sessionUserId = activeSessionUserId;
@@ -702,12 +702,12 @@ if (
         epics: [{ id: 'e1', name: 'Remote epic', description: '', createdAt: '2026-08-01T09:00:00.000Z' }],
       };
     },
-    readThreadsFile: async () => {
+    readThreadsFile: async ({ threadId } = {}) => {
       if (snapshotReadFailure === 'threads') throw new Error('Test transcript snapshot read failed.');
-      threadFileReads += 1;
       if (
         process.env.ORION_REMOTE_TEST_MUTATE_LARGE_THREAD_DURING_FETCH === '1' &&
-        threadFileReads === 3
+        threadId === 't-large' &&
+        !largeThreadMutated
       ) {
         // Snapshot the transcript returned for the first large-thread chunk,
         // then simulate the normal live transcript saver changing the source
@@ -721,6 +721,8 @@ if (
           kind: 'agent-run',
           status: 'running',
         });
+        largeThreadMutated = true;
+        send({ kind: 'largeThreadMutated' });
         return { threads: capturedThreads };
       }
       return { threads: fixtureThreads };
@@ -1705,7 +1707,7 @@ if (
   // Replacing a live code owns the same host-side proof lifecycle even while
   // the authenticated controller remains connected.
   {
-    const retryPort = port + 10;
+    const retryPort = port + 17;
     const retryHost = spawnRole('host', {
       ORION_REMOTE_TEST_PORT: String(retryPort),
       ORION_REMOTE_TEST_BLOCK_HOST_PROOF: '1',
@@ -1738,7 +1740,7 @@ if (
   // A second controller submission supersedes an older POST immediately and
   // can use the still-live host code itself.
   {
-    const retryPort = port + 11;
+    const retryPort = port + 18;
     const retryHost = spawnRole('host', {
       ORION_REMOTE_TEST_PORT: String(retryPort),
       ORION_TEST_USERDATA: path.join(tmpRoot, 'controller-retry-host'),
@@ -1841,6 +1843,7 @@ if (
 
   let establishedController = null;
   {
+    const largeThreadMutated = host.waitFor('largeThreadMutated');
     const controller = spawnRole('controller', {
       ORION_REMOTE_TEST_CODE: ready2.code,
       ORION_REMOTE_TEST_STAY_CONNECTED: '1',
@@ -1849,6 +1852,7 @@ if (
     establishedController = controller;
     const commandSeen = host.waitFor('commandSeen');
     const { results } = await controller.waitFor('results', 30_000);
+    await largeThreadMutated;
 
     assert.equal(results.wrongCode.ok, false, 'wrong pairing code must fail');
     assert.equal(results.pair.ok, true, `pairing failed: ${results.pair.error}`);
@@ -2265,7 +2269,6 @@ if (
   // post-auth budget, and concurrent connections are capped per IP.
   {
     const net = await import('node:net');
-    const before = process.memoryUsage().rss;
     const sockets = [];
     for (let index = 0; index < 40; index += 1) {
       const socket = net.connect(port, '127.0.0.1');
@@ -2288,11 +2291,10 @@ if (
     }
     await Promise.all(sockets);
     await new Promise((resolve) => setTimeout(resolve, 500));
-    const growthMb = (process.memoryUsage().rss - before) / (1024 * 1024);
     host.send('state');
     const { state: stillUp } = await host.waitFor('state');
     assert.equal(stillUp.host.listening, true, 'host must survive an anonymous flood');
-    console.log(`ok  anonymous flood absorbed (parent rss +${growthMb.toFixed(0)} MB)`);
+    console.log('ok  anonymous flood rejected without taking down the host');
     for (const socket of await Promise.all(sockets)) socket.destroy();
   }
 
