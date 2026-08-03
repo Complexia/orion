@@ -149,6 +149,109 @@ export type SubagentStopRequest = {
   all?: boolean;         // stop every match instead of requiring a unique one
 };
 
+// ---------------------------------------------------------------------------
+// Remote control (paired Orion instances on the same account)
+
+/** A paired controller allowed to drive this machine. */
+export type RemoteDeviceEntry = {
+  id: string;
+  name: string;
+  pairedAt: string | null;
+  lastSeenAt: string | null;
+  connected: boolean;
+};
+
+/** A paired host this machine can control. */
+export type RemoteMachineEntry = {
+  id: string;
+  name: string;
+  /** Null for a machine paired over the relay: its machine id is the route. */
+  host: string | null;
+  port: number | null;
+  /** Paired over the internet relay rather than a direct address. */
+  relay: boolean;
+  pairedAt: string | null;
+  status: 'connected' | 'connecting' | 'offline' | 'error';
+  error: string | null;
+};
+
+/** Engine state pushed from main over remote:state. */
+export type RemoteControlState = {
+  available: boolean;
+  /** Set when pairings cannot be read or persisted at all on this machine. */
+  error?: string | null;
+  machineId?: string;
+  machineName?: string;
+  authenticated?: boolean;
+  connectionMode?: 'direct' | 'relay';
+  host?: {
+    enabled: boolean;
+    listening: boolean;
+    port: number;
+    addresses: string[];
+    error: string | null;
+    /** Internet mode only; `enabled` is false whenever the relay is not held. */
+    relay: { enabled: boolean; online: boolean; error: string | null };
+    pairing: { code: string; expiresAt: string } | null;
+    devices: RemoteDeviceEntry[];
+  };
+  machines?: RemoteMachineEntry[];
+};
+
+export type RemoteThreadMeta = {
+  id: string;
+  projectId: string;
+  epicId: string | null;
+  parentThreadId: string | null;
+  subagent: boolean;
+  title: string;
+  status: 'idle' | 'running' | 'done' | 'error';
+  modelId: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+};
+
+export type RemoteSnapshot = {
+  machine: { id: string; name: string };
+  capturedAt: string;
+  projects: Array<{ id: string; name: string; path: string }>;
+  epics: Array<{
+    id: string;
+    name: string;
+    description: string;
+    repositoryProjectId: string | null;
+    createdAt: string | null;
+    settledAt: string | null;
+  }>;
+  threads: RemoteThreadMeta[];
+};
+
+/** Push from a controlled host, forwarded to the controller's renderer. */
+export type RemoteEvent = {
+  machineId: string;
+  kind: 'turnEvent' | 'workspaceChanged';
+  payload: { threadId?: string; runId?: string; type?: string } | null;
+};
+
+// A paired controller asked this (host) machine to run or stop a turn; the
+// renderer executes it exactly like a local user action and reports back via
+// reportRemoteCommandResult.
+export type RemoteCommandRequest = {
+  commandId: string;
+  /** Main-process startup deadline, checked around renderer-side preparation. */
+  expiresAt: number;
+  command: {
+    kind: 'runTurn' | 'stopTurn';
+    prompt?: string;
+    threadId?: string;
+    projectId?: string;
+    epicId?: string;
+    modelId?: string;
+    source?: { machineId: string; machineName: string };
+  };
+};
+
 declare global {
 type OrionCloudSyncStatus = 'synced' | 'ahead' | 'behind' | 'diverged' | 'unknown';
 
@@ -1003,6 +1106,66 @@ type OrionComputerUsePermissions = {
       workspaceSyncNow?: () => Promise<OrionWorkspaceSyncStatus>;
       workspaceSyncGetState?: () => Promise<OrionWorkspaceSyncStatus>;
       onWorkspaceSyncState?: (cb: (state: OrionWorkspaceSyncStatus) => void) => () => void;
+      // Remote control (Settings > Remote Control, sidebar Machines section)
+      remoteControlGetState?: () => Promise<RemoteControlState>;
+      remoteControlConfigure?: (settings: {
+        enabled: boolean;
+        allowIncoming: boolean;
+        port: number;
+        connectionMode: 'direct' | 'relay';
+      }) => Promise<{ ok: boolean }>;
+      remoteStartPairing?: () => Promise<{
+        ok: boolean;
+        code?: string;
+        expiresAt?: string;
+        addresses?: string[];
+        port?: number;
+        error?: string;
+        needsAuth?: boolean;
+      }>;
+      remoteCancelPairing?: () => Promise<{ ok: boolean }>;
+      remoteRevokeDevice?: (input: { deviceId: string }) => Promise<{ ok: boolean; error?: string }>;
+      remotePair?: (input: {
+        /** Direct mode: the host's address and port. */
+        host?: string;
+        port?: number;
+        /** Internet mode: the host's machine ID, used instead of host/port. */
+        machineId?: string;
+        code: string;
+      }) => Promise<{ ok: boolean; machine?: { id: string; name: string }; error?: string; needsAuth?: boolean }>;
+      remoteRemoveMachine?: (input: { machineId: string }) => Promise<{ ok: boolean; error?: string }>;
+      remoteConnectMachine?: (input: { machineId: string }) => Promise<{ ok: boolean; error?: string }>;
+      remoteDisconnectMachine?: (input: { machineId: string }) => Promise<{ ok: boolean }>;
+      remoteFetchSnapshot?: (input: {
+        machineId: string;
+      }) => Promise<{ ok: boolean; snapshot?: RemoteSnapshot; error?: string }>;
+      remoteFetchThread?: (input: {
+        machineId: string;
+        threadId: string;
+      }) => Promise<{ ok: boolean; thread?: import('./store').Thread; error?: string }>;
+      remoteRunTurn?: (input: {
+        machineId: string;
+        threadId?: string;
+        projectId?: string;
+        epicId?: string;
+        modelId?: string;
+        prompt: string;
+      }) => Promise<{ ok: boolean; threadId?: string; error?: string }>;
+      remoteStopTurn?: (input: {
+        machineId: string;
+        threadId: string;
+      }) => Promise<{ ok: boolean; error?: string }>;
+      remoteRendererReady?: () => Promise<{ ok: boolean }>;
+      remoteClaimCommand?: (input: { commandId: string }) => Promise<{ ok: boolean }>;
+      reportRemoteCommandResult?: (payload: {
+        commandId: string;
+        ok: boolean;
+        threadId?: string;
+        error?: string;
+      }) => Promise<{ ok: boolean }>;
+      onRemoteState?: (cb: (state: RemoteControlState) => void) => () => void;
+      onRemoteEvent?: (cb: (event: RemoteEvent) => void) => () => void;
+      onRemoteCommandRequest?: (cb: (request: RemoteCommandRequest) => void) => () => void;
     };
   }
 }
