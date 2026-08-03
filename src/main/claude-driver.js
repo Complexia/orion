@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
 import { captureGitChangeSnapshot, summarizeChangedFiles } from './git-utils.js';
 import { requestSubagentSpawn, requestSubagentStop } from './mcp-bridge.js';
+import { READ_THREAD_DEFAULT_LIMIT, READ_THREAD_MAX_LIMIT, readThreadForAgent } from './thread-reader.js';
 import { claudeEffortForCli, claudeModelArgForContextWindow, defaultClaudeContextWindow, defaultClaudeReasoningEffort, parseExtraArgs } from './models.js';
 import { finalizingAgentRuns, startingAgentRuns } from './run-registry.js';
 import { resolveCommandPath } from './shell-env.js';
@@ -160,6 +161,37 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
           // keys approval off this hint (each special-cases the orion tools
           // by qualified name), so it only governs call scheduling, and the
           // call mutates nothing in the driver's own session.
+          annotations: { readOnlyHint: true },
+        }
+      ),
+      tool(
+        'read_thread',
+        'Read the transcript of another Orion thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Orion work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit.',
+        {
+          thread_id: z
+            .string()
+            .describe('Thread id — the exact id from the [Thread mentions] block (a unique prefix or the @thread mention token also resolve)'),
+          offset: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe('1-based index of the first message to return; messages are ordered oldest to newest. Omit to get the newest messages.'),
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(READ_THREAD_MAX_LIMIT)
+            .optional()
+            .describe(`Maximum number of messages to return (default ${READ_THREAD_DEFAULT_LIMIT})`),
+        },
+        async (args) => {
+          const resultText = await readThreadForAgent(args);
+          return { content: [{ type: 'text', text: resultText }] };
+        },
+        {
+          // Genuinely read-only: reads persisted transcripts from disk and
+          // mutates nothing. Mirrored in mcp-bridge-shim.cjs; keep in sync.
           annotations: { readOnlyHint: true },
         }
       ),
@@ -1057,6 +1089,7 @@ export const createClaudeSdkSession = ({
               ...sdkOptions.allowedTools,
               'mcp__orion__spawn_subagent',
               'mcp__orion__stop_subagent',
+              'mcp__orion__read_thread',
             ]),
           ];
     session.query = sdk.query({

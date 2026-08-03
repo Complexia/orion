@@ -7,6 +7,8 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import mcpBridgeShimSource from '../mcp-bridge-shim.cjs?raw';
 import { runShellCommand } from './shell-env.js';
+import { readThreadForAgent } from './thread-reader.js';
+import { isMcpBridgeProvider } from './thread-reader-routing.js';
 
 export let legacyMcpCleanupPromise = Promise.resolve();
 
@@ -157,6 +159,17 @@ export const handleMcpBridgeConnection = (socket) => {
         void requestSubagentStop(session, args).then((text) => reply(true, text));
         continue;
       }
+      if (message.tool === 'read_thread') {
+        if (typeof args.thread_id !== 'string' || !args.thread_id.trim()) {
+          reply(false, 'read_thread requires a string `thread_id` argument.');
+          continue;
+        }
+        void readThreadForAgent(args).then(
+          (text) => reply(true, text),
+          (error) => reply(false, `Could not read the thread: ${error?.message ?? error}`)
+        );
+        continue;
+      }
       reply(false, `Unknown tool: ${message.tool}`);
     }
   });
@@ -254,6 +267,15 @@ export const providerSupportsRunPlugin = (providerId) => {
     );
   }
   return runPluginSupportPromises.get(providerId);
+};
+
+// Claude registers read_thread in-process. The other supported providers use
+// the per-run bridge; Cursor and Grok can only receive it when their installed
+// CLI exposes --plugin-dir.
+export const providerSupportsThreadReader = async (providerId) => {
+  if (providerId === 'claude') return true;
+  if (!isMcpBridgeProvider(providerId)) return false;
+  return providerSupportsRunPlugin(providerId);
 };
 
 export const registerMcpBridgeForRun = async ({

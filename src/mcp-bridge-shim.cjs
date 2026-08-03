@@ -91,6 +91,39 @@ const stopSubagentTool = {
   },
 };
 
+const readThreadTool = {
+  name: 'read_thread',
+  description:
+    'Read the transcript of another Orion thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Orion work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit.',
+  // Genuinely read-only: reads persisted transcripts and mutates nothing.
+  // Mirrored in main's in-process SDK server for Claude runs; keep in sync.
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      thread_id: {
+        type: 'string',
+        description:
+          'Thread id — the exact id from the [Thread mentions] block (a unique prefix or the @thread mention token also resolve)',
+      },
+      offset: {
+        type: 'integer',
+        minimum: 1,
+        description:
+          '1-based index of the first message to return; messages are ordered oldest to newest. Omit to get the newest messages.',
+      },
+      limit: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 200,
+        description: 'Maximum number of messages to return (default 30)',
+      },
+    },
+    required: ['thread_id'],
+    additionalProperties: false,
+  },
+};
+
 const write = (message) => {
   try {
     process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -156,12 +189,12 @@ const handleMessage = async (message) => {
   }
   if (typeof method === 'string' && method.startsWith('notifications/')) return;
   if (method === 'tools/list') {
-    respond(message.id, { tools: [spawnSubagentTool, stopSubagentTool] });
+    respond(message.id, { tools: [spawnSubagentTool, stopSubagentTool, readThreadTool] });
     return;
   }
   if (method === 'tools/call') {
     const name = message.params?.name;
-    if (name !== 'spawn_subagent' && name !== 'stop_subagent') {
+    if (name !== 'spawn_subagent' && name !== 'stop_subagent' && name !== 'read_thread') {
       respondError(message.id, -32602, `Unknown tool: ${name}`);
       return;
     }

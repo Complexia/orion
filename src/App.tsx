@@ -132,19 +132,35 @@ import {
   getDefaultClaudeReasoningEffort,
   getEffectiveClaudeContextWindow,
 } from './app/modelPrefs';
+import { resolveOrionMainDriverModel } from './app/orionDriver';
 import {
   accessModeOptions,
   buildLinkedTaskContext,
   buildModelMentionsContext,
   buildOrchestrationContext,
   buildReviewThreadContext,
+  buildThreadMentionsContext,
   linkedTaskFromBoardTask,
   linkedTaskMediaAttachments,
   linkedTaskStatusLabel,
   modelMentionToken,
   orchestrationRoleMeta,
   parseModelMentions,
+  parseThreadMentions,
+  threadMentionToken,
 } from './app/promptContext';
+import {
+  buildThreadSearchEntry,
+  scoreThreadSearchEntry,
+  type CachedThreadSearchEntry,
+} from './app/threadSearch';
+import {
+  allowsThreadMentionsInComposer,
+  getChatMentionReplaceEnd,
+  hasThreadReaderSupport,
+  isThreadReferenceCandidate,
+} from './app/chatMentions';
+import { withThreadStartReservation } from './app/turnStart';
 import { formatShortTime, getThreadActivityTime } from './app/time';
 import {
   deriveTitle,
@@ -511,6 +527,18 @@ const renderThreadStatusDot = (thread: Thread) => {
   );
 };
 
+// One row of the composer's @-mention dropdown. The root level offers the
+// mention kinds; picking one (or just typing) narrows to models or threads.
+type ChatMentionCandidate =
+  | { kind: 'category'; category: 'model' | 'thread'; label: string; hint: string }
+  | { kind: 'model'; model: AgentModel }
+  | { kind: 'thread'; thread: Thread; projectName: string };
+
+const chatMentionCategories: Array<Extract<ChatMentionCandidate, { kind: 'category' }>> = [
+  { kind: 'category', category: 'model', label: 'Model', hint: 'delegate to a model' },
+  { kind: 'category', category: 'thread', label: 'Thread', hint: 'reference another thread' },
+];
+
 const App: React.FC = () => {
   const {
     activeTab,
@@ -687,15 +715,26 @@ const App: React.FC = () => {
   const [utilityModelSearch, setUtilityModelSearch] = useState('');
   const [utilityModelTab, setUtilityModelTab] = useState<AgentProviderId>('codex');
   // Active @-mention token in the composer: index of the '@' and the query
-  // typed after it (null when the caret isn't inside a mention token).
+  // typed after it (null when the caret isn't inside a mention token). `mode`
+  // is set once the user picks a kind from the root dropdown level; while
+  // unset, typing filters models directly (the pre-thread-mentions behavior).
   const [chatMention, setChatMention] = useState<{
     start: number;
     query: string;
+    mode?: 'model' | 'thread';
   } | null>(null);
   const [chatMentionIndex, setChatMentionIndex] = useState(0);
+  const [threadReaderSupport, setThreadReaderSupport] = useState<{
+    providerId: AgentProviderId;
+    supported: boolean;
+  } | null>(null);
   // Start offset of a token dismissed with Escape, so it stays closed until
   // the user begins a new mention.
   const chatMentionDismissRef = useRef<number | null>(null);
+  const chatMentionRef = useRef<typeof chatMention>(null);
+  useEffect(() => {
+    chatMentionRef.current = chatMention;
+  }, [chatMention]);
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [accessModeOpen, setAccessModeOpen] = useState(false);
@@ -1408,6 +1447,39 @@ const App: React.FC = () => {
     }),
     [orchestrationSettings]
   );
+  const threadReaderModel = useMemo(() => {
+    if (selectedAgentModel?.providerId !== 'orion') return selectedAgentModel;
+    return resolveOrionMainDriverModel(
+      agentModels,
+      normalizedOrchestrationSettings.models.mainDriver,
+      defaultAgentModelId,
+      claudeCodeCliModelId
+    );
+  }, [agentModels, normalizedOrchestrationSettings.models.mainDriver, selectedAgentModel]);
+  const threadReaderProviderId = isTerminalThread ? null : (threadReaderModel?.providerId ?? null);
+  useEffect(() => {
+    let active = true;
+    if (!threadReaderProviderId || !window.orion?.supportsThreadReader) {
+      setThreadReaderSupport(null);
+      return () => {
+        active = false;
+      };
+    }
+    void window.orion.supportsThreadReader(threadReaderProviderId).then(
+      (supported) => {
+        if (active) setThreadReaderSupport({ providerId: threadReaderProviderId, supported });
+      },
+      () => {
+        if (active) setThreadReaderSupport({ providerId: threadReaderProviderId, supported: false });
+      }
+    );
+    return () => {
+      active = false;
+    };
+  }, [threadReaderProviderId]);
+  const canReferenceThreads = hasThreadReaderSupport(threadReaderProviderId, threadReaderSupport);
+  const canReferenceThreadsFromComposer =
+    canReferenceThreads && allowsThreadMentionsInComposer(chatInput);
   const enabledProviderIds = useMemo(
     () =>
       agentProviders
@@ -1438,11 +1510,68 @@ const App: React.FC = () => {
     () => agentModels.find((model) => model.id === claudeCodeCliModelId),
     [agentModels]
   );
-  // Composer @-mention candidates: models on enabled providers, 'orion'
-  // excluded (work can't be delegated to the orchestrator itself). An empty
-  // query shows the favorites (or everything), capped at 8 rows.
-  const chatMentionCandidates = useMemo(() => {
+  // Composer @-mention candidates. Root level (no mode picked yet) offers the
+  // Model / Thread kinds; typing there filters models directly so the
+  // pre-thread-mentions muscle memory keeps working. Model mode: models on
+  // enabled providers, 'orion' excluded (work can't be delegated to the
+  // orchestrator itself); an empty query shows the favorites (or everything).
+  // Thread mode: threads sorted by recent activity, searched with the same
+  // scoring as the sidebar's thread search. All lists cap at 8 rows.
+  const chatMentionThreadEntryCacheRef = useRef(new WeakMap<Thread, CachedThreadSearchEntry>());
+  const chatMentionCandidates = useMemo<ChatMentionCandidate[]>(() => {
     if (!chatMention) return [];
+    const query = chatMention.query.toLowerCase();
+
+    if (chatMention.mode === 'thread') {
+      // Hide unresolvable references for terminal threads and providers whose
+      // installed CLI cannot receive Orion's read_thread tool.
+      if (!canReferenceThreadsFromComposer) return [];
+      const projectById = new Map(projects.map((project) => [project.id, project]));
+      // The composing thread can't usefully reference itself.
+      const base = threads.filter((thread) =>
+        isThreadReferenceCandidate(
+          thread.id,
+          selectedThreadId,
+          isClaudeCodeCliModelId(thread.modelId)
+        )
+      );
+      const trimmedQuery = chatMention.query.trim();
+      if (!trimmedQuery) {
+        return base
+          .slice()
+          .sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime())
+          .slice(0, 8)
+          .map((thread) => ({
+            kind: 'thread' as const,
+            thread,
+            projectName: projectById.get(thread.projectId)?.name ?? 'Unknown project',
+          }));
+      }
+      return base
+        .map((thread) => {
+          const project = projectById.get(thread.projectId);
+          const projectName = project?.name ?? 'Unknown project';
+          const projectPath = project?.path ?? '';
+          const cached = chatMentionThreadEntryCacheRef.current.get(thread);
+          const entry =
+            cached && cached.projectName === projectName && cached.projectPath === projectPath
+              ? cached.entry
+              : buildThreadSearchEntry(thread, projectName, projectPath);
+          if (!cached || cached.entry !== entry) {
+            chatMentionThreadEntryCacheRef.current.set(thread, { projectName, projectPath, entry });
+          }
+          return { thread, projectName, score: scoreThreadSearchEntry(entry, trimmedQuery) };
+        })
+        .filter((result) => result.score > 0)
+        .sort(
+          (a, b) =>
+            b.score - a.score ||
+            getThreadActivityTime(b.thread).getTime() - getThreadActivityTime(a.thread).getTime()
+        )
+        .slice(0, 8)
+        .map(({ thread, projectName }) => ({ kind: 'thread' as const, thread, projectName }));
+    }
+
     const base = agentModels.filter(
       (model) =>
         model.providerId !== 'orion' &&
@@ -1451,12 +1580,27 @@ const App: React.FC = () => {
         model.id !== claudeCodeCliModelId &&
         enabledProviderIdSet.has(model.providerId)
     );
-    const query = chatMention.query.toLowerCase();
     if (!query) {
+      if (!chatMention.mode) {
+        return !canReferenceThreadsFromComposer
+          ? chatMentionCategories.filter((candidate) => candidate.category === 'model')
+          : chatMentionCategories;
+      }
       const favorites = base.filter((model) => model.favorite);
-      return (favorites.length > 0 ? favorites : base).slice(0, 8);
+      return (favorites.length > 0 ? favorites : base)
+        .slice(0, 8)
+        .map((model) => ({ kind: 'model' as const, model }));
     }
-    return base
+    // Kind rows that prefix-match keep the root level reachable by typing
+    // (e.g. "@th" highlights Thread).
+    const categories = chatMention.mode
+      ? []
+      : chatMentionCategories.filter(
+          (candidate) =>
+            (canReferenceThreadsFromComposer || candidate.category !== 'thread') &&
+            candidate.label.toLowerCase().startsWith(query)
+        );
+    const models = base
       .filter(
         (model) =>
           model.id.toLowerCase().includes(query) ||
@@ -1464,11 +1608,29 @@ const App: React.FC = () => {
           model.slug.toLowerCase().includes(query) ||
           model.providerLabel.toLowerCase().includes(query)
       )
-      .slice(0, 8);
-  }, [agentModels, chatMention, enabledProviderIdSet]);
+      .slice(0, 8)
+      .map((model) => ({ kind: 'model' as const, model }));
+    return [...categories, ...models];
+  }, [
+    agentModels,
+    canReferenceThreadsFromComposer,
+    chatMention,
+    enabledProviderIdSet,
+    projects,
+    selectedThreadId,
+    threads,
+  ]);
   const chatMentionOpen = Boolean(chatMention) && chatMentionCandidates.length > 0;
   // Reset the highlight to the top whenever the candidate list changes.
-  const chatMentionListKey = chatMentionCandidates.map((model) => model.id).join('|');
+  const chatMentionListKey = chatMentionCandidates
+    .map((candidate) =>
+      candidate.kind === 'category'
+        ? `category:${candidate.category}`
+        : candidate.kind === 'model'
+          ? `model:${candidate.model.id}`
+          : `thread:${candidate.thread.id}`
+    )
+    .join('|');
   useEffect(() => {
     setChatMentionIndex(0);
   }, [chatMentionListKey]);
@@ -5921,27 +6083,17 @@ const App: React.FC = () => {
     setChatAttachments((current) => current.filter((attachment) => attachment.id !== id));
   };
 
-  // Start a turn on any thread — not just the selected one — so queued
-  // follow-ups can dispatch for threads running in the background. Linked-task
-  // freshness is awaited first; transcript setup stays synchronous once that
-  // snapshot is ready, and the CLI spawn result is handled in the continuation.
-  const startTurnForThread = useCallback(
+  // Internal turn setup. The wrapper below owns the per-thread reservation
+  // across this whole promise, including every asynchronous preflight.
+  const startTurnForThreadUnlocked = useCallback(
     async (
       threadId: string,
       promptText: string,
       attachments: ImageAttachment[]
     ): Promise<{ ok: boolean; error?: string }> => {
-      if (pendingTurnStartsRef.current.has(threadId)) {
-        return { ok: false, error: 'An agent turn is already starting' };
-      }
-      pendingTurnStartsRef.current.add(threadId);
-      try {
-        await refreshLinkedTasksBeforeDispatch(threadId);
-      } finally {
-        pendingTurnStartsRef.current.delete(threadId);
-      }
-      const state = useOrionStore.getState();
-      const thread = state.threads.find((t) => t.id === threadId);
+      await refreshLinkedTasksBeforeDispatch(threadId);
+      let state = useOrionStore.getState();
+      let thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       if (thread.subagent) {
         return {
@@ -6019,13 +6171,12 @@ const App: React.FC = () => {
         };
         const generalInstructions =
           state.orchestrationSettings?.generalInstructions ?? defaultOrchestrationSettings.generalInstructions;
-        let driverModel = agentModels.find((candidate) => candidate.id === roleModels.mainDriver);
-        if (!driverModel || driverModel.providerId === 'orion' || driverModel.id === claudeCodeCliModelId) {
-          // Misconfigured/pseudo driver: fall back to a real agent model.
-          driverModel =
-            agentModels.find((candidate) => candidate.id === defaultAgentModelId) ??
-            agentModels.find((candidate) => candidate.providerId !== 'orion' && candidate.id !== claudeCodeCliModelId);
-        }
+        const driverModel = resolveOrionMainDriverModel(
+          agentModels,
+          roleModels.mainDriver,
+          defaultAgentModelId,
+          claudeCodeCliModelId
+        );
         if (!driverModel || driverModel.providerId === 'orion' || driverModel.id === claudeCodeCliModelId) {
           return {
             ok: false,
@@ -6067,15 +6218,49 @@ const App: React.FC = () => {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
 
+      const mentionedThreads = promptText
+        ? parseThreadMentions(promptText, state.threads, threadId)
+        : [];
+      if (mentionedThreads.length > 0) {
+        let supportsThreadReader = false;
+        try {
+          supportsThreadReader =
+            (await window.orion?.supportsThreadReader?.(model.providerId)) === true;
+        } catch {
+          supportsThreadReader = false;
+        }
+        if (!supportsThreadReader) {
+          return {
+            ok: false,
+            error: `${model.providerLabel} cannot read referenced threads with this installation`,
+          };
+        }
+        // read_thread runs in main and reads the on-disk transcript snapshot.
+        // Persist all live renderer threads before exposing those ids so a
+        // just-created or just-updated reference is immediately readable.
+        if (!(await flushOrionThreadsSave())) {
+          return {
+            ok: false,
+            error: 'Referenced threads could not be saved before starting this turn',
+          };
+        }
+        // Capability probing and persistence both yield. Continue from the
+        // current source thread so edits made during preflight are preserved.
+        state = useOrionStore.getState();
+        const refreshedThread = state.threads.find((candidate) => candidate.id === threadId);
+        if (!refreshedThread) return { ok: false, error: 'Thread no longer exists' };
+        thread = refreshedThread;
+      }
+
       // First turn carrying linked board tasks: the tasks themselves are the
       // prompt, so an empty draft is fine — their titles and descriptions
       // become the agent context (later turns resume the same session, so the
-      // agent already has them). The chips move onto this turn's user message.
+      // agent already has them). Derive this after asynchronous preflight so
+      // newly linked tasks are neither omitted nor overwritten.
       const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
       if (!promptText && attachments.length === 0 && tasksToInject.length === 0) {
         return { ok: false, error: 'Type a message first' };
       }
-
       const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
       const turnAttachments = [...taskMediaAttachments, ...attachments];
       const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
@@ -6104,6 +6289,16 @@ const App: React.FC = () => {
       if (mentionedModels.length > 0) {
         const mentionsContext = buildModelMentionsContext(mentionedModels);
         agentPrompt = agentPrompt ? `${mentionsContext}\n\n${agentPrompt}` : mentionsContext;
+      }
+      // @-thread mentions: hand the agent pointers to the referenced Orion
+      // threads (id + metadata), not their transcripts — it browses them on
+      // demand through the read_thread MCP tool.
+      if (mentionedThreads.length > 0) {
+        const threadMentionsContext = buildThreadMentionsContext(
+          mentionedThreads,
+          new Map(state.projects.map((project) => [project.id, project.name]))
+        );
+        agentPrompt = agentPrompt ? `${threadMentionsContext}\n\n${agentPrompt}` : threadMentionsContext;
       }
       if (orchestration) {
         // Prepended last so it sits before the linked-task context when both apply.
@@ -6217,6 +6412,7 @@ const App: React.FC = () => {
               }
             : {}),
           ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
+          ...(mentionedThreads.length > 0 ? { hasThreadMentions: true } : {}),
           ...(orchestration ? { orchestration } : {}),
         })
       );
@@ -6260,6 +6456,28 @@ const App: React.FC = () => {
       trackRunStartup,
       refreshLinkedTasksBeforeDispatch,
     ]
+  );
+
+  // Start a turn on any thread — not just the selected one — so queued
+  // follow-ups can dispatch for threads running in the background. The
+  // reservation is acquired synchronously and released only after setup has
+  // failed or the active run has been registered.
+  const startTurnForThread = useCallback(
+    async (
+      threadId: string,
+      promptText: string,
+      attachments: ImageAttachment[]
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const turnStart = await withThreadStartReservation(
+        pendingTurnStartsRef.current,
+        threadId,
+        () => startTurnForThreadUnlocked(threadId, promptText, attachments)
+      );
+      return turnStart.acquired
+        ? turnStart.value
+        : { ok: false, error: 'An agent turn is already starting' };
+    },
+    [startTurnForThreadUnlocked]
   );
 
   useEffect(() => {
@@ -7992,40 +8210,75 @@ const App: React.FC = () => {
 
   // Track the composer's active @-mention token: the last '@' at/before the
   // caret whose preceding character is start-of-text or whitespace, with no
-  // whitespace between the '@' and the caret.
+  // whitespace between the '@' and the caret. Thread mode is the exception:
+  // its search query may contain spaces (thread titles do), so only a newline
+  // ends the token there. The mode a user picked survives as long as the same
+  // '@' is being edited — once the mention closes, it is gone, which is what
+  // stops a completed "@thread:… " token from reopening the dropdown while
+  // the rest of the message is typed.
   const updateChatMention = useCallback((value: string, caret: number | null) => {
-    let next: { start: number; query: string } | null = null;
+    const prev = chatMentionRef.current;
+    let next: { start: number; query: string; mode?: 'model' | 'thread' } | null = null;
     if (caret !== null) {
       const beforeCaret = value.slice(0, caret);
       const atIndex = beforeCaret.lastIndexOf('@');
       if (atIndex !== -1) {
         const charBefore = atIndex > 0 ? beforeCaret[atIndex - 1] : '';
         const query = beforeCaret.slice(atIndex + 1);
-        if ((!charBefore || /\s/.test(charBefore)) && !/\s/.test(query)) {
-          next = { start: atIndex, query };
+        const mode = prev && prev.start === atIndex ? prev.mode : undefined;
+        const queryAllowed = mode === 'thread' ? !/[\r\n]/.test(query) : !/\s/.test(query);
+        if ((!charBefore || /\s/.test(charBefore)) && queryAllowed) {
+          next = { start: atIndex, query, ...(mode ? { mode } : {}) };
         }
       }
     }
     // A token dismissed with Escape stays closed until a new '@' is typed.
     if (next && chatMentionDismissRef.current === next.start) {
-      setChatMention(null);
-      return;
+      next = null;
+    } else {
+      chatMentionDismissRef.current = null;
     }
-    chatMentionDismissRef.current = null;
+    chatMentionRef.current = next;
     setChatMention(next);
   }, []);
 
-  // Selecting a mention replaces the typed token with the model's unambiguous
-  // mention token and puts the caret right after the inserted text.
-  const insertChatMention = (model: AgentModel) => {
+  // Selecting a kind at the dropdown's root level clears anything typed after
+  // the '@' and narrows the dropdown to that kind's list.
+  const selectChatMentionCategory = (mode: 'model' | 'thread') => {
     if (!chatMention) return;
-    const inserted = `@${modelMentionToken(model, agentModels)} `;
-    // Completing mid-token replaces the whole token: consume slug-like
-    // characters after the caret too, so no dangling suffix is left behind.
-    let replaceEnd = chatMention.start + 1 + chatMention.query.length;
-    while (replaceEnd < chatInput.length && /[A-Za-z0-9._:/-]/.test(chatInput[replaceEnd])) {
-      replaceEnd += 1;
+    const replaceEnd = getChatMentionReplaceEnd(chatInput, chatMention, 'model');
+    const nextValue = chatInput.slice(0, chatMention.start + 1) + chatInput.slice(replaceEnd);
+    const caret = chatMention.start + 1;
+    setChatInput(nextValue);
+    setChatMention({ start: chatMention.start, query: '', mode });
+    requestAnimationFrame(() => {
+      const el = chatInputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    });
+  };
+
+  // Selecting a mention replaces the typed token with the model's or thread's
+  // unambiguous mention token and puts the caret right after the inserted text.
+  const insertChatMention = (candidate: ChatMentionCandidate | undefined) => {
+    if (!chatMention || !candidate) return;
+    if (candidate.kind === 'category') {
+      selectChatMentionCategory(candidate.category);
+      return;
     }
+    const inserted =
+      candidate.kind === 'model'
+        ? `@${modelMentionToken(candidate.model, agentModels)} `
+        : `@${threadMentionToken(candidate.thread)} `;
+    // Thread searches can contain spaces, so text after the caret is
+    // ambiguous and must be preserved. Model mentions have a safe slug-like
+    // token boundary and still consume a matching suffix.
+    const replaceEnd = getChatMentionReplaceEnd(
+      chatInput,
+      chatMention,
+      candidate.kind === 'thread' ? 'thread' : 'model'
+    );
     const nextValue = chatInput.slice(0, chatMention.start) + inserted + chatInput.slice(replaceEnd);
     const caret = chatMention.start + inserted.length;
     setChatInput(nextValue);
@@ -8950,23 +9203,45 @@ const App: React.FC = () => {
           )}
         {chatMentionOpen && (
           <ComposerPopover>
-            {chatMentionCandidates.map((model, index) => {
+            {chatMentionCandidates.map((candidate, index) => {
+              const rowProps = {
+                ref: index === chatMentionIndex ? chatMentionSelectedRef : null,
+                type: 'button' as const,
+                role: 'option',
+                'aria-selected': index === chatMentionIndex,
+                className: `mention-row ${index === chatMentionIndex ? 'selected' : ''}`,
+                onMouseEnter: () => setChatMentionIndex(index),
+                // Keep the textarea focused so selection doesn't blur the composer.
+                onMouseDown: (e: React.MouseEvent) => e.preventDefault(),
+                onClick: () => insertChatMention(candidate),
+              };
+              if (candidate.kind === 'category') {
+                const CategoryIcon = candidate.category === 'model' ? Bot : MessageSquare;
+                return (
+                  <button key={`category:${candidate.category}`} {...rowProps} title={candidate.hint}>
+                    <CategoryIcon size={16} />
+                    <span className="mention-row-label">{candidate.label}</span>
+                    <span className="mention-row-slug">{candidate.hint}</span>
+                  </button>
+                );
+              }
+              if (candidate.kind === 'thread') {
+                const { thread, projectName } = candidate;
+                return (
+                  <button key={thread.id} {...rowProps} title={threadMentionToken(thread)}>
+                    <MessageSquare size={16} />
+                    <span className="mention-row-label">{thread.title}</span>
+                    <span className="mention-row-slug">
+                      {projectName} · {formatShortTime(getThreadActivityTime(thread))}
+                    </span>
+                  </button>
+                );
+              }
+              const { model } = candidate;
               const ProviderIcon =
                 agentProviders.find((provider) => provider.id === model.providerId)?.icon ?? Play;
               return (
-                <button
-                  key={model.id}
-                  ref={index === chatMentionIndex ? chatMentionSelectedRef : null}
-                  type="button"
-                  role="option"
-                  aria-selected={index === chatMentionIndex}
-                  className={`mention-row ${index === chatMentionIndex ? 'selected' : ''}`}
-                  onMouseEnter={() => setChatMentionIndex(index)}
-                  // Keep the textarea focused so selection doesn't blur the composer.
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => insertChatMention(model)}
-                  title={modelMentionToken(model, agentModels)}
-                >
+                <button key={model.id} {...rowProps} title={modelMentionToken(model, agentModels)}>
                   <ProviderIcon size={16} />
                   <span className="mention-row-label">{model.label}</span>
                   <span className="mention-row-slug">{modelMentionToken(model, agentModels)}</span>

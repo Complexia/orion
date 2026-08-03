@@ -504,18 +504,20 @@ export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, a
     const kind = toolCall.kind ?? meta?.kind ?? known?.kind;
     const readOnly =
       meta?.read_only === true || kind === 'read' || kind === 'search' || kind === 'fetch';
-    // Orion's own spawn_subagent/stop_subagent MCP tools are safe in every
-    // mode: the spawned subthread runs with the driver thread's access mode,
-    // never more, and stopping one only halts Orion's own child run. Grok
-    // routes MCP calls through use_tool, whose rawInput.tool_name is the
-    // qualified MCP identity. Titles and wrapper metadata are presentation
-    // fields and must not grant an exemption.
+    // Orion's own MCP tools are safe in every mode: the spawned subthread
+    // runs with the driver thread's access mode, never more; stopping one
+    // only halts Orion's own child run; read_thread only reads persisted
+    // transcripts. Grok routes MCP calls through use_tool, whose
+    // rawInput.tool_name is the qualified MCP identity. Titles and wrapper
+    // metadata are presentation fields and must not grant an exemption.
     const grokMcpToolName =
       typeof toolCall.rawInput?.tool_name === 'string'
         ? toolCall.rawInput.tool_name
         : known?.rawInputToolName;
     const isOrionSpawn =
-      grokMcpToolName === 'orion__spawn_subagent' || grokMcpToolName === 'orion__stop_subagent';
+      grokMcpToolName === 'orion__spawn_subagent' ||
+      grokMcpToolName === 'orion__stop_subagent' ||
+      grokMcpToolName === 'orion__read_thread';
     const allow =
       isOrionSpawn || accessMode === 'full-access'
         ? true

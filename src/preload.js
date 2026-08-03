@@ -78,6 +78,7 @@ contextBridge.exposeInMainWorld('orion', {
 
   // Agent runtime
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),
+  supportsThreadReader: (providerId) => ipcRenderer.invoke('agent:supportsThreadReader', providerId),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
   stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),
   isRunFinalizing: (runId) => ipcRenderer.invoke('agent:isRunFinalizing', runId),

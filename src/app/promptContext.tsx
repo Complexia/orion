@@ -1,5 +1,6 @@
 import { type ImageAttachment, type LinkedBoardTask, type OrchestrationRoleId, type Thread } from '../store';
 import { type AgentModel } from '../agentCatalog';
+import { getThreadActivityTime } from './time';
 
 export const linkedTaskFromBoardTask = (task: OrionBoardTask): LinkedBoardTask => ({
   id: task.id,
@@ -297,6 +298,79 @@ export const buildModelMentionsContext = (mentions: ModelMention[]) =>
     'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it with the `spawn_subagent` tool from Orion\'s MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt. The task runs as a visible Orion subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list.',
     ...mentions.map((mention) => `- @${mention.token} → ${mention.label} (${mention.modelId})`),
     '[/Model mentions]',
+  ].join('\n');
+
+export type ThreadMention = {
+  thread: Thread;
+  token: string;
+};
+
+// The 8-character id fragment that anchors an @thread mention token. Titles
+// change (they are even LLM-refined asynchronously), so the fragment — not the
+// title slug — is what a mention resolves by.
+export const threadMentionIdFragment = (threadId: string) =>
+  threadId.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8);
+
+export const threadMentionToken = (thread: Thread) => {
+  const slug = thread.title
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40)
+    .replace(/-+$/g, '');
+  return `thread:${slug ? `${slug}-` : ''}${threadMentionIdFragment(thread.id)}`;
+};
+
+// Scan the user's original text for @thread mention tokens. Matching keys off
+// the trailing id fragment so a mention still resolves if the thread was
+// retitled between typing and sending.
+export const parseThreadMentions = (
+  text: string,
+  threads: Thread[],
+  excludeThreadId?: string
+): ThreadMention[] => {
+  if (!/@thread:/i.test(text)) return [];
+  const mentions: ThreadMention[] = [];
+  for (const thread of threads) {
+    if (thread.id === excludeThreadId) continue;
+    const fragment = threadMentionIdFragment(thread.id);
+    if (!fragment) continue;
+    const pattern = new RegExp(
+      `(?:^|\\s)@thread:[A-Za-z0-9-]*${escapeRegExp(fragment)}(?![A-Za-z0-9._:/-])`,
+      'i'
+    );
+    if (pattern.test(text)) {
+      mentions.push({ thread, token: threadMentionToken(thread) });
+    }
+  }
+  return mentions;
+};
+
+// Context block prepended when the user @-mentions other Orion threads. It
+// deliberately carries only metadata — the agent pulls transcript pages on
+// demand through the read_thread MCP tool instead of having whole threads
+// stuffed into its prompt.
+export const buildThreadMentionsContext = (
+  mentions: ThreadMention[],
+  projectNameById?: Map<string, string>
+) =>
+  [
+    '[Thread mentions]',
+    'The user referenced these Orion threads (separate agent conversations in this app) with @-mentions. Their transcripts are NOT included here. To see what happened in a mentioned thread, call the `read_thread` tool from Orion\'s MCP server (the fully-qualified name varies by provider, for example mcp__orion__read_thread, orion.read_thread, or a plugin-prefixed equivalent) with its thread_id. It returns thread metadata plus a page of messages — the newest page by default; browse earlier ones with offset/limit. Read a mentioned thread before making claims about what happened in it, and pull only the pages the task needs.',
+    ...mentions.map(({ thread, token }) => {
+      const projectName = projectNameById?.get(thread.projectId);
+      const details = [
+        `thread_id: ${thread.id}`,
+        `${thread.messages.length} messages`,
+        `status: ${thread.status}`,
+        ...(projectName ? [`project: ${projectName}`] : []),
+        `last active: ${getThreadActivityTime(thread).toISOString()}`,
+      ].join('; ');
+      return `- @${token} → "${thread.title}" (${details})`;
+    }),
+    '[/Thread mentions]',
   ].join('\n');
 
 export const linkedTaskStatusLabel = (status?: string) => {
