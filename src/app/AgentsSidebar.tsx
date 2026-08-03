@@ -8,6 +8,8 @@ import {
   FolderOpen,
   FolderPlus,
   GitBranch,
+  Monitor,
+  MonitorSmartphone,
   Pin,
   PinOff,
   Plus,
@@ -18,6 +20,7 @@ import {
   X,
 } from 'lucide-react';
 import type { Epic, Project, SavedView, Thread } from '../store';
+import type { RemoteMachineEntry } from '../types';
 import { ProjectIcon } from './ProjectIcon';
 import { InlineRenameInput } from './fileTree';
 import { ThreadSearchResults } from './threadSearch';
@@ -117,6 +120,14 @@ export type AgentsSidebarModel = {
   renderThreadStatusDot: (thread: Thread) => React.JSX.Element | null;
   sidebarFooterProps: SidebarFooterProps;
   epicPrStatus: (epic: Pick<Epic, 'prUrl' | 'prState'> | null | undefined) => EpicPrStatus | null;
+  /** Machines section (remote control). Hidden entirely while the feature is off. */
+  remoteMachinesVisible: boolean;
+  machinesSectionOpen: boolean;
+  setMachinesSectionOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  remoteMachines: RemoteMachineEntry[];
+  activeRemoteMachineId: string | null;
+  selectRemoteMachine: (machineId: string | null) => void;
+  localMachineName: string;
 };
 
 // Dragging a sidebar thread onto the main view opens it as an extra pane. The
@@ -241,6 +252,13 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     renderThreadStatusDot,
     sidebarFooterProps,
     epicPrStatus,
+    remoteMachinesVisible,
+    machinesSectionOpen,
+    setMachinesSectionOpen,
+    remoteMachines,
+    activeRemoteMachineId,
+    selectRemoteMachine,
+    localMachineName,
   } = props;
 
   // A thread can appear in several sidebar sections at once (pinned, recent,
@@ -307,6 +325,64 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/*
+          Machines (remote control): this machine plus every paired host this
+          instance can drive. Absent entirely while remote control is off.
+        */}
+        {remoteMachinesVisible && (
+          <div className="recent-agents-section machines-section">
+            <button
+              type="button"
+              className="sidebar-section-toggle"
+              onClick={() => setMachinesSectionOpen((open) => !open)}
+              aria-expanded={machinesSectionOpen}
+            >
+              <ChevronRight
+                size={12}
+                className={`sidebar-section-chevron ${machinesSectionOpen ? 'open' : ''}`}
+              />
+              <span>Machines</span>
+            </button>
+            {machinesSectionOpen && (
+              <div className="threads-list machines-list">
+                <div className={`thread-item machine-item${activeRemoteMachineId === null ? ' selected' : ''}`}>
+                  <button
+                    type="button"
+                    className="thread-item-select"
+                    onClick={() => selectRemoteMachine(null)}
+                    title="Work on this machine"
+                  >
+                    <Monitor size={13} className="machine-item-icon" />
+                    <span className="thread-title">
+                      <span className="thread-title-text">{localMachineName || 'This machine'}</span>
+                    </span>
+                    <span className="machine-status-dot local" />
+                  </button>
+                </div>
+                {remoteMachines.map((machine) => (
+                  <div
+                    key={machine.id}
+                    className={`thread-item machine-item${activeRemoteMachineId === machine.id ? ' selected' : ''}`}
+                  >
+                    <button
+                      type="button"
+                      className="thread-item-select"
+                      onClick={() => selectRemoteMachine(machine.id)}
+                      title={`${machine.name} (${machine.host ? `${machine.host}:${machine.port}` : 'over the internet'}) — ${machine.status}${machine.error ? ` — ${machine.error}` : ''}`}
+                    >
+                      <MonitorSmartphone size={13} className="machine-item-icon" />
+                      <span className="thread-title">
+                        <span className="thread-title-text">{machine.name}</span>
+                      </span>
+                      <span className={`machine-status-dot ${machine.status}`} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

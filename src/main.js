@@ -48,7 +48,32 @@ import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvi
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { deleteSkill, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
-import { emitAgentEvent, sendToAllWindows } from './main/events.js';
+import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
+import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
+import {
+  cancelRemotePairing,
+  configureRemoteControl,
+  connectRemoteMachine,
+  disconnectRemoteMachine,
+  fetchRemoteSnapshot,
+  fetchRemoteThread,
+  forwardAgentEventToRemote,
+  getRemoteControlState,
+  initRemoteControl,
+  notifyRemoteControlAccountChanged,
+  notifyRemoteCommandRendererLost,
+  claimRemoteCommand,
+  notifyRemoteWorkspaceChanged,
+  pairWithRemoteHost,
+  removeRemoteMachine,
+  resolveRemoteCommand,
+  revokeRemoteDevice,
+  runRemoteTurn,
+  shutdownRemoteControl,
+  startRemotePairing,
+  stopRemoteTurn,
+  waitForRemoteControlPersistence,
+} from './main/remote-control.js';
 import {
   configureWorkspaceSync,
   getWorkspaceSyncStatus,
@@ -287,6 +312,48 @@ let threadsSaveQueue = Promise.resolve();
 let threadsWriteSeq = 0;
 let threadsCommittedSeq = 0;
 let threadsSyncSnapshot = null; // { seq, value } from the latest sync flush
+// A BrowserWindow can exist while its renderer is still loading or has
+// crashed/reloaded before installing the remote-command subscription. Only a
+// renderer that explicitly announces readiness may receive a command.
+let remoteCommandRenderer = null;
+let remoteCommandRendererCleanup = null;
+
+const markRemoteCommandRendererReady = (webContents) => {
+  if (!webContents || webContents.isDestroyed()) return { ok: false };
+  if (remoteCommandRenderer === webContents) return { ok: true };
+  remoteCommandRendererCleanup?.();
+  remoteCommandRenderer = webContents;
+  const clear = () => {
+    webContents.removeListener('did-start-loading', clear);
+    webContents.removeListener('render-process-gone', clear);
+    webContents.removeListener('destroyed', clear);
+    if (remoteCommandRenderer === webContents) {
+      remoteCommandRenderer = null;
+      notifyRemoteCommandRendererLost();
+    }
+    if (remoteCommandRendererCleanup === clear) remoteCommandRendererCleanup = null;
+  };
+  remoteCommandRendererCleanup = clear;
+  webContents.once('did-start-loading', clear);
+  webContents.once('render-process-gone', clear);
+  webContents.once('destroyed', clear);
+  return { ok: true };
+};
+
+const dispatchRemoteCommand = (payload) => {
+  const target = remoteCommandRenderer;
+  if (!target || target.isDestroyed()) {
+    remoteCommandRendererCleanup?.();
+    return 0;
+  }
+  try {
+    target.send('remote:commandRequest', payload);
+    return 1;
+  } catch {
+    remoteCommandRendererCleanup?.();
+    return 0;
+  }
+};
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -412,6 +479,94 @@ const getOrionWebUrl = () => {
   return url;
 };
 
+const remotePairingProofRequest = async (method, body, token, { signal } = {}) => {
+  const { response, data } = await fetchRemotePairingProofJson({
+    url: new URL('/api/desktop-auth/remote-pairing-proof', getOrionWebUrl()),
+    method,
+    token,
+    body,
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(
+      data?.error ||
+        (response.status === 404
+          ? 'Orion Cloud does not support secure remote pairing yet.'
+          : 'Orion Cloud could not authenticate remote pairing.')
+    );
+  }
+  return data;
+};
+
+const createRemotePairingProof = async ({ token, challenge, machineId, signal }) => {
+  const data = await remotePairingProofRequest('POST', { challenge, machineId }, token, { signal });
+  if (typeof data?.proof !== 'string' || !data.proof) {
+    throw new Error('Orion Cloud returned an invalid remote pairing proof.');
+  }
+  return data.proof;
+};
+
+const verifyRemotePairingProof = async ({ proof, challenge, machineId, signal }) => {
+  try {
+    const data = await remotePairingProofRequest('PUT', { proof, challenge, machineId }, null, { signal });
+    return typeof data?.userId === 'string' && data.userId ? data.userId : null;
+  } catch {
+    return null;
+  }
+};
+
+// Remote control over the internet. Only reached when the user has switched
+// remote control to relay mode; direct mode never calls any of this.
+const getOrionRelayUrl = () => {
+  const defaultRelayUrl = app.isPackaged ? 'wss://relay.orioncode.xyz' : 'ws://localhost:8787';
+  return process.env.ORION_RELAY_URL || defaultRelayUrl;
+};
+
+/**
+ * Bearer-authed call to the relay APIs on orion-next. The desktop account
+ * token authenticates THESE calls and never leaves this function: what comes
+ * back is a short-lived relay ticket, and that is all the relay ever sees.
+ */
+const relayApiRequest = async (apiPath, body, { signal } = {}) => {
+  const session = await readAccountSession();
+  if (!session?.token) throw new Error('Sign in to your Orion account first.');
+  const { response, data } = await fetchRelayApiJson({
+    url: new URL(apiPath, getOrionWebUrl()),
+    token: session.token,
+    body,
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(
+      data?.error ||
+        (response.status === 404
+          ? 'Orion Cloud does not support internet remote control yet.'
+          : 'Orion Cloud refused the relay request.')
+    );
+  }
+  return data;
+};
+
+const registerRelayDevice = ({ machineId, name, platform, appVersion, signal }) =>
+  relayApiRequest('/api/relay/devices', { machineId, name, platform, appVersion }, { signal });
+
+const mintRelayTicket = async ({ role, machineId, signal }) => {
+  const data = await relayApiRequest('/api/relay/ticket', { role, machineId }, { signal });
+  if (typeof data?.ticket !== 'string' || !data.ticket) {
+    throw new Error('Orion Cloud returned an invalid relay ticket.');
+  }
+  const relayUrl =
+    typeof data?.relayUrl === 'string' && data.relayUrl.trim() ? data.relayUrl.trim() : getOrionRelayUrl();
+  try {
+    const parsed = new URL(relayUrl);
+    const allowedProtocols = app.isPackaged ? ['wss:', 'https:'] : ['ws:', 'wss:', 'http:', 'https:'];
+    if (!allowedProtocols.includes(parsed.protocol)) throw new Error();
+  } catch {
+    throw new Error('Orion Cloud returned an invalid relay address.');
+  }
+  return { ticket: data.ticket, relayUrl };
+};
+
 const desktopAccountForRenderer = (session) => {
   if (!session?.token || !session?.user) {
     return { authenticated: false, user: null, expiresAt: null };
@@ -497,11 +652,16 @@ const writeAccountSession = async (session) => {
 
 const clearAccountSession = async () => {
   inMemoryAccountSession = null;
+  // Authorization ends when sign-out begins, not after the session file has
+  // finished being removed. This synchronously closes remote listeners and
+  // sessions before any account transition can await filesystem work.
+  notifyRemoteControlAccountChanged(null, { reconcile: false });
   await fs.rm(getAccountSessionFilePath(), { force: true });
 };
 
 const publishAccountState = async (session) => {
-  const account = desktopAccountForRenderer(session ?? (await readAccountSession()));
+  const effectiveSession = session === undefined ? await readAccountSession() : session;
+  const account = desktopAccountForRenderer(effectiveSession);
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('account:changed', account);
   }
@@ -515,6 +675,9 @@ const publishAccountState = async (session) => {
     notifyWorkspaceSyncAccountChanged();
   }
   lastPublishedAccountAuthenticated = account.authenticated;
+  // Remote control is gated on the live session: sign-out must stop the
+  // listener and drop every connection immediately, sign-in re-arms it.
+  notifyRemoteControlAccountChanged(effectiveSession);
   return account;
 };
 
@@ -798,31 +961,33 @@ app.whenReady().then(async () => {
   // Seed the engine from the persisted store so an enabled sync resumes after
   // restart without waiting for the renderer to hydrate; the renderer re-pushes
   // the settings over sync:configure on hydration and every change.
+  const readThreadsFileSnapshot = async () => {
+    let value;
+    try {
+      value = await fs.readFile(getThreadsFilePath(), 'utf-8');
+    } catch (error) {
+      // No split transcript file yet is a legitimate empty workspace. Any
+      // other read failure is ambiguous, so reject the pass before it can
+      // publish a complete empty snapshot and remove every remote thread.
+      if (error?.code === 'ENOENT') return { threads: [] };
+      throw new Error('Could not read workspace transcripts for sync.', { cause: error });
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(value);
+    } catch (error) {
+      throw new Error('Could not parse workspace transcripts for sync.', { cause: error });
+    }
+    if (!Array.isArray(parsed?.threads)) {
+      throw new Error('Transcript file does not contain a threads array.');
+    }
+    return parsed;
+  };
   initWorkspaceSync({
     getWebUrl: () => getOrionWebUrl(),
     readSession: () => readAccountSession(),
     readStoreState: () => readPersistedStoreState(),
-    readThreadsFile: async () => {
-      let value;
-      try {
-        value = await fs.readFile(getThreadsFilePath(), 'utf-8');
-      } catch (error) {
-        // No split transcript file yet is a legitimate empty workspace. Any
-        // other read failure is ambiguous, so reject the pass before it can
-        // publish a complete empty snapshot and remove every remote thread.
-        if (error?.code === 'ENOENT') return { threads: [] };
-        throw new Error('Could not read workspace transcripts for sync.', { cause: error });
-      }
-      try {
-        const parsed = JSON.parse(value);
-        if (!Array.isArray(parsed?.threads)) {
-          throw new Error('Transcript file does not contain a threads array.');
-        }
-        return parsed;
-      } catch (error) {
-        throw new Error('Could not parse workspace transcripts for sync.', { cause: error });
-      }
-    },
+    readThreadsFile: readThreadsFileSnapshot,
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
   });
   void readPersistedStoreState().then((state) => {
@@ -830,6 +995,29 @@ app.whenReady().then(async () => {
       configureWorkspaceSync(state.workspaceSyncSettings);
     }
   });
+
+  // Remote control (opt-in): lets paired Orion instances on the same account
+  // view and drive this one. Same seeding strategy as workspace sync.
+  await initRemoteControl({
+    readSession: () => readAccountSession(),
+    readStoreState: () => readPersistedStoreState(),
+    readThreadsFile: readThreadsFileSnapshot,
+    broadcast: (channel, payload) => sendToAllWindows(channel, payload),
+    dispatchRendererCommand: (payload) => dispatchRemoteCommand(payload),
+    createRemotePairingProof,
+    verifyRemotePairingProof,
+    registerRelayDevice,
+    mintRelayTicket,
+    getAppVersion: () => app.getVersion(),
+  });
+  addAgentEventListener((event) => forwardAgentEventToRemote(event));
+  void readPersistedStoreState()
+    .then((state) =>
+      state?.remoteControlSettings ? configureRemoteControl(state.remoteControlSettings) : undefined
+    )
+    .catch((error) => {
+      console.error('Could not restore remote control settings', error);
+    });
 
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({
@@ -1089,11 +1277,16 @@ const disposeForQuit = () => {
 // Waiting for the queue after agent shutdown matters: shutdown can enqueue a
 // goal-pause persistence write of its own.
 const waitForPendingQuitWork = () =>
-  Promise.all([waitForPendingAgentShutdowns(), waitForPendingRiftCreations()])
+  Promise.all([
+    waitForPendingAgentShutdowns(),
+    waitForPendingRiftCreations(),
+    waitForRemoteControlPersistence(),
+  ])
     .then(() => threadsSaveQueue.catch(() => {}));
 
 app.on('will-quit', (event) => {
   shutdownWorkspaceSync();
+  shutdownRemoteControl();
   disposeForQuit();
   if (quitBarrierSatisfied) return;
 
@@ -1115,6 +1308,11 @@ app.on('will-quit', (event) => {
 // through instead of being held (and possibly dropped).
 const settleQuitBarrierForUpdate = async () => {
   if (quitBarrierSatisfied) return;
+  // Stop remote lifecycle work before taking the persistence-queue snapshot.
+  // Otherwise a pairing/revoke could start after this pre-drain and be skipped
+  // when will-quit sees the already-satisfied updater barrier.
+  shutdownWorkspaceSync();
+  shutdownRemoteControl();
   disposeForQuit();
   // If a quit is already draining this same work, waiting on it here settles at
   // the same time; either way the barrier is open once the work has landed.
@@ -1162,6 +1360,7 @@ ipcMain.handle('storage:save', async (_event, value) => {
     await save;
     // Projects/epics/settings changed — nudge the (opt-in) workspace sync.
     notifyWorkspaceChanged();
+    notifyRemoteWorkspaceChanged();
     return true;
   } catch (error) {
     console.error('storage:save error', error);
@@ -1201,6 +1400,34 @@ ipcMain.handle('sync:configure', (_event, value) => configureWorkspaceSync(value
 ipcMain.handle('sync:now', () => workspaceSyncNow());
 ipcMain.handle('sync:getState', () => getWorkspaceSyncStatus());
 
+// Remote control surface. The engine no-ops while disabled or signed out;
+// every mutating handler re-checks the live account session inside the
+// engine, so a stale renderer can never act on a signed-out machine.
+ipcMain.handle('remote:getState', () => getRemoteControlState());
+ipcMain.handle('remote:configure', (_event, value) => configureRemoteControl(value));
+ipcMain.handle('remote:startPairing', () => startRemotePairing());
+ipcMain.handle('remote:cancelPairing', () => cancelRemotePairing());
+ipcMain.handle('remote:revokeDevice', (_event, input) => revokeRemoteDevice(input));
+ipcMain.handle('remote:pair', (_event, input) => pairWithRemoteHost(input));
+ipcMain.handle('remote:removeMachine', (_event, input) => removeRemoteMachine(input));
+ipcMain.handle('remote:connectMachine', (_event, input) => connectRemoteMachine(input));
+ipcMain.handle('remote:disconnectMachine', (_event, input) => disconnectRemoteMachine(input));
+ipcMain.handle('remote:fetchSnapshot', (_event, input) => fetchRemoteSnapshot(input));
+ipcMain.handle('remote:fetchThread', (_event, input) => fetchRemoteThread(input));
+ipcMain.handle('remote:runTurn', (_event, input) => runRemoteTurn(input));
+ipcMain.handle('remote:stopTurn', (_event, input) => stopRemoteTurn(input));
+// Registered only after the renderer has installed onRemoteCommandRequest.
+// did-start-loading/destroyed clear this authority until the next mount.
+ipcMain.handle('remote:rendererReady', (event) => markRemoteCommandRendererReady(event.sender));
+ipcMain.handle('remote:claimCommand', (event, input) =>
+  event.sender === remoteCommandRenderer ? claimRemoteCommand(input) : { ok: false }
+);
+// The host renderer reports a remote command's outcome here, unblocking the
+// controller's pending request (mirrors orchestration:subagentResult).
+ipcMain.handle('remote:commandResult', (event, payload) =>
+  event.sender === remoteCommandRenderer ? resolveRemoteCommand(payload) : { ok: false }
+);
+
 ipcMain.handle('storage:saveThreads', async (_event, value) => {
   // Same settled-queue chaining as storage:save above.
   const seq = ++threadsWriteSeq;
@@ -1237,6 +1464,7 @@ ipcMain.handle('storage:saveThreads', async (_event, value) => {
     // The threads file just changed on disk — let the (opt-in) workspace sync
     // engine schedule a debounced pass. Inert while sync is disabled.
     notifyWorkspaceChanged();
+    notifyRemoteWorkspaceChanged();
     return true;
   } catch (error) {
     console.error('storage:saveThreads error', error);

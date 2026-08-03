@@ -208,6 +208,39 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('account:changed', listener);
   },
 
+  // Remote control (Settings > Remote Control, sidebar Machines section)
+  remoteControlGetState: () => ipcRenderer.invoke('remote:getState'),
+  remoteControlConfigure: (settings) => ipcRenderer.invoke('remote:configure', settings),
+  remoteStartPairing: () => ipcRenderer.invoke('remote:startPairing'),
+  remoteCancelPairing: () => ipcRenderer.invoke('remote:cancelPairing'),
+  remoteRevokeDevice: (input) => ipcRenderer.invoke('remote:revokeDevice', input),
+  remotePair: (input) => ipcRenderer.invoke('remote:pair', input),
+  remoteRemoveMachine: (input) => ipcRenderer.invoke('remote:removeMachine', input),
+  remoteConnectMachine: (input) => ipcRenderer.invoke('remote:connectMachine', input),
+  remoteDisconnectMachine: (input) => ipcRenderer.invoke('remote:disconnectMachine', input),
+  remoteFetchSnapshot: (input) => ipcRenderer.invoke('remote:fetchSnapshot', input),
+  remoteFetchThread: (input) => ipcRenderer.invoke('remote:fetchThread', input),
+  remoteRunTurn: (input) => ipcRenderer.invoke('remote:runTurn', input),
+  remoteStopTurn: (input) => ipcRenderer.invoke('remote:stopTurn', input),
+  remoteRendererReady: () => ipcRenderer.invoke('remote:rendererReady'),
+  remoteClaimCommand: (input) => ipcRenderer.invoke('remote:claimCommand', input),
+  reportRemoteCommandResult: (payload) => ipcRenderer.invoke('remote:commandResult', payload),
+  onRemoteState: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('remote:state', listener);
+    return () => ipcRenderer.removeListener('remote:state', listener);
+  },
+  onRemoteEvent: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('remote:event', listener);
+    return () => ipcRenderer.removeListener('remote:event', listener);
+  },
+  onRemoteCommandRequest: (callback) => {
+    const listener = (_event, request) => callback(request);
+    ipcRenderer.on('remote:commandRequest', listener);
+    return () => ipcRenderer.removeListener('remote:commandRequest', listener);
+  },
+
   workspaceSyncConfigure: (settings) => ipcRenderer.invoke('sync:configure', settings),
   workspaceSyncNow: () => ipcRenderer.invoke('sync:now'),
   workspaceSyncGetState: () => ipcRenderer.invoke('sync:getState'),

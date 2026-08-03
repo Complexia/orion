@@ -179,6 +179,35 @@ export const defaultWorkspaceSyncSettings: WorkspaceSyncSettings = {
   syncCode: true,
 };
 
+/**
+ * Remote control between paired Orion instances signed in to the same
+ * account. `enabled` is the master switch: it shows the sidebar Machines
+ * section and lets this machine drive its paired hosts. `allowIncoming`
+ * additionally lets paired machines drive THIS one (starts a listener on
+ * `port`); it is meaningless while `enabled` is off or the user is signed
+ * out — the main-process engine enforces both.
+ */
+export type RemoteControlSettings = {
+  enabled: boolean;
+  allowIncoming: boolean;
+  port: number;
+  /**
+   * How paired machines reach each other. `'direct'` is LAN/VPN only and
+   * contacts nothing outside your network. `'relay'` additionally lets this
+   * machine be reached over the internet through Orion Cloud's relay, which
+   * brokers an already-encrypted connection it cannot read. Defaults to
+   * `'direct'` — being reachable from outside is always an explicit choice.
+   */
+  connectionMode: 'direct' | 'relay';
+};
+
+export const defaultRemoteControlSettings: RemoteControlSettings = {
+  enabled: false,
+  allowIncoming: false,
+  port: 47615,
+  connectionMode: 'direct',
+};
+
 const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
 
 /**
@@ -632,6 +661,7 @@ interface OrionState {
   epicsSettings: EpicsSettings;
   riftsSettings: RiftsSettings;
   workspaceSyncSettings: WorkspaceSyncSettings;
+  remoteControlSettings: RemoteControlSettings;
 
   // Code tab workspace
   workspacePath: string | null;
@@ -680,6 +710,7 @@ interface OrionState {
   setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
   setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
+  setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
 
   createThread: (
     projectId: string,
@@ -1175,6 +1206,7 @@ export const useOrionStore = create<OrionState>()(
       epicsSettings: defaultEpicsSettings,
       riftsSettings: defaultRiftsSettings,
       workspaceSyncSettings: defaultWorkspaceSyncSettings,
+      remoteControlSettings: defaultRemoteControlSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -1539,6 +1571,15 @@ export const useOrionStore = create<OrionState>()(
           workspaceSyncSettings: {
             ...defaultWorkspaceSyncSettings,
             ...state.workspaceSyncSettings,
+            ...updates,
+          },
+        })),
+
+      setRemoteControlSettings: (updates) =>
+        set((state) => ({
+          remoteControlSettings: {
+            ...defaultRemoteControlSettings,
+            ...state.remoteControlSettings,
             ...updates,
           },
         })),
@@ -2107,6 +2148,10 @@ export const useOrionStore = create<OrionState>()(
         workspaceSyncSettings: {
           ...defaultWorkspaceSyncSettings,
           ...state.workspaceSyncSettings,
+        },
+        remoteControlSettings: {
+          ...defaultRemoteControlSettings,
+          ...state.remoteControlSettings,
         },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,

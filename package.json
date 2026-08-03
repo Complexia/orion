@@ -18,6 +18,10 @@
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",
+    "test:remote-crypto": "node scripts/test-remote-crypto.mjs",
+    "test:remote-control": "node scripts/test-remote-control.mjs",
+    "test:remote-relay": "node scripts/test-remote-relay.mjs",
+    "test:remote-view-races": "node --no-warnings --experimental-strip-types scripts/test-remote-view-races.mjs",
     "test:suggested-tasks": "node scripts/test-suggested-tasks.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "publish": "electron-forge publish",
@@ -68,6 +72,7 @@
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "sonner": "^2.0.7",
+    "undici": "^7.28.0",
     "zod": "^4.4.3",
     "zustand": "^5.0.14"
   }
