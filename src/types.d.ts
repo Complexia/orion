@@ -1125,6 +1125,7 @@ type OrionComputerUsePermissions = {
       }>;
       remoteCancelPairing?: () => Promise<{ ok: boolean }>;
       remoteRevokeDevice?: (input: { deviceId: string }) => Promise<{ ok: boolean; error?: string }>;
+      remoteRelayDeregister?: () => Promise<{ ok: boolean; error?: string }>;
       remotePair?: (input: {
         /** Direct mode: the host's address and port. */
         host?: string;

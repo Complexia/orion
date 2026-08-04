@@ -214,6 +214,7 @@ contextBridge.exposeInMainWorld('orion', {
   remoteStartPairing: () => ipcRenderer.invoke('remote:startPairing'),
   remoteCancelPairing: () => ipcRenderer.invoke('remote:cancelPairing'),
   remoteRevokeDevice: (input) => ipcRenderer.invoke('remote:revokeDevice', input),
+  remoteRelayDeregister: () => ipcRenderer.invoke('remote:relayDeregister'),
   remotePair: (input) => ipcRenderer.invoke('remote:pair', input),
   remoteRemoveMachine: (input) => ipcRenderer.invoke('remote:removeMachine', input),
   remoteConnectMachine: (input) => ipcRenderer.invoke('remote:connectMachine', input),

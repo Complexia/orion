@@ -573,6 +573,37 @@ const ensureRelayRegistration = async (signal) => {
 };
 
 /**
+ * Remove this machine from the account's machine list at Orion Cloud. This is
+ * the explicit revoke: merely turning internet mode off keeps the machine
+ * registered (it just shows offline), so a controller's list stays stable.
+ * Stops the relay listener first so a ticket-mint reconnect cannot re-register
+ * the row in the same breath.
+ */
+export const deregisterRelayMachine = async () => {
+  if (!identity) return { ok: false, error: stateError ?? 'Remote control is unavailable on this machine.' };
+  if (!currentUserId) return { ok: false, error: 'Sign in to your Orion account first.' };
+  if (typeof deps?.deregisterRelayDevice !== 'function') {
+    return { ok: false, error: 'This build cannot manage Orion Cloud registrations.' };
+  }
+  // Leave relay mode in the engine's own settings copy as well: the renderer
+  // sends its matching configure({connectionMode:'direct'}) asynchronously,
+  // and a reconcile triggered in between (account refresh, expiry timer)
+  // must not restart the listener and re-register the row we are deleting.
+  settings = { ...settings, connectionMode: 'direct' };
+  stopRelayListener();
+  closeRelaySessions('This machine was removed from Orion Cloud.');
+  relayRegisteredFor = null;
+  try {
+    await deps.deregisterRelayDevice({ machineId: identity.machineId });
+  } catch (error) {
+    publishState();
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+  publishState();
+  return { ok: true };
+};
+
+/**
  * Mint a short-lived, single-socket relay ticket. Tickets are the ONLY
  * credential that ever reaches the relay — never the desktop account bearer
  * token, and never anything a peer sends us.
@@ -606,6 +637,11 @@ const stopRelayListener = () => {
   relayListener = null;
   relayOnline = false;
   relayError = null;
+  // Forget the cached registration so the next start re-POSTs it. The upsert
+  // is idempotent and revives a soft-deleted row — without this, a machine
+  // removed at Orion Cloud (or whose name/version changed) stays wrong until
+  // the app restarts or the account changes.
+  relayRegisteredFor = null;
   active?.stop();
 };
 
@@ -872,7 +908,7 @@ export const startRemotePairing = () => {
     return { ok: false, error: stateError ?? 'Remote control is unavailable on this machine.' };
   }
   if (!hostAcceptingConnections()) {
-    return { ok: false, error: 'Enable "Allow this machine to be controlled" first.' };
+    return { ok: false, error: 'Enable remote control first.' };
   }
   if (!currentUserId) {
     return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
