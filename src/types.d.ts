@@ -424,7 +424,7 @@ type OrionComputerUsePermissions = {
       loadStore: () => Promise<string | null>;
       saveStore: (value: string) => Promise<boolean>;
       /** Bounded, revision-consistent transcript hydration. ok:false suppresses thread persistence. */
-      loadThreadsPage: (input: {
+      loadThreadsPage?: (input?: {
         offset?: number;
         revision?: number;
         maxBytes?: number;

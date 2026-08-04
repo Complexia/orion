@@ -104,13 +104,23 @@ try {
     title: 'Fifth',
     messages: [{ role: 'agent', content: 'y'.repeat(1_500), ts: '2026-08-04T00:00:05.000Z' }],
   };
+  const oversized = {
+    ...second,
+    id: 'thread-oversized',
+    title: 'Oversized',
+    messages: [{ role: 'agent', content: 'z'.repeat(8 * 1024 * 1024), ts: '2026-08-04T00:00:06.000Z' }],
+  };
   const pagedManifest = await writeThreadsPatch({
     version: 2,
-    upserts: [fourth, fifth],
+    upserts: [fourth, fifth, oversized],
     deletes: [],
-    order: [second.id, third.id, fourth.id, fifth.id],
+    order: [second.id, third.id, fourth.id, fifth.id, oversized.id],
   });
+  const packedPage = await readThreadsPage({ revision: pagedManifest.revision, maxBytes: 2_048 });
+  assert.ok(packedPage.threads.length > 1, 'small transcripts should share a page');
+  assert.ok(Buffer.byteLength(JSON.stringify(packedPage), 'utf8') <= 2_048, 'packed pages must honor their byte target');
   const pagedThreads = [];
+  let sawOversizedPage = false;
   let pageOffset = 0;
   while (pageOffset !== null) {
     const page = await readThreadsPage({
@@ -127,10 +137,21 @@ try {
       page.threads.length === 1 || Buffer.byteLength(JSON.stringify(page), 'utf8') <= 1_024,
       'a page may exceed its target only for one individually oversized thread'
     );
+    if (page.threads[0]?.id === oversized.id) {
+      assert.equal(page.threads.length, 1, 'an oversized transcript must be isolated to its own page');
+      sawOversizedPage = true;
+    }
     pagedThreads.push(...page.threads);
     pageOffset = page.nextOffset;
   }
-  assert.deepEqual(pagedThreads, [second, third, fourth, fifth], 'paged reads must preserve manifest order');
+  assert.equal(sawOversizedPage, true, 'an individually oversized transcript must not block hydration');
+  assert.deepEqual(pagedThreads, [second, third, fourth, fifth, oversized], 'paged reads must preserve manifest order');
+  const terminalPage = await readThreadsPage({
+    offset: pagedManifest.entries.length,
+    revision: pagedManifest.revision,
+  });
+  assert.deepEqual(terminalPage.threads, []);
+  assert.equal(terminalPage.nextOffset, null, 'an offset at the end is a valid empty terminal page');
   const stalePage = await readThreadsPage({ revision: pagedManifest.revision - 1 });
   assert.equal(stalePage.stale, true, 'a mismatched revision must restart hydration without returning threads');
   assert.deepEqual(stalePage.threads, []);
