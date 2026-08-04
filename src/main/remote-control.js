@@ -1480,8 +1480,10 @@ export const resolveRemoteCommand = (payload) => {
 
 const buildSnapshot = async () => {
   const state = (await deps.readStoreState()) ?? {};
-  const threadsFile = await deps.readThreadsFile();
-  const threads = Array.isArray(threadsFile?.threads) ? threadsFile.threads : [];
+  const threadIndex = deps.readThreadsIndex
+    ? await deps.readThreadsIndex()
+    : { entries: (await deps.readThreadsFile())?.threads ?? [] };
+  const threads = Array.isArray(threadIndex?.entries) ? threadIndex.entries : [];
   return {
     machine: { id: identity.machineId, name: identity.machineName },
     capturedAt: new Date().toISOString(),
@@ -1508,8 +1510,10 @@ const buildSnapshot = async () => {
       status: thread.status,
       modelId: thread.modelId,
       createdAt: thread.createdAt,
-      updatedAt: thread.messages?.at?.(-1)?.ts ?? thread.createdAt,
-      messageCount: Array.isArray(thread.messages) ? thread.messages.length : 0,
+      updatedAt: thread.updatedAt ?? thread.messages?.at?.(-1)?.ts ?? thread.createdAt,
+      messageCount: Number.isSafeInteger(thread.messageCount)
+        ? thread.messageCount
+        : Array.isArray(thread.messages) ? thread.messages.length : 0,
     })),
   };
 };
@@ -1639,11 +1643,15 @@ const handleHostRequest = async (session, message) => {
           });
           return;
         }
-        let threadsFile = { threads: [] };
+        let thread = null;
         try {
-          threadsFile = await deps.readThreadsFile({ threadId });
+          if (deps.readThreadById) {
+            thread = await deps.readThreadById(threadId);
+          } else {
+            const threadsFile = await deps.readThreadsFile({ threadId });
+            thread = (threadsFile?.threads ?? []).find((candidate) => candidate?.id === threadId) ?? null;
+          }
         } catch {}
-        const thread = (threadsFile?.threads ?? []).find((candidate) => candidate?.id === threadId);
         if (!thread) {
           respond({ ok: false, error: 'Thread not found on the host (it may not be saved yet).' });
           return;

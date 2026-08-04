@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
-import { getStorageFilePath, getThreadsFilePath } from './paths.js';
+import { getStorageFilePath } from './paths.js';
+import { readThreadById, readThreadsIndex } from './thread-storage.js';
 
 // The read_thread MCP tool: lets an agent browse another Orion thread's
 // transcript on demand. @thread mentions inject only metadata into the
@@ -143,8 +144,12 @@ export const readThreadForAgent = async (args = {}) => {
   const rawId = typeof args.thread_id === 'string' ? args.thread_id.trim() : '';
   if (!rawId) return 'read_thread requires a `thread_id` string argument.';
 
-  const parsed = await readJson(getThreadsFilePath());
-  const threads = Array.isArray(parsed?.threads) ? parsed.threads : [];
+  let threads = [];
+  try {
+    threads = (await readThreadsIndex()).entries;
+  } catch {
+    return 'Orion could not read the stored thread index.';
+  }
   if (threads.length === 0) return 'No Orion threads are stored yet.';
 
   const matches = matchThreads(threads, rawId);
@@ -159,7 +164,13 @@ export const readThreadForAgent = async (args = {}) => {
     return `thread_id "${rawId}" is ambiguous; it matches ${matches.length} threads. Call read_thread again with one exact id:\n${listing}`;
   }
 
-  const thread = matches[0];
+  let thread;
+  try {
+    thread = await readThreadById(matches[0].id);
+  } catch {
+    return `Orion could not read thread "${matches[0].id}".`;
+  }
+  if (!thread) return `Orion thread "${matches[0].id}" is no longer stored.`;
   const storeState = (await readJson(getStorageFilePath()))?.state;
   const project = Array.isArray(storeState?.projects)
     ? storeState.projects.find((candidate) => candidate?.id === thread.projectId)

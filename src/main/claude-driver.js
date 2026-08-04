@@ -319,7 +319,8 @@ export const createClaudeTurnState = (runId, snapshot) => ({
   snapshot,
   streamContext: { textSeen: false },
   knownToolActivities: new Map(),
-  reasoningText: '',
+  pendingReasoning: '',
+  reasoningEmitted: false,
   reasoningEmitTimer: null,
   lastReasoningEmitAt: 0,
   toolWrittenPaths: new Set(),
@@ -344,13 +345,15 @@ export const trackClaudeFileWrites = (turn, message) => {
 };
 
 export const sendClaudeTurnReasoning = (session, turn, status = 'running') => {
-  const detail = turn.reasoningText.trim();
-  if (!detail) return;
+  const detailDelta = turn.pendingReasoning;
+  turn.pendingReasoning = '';
+  if (!detailDelta && !turn.reasoningEmitted) return;
+  turn.reasoningEmitted = true;
   emitAgentEvent(session.sender, {
     runId: turn.runId,
     threadId: session.threadId,
     type: 'activity',
-    activity: { key: `${turn.runId}:reasoning`, type: 'thought', title: 'Reasoning', detail, status },
+    activity: { key: `${turn.runId}:reasoning`, type: 'thought', title: 'Reasoning', detailDelta, status },
   });
 };
 
@@ -819,7 +822,7 @@ export const handleClaudeSessionMessage = async (session, message) => {
 
   const reasoningDelta = extractClaudeReasoningFromJsonEvent(message, turn.streamContext);
   if (reasoningDelta) {
-    turn.reasoningText = `${turn.reasoningText}${reasoningDelta}`;
+    turn.pendingReasoning = `${turn.pendingReasoning}${reasoningDelta}`;
     queueClaudeTurnReasoning(session, turn);
   }
 

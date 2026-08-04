@@ -3,11 +3,13 @@ import path from 'node:path';
 
 export const storageFileName = 'orion-store.json';
 export const threadsFileName = 'orion-threads.json';
+export const threadsDirectoryName = 'orion-threads';
 export const accountSessionFileName = 'orion-account-session.json';
 export const attachmentDirectoryName = 'attachments';
 export const attachmentProtocol = 'orion-attachment';
 export const appProtocol = 'orion';
 export const getStorageFilePath = () => path.join(app.getPath('userData'), storageFileName);
 export const getThreadsFilePath = () => path.join(app.getPath('userData'), threadsFileName);
+export const getThreadsDirectoryPath = () => path.join(app.getPath('userData'), threadsDirectoryName);
 export const getAccountSessionFilePath = () => path.join(app.getPath('userData'), accountSessionFileName);
 export const getAttachmentDirectoryPath = () => path.join(app.getPath('userData'), attachmentDirectoryName);

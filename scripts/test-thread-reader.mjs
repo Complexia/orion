@@ -10,6 +10,7 @@ app.setPath('userData', testDataDir);
 
 try {
   const { getStorageFilePath, getThreadsFilePath } = await import('../src/main/paths.js');
+  const { writeThreadsPatch } = await import('../src/main/thread-storage.js');
   const { readThreadForAgent } = await import('../src/main/thread-reader.js');
   const thread = {
     id: 'thread-12345678-abcd',
@@ -23,6 +24,8 @@ try {
       { role: 'agent', content: 'second' },
     ],
   };
+  const persistThread = () =>
+    writeThreadsPatch({ version: 2, upserts: [thread], deletes: [], order: [thread.id] });
 
   await fs.writeFile(
     getThreadsFilePath(),
@@ -59,7 +62,7 @@ try {
       ],
     },
   ];
-  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  await persistThread();
   const toolEvidence = await readThreadForAgent({ thread_id: thread.id });
   assert.match(toolEvidence, /Input:\n    path=\/tmp\/example\.txt/);
   assert.match(toolEvidence, /Output:\n    essential persisted result/);
@@ -84,7 +87,7 @@ try {
       ],
     },
   ];
-  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  await persistThread();
   const linkedTaskPrompt = await readThreadForAgent({ thread_id: thread.id });
   assert.match(linkedTaskPrompt, /Linked board tasks \(2\):/);
   assert.match(linkedTaskPrompt, /Preserve linked task prompts/);
@@ -103,7 +106,7 @@ try {
       })),
     },
   ];
-  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  await persistThread();
   const cappedPage = await readThreadForAgent({ thread_id: thread.id, limit: 1 });
   assert.ok(cappedPage.length <= 48_000, `reply exceeded cap: ${cappedPage.length}`);
   assert.match(cappedPage, /Changed files \(2000\):/);
@@ -127,7 +130,7 @@ try {
       })),
     },
   ];
-  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  await persistThread();
   const boundedCollections = await readThreadForAgent({ thread_id: thread.id });
   assert.match(boundedCollections, /…2 more linked tasks omitted/);
   assert.match(boundedCollections, /…5 more attachments omitted/);
@@ -144,7 +147,7 @@ try {
       })),
     },
   ];
-  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  await persistThread();
   const boundedMessage = await readThreadForAgent({ thread_id: thread.id });
   assert.match(boundedMessage, /\[message details truncated\]/);
   assert.ok(boundedMessage.length <= 48_000, `bounded message exceeded reply cap: ${boundedMessage.length}`);
@@ -153,7 +156,7 @@ try {
     role: index % 2 === 0 ? 'user' : 'agent',
     content: `page marker ${index + 1}\n${'x'.repeat(5900)}`,
   }));
-  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [thread] }), 'utf8');
+  await persistThread();
   const oversizedPage = await readThreadForAgent({ thread_id: thread.id, offset: 1, limit: 12 });
   const recoveryHint = oversizedPage.match(
     /(\d+) messages of this page were dropped[^\n]+offset=(\d+), limit=(\d+)/
