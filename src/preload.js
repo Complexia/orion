@@ -7,7 +7,7 @@ contextBridge.exposeInMainWorld('orion', {
   // App persistence
   loadStore: () => ipcRenderer.invoke('storage:load'),
   saveStore: (value) => ipcRenderer.invoke('storage:save', value),
-  loadThreads: () => ipcRenderer.invoke('storage:loadThreads'),
+  loadThreadsPage: (input) => ipcRenderer.invoke('storage:loadThreadsPage', input),
   saveThreads: (value) => ipcRenderer.invoke('storage:saveThreads', value),
   // Synchronous on purpose: the quit-time flush must block unload until the
   // write is on disk (an async invoke would race app teardown).

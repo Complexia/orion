@@ -10,9 +10,11 @@ app.setPath('userData', testDataDir);
 try {
   const { getThreadsDirectoryPath, getThreadsFilePath } = await import('../src/main/paths.js');
   const {
+    clearThreadsStorage,
     readAllThreads,
     readThreadById,
     readThreadsIndex,
+    readThreadsPage,
     writeThreadsPatch,
     writeThreadsPatchSync,
   } = await import('../src/main/thread-storage.js');
@@ -90,10 +92,58 @@ try {
   await writeThreadsPatch({ version: 2, upserts: [third], deletes: [], order: [second.id, third.id] });
   assert.deepEqual(await readThreadById(third.id), third, 'a later valid patch should repair corrupt bytes');
 
+  const fourth = {
+    ...second,
+    id: 'thread-fourth',
+    title: 'Fourth',
+    messages: [{ role: 'agent', content: 'x'.repeat(1_500), ts: '2026-08-04T00:00:04.000Z' }],
+  };
+  const fifth = {
+    ...second,
+    id: 'thread-fifth',
+    title: 'Fifth',
+    messages: [{ role: 'agent', content: 'y'.repeat(1_500), ts: '2026-08-04T00:00:05.000Z' }],
+  };
+  const pagedManifest = await writeThreadsPatch({
+    version: 2,
+    upserts: [fourth, fifth],
+    deletes: [],
+    order: [second.id, third.id, fourth.id, fifth.id],
+  });
+  const pagedThreads = [];
+  let pageOffset = 0;
+  while (pageOffset !== null) {
+    const page = await readThreadsPage({
+      offset: pageOffset,
+      revision: pagedManifest.revision,
+      maxBytes: 1_024,
+    });
+    assert.equal(page.present, true);
+    assert.equal(page.stale, false);
+    assert.equal(page.revision, pagedManifest.revision);
+    assert.equal(page.offset, pageOffset);
+    assert.ok(page.threads.length > 0, 'every non-terminal page must make progress');
+    assert.ok(
+      page.threads.length === 1 || Buffer.byteLength(JSON.stringify(page), 'utf8') <= 1_024,
+      'a page may exceed its target only for one individually oversized thread'
+    );
+    pagedThreads.push(...page.threads);
+    pageOffset = page.nextOffset;
+  }
+  assert.deepEqual(pagedThreads, [second, third, fourth, fifth], 'paged reads must preserve manifest order');
+  const stalePage = await readThreadsPage({ revision: pagedManifest.revision - 1 });
+  assert.equal(stalePage.stale, true, 'a mismatched revision must restart hydration without returning threads');
+  assert.deepEqual(stalePage.threads, []);
+  await assert.rejects(readThreadsPage({ offset: 99 }), /page offset/);
+
   await fs.writeFile(path.join(getThreadsDirectoryPath(), 'manifest.json'), '{broken', 'utf8');
   await assert.rejects(readAllThreads(), 'a corrupt v2 manifest must fail closed instead of reviving stale v1 data');
+  await clearThreadsStorage();
+  const absentPage = await readThreadsPage();
+  assert.equal(absentPage.present, false, 'absent storage must remain distinct from a failed read');
+  assert.equal(absentPage.nextOffset, null);
 
-  console.log('Thread storage migration and incremental persistence checks passed.');
+  console.log('Thread storage migration, paging, and incremental persistence checks passed.');
 } finally {
   await fs.rm(testDataDir, { recursive: true, force: true });
   app.quit();

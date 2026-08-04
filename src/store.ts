@@ -870,26 +870,99 @@ const cancelQueuedThreadsSave = () => {
   }
 };
 
+type PersistedThreadsPage = {
+  version: 2;
+  present: boolean;
+  stale: boolean;
+  revision: number;
+  offset: number;
+  total: number;
+  threads: Thread[];
+  nextOffset: number | null;
+};
+
+const THREADS_PAGE_BYTES = 4 * 1024 * 1024;
+const THREADS_HYDRATION_ATTEMPTS = 3;
+
 // Graft the separately-persisted threads back into the persisted state so the
 // persist middleware — including its crash-recovery merge — sees one combined
-// snapshot. With no threads file yet (pre-split builds), the store value's own
-// embedded threads are used as-is; the first threads save migrates them out.
+// snapshot. Pages keep the main-process IPC allocation bounded; the manifest
+// revision prevents a concurrent save from producing a mixed snapshot. With
+// no threads file yet (pre-split builds), the store value's own embedded
+// threads are used as-is and the first threads save migrates them out.
 const withThreadsGrafted = async (value: string | null): Promise<string | null> => {
-  const result = await window.orion.loadThreads?.();
-  if (result && !result.ok) {
-    // The file exists but couldn't be read/parsed — hydrating without it is
-    // survivable, but persisting over it is not.
-    threadsPersistenceBlocked = true;
-    return value;
-  }
-  const threadsValue = result?.value;
-  if (!threadsValue) return value;
+  if (!window.orion.loadThreadsPage) return value;
+  let storedThreads: Thread[] | null = null;
   try {
-    const threads = JSON.parse(threadsValue)?.threads;
-    if (!Array.isArray(threads)) {
-      threadsPersistenceBlocked = true;
-      return value;
+    for (let attempt = 0; attempt < THREADS_HYDRATION_ATTEMPTS; attempt += 1) {
+      const threads: Thread[] = [];
+      let offset = 0;
+      let revision: number | undefined;
+      let total: number | undefined;
+      let retry = false;
+
+      while (true) {
+        const result = await window.orion.loadThreadsPage({
+          offset,
+          revision,
+          maxBytes: THREADS_PAGE_BYTES,
+        });
+        if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread page read failed.');
+        const page = JSON.parse(result.value) as PersistedThreadsPage;
+        if (
+          page?.version !== 2 ||
+          typeof page.present !== 'boolean' ||
+          typeof page.stale !== 'boolean' ||
+          !Number.isInteger(page.revision) ||
+          !Number.isInteger(page.offset) ||
+          !Number.isInteger(page.total) ||
+          !Array.isArray(page.threads) ||
+          (page.nextOffset !== null && !Number.isInteger(page.nextOffset))
+        ) {
+          throw new Error('Invalid thread page response.');
+        }
+        if (page.stale) {
+          retry = true;
+          break;
+        }
+        if (!page.present) {
+          if (offset !== 0 || page.threads.length !== 0 || page.nextOffset !== null) {
+            throw new Error('Invalid absent thread page response.');
+          }
+          return value;
+        }
+        if (
+          page.offset !== offset ||
+          page.revision < 0 ||
+          page.total < 0 ||
+          (revision !== undefined && page.revision !== revision) ||
+          (total !== undefined && page.total !== total)
+        ) {
+          throw new Error('Inconsistent thread page response.');
+        }
+        revision = page.revision;
+        total = page.total;
+        threads.push(...page.threads);
+
+        if (page.nextOffset === null) {
+          if (threads.length !== total) throw new Error('Incomplete thread page response.');
+          storedThreads = threads;
+          break;
+        }
+        if (
+          page.nextOffset <= offset ||
+          page.nextOffset > total ||
+          page.nextOffset - offset !== page.threads.length
+        ) {
+          throw new Error('Invalid next thread page offset.');
+        }
+        offset = page.nextOffset;
+      }
+
+      if (storedThreads !== null) break;
+      if (!retry) throw new Error('Thread hydration did not complete.');
     }
+    if (storedThreads === null) throw new Error('Thread storage changed repeatedly during hydration.');
     loadedThreadsFromStorage = true;
     // A lost/corrupt store file must not take the transcripts with it.
     let parsed: { state: Record<string, unknown>; version?: number };
@@ -911,9 +984,11 @@ const withThreadsGrafted = async (value: string | null): Promise<string | null> 
       // over the valid threads file.
       parsed = { state: {}, version: 1 };
     }
-    parsed.state = { ...parsed.state, threads };
+    parsed.state = { ...parsed.state, threads: storedThreads };
     return JSON.stringify(parsed);
   } catch {
+    // Hydrating without the real transcript snapshot is survivable, but
+    // persisting over it is not.
     threadsPersistenceBlocked = true;
     return value;
   }

@@ -39,7 +39,7 @@ import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, get
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
-import { clearThreadsStorage, readAllThreads, readThreadById, readThreadsByIds, readThreadsIndex, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
+import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import { getAgentModels, invalidateAgentModelsCache, listAgentModelsWithAvailability } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
@@ -1374,20 +1374,14 @@ ipcMain.handle('storage:save', async (_event, value) => {
   }
 });
 
-// Threads dominate the store and are persisted as independently replaceable
-// records behind a small manifest — see the renderer's dirty-thread saver.
-// Returns { ok: true, value } with value null for a genuinely absent file.
-// A read failure or an unrepairable file returns { ok: false } instead — the
-// renderer must be able to tell the two apart, because "absent" lets it
-// persist a fresh snapshot while "failed" must suppress persistence (an
-// unconditional post-hydration flush would overwrite the transcripts with
-// the empty hydrated state).
-ipcMain.handle('storage:loadThreads', async () => {
+// Keep each startup response bounded. A single response containing every
+// transcript made Electron's main process retain the large IPC backing
+// allocations long after hydration completed.
+ipcMain.handle('storage:loadThreadsPage', async (_event, input) => {
   try {
-    const threads = await readAllThreads();
-    return { ok: true, value: threads === null ? null : JSON.stringify({ version: 2, threads }) };
+    return { ok: true, value: JSON.stringify(await readThreadsPage(input)) };
   } catch (error) {
-    console.error('storage:loadThreads error', error);
+    console.error('storage:loadThreadsPage error', error);
     return { ok: false };
   }
 });
