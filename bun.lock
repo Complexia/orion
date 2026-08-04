@@ -23,6 +23,7 @@
         "remark-gfm": "^4.0.1",
         "rift-snapshot": "0.0.10",
         "sonner": "^2.0.7",
+        "undici": "^7.28.0",
         "zod": "^4.4.3",
         "zustand": "^5.0.14",
       },
