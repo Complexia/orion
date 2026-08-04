@@ -1518,6 +1518,38 @@ const buildSnapshot = async () => {
   };
 };
 
+// Kept in sync with src/app/remote-control-policy.ts (remoteThreadRuntime):
+// remote turns on Claude Code CLI terminal threads are rejected there, so the
+// model catalog must not offer that entry to remote controllers either.
+const REMOTE_UNSUPPORTED_MODEL_ID = 'claude:claude-code-cli';
+
+// Anything but a known access mode is dropped rather than failing the
+// request, so peers with a newer option set still get their turn started.
+const sanitizeAccessMode = (value) =>
+  value === 'read-only' || value === 'workspace-write' || value === 'full-access'
+    ? value
+    : undefined;
+
+// Shape every entry explicitly: the discovered catalog is an internal object
+// (per-provider CLI details may grow fields) and must not be serialized
+// verbatim onto the wire.
+const buildModelCatalog = (models) =>
+  (Array.isArray(models) ? models : [])
+    .filter((model) => typeof model?.id === 'string' && model.id !== REMOTE_UNSUPPORTED_MODEL_ID)
+    .map((model) => ({
+      id: model.id,
+      providerId: String(model.providerId ?? ''),
+      providerLabel: String(model.providerLabel ?? ''),
+      label: String(model.label ?? ''),
+      slug: String(model.slug ?? ''),
+      ...(typeof model.shortcut === 'string' ? { shortcut: model.shortcut } : {}),
+      ...(model.favorite === true ? { favorite: true } : {}),
+      ...(typeof model.available === 'boolean' ? { available: model.available } : {}),
+      ...(typeof model.unavailableReason === 'string'
+        ? { unavailableReason: model.unavailableReason }
+        : {}),
+    }));
+
 const clearThreadTransfer = (session) => {
   const transfer = session.threadTransfer;
   if (!transfer) return;
@@ -1570,6 +1602,9 @@ const handleHostRequest = async (session, message) => {
         return;
       case 'snapshot':
         respond({ ok: true, snapshot: await buildSnapshot() });
+        return;
+      case 'models':
+        respond({ ok: true, models: buildModelCatalog(await deps.listAgentModels()) });
         return;
       case 'thread': {
         const threadId = String(message?.threadId ?? '');
@@ -1668,6 +1703,7 @@ const handleHostRequest = async (session, message) => {
             projectId: typeof message?.projectId === 'string' ? message.projectId : undefined,
             epicId: typeof message?.epicId === 'string' ? message.epicId : undefined,
             modelId: typeof message?.modelId === 'string' ? message.modelId : undefined,
+            accessMode: sanitizeAccessMode(message?.accessMode),
             source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
           },
           Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS,
@@ -2496,8 +2532,9 @@ export const fetchRemoteThread = async ({ machineId, threadId } = {}) => {
   }
 };
 
-export const runRemoteTurn = async ({ machineId, threadId, projectId, epicId, prompt, modelId } = {}) => {
+export const runRemoteTurn = async ({ machineId, threadId, projectId, epicId, prompt, modelId, accessMode } = {}) => {
   try {
+    const requestedAccessMode = sanitizeAccessMode(accessMode);
     const response = await clientRequest(
       String(machineId ?? ''),
       {
@@ -2506,6 +2543,7 @@ export const runRemoteTurn = async ({ machineId, threadId, projectId, epicId, pr
         ...(projectId ? { projectId: String(projectId) } : {}),
         ...(epicId ? { epicId: String(epicId) } : {}),
         ...(modelId ? { modelId: String(modelId) } : {}),
+        ...(requestedAccessMode ? { accessMode: requestedAccessMode } : {}),
         prompt: String(prompt ?? ''),
       },
       (Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS) +

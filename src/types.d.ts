@@ -248,6 +248,7 @@ export type RemoteCommandRequest = {
     projectId?: string;
     epicId?: string;
     modelId?: string;
+    accessMode?: 'read-only' | 'workspace-write' | 'full-access';
     source?: { machineId: string; machineName: string };
   };
 };
@@ -1162,6 +1163,7 @@ type OrionComputerUsePermissions = {
         projectId?: string;
         epicId?: string;
         modelId?: string;
+        accessMode?: 'read-only' | 'workspace-write' | 'full-access';
         prompt: string;
       }) => Promise<{ ok: boolean; threadId?: string; error?: string }>;
       remoteStopTurn?: (input: {

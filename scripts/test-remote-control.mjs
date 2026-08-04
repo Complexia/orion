@@ -727,6 +727,38 @@ if (
       }
       return { threads: fixtureThreads };
     },
+    // The terminal pseudo-model must be filtered out on the host, and the
+    // internal `command` field must never reach the wire.
+    listAgentModels: async () => [
+      {
+        id: 'claude:claude-opus-5',
+        providerId: 'claude',
+        providerLabel: 'Claude',
+        label: 'Claude Opus 5',
+        slug: 'claude-opus-5',
+        shortcut: '⌘2',
+        favorite: true,
+        available: true,
+      },
+      {
+        id: 'grok:grok-4.5',
+        providerId: 'grok',
+        providerLabel: 'Grok',
+        label: 'Grok 4.5',
+        slug: 'grok-4.5',
+        available: false,
+        unavailableReason: 'Install or authenticate grok on PATH.',
+        command: 'grok',
+      },
+      {
+        id: 'claude:claude-code-cli',
+        providerId: 'claude',
+        providerLabel: 'Claude',
+        label: 'Claude Code CLI',
+        slug: 'claude-code-cli',
+        available: true,
+      },
+    ],
     broadcast: (channel, payload) => {
       if (channel === 'remote:event') send({ kind: 'remoteEvent', event: payload });
       return rendererAvailable ? 1 : 0;
@@ -1927,6 +1959,137 @@ if (
   assert.equal(state.host.devices.length, 1);
   assert.equal(state.host.listening, true);
   console.log('ok  host records the paired device');
+
+  // Established-session request dispatch: the `models` catalog request, the
+  // runTurn accessMode field (valid passed through, unknown dropped), and the
+  // catch-all "Unsupported request." answer that keeps unknown types
+  // forward-compatible. Uses a raw session client so arbitrary wire messages
+  // can be sent with the paired device's credential.
+  {
+    const net = await import('node:net');
+    const {
+      REMOTE_PROTOCOL_VERSION,
+      SecureChannel,
+      confirmationMac,
+      createEphemeralKeyPair,
+      deriveHandshakeKeys,
+      handshakeTranscript,
+      macsEqual,
+    } = await import('../src/main/remote-crypto.js');
+    const persisted = JSON.parse(
+      fs.readFileSync(path.join(tmpRoot, 'host', 'orion-remote-control.json'), 'utf-8')
+    );
+    const device = persisted.hostDevices[0];
+
+    const socket = net.connect(port, '127.0.0.1');
+    await new Promise((resolve) => socket.on('connect', resolve));
+    const channel = new SecureChannel(socket, { maxFrame: 4096 });
+    const eph = createEphemeralKeyPair();
+    const inbox = [];
+    const waiters = [];
+    channel.onMessage((message, raw) => {
+      const entry = { message, raw };
+      const waiter = waiters.shift();
+      if (waiter) waiter(entry);
+      else inbox.push(entry);
+    });
+    const nextMessage = () =>
+      inbox.length > 0
+        ? Promise.resolve(inbox.shift())
+        : new Promise((resolve) => waiters.push(resolve));
+
+    const helloRaw = channel.send({
+      t: 'hello',
+      v: REMOTE_PROTOCOL_VERSION,
+      mode: 'session',
+      deviceId: device.id,
+      pub: eph.publicDer.toString('base64'),
+      nonce: crypto.randomBytes(16).toString('base64'),
+    });
+    const ack = await nextMessage();
+    assert.equal(ack.message.t, 'helloAck');
+    const transcript = handshakeTranscript(helloRaw, ack.raw);
+    const keys = deriveHandshakeKeys({
+      privateKey: eph.privateKey,
+      peerPublicDer: Buffer.from(ack.message.pub, 'base64'),
+      psk: Buffer.from(device.secret.value, 'base64'),
+      transcript,
+      isClient: true,
+    });
+    channel.send({ t: 'confirm', mac: confirmationMac(keys.macKey, 'client', transcript).toString('base64') });
+    const confirm = await nextMessage();
+    assert.ok(
+      macsEqual(
+        confirmationMac(keys.macKey, 'server', transcript),
+        Buffer.from(String(confirm.message.mac ?? ''), 'base64')
+      )
+    );
+    channel.enableEncryption(keys);
+    channel.setMaxFrame(8 * 1024 * 1024);
+    assert.equal((await nextMessage()).message.t, 'welcome');
+
+    channel.send({ t: 'models', reqId: 'models-1' });
+    const models = (await nextMessage()).message;
+    assert.equal(models.t, 'res');
+    assert.equal(models.reqId, 'models-1');
+    assert.equal(models.ok, true, `models request failed: ${models.error}`);
+    // Exact shapes: the terminal pseudo-model is filtered out and the grok
+    // entry's internal `command` field does not leak.
+    assert.deepEqual(models.models, [
+      {
+        id: 'claude:claude-opus-5',
+        providerId: 'claude',
+        providerLabel: 'Claude',
+        label: 'Claude Opus 5',
+        slug: 'claude-opus-5',
+        shortcut: '⌘2',
+        favorite: true,
+        available: true,
+      },
+      {
+        id: 'grok:grok-4.5',
+        providerId: 'grok',
+        providerLabel: 'Grok',
+        label: 'Grok 4.5',
+        slug: 'grok-4.5',
+        available: false,
+        unavailableReason: 'Install or authenticate grok on PATH.',
+      },
+    ]);
+    console.log('ok  models request returns the sanitized catalog without the terminal pseudo-model');
+
+    const validAccessSeen = host.waitFor('commandSeen');
+    channel.send({
+      t: 'runTurn',
+      reqId: 'access-1',
+      projectId: 'p1',
+      prompt: 'run with workspace access',
+      accessMode: 'workspace-write',
+    });
+    assert.equal((await nextMessage()).message.ok, true);
+    assert.equal((await validAccessSeen).command.accessMode, 'workspace-write');
+    const invalidAccessSeen = host.waitFor('commandSeen');
+    channel.send({
+      t: 'runTurn',
+      reqId: 'access-2',
+      projectId: 'p1',
+      prompt: 'run with unknown access',
+      accessMode: 'root-of-all-evil',
+    });
+    assert.equal((await nextMessage()).message.ok, true, 'an unknown accessMode must not fail the turn');
+    assert.equal((await invalidAccessSeen).command.accessMode, undefined);
+    console.log('ok  runTurn passes valid accessMode through and drops unknown values');
+
+    channel.send({ t: 'definitely-not-a-request', reqId: 'unknown-1' });
+    const unknown = (await nextMessage()).message;
+    assert.equal(unknown.t, 'res');
+    assert.equal(unknown.reqId, 'unknown-1');
+    assert.equal(unknown.ok, false);
+    assert.equal(unknown.error, 'Unsupported request.');
+    console.log('ok  genuinely unknown request types still answer "Unsupported request."');
+
+    socket.destroy();
+  }
 
   // macOS keeps the listener alive after the final renderer closes. Reads can
   // continue, but renderer-owned commands must fail immediately and clearly.

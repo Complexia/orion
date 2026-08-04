@@ -41,7 +41,7 @@ import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, 
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { clearThreadsStorage, readAllThreads, readThreadById, readThreadsByIds, readThreadsIndex, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
-import { getAgentModels, invalidateAgentModelsCache } from './main/models.js';
+import { getAgentModels, invalidateAgentModelsCache, listAgentModelsWithAvailability } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdate, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
@@ -1002,6 +1002,9 @@ app.whenReady().then(async () => {
     readStoreState: () => readPersistedStoreState(),
     readThreadsIndex,
     readThreadById,
+    // Cached-list entry point (same path as agent:listModels without `force`),
+    // so a remote `models` request never triggers a CLI re-probe by itself.
+    listAgentModels: () => listAgentModelsWithAvailability(),
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
     dispatchRendererCommand: (payload) => dispatchRemoteCommand(payload),
     createRemotePairingProof,
@@ -5013,24 +5016,7 @@ ipcMain.handle('attachment:saveImage', async (_event, input) => {
 
 ipcMain.handle('agent:listModels', async (_event, input) => {
   if (input?.force === true) invalidateAgentModelsCache();
-  const models = await getAgentModels();
-  const uniqueCommands = [...new Set(models.map((model) => model.command).filter(Boolean))];
-  const availability = new Map(
-    await Promise.all(
-      uniqueCommands.map(async (command) => [command, await checkCommandAvailable(command)])
-    )
-  );
-
-  return models.map(({ command, ...model }) => {
-    // Pseudo-models (Orion orchestrator) have no CLI to probe.
-    if (!command) return { ...model, available: true };
-    const available = availability.get(command) === true;
-    return {
-      ...model,
-      available,
-      ...(available ? {} : { unavailableReason: `Install or authenticate ${command} on PATH.` }),
-    };
-  });
+  return listAgentModelsWithAvailability();
 });
 
 ipcMain.handle('agent:supportsThreadReader', async (_event, providerId) =>

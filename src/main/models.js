@@ -542,6 +542,30 @@ export const getAgentModels = () => {
   return agentModelsDiscoveryPromise;
 };
 
+// Shared by the agent:listModels IPC and the remote-control `models` request.
+// Availability is probed once per provider CLI (not per model), and the
+// internal `command` field never leaves the main process.
+export const listAgentModelsWithAvailability = async () => {
+  const models = await getAgentModels();
+  const uniqueCommands = [...new Set(models.map((model) => model.command).filter(Boolean))];
+  const availability = new Map(
+    await Promise.all(
+      uniqueCommands.map(async (command) => [command, await checkCommandAvailable(command)])
+    )
+  );
+
+  return models.map(({ command, ...model }) => {
+    // Pseudo-models (Orion orchestrator) have no CLI to probe.
+    if (!command) return { ...model, available: true };
+    const available = availability.get(command) === true;
+    return {
+      ...model,
+      available,
+      ...(available ? {} : { unavailableReason: `Install or authenticate ${command} on PATH.` }),
+    };
+  });
+};
+
 export const claudeEffortForCli = (reasoningEffort = defaultClaudeReasoningEffort) => {
   if (reasoningEffort === 'ultracode') return 'xhigh';
   if (reasoningEffort === 'ultrathink') return defaultClaudeReasoningEffort;
