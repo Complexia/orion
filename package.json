@@ -1,7 +1,7 @@
 {
   "name": "orion",
   "productName": "Orion",
-  "version": "1.0.78",
+  "version": "1.0.79",
   "description": "Orion - Agentic IDE",
   "main": ".vite/build/main.js",
   "private": true,
