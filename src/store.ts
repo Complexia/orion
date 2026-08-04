@@ -420,16 +420,19 @@ export type LinkedBoardTask = {
 };
 
 // The harness's predicted next prompt for a thread (Claude's promptSuggestions
-// stream message), surfaced as a "Suggested task" card the user can spin off
-// into its own epic + rift. At most one per thread; each new one replaces it.
+// stream message), surfaced as a "Suggested task" card the user can start as a
+// regular thread on the current branch or spin off into its own epic + rift.
+// At most one per thread; each new one replaces it.
 export type SuggestedTask = {
   /** The suggested prompt, verbatim from the harness. */
   text: string;
   createdAt: string;
   /** Run generation that produced this suggestion. */
   turnRunId: string;
-  /** Epic created from this suggestion, once the user started it. */
+  /** Epic created from this suggestion, once the user started it in a rift. */
   startedEpicId?: string;
+  /** Thread created from this suggestion, once the user started it on the current branch. */
+  startedThreadId?: string;
 };
 
 export type Thread = {

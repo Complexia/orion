@@ -57,13 +57,34 @@ assert.match(
 
 const startSuggestedTask = section(
   appSource,
-  '  const handleStartSuggestedTask = useCallback((threadId: string) => {',
+  "  const handleStartSuggestedTask = useCallback((threadId: string, mode: 'thread' | 'rift') => {",
   '  const handleDismissSuggestedTask'
 );
 const epicsGuardIndex = startSuggestedTask.indexOf('if (!epicsEnabled)');
 const addEpicIndex = startSuggestedTask.indexOf('addEpic(');
-assert.ok(epicsGuardIndex >= 0, 'Suggested tasks must be gated by the Epics setting');
+assert.ok(epicsGuardIndex >= 0, 'Rift-mode suggested tasks must be gated by the Epics setting');
 assert.ok(addEpicIndex > epicsGuardIndex, 'The Epics setting guard must run before creating an epic');
+assert.match(
+  startSuggestedTask,
+  /suggestion\.startedEpicId \|\| suggestion\.startedThreadId\) return;/,
+  'An already-started suggestion must not start twice in either mode'
+);
+const threadMode = section(startSuggestedTask, "if (mode === 'thread') {", 'if (!epicsEnabled)');
+assert.doesNotMatch(
+  threadMode,
+  /addEpic\(|setupRiftForEpic\(/,
+  'Thread mode must stay on the current branch — no epic, no rift'
+);
+assert.match(
+  threadMode,
+  /const newThreadId = createThread\(project\.id, undefined, \{ epicId: thread\.epicId \}\);[\s\S]*startedThreadId: newThreadId[\s\S]*startTurnForThreadRef\.current\?\.\(newThreadId, suggestion\.text, \[\]\)/,
+  'Thread mode must preserve the source epic workspace before running the suggested prompt'
+);
+assert.match(
+  threadMode,
+  /if \(result\.ok\) return;[\s\S]*composerDraftsRef\.current\.set\(newThreadId, \{ text: suggestion\.text, attachments: \[\] \}\)/,
+  'A failed thread-mode start must preserve the prompt as the composer draft'
+);
 assert.match(
   startSuggestedTask,
   /\}, \[[\s\S]*setupRiftForEpic[\s\S]*updateThread,[\s\S]*\]\);/,
@@ -139,8 +160,13 @@ const suggestedTaskCard = section(
 );
 assert.match(
   suggestedTaskCard,
-  /canStart \? \(/,
-  'The suggested-task card must hide its start action while Epics is disabled'
+  /onStart\('thread'\)/,
+  'The suggested-task card must offer starting as a regular thread on the current branch'
+);
+assert.match(
+  suggestedTaskCard,
+  /disabled=\{!canStartRift\}[\s\S]*onStart\('rift'\)/,
+  'The rift/epic start option must be disabled while Epics is disabled'
 );
 assert.match(
   suggestedTaskCard,
@@ -164,7 +190,7 @@ assert.match(
 );
 assert.match(
   appSource,
-  /suggestedTaskCanStart=\{epicsEnabled\}/,
+  /suggestedTaskCanStartRift=\{epicsEnabled\}/,
   'The transcript must receive the current Epics setting'
 );
 
