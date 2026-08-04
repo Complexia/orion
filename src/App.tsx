@@ -290,6 +290,11 @@ type EpicPrLookupRequest = {
   startedAt: string;
 };
 
+type AgentRunStartupResult = { ok: boolean; runId?: string; error?: string };
+type ThreadTurnStartResult =
+  | { ok: false; error?: string }
+  | { ok: true; startup: Promise<AgentRunStartupResult> };
+
 // What prompted a batch PR-state refresh, which decides how long it must wait
 // since the last one: the background interval or a window focus.
 type EpicPrRefreshReason = 'tick' | 'focus';
@@ -1069,9 +1074,9 @@ const App: React.FC = () => {
   // Startup IPC resolves long before a normal turn ends. Retain its result for
   // a short grace window so a steer whose stop lands just after startup failed
   // can distinguish that failure from a run that completed naturally.
-  const runStartupResults = useRef(new Map<string, Promise<{ ok: boolean; runId?: string; error?: string }>>());
+  const runStartupResults = useRef(new Map<string, Promise<AgentRunStartupResult>>());
   const trackRunStartup = useCallback(
-    (runId: string, startup: Promise<{ ok: boolean; runId?: string; error?: string }>) => {
+    (runId: string, startup: Promise<AgentRunStartupResult>) => {
       runStartupResults.current.set(runId, startup);
       const forgetLater = () => {
         window.setTimeout(() => {
@@ -1100,7 +1105,7 @@ const App: React.FC = () => {
         promptText: string,
         attachments: ImageAttachment[],
         claimStart?: () => Promise<boolean>
-      ) => Promise<{ ok: boolean; error?: string }>)
+      ) => Promise<ThreadTurnStartResult>)
     | null
   >(null);
   // In-flight snapshot refreshes, keyed by `${threadId} ${taskId}`.
@@ -4770,16 +4775,30 @@ const App: React.FC = () => {
       const newThreadId = createThread(project.id, undefined, { epicId: thread.epicId });
       updateThread(threadId, { suggestedTask: { ...suggestion, startedThreadId: newThreadId } });
       setActiveTab('agents');
-      const start = startTurnForThreadRef.current?.(newThreadId, suggestion.text, []);
-      void start?.then((result) => {
-        if (result.ok) return;
+      const restoreDraft = (error?: string) => {
         // The turn never started; keep the prompt as the new thread's draft.
         composerDraftsRef.current.set(newThreadId, { text: suggestion.text, attachments: [] });
         if (useOrionStore.getState().selectedThreadId === newThreadId) {
           setChatInput(suggestion.text);
         }
-        toast.error(result.error ?? 'Could not start the suggested task');
-      });
+        toast.error(error ?? 'Could not start the suggested task');
+      };
+      const start = startTurnForThreadRef.current?.(newThreadId, suggestion.text, []);
+      void start?.then(
+        async (result) => {
+          if (!result.ok) {
+            restoreDraft(result.error);
+            return;
+          }
+          try {
+            const startup = await result.startup;
+            if (!startup.ok) restoreDraft(startup.error);
+          } catch (error) {
+            restoreDraft(error instanceof Error ? error.message : undefined);
+          }
+        },
+        (error) => restoreDraft(error instanceof Error ? error.message : undefined)
+      );
       toast.success('Suggested task started in a new thread');
       return;
     }
@@ -6278,7 +6297,7 @@ const App: React.FC = () => {
       promptText: string,
       attachments: ImageAttachment[],
       claimStart?: () => Promise<boolean>
-    ): Promise<{ ok: boolean; error?: string }> => {
+    ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
       if (claimStart && !(await claimStart())) {
         return { ok: false, error: 'The remote command expired before the turn started.' };
@@ -6640,7 +6659,7 @@ const App: React.FC = () => {
         }
       });
 
-      return { ok: true };
+      return { ok: true, startup };
     },
     [
       agentModels,
@@ -6666,7 +6685,7 @@ const App: React.FC = () => {
       promptText: string,
       attachments: ImageAttachment[],
       claimStart?: () => Promise<boolean>
-    ): Promise<{ ok: boolean; error?: string }> => {
+    ): Promise<ThreadTurnStartResult> => {
       const turnStart = await withThreadStartReservation(
         pendingTurnStartsRef.current,
         threadId,

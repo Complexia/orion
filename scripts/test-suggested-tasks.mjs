@@ -15,6 +15,17 @@ const section = (source, start, end) => {
   return source.slice(startIndex, endIndex);
 };
 
+const elementContaining = (source, tag, marker) => {
+  const markerIndex = source.indexOf(marker);
+  assert.notEqual(markerIndex, -1, `Missing ${tag} marker: ${marker}`);
+  const startIndex = source.lastIndexOf(`<${tag}`, markerIndex);
+  assert.notEqual(startIndex, -1, `Missing ${tag} start before: ${marker}`);
+  const endToken = `</${tag}>`;
+  const endIndex = source.indexOf(endToken, markerIndex);
+  assert.notEqual(endIndex, -1, `Missing ${tag} end after: ${marker}`);
+  return source.slice(startIndex, endIndex + endToken.length);
+};
+
 const autoScrollEffect = section(
   chatSource,
   'useEffect(() => {\n    if (!chatPinnedRef.current) return;',
@@ -60,14 +71,31 @@ const startSuggestedTask = section(
   "  const handleStartSuggestedTask = useCallback((threadId: string, mode: 'thread' | 'rift') => {",
   '  const handleDismissSuggestedTask'
 );
-const epicsGuardIndex = startSuggestedTask.indexOf('if (!epicsEnabled)');
-const addEpicIndex = startSuggestedTask.indexOf('addEpic(');
-assert.ok(epicsGuardIndex >= 0, 'Rift-mode suggested tasks must be gated by the Epics setting');
-assert.ok(addEpicIndex > epicsGuardIndex, 'The Epics setting guard must run before creating an epic');
-assert.match(
+const duplicateStartGuard = section(
   startSuggestedTask,
+  'const suggestion = thread?.suggestedTask;',
+  'const project = state.projects.find'
+);
+assert.match(
+  duplicateStartGuard,
   /suggestion\.startedEpicId \|\| suggestion\.startedThreadId\) return;/,
   'An already-started suggestion must not start twice in either mode'
+);
+assert.doesNotMatch(
+  duplicateStartGuard,
+  /createThread\(|addEpic\(/,
+  'Duplicate-start rejection must happen before either start mode creates anything'
+);
+const epicsGuard = section(startSuggestedTask, 'if (!epicsEnabled) {', 'const createRift').trim();
+assert.match(
+  epicsGuard,
+  /^if \(!epicsEnabled\) \{[\s\S]*toast\.error\([\s\S]*\);\s*return;\s*\}$/,
+  'The Epics-disabled Rift branch must return before epic creation'
+);
+assert.doesNotMatch(
+  epicsGuard,
+  /addEpic\(/,
+  'The Epics-disabled Rift branch must not create an epic before returning'
 );
 const threadMode = section(startSuggestedTask, "if (mode === 'thread') {", 'if (!epicsEnabled)');
 assert.doesNotMatch(
@@ -82,8 +110,18 @@ assert.match(
 );
 assert.match(
   threadMode,
-  /if \(result\.ok\) return;[\s\S]*composerDraftsRef\.current\.set\(newThreadId, \{ text: suggestion\.text, attachments: \[\] \}\)/,
-  'A failed thread-mode start must preserve the prompt as the composer draft'
+  /const startup = await result\.startup;[\s\S]*if \(!startup\.ok\) restoreDraft\(startup\.error\)/,
+  'Thread mode must observe the asynchronous IPC startup result'
+);
+assert.match(
+  threadMode,
+  /const restoreDraft = \(error\?: string\) => \{[\s\S]*composerDraftsRef\.current\.set\(newThreadId, \{ text: suggestion\.text, attachments: \[\] \}\)[\s\S]*setChatInput\(suggestion\.text\)[\s\S]*toast\.error/,
+  'A failed thread-mode start must preserve and show the prompt as the composer draft'
+);
+assert.match(
+  startTurn,
+  /return \{ ok: true, startup \};/,
+  'A dispatched turn must expose its IPC startup result to launch callers'
 );
 assert.match(
   startSuggestedTask,
@@ -158,16 +196,28 @@ const suggestedTaskCard = section(
   'export const FloatingSuggestedTaskCard:',
   'export const changedFileStatusLabels'
 );
-assert.match(
+const primaryThreadButton = elementContaining(
   suggestedTaskCard,
+  'button',
+  'className="suggested-task-start"'
+);
+assert.match(
+  primaryThreadButton,
   /onStart\('thread'\)/,
   'The suggested-task card must offer starting as a regular thread on the current branch'
 );
+assert.doesNotMatch(
+  primaryThreadButton,
+  /\bdisabled=/,
+  'The primary regular-thread start action must remain enabled'
+);
+const riftButton = elementContaining(suggestedTaskCard, 'button', 'disabled={!canStartRift}');
 assert.match(
-  suggestedTaskCard,
-  /disabled=\{!canStartRift\}[\s\S]*onStart\('rift'\)/,
+  riftButton,
+  /disabled=\{!canStartRift\}/,
   'The rift/epic start option must be disabled while Epics is disabled'
 );
+assert.match(riftButton, /onStart\('rift'\)/, 'The Epics-gated option must start Rift mode');
 assert.match(
   suggestedTaskCard,
   /useFloatingCardDrag\(/,
