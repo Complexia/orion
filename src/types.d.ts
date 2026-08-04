@@ -424,9 +424,19 @@ type OrionComputerUsePermissions = {
       saveStore: (value: string) => Promise<boolean>;
       /** ok:false = read/parse failure (suppress thread persistence); value null = file genuinely absent. */
       loadThreads: () => Promise<{ ok: boolean; value?: string | null }>;
-      saveThreads: (value: string) => Promise<boolean>;
+      saveThreads: (value: {
+        version: 2;
+        upserts: import('./store').Thread[];
+        deletes: string[];
+        order: string[];
+      }) => Promise<boolean>;
       /** Blocking quit-time flush — see preload. */
-      saveThreadsSync?: (value: string) => boolean;
+      saveThreadsSync?: (value: {
+        version: 2;
+        upserts: import('./store').Thread[];
+        deletes: string[];
+        order: string[];
+      }) => boolean;
       clearStore: () => Promise<boolean>;
       openDirectory: () => Promise<string | null>;
       readDirectory: (dirPath: string) => Promise<Array<{
@@ -1066,6 +1076,8 @@ type OrionComputerUsePermissions = {
           kind?: string;
           title: string;
           detail?: string;
+          /** Append-only reasoning payload; the renderer folds it into detail. */
+          detailDelta?: string;
           input?: string;
           output?: string;
           exitCode?: number;

@@ -24,7 +24,8 @@ const MIN_SYNC_GAP_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 
 // Injected by main.js at startup so this module needs no knowledge of Electron
-// state: { getWebUrl, readSession, readStoreState, readThreadsFile, broadcast }.
+// state: { getWebUrl, readSession, readStoreState, readThreadsIndex,
+// readThreadsByIds, broadcast }.
 let deps = null;
 
 let settings = { enabled: false, syncCode: true };
@@ -60,6 +61,23 @@ const publishFailures = new Map();
 const repoLinkOwners = new Map();
 let syncOwnerId = null;
 let totals = { projects: 0, epics: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
+
+const readThreadIndex = async () => {
+  if (deps.readThreadsIndex) return deps.readThreadsIndex();
+  const threads = (await deps.readThreadsFile?.())?.threads ?? [];
+  return {
+    entries: threads.map((thread) => ({
+      id: thread.id,
+      hash: crypto.createHash('sha256').update(JSON.stringify(thread)).digest('hex'),
+    })),
+    legacyThreads: threads,
+  };
+};
+
+const readChangedThreads = async (threadIndex, ids) => {
+  if (deps.readThreadsByIds) return deps.readThreadsByIds(ids);
+  return (threadIndex.legacyThreads ?? []).filter((thread) => ids.includes(thread?.id));
+};
 
 const broadcastStatus = () => {
   deps?.broadcast('sync:state', { ...status, counts: totals.threads > 0 ? { ...totals } : status.counts });
@@ -339,19 +357,24 @@ const syncSnapshot = async (token, storeState, threads, { ownerId, generation, s
   totals.epics = epicPayloads.length;
 };
 
-const syncThreads = async (token, threads, { generation, signal }) => {
-  // Serialize every thread once; the hash doubles as the change detector, so
-  // unchanged threads cost one JSON.stringify and no network.
+const syncThreads = async (token, threadIndex, { generation, signal }) => {
+  // The local manifest already carries the content hash written alongside
+  // each transcript. Load and serialize only threads that differ from the
+  // server instead of rebuilding every historical transcript every minute.
+  const changedIds = threadIndex.entries
+    .filter((entry) => typeof entry?.id === 'string' && knownTranscriptHashes.get(entry.id) !== entry.hash)
+    .map((entry) => entry.id);
+  totals.threads = threadIndex.entries.length;
+  if (changedIds.length === 0) return;
+  const threads = await readChangedThreads(threadIndex, changedIds);
   const entries = [];
   for (const thread of threads) {
     ensureCurrentSync(generation, signal);
     if (typeof thread?.id !== 'string') continue;
     const serialized = JSON.stringify(thread);
     const hash = crypto.createHash('sha256').update(serialized).digest('hex');
-    if (knownTranscriptHashes.get(thread.id) === hash) continue;
     entries.push({ thread, serialized, hash });
   }
-  totals.threads = threads.length;
   if (entries.length === 0) return;
 
   for (let index = 0; index < entries.length; index += THREAD_SYNC_BATCH) {
@@ -571,20 +594,20 @@ const runSyncPass = async (
     await seedServerState(session.token, signal);
     ensureCurrentSync(generation, signal);
 
-    const [storeState, threadsData] = await Promise.all([
+    const [storeState, threadIndex] = await Promise.all([
       deps.readStoreState(),
-      deps.readThreadsFile(),
+      readThreadIndex(),
     ]);
     ensureCurrentSync(generation, signal);
-    const threads = Array.isArray(threadsData?.threads) ? threadsData.threads : [];
+    const entries = Array.isArray(threadIndex?.entries) ? threadIndex.entries : [];
 
-    await syncSnapshot(session.token, storeState, threads, {
+    await syncSnapshot(session.token, storeState, entries, {
       ownerId,
       generation,
       signal,
     });
     ensureCurrentSync(generation, signal);
-    await syncThreads(session.token, threads, { generation, signal });
+    await syncThreads(session.token, { ...threadIndex, entries }, { generation, signal });
     ensureCurrentSync(generation, signal);
     let codeFailures = [];
     if (settings.syncCode) {

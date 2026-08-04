@@ -150,7 +150,14 @@ initWorkspaceSync({
   getWebUrl: () => BASE_URL,
   readSession: async () => ({ token, user: { id: OWNER } }),
   readStoreState: async () => storeState,
-  readThreadsFile: async () => threadsData,
+  readThreadsIndex: async () => ({
+    entries: threadsData.threads.map((thread) => ({
+      id: thread.id,
+      hash: crypto.createHash('sha256').update(JSON.stringify(thread)).digest('hex'),
+    })),
+  }),
+  readThreadsByIds: async (ids) =>
+    threadsData.threads.filter((thread) => ids.includes(thread.id)),
   broadcast: () => {},
 });
 

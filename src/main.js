@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import {
   copyFileSync,
+  cpSync,
   createReadStream,
   existsSync,
   lstatSync,
@@ -38,9 +39,10 @@ import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, get
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
+import { clearThreadsStorage, readAllThreads, readThreadById, readThreadsByIds, readThreadsIndex, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import { getAgentModels, invalidateAgentModelsCache } from './main/models.js';
-import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, getThreadsFilePath, storageFileName, threadsFileName } from './main/paths.js';
+import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdate, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
@@ -305,14 +307,14 @@ let storageSaveQueue = Promise.resolve();
 let threadsSaveQueue = Promise.resolve();
 // The quit-time synchronous threads flush jumps the async save queue; the
 // sequence pair lets a stale queued write detect it has been superseded so
-// its rename cannot clobber the newer quit-time snapshot. An async rename
+// its manifest commit cannot clobber the newer quit-time snapshot. A commit
 // already submitted to the fs when the sync flush runs can still land after
 // it — the retained sync snapshot lets that writer notice (post-rename seq
 // check) and reinstall the newer data, which matters on macOS where the main
 // process outlives the window and the clobbered file would persist.
 let threadsWriteSeq = 0;
 let threadsCommittedSeq = 0;
-let threadsSyncSnapshot = null; // { seq, value } from the latest sync flush
+let threadsSyncSnapshot = null; // { seq, patch } from the latest sync flush
 // A BrowserWindow can exist while its renderer is still loading or has
 // crashed/reloaded before installing the remote-command subscription. Only a
 // renderer that explicitly announces readiness may receive a command.
@@ -423,8 +425,7 @@ const readPersistedRiftOwners = async (state) => {
 const readPersistedRuntimeThreadIdsByEpic = async () => {
   let threads = [];
   try {
-    const parsed = JSON.parse(await fs.readFile(getThreadsFilePath(), 'utf-8'));
-    if (Array.isArray(parsed?.threads)) threads = parsed.threads;
+    threads = (await readThreadsIndex()).entries;
   } catch {}
   const result = new Map();
   const knownEpicIds = new Set(
@@ -864,7 +865,8 @@ if (!app.isPackaged) {
     // fallbacks instead.
     if (
       !existsSync(path.join(devUserData, storageFileName)) &&
-      !existsSync(path.join(devUserData, threadsFileName))
+      !existsSync(path.join(devUserData, threadsFileName)) &&
+      !existsSync(path.join(devUserData, threadsDirectoryName))
     ) {
       for (const fileName of [storageFileName, threadsFileName]) {
         const liveFile = path.join(liveUserData, fileName);
@@ -872,6 +874,11 @@ if (!app.isPackaged) {
         if (!existsSync(devFile) && existsSync(liveFile)) {
           copyFileSync(liveFile, devFile);
         }
+      }
+      const liveThreadsDirectory = path.join(liveUserData, threadsDirectoryName);
+      const devThreadsDirectory = path.join(devUserData, threadsDirectoryName);
+      if (!existsSync(devThreadsDirectory) && existsSync(liveThreadsDirectory)) {
+        cpSync(liveThreadsDirectory, devThreadsDirectory, { recursive: true });
       }
     }
   } catch (error) {
@@ -974,33 +981,12 @@ app.whenReady().then(async () => {
   // Seed the engine from the persisted store so an enabled sync resumes after
   // restart without waiting for the renderer to hydrate; the renderer re-pushes
   // the settings over sync:configure on hydration and every change.
-  const readThreadsFileSnapshot = async () => {
-    let value;
-    try {
-      value = await fs.readFile(getThreadsFilePath(), 'utf-8');
-    } catch (error) {
-      // No split transcript file yet is a legitimate empty workspace. Any
-      // other read failure is ambiguous, so reject the pass before it can
-      // publish a complete empty snapshot and remove every remote thread.
-      if (error?.code === 'ENOENT') return { threads: [] };
-      throw new Error('Could not read workspace transcripts for sync.', { cause: error });
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(value);
-    } catch (error) {
-      throw new Error('Could not parse workspace transcripts for sync.', { cause: error });
-    }
-    if (!Array.isArray(parsed?.threads)) {
-      throw new Error('Transcript file does not contain a threads array.');
-    }
-    return parsed;
-  };
   initWorkspaceSync({
     getWebUrl: () => getOrionWebUrl(),
     readSession: () => readAccountSession(),
     readStoreState: () => readPersistedStoreState(),
-    readThreadsFile: readThreadsFileSnapshot,
+    readThreadsIndex,
+    readThreadsByIds,
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
   });
   void readPersistedStoreState().then((state) => {
@@ -1014,7 +1000,8 @@ app.whenReady().then(async () => {
   await initRemoteControl({
     readSession: () => readAccountSession(),
     readStoreState: () => readPersistedStoreState(),
-    readThreadsFile: readThreadsFileSnapshot,
+    readThreadsIndex,
+    readThreadById,
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
     dispatchRendererCommand: (payload) => dispatchRemoteCommand(payload),
     createRemotePairingProof,
@@ -1188,26 +1175,17 @@ const patchPersistedGoalPause = (threadIds) => {
   threadsSaveQueue = threadsSaveQueue
     .catch(() => {})
     .then(async () => {
-      const threadsPath = getThreadsFilePath();
-      let parsed;
-      try {
-        parsed = JSON.parse(await fs.readFile(threadsPath, 'utf-8'));
-      } catch {
-        return; // no threads file yet — nothing to patch
-      }
-      if (!Array.isArray(parsed?.threads)) return;
-      let changed = false;
-      for (const thread of parsed.threads) {
-        if (threadIds.includes(thread?.id) && thread?.goal?.status === 'active') {
+      const threads = await readThreadsByIds(threadIds);
+      const changed = [];
+      for (const thread of threads) {
+        if (thread?.goal?.status === 'active') {
           thread.goal.status = 'paused';
           thread.goal.updatedAt = Date.now();
-          changed = true;
+          changed.push(thread);
         }
       }
-      if (!changed || seq <= threadsCommittedSeq) return;
-      const tempPath = `${threadsPath}.${process.pid}.goal.tmp`;
-      await fs.writeFile(tempPath, JSON.stringify(parsed), 'utf-8');
-      await fs.rename(tempPath, threadsPath);
+      if (changed.length === 0 || seq <= threadsCommittedSeq) return;
+      await writeThreadsPatch({ version: 2, upserts: changed });
       threadsCommittedSeq = Math.max(threadsCommittedSeq, seq);
     });
 };
@@ -1393,9 +1371,8 @@ ipcMain.handle('storage:save', async (_event, value) => {
   }
 });
 
-// Threads (whole chat transcripts) dominate the store and are persisted to
-// their own file on a slower cadence than the lightweight settings state —
-// see the renderer's orionStorage for the split.
+// Threads dominate the store and are persisted as independently replaceable
+// records behind a small manifest — see the renderer's dirty-thread saver.
 // Returns { ok: true, value } with value null for a genuinely absent file.
 // A read failure or an unrepairable file returns { ok: false } instead — the
 // renderer must be able to tell the two apart, because "absent" lets it
@@ -1404,16 +1381,9 @@ ipcMain.handle('storage:save', async (_event, value) => {
 // the empty hydrated state).
 ipcMain.handle('storage:loadThreads', async () => {
   try {
-    const threadsPath = getThreadsFilePath();
-    const value = await fs.readFile(threadsPath, 'utf-8');
-    const sanitized = sanitizeStoreValue(value);
-    if (sanitized === null) return { ok: false };
-    if (sanitized !== value) {
-      await fs.writeFile(threadsPath, sanitized, 'utf-8');
-    }
-    return { ok: true, value: sanitized };
+    const threads = await readAllThreads();
+    return { ok: true, value: threads === null ? null : JSON.stringify({ version: 2, threads }) };
   } catch (error) {
-    if (error?.code === 'ENOENT') return { ok: true, value: null };
     console.error('storage:loadThreads error', error);
     return { ok: false };
   }
@@ -1459,35 +1429,23 @@ ipcMain.handle('storage:saveThreads', async (_event, value) => {
   const seq = ++threadsWriteSeq;
   const save = threadsSaveQueue.catch(() => {}).then(async () => {
     if (seq <= threadsCommittedSeq) return; // superseded by the sync flush
-    const threadsPath = getThreadsFilePath();
-    const tempPath = `${threadsPath}.${process.pid}.tmp`;
-    const sanitized = sanitizeStoreValue(value) ?? value;
-    await fs.mkdir(path.dirname(threadsPath), { recursive: true });
-    await fs.writeFile(tempPath, sanitized, 'utf-8');
-    if (seq <= threadsCommittedSeq) {
-      await fs.rm(tempPath, { force: true });
-      return;
-    }
-    await fs.rename(tempPath, threadsPath);
+    await writeThreadsPatch(value);
     if (seq >= threadsCommittedSeq) {
       threadsCommittedSeq = seq;
       return;
     }
-    // The quit-time sync flush committed a newer snapshot while our rename
-    // was in flight, and our rename may have just clobbered it — reinstall
-    // the newer data (idempotent if our rename actually landed first).
+    // The quit-time sync flush committed a newer patch while our manifest
+    // write was in flight and may have been superseded — reinstall it.
     const snapshot = threadsSyncSnapshot;
     if (snapshot && snapshot.seq > seq) {
-      const restorePath = `${threadsPath}.${process.pid}.restore.tmp`;
-      await fs.writeFile(restorePath, snapshot.value, 'utf-8');
-      await fs.rename(restorePath, threadsPath);
+      await writeThreadsPatch(snapshot.patch);
     }
   });
   threadsSaveQueue = save;
 
   try {
     await save;
-    // The threads file just changed on disk — let the (opt-in) workspace sync
+    // A stored thread just changed — let the (opt-in) workspace sync
     // engine schedule a debounced pass. Inert while sync is disabled.
     notifyWorkspaceChanged();
     notifyRemoteWorkspaceChanged();
@@ -1505,17 +1463,11 @@ ipcMain.handle('storage:saveThreads', async (_event, value) => {
 ipcMain.on('storage:saveThreadsSync', (event, value) => {
   try {
     const seq = ++threadsWriteSeq;
-    const threadsPath = getThreadsFilePath();
-    // Distinct temp name: an in-flight async save may hold the .tmp path.
-    const tempPath = `${threadsPath}.${process.pid}.sync.tmp`;
-    const sanitized = sanitizeStoreValue(value) ?? value;
-    mkdirSync(path.dirname(threadsPath), { recursive: true });
-    writeFileSync(tempPath, sanitized, 'utf-8');
-    renameSync(tempPath, threadsPath);
+    writeThreadsPatchSync(value);
     threadsCommittedSeq = seq;
-    // Retained so an in-flight async rename that lands after us can detect
-    // the supersession and reinstall this snapshot.
-    threadsSyncSnapshot = { seq, value: sanitized };
+    // Retained so an in-flight async manifest commit can detect the
+    // supersession and reinstall this patch.
+    threadsSyncSnapshot = { seq, patch: value };
     event.returnValue = true;
   } catch (error) {
     console.error('storage:saveThreadsSync error', error);
@@ -1536,16 +1488,13 @@ ipcMain.handle('storage:clear', async () => {
 
   const clearThreads = threadsSaveQueue.catch(() => {}).then(async () => {
     if (threadsSeq <= threadsCommittedSeq) return;
-    const threadsPath = getThreadsFilePath();
-    await fs.rm(threadsPath, { force: true });
+    await clearThreadsStorage();
     if (threadsSeq < threadsCommittedSeq) {
       // A newer synchronous unload flush raced the removal. Reinstall its
       // snapshot in case the rm landed after that flush's rename.
       const snapshot = threadsSyncSnapshot;
       if (snapshot && snapshot.seq > threadsSeq) {
-        const restorePath = `${threadsPath}.${process.pid}.restore.tmp`;
-        await fs.writeFile(restorePath, snapshot.value, 'utf-8');
-        await fs.rename(restorePath, threadsPath);
+        await writeThreadsPatch(snapshot.patch);
       }
       return;
     }
@@ -5606,7 +5555,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         subagentTracker.finish(agentId, { status: result.success ? 'done' : 'error' });
       }
     };
-    let reasoningText = '';
+    let pendingReasoning = '';
+    let reasoningEmitted = false;
     let reasoningEmitTimer = null;
     let lastReasoningEmitAt = 0;
     let sessionIdReported = false;
@@ -5716,10 +5666,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     };
 
     const sendReasoningActivity = (status = 'running') => {
-      // Send the full thought stream; the renderer shows a one-line tail
-      // preview when the row is collapsed and the full text when expanded.
-      const detail = reasoningText.trim();
-      if (!detail) return;
+      const detailDelta = pendingReasoning;
+      pendingReasoning = '';
+      if (!detailDelta && !reasoningEmitted) return;
+      reasoningEmitted = true;
 
       emitAgentEvent(event.sender, {
         runId,
@@ -5729,7 +5679,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           key: reasoningActivityKey,
           type: 'thought',
           title: 'Reasoning',
-          detail,
+          detailDelta,
           status,
         },
       });
@@ -5775,7 +5725,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
       const reasoningDelta = adapter.reasoning(parsed, streamContext);
       if (reasoningDelta) {
-        reasoningText = `${reasoningText}${reasoningDelta}`;
+        pendingReasoning = `${pendingReasoning}${reasoningDelta}`;
         queueReasoningActivity();
       }
 
@@ -5843,7 +5793,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         });
       },
       onReasoning: (delta) => {
-        reasoningText = `${reasoningText}${delta}`;
+        pendingReasoning = `${pendingReasoning}${delta}`;
         queueReasoningActivity();
       },
       onText: (text) => {

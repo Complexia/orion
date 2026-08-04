@@ -251,6 +251,8 @@ export type AgentActivity = {
   kind?: string;
   title: string;
   detail?: string;
+  /** Transient IPC-only append. It is folded into detail before persistence. */
+  detailDelta?: string;
   /** Full tool input (command, pretty-printed arguments) shown when the row is expanded. */
   input?: string;
   /** Live tool output (streaming terminal stdout, tool result text). */
@@ -841,11 +843,16 @@ if (typeof window !== 'undefined') {
 }
 
 // Threads (full transcripts) are excluded from the persisted store above and
-// live in their own file on a slower save cadence — see the saver below the
+// live in sharded storage on a slower save cadence — see the saver below the
 // store definition. State shared with it:
 let threadsSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let threadsSaveFlush: Promise<boolean> | null = null;
-let lastPersistedThreads: Thread[] | null = null;
+type ThreadsPatch = { version: 2; upserts: Thread[]; deletes: string[]; order: string[] };
+const pendingThreadUpserts = new Map<string, Thread>();
+const pendingThreadDeletes = new Set<string>();
+let pendingThreadOrder = false;
+let threadsInFlightPatch: ThreadsPatch | null = null;
+let loadedThreadsFromStorage = false;
 // The threads reference at clearStorage time: zustand clears storage without
 // clearing in-memory state, so the savers must not write this exact snapshot
 // back to disk. A later thread change (fresh reference) resumes persistence.
@@ -883,6 +890,7 @@ const withThreadsGrafted = async (value: string | null): Promise<string | null> 
       threadsPersistenceBlocked = true;
       return value;
     }
+    loadedThreadsFromStorage = true;
     // A lost/corrupt store file must not take the transcripts with it.
     let parsed: { state: Record<string, unknown>; version?: number };
     try {
@@ -957,11 +965,12 @@ const orionStorage: StateStorage = {
     // A queued or future threads write after the clear would resurrect the
     // cleared transcripts (zustand leaves them in memory): drop the queued
     // timer and mark the current snapshot as not-to-be-rewritten, which the
-    // throttled saver (via lastPersistedThreads) and the unload flush (via
-    // clearedThreadsSnapshot) both honor.
+    // throttled saver and the unload flush both honor.
     cancelQueuedThreadsSave();
     clearedThreadsSnapshot = useOrionStore.getState().threads;
-    lastPersistedThreads = clearedThreadsSnapshot;
+    pendingThreadUpserts.clear();
+    pendingThreadDeletes.clear();
+    pendingThreadOrder = false;
     // An explicit clear discards whatever unreadable file blocked
     // persistence — new activity may persist fresh snapshots again.
     threadsPersistenceBlocked = false;
@@ -1904,8 +1913,10 @@ export const useOrionStore = create<OrionState>()(
 
       addActivityToThreadMessage: (threadId, messageId, activity) =>
         set((state) => {
+          const { detailDelta, ...activityFields } = activity;
           const nextActivity: AgentActivity = {
-            ...activity,
+            ...activityFields,
+            ...(detailDelta ? { detail: `${activity.detail ?? ''}${detailDelta}` } : {}),
             id: crypto.randomUUID(),
             ts: new Date().toISOString(),
           };
@@ -1914,7 +1925,7 @@ export const useOrionStore = create<OrionState>()(
           // call, its output only in the result). An explicit undefined must
           // not erase what the row already knows.
           const patch = Object.fromEntries(
-            Object.entries(activity).filter(([, value]) => value !== undefined)
+            Object.entries(activityFields).filter(([, value]) => value !== undefined)
           ) as Partial<AgentActivity>;
 
           return {
@@ -1938,6 +1949,9 @@ export const useOrionStore = create<OrionState>()(
                               ? {
                                   ...existing,
                                   ...patch,
+                                  ...(detailDelta
+                                    ? { detail: `${existing.detail ?? ''}${detailDelta}` }
+                                    : {}),
                                   ts: nextActivity.ts,
                                   contentOffset: existing.contentOffset,
                                 }
@@ -2327,10 +2341,10 @@ export const useOrionStore = create<OrionState>()(
   )
 );
 
-// The threads saver: serializes transcripts to their own file at most once
-// per THREADS_SAVE_MS (a streaming run mutates threads many times a second),
-// with a flush on unload. Reference equality is enough to detect changes —
-// every store update replaces the threads array.
+// The threads saver sends only changed transcripts at most once per
+// THREADS_SAVE_MS (a streaming run mutates a thread many times a second),
+// with a synchronous patch flush on unload. Zustand actions replace the
+// changed thread object, so reference identity identifies dirty transcripts.
 const THREADS_SAVE_MS = 5000;
 
 const scheduleThreadsSave = () => {
@@ -2353,35 +2367,38 @@ export const flushOrionThreadsSave = async (): Promise<boolean> => {
   if (!useOrionStore.persist.hasHydrated()) return false;
   if (threadsSaveFlush !== null) {
     if (!(await threadsSaveFlush)) return false;
-    // The in-flight write may have saved an older snapshot. Re-enter after it
-    // settles so callers only receive true once the current threads reached
-    // disk, not merely because an optimistic marker matched temporarily.
     return flushOrionThreadsSave();
   }
   const threads = useOrionStore.getState().threads;
-  if (threads === lastPersistedThreads) return true;
-  // Claim the marker optimistically so overlapping flushes don't double-save,
-  // but surrender it if the write fails: a snapshot only counts as persisted
-  // on a successful acknowledgement, otherwise nothing would ever retry and
-  // the unload flush would skip it by reference equality — during the split
-  // migration that could orphan the only copy of the transcripts.
-  lastPersistedThreads = threads;
-  const failed = () => {
-    console.warn('Failed to persist orion-threads; retrying');
-    // A newer snapshot may have claimed the marker meanwhile — its own
-    // save owns the retry then.
-    if (lastPersistedThreads === threads) {
-      lastPersistedThreads = null;
-      scheduleThreadsSave();
-    }
+  if (pendingThreadUpserts.size === 0 && pendingThreadDeletes.size === 0 && !pendingThreadOrder) return true;
+  const patch: ThreadsPatch = {
+    version: 2,
+    upserts: [...pendingThreadUpserts.values()],
+    deletes: [...pendingThreadDeletes],
+    order: threads.map((thread) => thread.id),
   };
+  for (const thread of patch.upserts) pendingThreadUpserts.delete(thread.id);
+  for (const id of patch.deletes) pendingThreadDeletes.delete(id);
+  pendingThreadOrder = false;
+  threadsInFlightPatch = patch;
   const save = (async () => {
     try {
-      const saved = await window.orion.saveThreads(JSON.stringify({ version: 1, threads }));
-      if (!saved) failed();
+      const saved = await window.orion.saveThreads(patch);
+      if (!saved) throw new Error('Thread patch was not acknowledged.');
       return saved;
-    } catch {
-      failed();
+    } catch (error) {
+      console.warn('Failed to persist Orion threads; retrying', error);
+      const currentById = new Map(useOrionStore.getState().threads.map((thread) => [thread.id, thread]));
+      for (const thread of patch.upserts) {
+        if (!pendingThreadUpserts.has(thread.id) && currentById.has(thread.id)) {
+          pendingThreadUpserts.set(thread.id, currentById.get(thread.id)!);
+        }
+      }
+      for (const id of patch.deletes) {
+        if (!pendingThreadUpserts.has(id) && !currentById.has(id)) pendingThreadDeletes.add(id);
+      }
+      pendingThreadOrder = true;
+      scheduleThreadsSave();
       return false;
     }
   })();
@@ -2389,6 +2406,7 @@ export const flushOrionThreadsSave = async (): Promise<boolean> => {
   try {
     return await save;
   } finally {
+    if (threadsInFlightPatch === patch) threadsInFlightPatch = null;
     if (threadsSaveFlush === save) threadsSaveFlush = null;
   }
 };
@@ -2397,8 +2415,47 @@ const flushThreadsSave = () => {
   void flushOrionThreadsSave();
 };
 
-useOrionStore.subscribe((state) => {
-  if (state.threads === lastPersistedThreads) return;
+useOrionStore.subscribe((state, previous) => {
+  if (state.threads === previous.threads || !useOrionStore.persist.hasHydrated()) return;
+  if (state.threads.length === previous.threads.length) {
+    let sameOrder = true;
+    let changed = false;
+    for (let index = 0; index < state.threads.length; index += 1) {
+      const thread = state.threads[index];
+      const prior = previous.threads[index];
+      if (thread.id !== prior.id) {
+        sameOrder = false;
+        break;
+      }
+      if (thread !== prior) {
+        pendingThreadUpserts.set(thread.id, thread);
+        pendingThreadDeletes.delete(thread.id);
+        changed = true;
+      }
+    }
+    // Streaming updates keep array order stable and replace only the active
+    // thread. Avoid allocating two 888-entry maps for every output chunk.
+    if (sameOrder) {
+      if (changed) scheduleThreadsSave();
+      return;
+    }
+  }
+  const previousById = new Map(previous.threads.map((thread) => [thread.id, thread]));
+  const currentIds = new Set<string>();
+  for (const thread of state.threads) {
+    currentIds.add(thread.id);
+    if (previousById.get(thread.id) !== thread) {
+      pendingThreadUpserts.set(thread.id, thread);
+      pendingThreadDeletes.delete(thread.id);
+    }
+  }
+  for (const thread of previous.threads) {
+    if (!currentIds.has(thread.id)) {
+      pendingThreadUpserts.delete(thread.id);
+      pendingThreadDeletes.add(thread.id);
+    }
+  }
+  pendingThreadOrder = true;
   scheduleThreadsSave();
 });
 
@@ -2406,8 +2463,20 @@ useOrionStore.subscribe((state) => {
 // throttle-window later: the store file stops embedding threads on its first
 // post-hydration save, so until this flush runs the transcripts exist only in
 // memory and a crash would lose them.
-useOrionStore.persist.onFinishHydration(() => flushThreadsSave());
-if (useOrionStore.persist.hasHydrated()) flushThreadsSave();
+useOrionStore.persist.onFinishHydration(() => {
+  if (!loadedThreadsFromStorage && !threadsPersistenceBlocked) {
+    for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
+    pendingThreadOrder = true;
+  }
+  flushThreadsSave();
+});
+if (useOrionStore.persist.hasHydrated()) {
+  if (!loadedThreadsFromStorage && !threadsPersistenceBlocked) {
+    for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
+    pendingThreadOrder = true;
+  }
+  flushThreadsSave();
+}
 
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
@@ -2420,15 +2489,32 @@ if (typeof window !== 'undefined') {
     // An async IPC save started here races app teardown — Electron can exit
     // before the promise settles, dropping up to a throttle-window of
     // transcript. Block the unload on a synchronous write instead.
-    // Unconditional (no lastPersistedThreads check): an optimistically
-    // claimed in-flight async save may never commit once the process exits.
+    // Include in-flight ids unconditionally: an async patch may never commit
+    // once the renderer exits.
     if (window.orion?.saveThreadsSync) {
       const threads = useOrionStore.getState().threads;
       // Cleared storage must stay cleared — don't write the lingering
       // in-memory snapshot back.
       if (threads === clearedThreadsSnapshot) return;
-      window.orion.saveThreadsSync(JSON.stringify({ version: 1, threads }));
-      lastPersistedThreads = threads;
+      const currentById = new Map(threads.map((thread) => [thread.id, thread]));
+      const affectedIds = new Set<string>([
+        ...pendingThreadUpserts.keys(),
+        ...pendingThreadDeletes,
+        ...(threadsInFlightPatch?.upserts.map((thread) => thread.id) ?? []),
+        ...(threadsInFlightPatch?.deletes ?? []),
+      ]);
+      const patch: ThreadsPatch = {
+        version: 2,
+        upserts: [...affectedIds].flatMap((id) => {
+          const thread = currentById.get(id);
+          return thread ? [thread] : [];
+        }),
+        deletes: [...affectedIds].filter((id) => !currentById.has(id)),
+        order: threads.map((thread) => thread.id),
+      };
+      if (patch.upserts.length > 0 || patch.deletes.length > 0 || pendingThreadOrder) {
+        window.orion.saveThreadsSync(patch);
+      }
     } else {
       flushThreadsSave();
     }

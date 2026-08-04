@@ -139,12 +139,14 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
   };
 
   const sendReasoning = (sub, status = 'running') => {
-    const detail = sub.reasoningText.trim();
-    if (!detail) return;
+    const detailDelta = sub.pendingReasoning;
+    sub.pendingReasoning = '';
+    if (!detailDelta && !sub.reasoningEmitted) return;
+    sub.reasoningEmitted = true;
     emit({
       type: 'subagent-activity',
       subagentId: sub.meta.id,
-      activity: { key: 'reasoning', type: 'thought', title: 'Reasoning', detail, status },
+      activity: { key: 'reasoning', type: 'thought', title: 'Reasoning', detailDelta, status },
     });
   };
 
@@ -166,7 +168,7 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
     },
     reasoning: (delta) => {
       if (!delta) return;
-      sub.reasoningText = `${sub.reasoningText}${delta}`;
+      sub.pendingReasoning = `${sub.pendingReasoning}${delta}`;
       const elapsed = Date.now() - sub.lastReasoningAt;
       if (elapsed >= SUBAGENT_REASONING_EMIT_MS) {
         sub.lastReasoningAt = Date.now();
@@ -225,7 +227,8 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
     const sub = {
       meta: { providerId, status: 'running', startedAt: Date.now(), ...meta },
       knownToolActivities: new Map(),
-      reasoningText: '',
+      pendingReasoning: '',
+      reasoningEmitted: false,
       reasoningTimer: null,
       lastReasoningAt: 0,
       ctx: {},

@@ -271,6 +271,8 @@ tracker.start(
     resolveFile: async () => trackerFile,
     handleLine: (_value, trackerApi) => {
       trackerApi.text('native child output');
+      trackerApi.reasoning('first thought');
+      trackerApi.reasoning(' and second thought');
       trackerApi.activity({
         key: 'tool-1',
         type: 'tool',
@@ -280,7 +282,7 @@ tracker.start(
     },
   }
 );
-await new Promise((resolve) => setTimeout(resolve, 400));
+await new Promise((resolve) => setTimeout(resolve, 700));
 for (const type of ['subagent', 'subagent-chunk', 'subagent-activity']) {
   assert.equal(
     emitted.find((event) => event.type === type)?.providerId,
@@ -288,6 +290,18 @@ for (const type of ['subagent', 'subagent-chunk', 'subagent-activity']) {
     `${type} events must carry the configured tracker provider`
   );
 }
+const reasoningEvents = emitted.filter(
+  (event) => event.type === 'subagent-activity' && event.activity?.type === 'thought'
+);
+assert.deepEqual(
+  reasoningEvents.map((event) => event.activity.detailDelta).join(''),
+  'first thought and second thought',
+  'reasoning activity transport must send append-only deltas'
+);
+assert.ok(
+  reasoningEvents.every((event) => event.activity.detail === undefined),
+  'reasoning activity transport must not resend the cumulative detail'
+);
 tracker.finish('short-task');
 assert.equal(
   stepUpdates.at(-1)?.status,
