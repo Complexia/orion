@@ -71,7 +71,12 @@ Useful overrides:
 bun run deploy --bump minor
 bun run deploy --version 1.2.3
 bun run deploy --bump none
+bun run deploy --resume-upload
 ```
+
+Use `--resume-upload` after a network failure during artifact upload. It reuses
+the existing versioned artifacts after verifying their signatures and
+notarization instead of rebuilding or bumping the version again.
 
 ## Extending
 

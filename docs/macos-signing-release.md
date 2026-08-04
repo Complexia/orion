@@ -70,6 +70,14 @@ Useful overrides:
 bun run deploy --bump minor
 bun run deploy --version 1.2.3
 bun run deploy --bump none
+bun run deploy --resume-upload
+```
+
+If signing and notarization completed but an artifact upload failed, resume the
+same version without rebuilding or submitting it to Apple again:
+
+```bash
+bun run deploy --resume-upload
 ```
 
 If Apple accepts a submitted DMG after the local wait was interrupted, resume without rebuilding or resubmitting:

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -16,7 +16,11 @@ const args = parseArgs(process.argv.slice(2));
 const platform = args.platform ?? process.platform;
 const arch = args.arch ?? process.arch;
 const osName = platform === 'darwin' ? 'macos' : platform === 'win32' ? 'windows' : 'linux';
-const bump = args.bump ?? (args.resumeNotaryId ? 'none' : 'patch');
+if (args.resumeNotaryId && args.resumeUpload) {
+  throw new Error('Use either --resume-notary-id or --resume-upload, not both.');
+}
+
+const bump = args.bump ?? (args.resumeNotaryId || args.resumeUpload ? 'none' : 'patch');
 const isMacRelease = platform === 'darwin';
 const macSigningIdentity = process.env.ORION_MAC_SIGN_IDENTITY
   ?? 'Developer ID Application: R&R Unicorns, LLC (KV46DBU287)';
@@ -46,11 +50,13 @@ if (version !== currentVersion) {
   console.log(`Bumped Orion from ${currentVersion} to ${version}`);
 } else if (args.resumeNotaryId) {
   console.log(`Resuming Orion ${version} notarization submission ${args.resumeNotaryId}`);
+} else if (args.resumeUpload) {
+  console.log(`Resuming Orion ${version} artifact upload`);
 } else {
   console.log(`Building Orion ${version}`);
 }
 
-if (!args.resumeNotaryId) {
+if (!args.resumeNotaryId && !args.resumeUpload) {
   await fs.rm(path.join(rootDir, 'out', 'make'), { recursive: true, force: true });
   run('bun', ['run', 'make', '--', `--platform=${platform}`, `--arch=${arch}`]);
 }
@@ -59,11 +65,18 @@ const artifactPaths = await findArtifacts(path.join(rootDir, 'out', 'make'));
 if (artifactPaths.length === 0) {
   throw new Error('No distributable artifacts were produced in out/make');
 }
+if (args.resumeUpload) {
+  verifyArtifactVersions(artifactPaths, version);
+}
 
 if (isMacRelease) {
   const macAppPath = await findMacApp(arch);
   await verifyMacAppSignature(macAppPath);
-  await notarizeMacArtifacts(artifactPaths, macAppPath, macSigningIdentity, macNotaryProfile, args.resumeNotaryId);
+  if (args.resumeUpload) {
+    await verifyNotarizedMacArtifacts(artifactPaths, macAppPath);
+  } else {
+    await notarizeMacArtifacts(artifactPaths, macAppPath, macSigningIdentity, macNotaryProfile, args.resumeNotaryId);
+  }
   await assessMacApp(macAppPath);
 }
 
@@ -89,10 +102,9 @@ for (const artifactPath of artifactPaths) {
   const sha512 = await sha512File(artifactPath);
   const contentType = contentTypeFor(ext);
 
-  await client.send(new PutObjectCommand({
+  const upload = {
     Bucket: config.bucket,
     Key: key,
-    Body: createReadStream(artifactPath),
     ContentLength: stat.size,
     ContentType: contentType,
     CacheControl: 'public, max-age=31536000, immutable',
@@ -108,7 +120,20 @@ for (const artifactPath of artifactPaths) {
       notarized: macSignedRelease ? 'true' : 'false',
       unsigned: macSignedRelease ? 'false' : 'true',
     },
-  }));
+  };
+
+  await sendWithRetry(
+    async () => {
+      const body = createReadStream(artifactPath);
+      try {
+        return await client.send(new PutObjectCommand({ ...upload, Body: body }));
+      } finally {
+        body.destroy();
+      }
+    },
+    `upload ${key}`,
+  );
+  await verifyUploadedArtifact(client, config.bucket, key, stat.size, sha256);
 
   artifacts.push({
     kind,
@@ -173,6 +198,7 @@ function parseArgs(argv) {
     else if (value.startsWith('--arch=')) parsed.arch = value.split('=')[1];
     else if (value === '--resume-notary-id') parsed.resumeNotaryId = argv[++index];
     else if (value.startsWith('--resume-notary-id=')) parsed.resumeNotaryId = value.split('=')[1];
+    else if (value === '--resume-upload') parsed.resumeUpload = true;
     else throw new Error(`Unknown argument: ${value}`);
   }
   return parsed;
@@ -294,6 +320,21 @@ async function verifyMacDmgSignature(dmgPath) {
   run('codesign', ['--verify', '--verbose=2', dmgPath]);
 }
 
+async function verifyNotarizedMacArtifacts(artifactPaths, appPath) {
+  const dmgPaths = artifactPaths.filter((artifactPath) => path.extname(artifactPath).toLowerCase() === '.dmg');
+  if (dmgPaths.length === 0) {
+    throw new Error('macOS release did not produce a DMG to verify');
+  }
+
+  for (const dmgPath of dmgPaths) {
+    await verifyMacDmgSignature(dmgPath);
+    run('xcrun', ['stapler', 'validate', dmgPath]);
+    run('spctl', ['-a', '-vvv', '-t', 'open', '--context', 'context:primary-signature', dmgPath]);
+  }
+
+  run('xcrun', ['stapler', 'validate', appPath]);
+}
+
 async function stapleMacApp(appPath, zipPaths, keychainProfile, resumeNotaryId) {
   console.log(`Stapling notarization ticket to app: ${path.relative(rootDir, appPath)}`);
   if (tryRun('xcrun', ['stapler', 'staple', appPath])) return;
@@ -362,6 +403,17 @@ async function findArtifacts(dir) {
     .sort();
 }
 
+function verifyArtifactVersions(artifactPaths, version) {
+  const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const versionPattern = new RegExp(`(^|[-_])${escapedVersion}(?=\\.|[-_]|$)`);
+  const mismatches = artifactPaths.filter((artifactPath) => !versionPattern.test(path.basename(artifactPath)));
+  if (mismatches.length > 0) {
+    throw new Error(
+      `Cannot resume Orion ${version}: artifact version does not match: ${mismatches.map((entry) => path.basename(entry)).join(', ')}`,
+    );
+  }
+}
+
 async function walk(dir) {
   let entries;
   try {
@@ -423,12 +475,56 @@ function contentTypeFor(ext) {
 }
 
 async function uploadJson(client, bucket, key, value, cacheControl) {
-  await client.send(new PutObjectCommand({
-    Bucket: bucket,
-    Key: key,
-    Body: JSON.stringify(value, null, 2),
-    ContentType: 'application/json; charset=utf-8',
-    CacheControl: cacheControl,
-  }));
+  await sendWithRetry(
+    () => client.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: JSON.stringify(value, null, 2),
+      ContentType: 'application/json; charset=utf-8',
+      CacheControl: cacheControl,
+    })),
+    `upload ${key}`,
+  );
   console.log(`Uploaded ${key}`);
+}
+
+async function verifyUploadedArtifact(client, bucket, key, expectedSize, expectedSha256) {
+  const result = await sendWithRetry(
+    () => client.send(new HeadObjectCommand({ Bucket: bucket, Key: key })),
+    `verify ${key}`,
+  );
+  if (result.ContentLength !== expectedSize) {
+    throw new Error(`Uploaded ${key} has size ${result.ContentLength}; expected ${expectedSize}`);
+  }
+  if (result.Metadata?.sha256 !== expectedSha256) {
+    throw new Error(`Uploaded ${key} has an unexpected sha256 metadata value`);
+  }
+}
+
+async function sendWithRetry(operation, label, maxAttempts = 4) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (attempt === maxAttempts || !isRetryableTransportError(error)) throw error;
+      const delayMs = 1000 * 2 ** (attempt - 1);
+      console.warn(`${label} failed because of a transient network error; retrying in ${delayMs / 1000}s (${attempt}/${maxAttempts})`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw new Error(`${label} failed`);
+}
+
+function isRetryableTransportError(error) {
+  const code = String(error?.code ?? error?.cause?.code ?? '');
+  const message = String(error?.message ?? '');
+  return [
+    'ECONNRESET',
+    'EPIPE',
+    'ETIMEDOUT',
+    'EAI_AGAIN',
+    'ENETDOWN',
+    'ENETUNREACH',
+    'ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC',
+  ].includes(code) || /bad record mac|socket hang up|network connection was lost/i.test(message);
 }
