@@ -423,8 +423,12 @@ type OrionComputerUsePermissions = {
     orion: {
       loadStore: () => Promise<string | null>;
       saveStore: (value: string) => Promise<boolean>;
-      /** ok:false = read/parse failure (suppress thread persistence); value null = file genuinely absent. */
-      loadThreads: () => Promise<{ ok: boolean; value?: string | null }>;
+      /** Bounded, revision-consistent transcript hydration. ok:false suppresses thread persistence. */
+      loadThreadsPage: (input: {
+        offset?: number;
+        revision?: number;
+        maxBytes?: number;
+      }) => Promise<{ ok: boolean; value?: string }>;
       saveThreads: (value: {
         version: 2;
         upserts: import('./store').Thread[];

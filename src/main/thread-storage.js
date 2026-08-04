@@ -14,6 +14,9 @@ import { getThreadsDirectoryPath, getThreadsFilePath } from './paths.js';
 const MANIFEST_VERSION = 2;
 const MANIFEST_FILE = 'manifest.json';
 const LEGACY_BACKUP_FILE = 'orion-threads.v1-backup.json';
+const DEFAULT_PAGE_BYTES = 4 * 1024 * 1024;
+const MAX_PAGE_BYTES = 8 * 1024 * 1024;
+const PAGE_ENVELOPE_BYTES = 512;
 let initializingStorage = false;
 
 const threadFileName = (id, hash) =>
@@ -304,6 +307,92 @@ export const readAllThreads = async () => {
     threads.push(await readEntry(entry));
   }
   return threads;
+};
+
+// Startup hydration deliberately reads bounded pages. Returning the entire
+// transcript corpus through one IPC response caused Electron's main process
+// to retain multi-gigabyte PartitionAlloc/Mojo regions after deserializing a
+// comparatively modest history file.
+export const readThreadsPage = async ({ offset = 0, revision, maxBytes = DEFAULT_PAGE_BYTES } = {}) => {
+  if (!Number.isInteger(offset) || offset < 0) throw new Error('Invalid Orion threads page offset.');
+  if (revision !== undefined && (!Number.isInteger(revision) || revision < 0)) {
+    throw new Error('Invalid Orion threads page revision.');
+  }
+  const requestedBytes = Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : DEFAULT_PAGE_BYTES;
+  const pageBytes = Math.min(Math.max(requestedBytes, PAGE_ENVELOPE_BYTES * 2), MAX_PAGE_BYTES);
+  const manifest = await ensureManifest();
+  if (!manifest) {
+    return {
+      version: MANIFEST_VERSION,
+      present: false,
+      stale: false,
+      revision: 0,
+      offset: 0,
+      total: 0,
+      threads: [],
+      nextOffset: null,
+    };
+  }
+
+  const manifestRevision = manifest.revision ?? 0;
+  if (revision !== undefined && revision !== manifestRevision) {
+    return {
+      version: MANIFEST_VERSION,
+      present: true,
+      stale: true,
+      revision: manifestRevision,
+      offset: 0,
+      total: manifest.entries.length,
+      threads: [],
+      nextOffset: 0,
+    };
+  }
+  if (offset > manifest.entries.length) throw new Error('Invalid Orion threads page offset.');
+
+  const threads = [];
+  const contentBudget = pageBytes - PAGE_ENVELOPE_BYTES;
+  let contentBytes = 0;
+  let cursor = offset;
+  while (cursor < manifest.entries.length) {
+    const thread = await readEntry(manifest.entries[cursor]);
+    const threadBytes = Buffer.byteLength(JSON.stringify(thread), 'utf8');
+    if (threadBytes + PAGE_ENVELOPE_BYTES > MAX_PAGE_BYTES) {
+      throw new Error(`Stored Orion thread ${thread.id} exceeds the IPC page limit.`);
+    }
+    const separatorBytes = threads.length > 0 ? 1 : 0;
+    if (threads.length > 0 && contentBytes + separatorBytes + threadBytes > contentBudget) break;
+    threads.push(thread);
+    contentBytes += separatorBytes + threadBytes;
+    cursor += 1;
+  }
+
+  // A write may commit while this page is being read. Never return a page
+  // labelled with the old revision if any entry could have been replaced.
+  const latest = await ensureManifest();
+  const latestRevision = latest?.revision ?? 0;
+  if (!latest || latestRevision !== manifestRevision) {
+    return {
+      version: MANIFEST_VERSION,
+      present: Boolean(latest),
+      stale: true,
+      revision: latestRevision,
+      offset: 0,
+      total: latest?.entries.length ?? 0,
+      threads: [],
+      nextOffset: 0,
+    };
+  }
+
+  return {
+    version: MANIFEST_VERSION,
+    present: true,
+    stale: false,
+    revision: manifestRevision,
+    offset,
+    total: manifest.entries.length,
+    threads,
+    nextOffset: cursor < manifest.entries.length ? cursor : null,
+  };
 };
 
 export const writeThreadsPatch = async (patch) => {
