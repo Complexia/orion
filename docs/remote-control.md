@@ -11,9 +11,13 @@ Off by default. While it is off, nothing listens and nothing connects.
 ## Using it
 
 **On the machine to be controlled (the host):** Settings → Remote Control →
-enable *Remote control*, then *Allow this machine to be controlled*. Press
-**Generate code** and note the code, plus either the address and port (LAN/VPN)
-or the machine ID (internet) shown next to it.
+enable *Remote control*. Press **Generate code** and note the code, plus
+either the address and port (LAN/VPN) or the machine ID (internet) shown next
+to it. Enabling remote control implies the machine may be controlled — there
+is no separate "allow incoming" switch in the UI; pairing codes are what gate
+every actual connection. (The engine still honors
+`remoteControlSettings.allowIncoming`, which the UI keeps in lockstep with
+`enabled`.)
 
 **On the controlling machine:** Settings → Remote Control → enable *Remote
 control*, then under "Machines you can control" enter the host's address and
@@ -32,7 +36,7 @@ listener.
 
 ## Connection modes
 
-*Reach this machine over the internet* (`remoteControlSettings.connectionMode`)
+*Connect over the internet* (`remoteControlSettings.connectionMode`)
 picks how the two machines find each other. It changes nothing about the
 encryption, the authentication, or what a controller may do.
 
@@ -44,7 +48,19 @@ encryption, the authentication, or what a controller may do.
 In internet mode, the host registers itself (`POST /api/relay/devices`) and
 mints a short-lived relay ticket per socket (`POST /api/relay/ticket`), both
 authenticated with the desktop account token. Settings shows whether the
-machine is currently online at the relay.
+machine is currently online at the relay. The control socket carries a
+liveness watchdog: the relay pings every 30 seconds, and 75 seconds with no
+inbound frame is treated as a half-open socket (sleep/wake, NAT rebind) — the
+listener tears it down and reconnects with backoff instead of reporting a dead
+connection as online.
+
+Turning internet mode **off does not deregister** the machine: it stays in the
+account's machine list at Orion Cloud and shows as offline, so controllers'
+lists stay stable. The explicit **Remove from Orion Cloud** action in Settings
+(`remote:relayDeregister` → `DELETE /api/relay/devices/:machineId`) is what
+deletes the registration; re-enabling internet mode re-registers it (the
+listener forgets its cached registration on every stop, so a fresh start
+always re-POSTs and revives a soft-deleted row).
 
 **Route choice on the controller** is deliberately boring: direct first when
 the machine has a known address, relay second when internet mode is on. No

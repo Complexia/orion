@@ -54,6 +54,7 @@ import {
   cancelRemotePairing,
   configureRemoteControl,
   connectRemoteMachine,
+  deregisterRelayMachine,
   disconnectRemoteMachine,
   fetchRemoteSnapshot,
   fetchRemoteThread,
@@ -527,11 +528,12 @@ const getOrionRelayUrl = () => {
  * token authenticates THESE calls and never leaves this function: what comes
  * back is a short-lived relay ticket, and that is all the relay ever sees.
  */
-const relayApiRequest = async (apiPath, body, { signal } = {}) => {
+const relayApiRequest = async (apiPath, body, { signal, method } = {}) => {
   const session = await readAccountSession();
   if (!session?.token) throw new Error('Sign in to your Orion account first.');
   const { response, data } = await fetchRelayApiJson({
     url: new URL(apiPath, getOrionWebUrl()),
+    method,
     token: session.token,
     body,
     signal,
@@ -549,6 +551,12 @@ const relayApiRequest = async (apiPath, body, { signal } = {}) => {
 
 const registerRelayDevice = ({ machineId, name, platform, appVersion, signal }) =>
   relayApiRequest('/api/relay/devices', { machineId, name, platform, appVersion }, { signal });
+
+const deregisterRelayDevice = ({ machineId, signal }) =>
+  relayApiRequest(`/api/relay/devices/${encodeURIComponent(machineId)}`, undefined, {
+    method: 'DELETE',
+    signal,
+  });
 
 const mintRelayTicket = async ({ role, machineId, signal }) => {
   const data = await relayApiRequest('/api/relay/ticket', { role, machineId }, { signal });
@@ -1007,6 +1015,7 @@ app.whenReady().then(async () => {
     createRemotePairingProof,
     verifyRemotePairingProof,
     registerRelayDevice,
+    deregisterRelayDevice,
     mintRelayTicket,
     getAppVersion: () => app.getVersion(),
   });
@@ -1408,6 +1417,7 @@ ipcMain.handle('remote:configure', (_event, value) => configureRemoteControl(val
 ipcMain.handle('remote:startPairing', () => startRemotePairing());
 ipcMain.handle('remote:cancelPairing', () => cancelRemotePairing());
 ipcMain.handle('remote:revokeDevice', (_event, input) => revokeRemoteDevice(input));
+ipcMain.handle('remote:relayDeregister', () => deregisterRelayMachine());
 ipcMain.handle('remote:pair', (_event, input) => pairWithRemoteHost(input));
 ipcMain.handle('remote:removeMachine', (_event, input) => removeRemoteMachine(input));
 ipcMain.handle('remote:connectMachine', (_event, input) => connectRemoteMachine(input));

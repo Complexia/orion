@@ -148,6 +148,31 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
     }
   };
 
+  const handleRelayDeregister = async () => {
+    setError(null);
+    setBusyId('relay-deregister');
+    try {
+      // Leave internet mode first so a reconnect cannot re-register the
+      // machine in the same breath, then delete the registration.
+      if (settings.connectionMode === 'relay') {
+        setRemoteControlSettings({ connectionMode: 'direct' });
+      }
+      const result = await window.orion?.remoteRelayDeregister?.();
+      if (!mountedRef.current) return;
+      if (result?.ok) {
+        setNotice('This machine was removed from your machine list at Orion Cloud.');
+      } else {
+        setError(result?.error ?? 'Could not remove this machine from Orion Cloud.');
+      }
+    } catch (cause) {
+      if (mountedRef.current) {
+        setError(remoteControlErrorMessage(cause, 'Could not remove this machine from Orion Cloud.'));
+      }
+    } finally {
+      if (mountedRef.current) setBusyId(null);
+    }
+  };
+
   const handleRevokeDevice = async (deviceId: string) => {
     setBusyId(deviceId);
     try {
@@ -228,9 +253,10 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
           <div className="setting-label">
             <div className="setting-label-title">Enable remote control</div>
             <div className="setting-label-desc">
-              Off by default. When enabled, a Machines section appears in the sidebar and this
-              machine can view and drive the Orion instances it is paired with. Pairing is
-              end-to-end encrypted and both machines must be signed in to the same Orion account.
+              Off by default. When enabled, this machine can drive the Orion instances it is
+              paired with — and devices you pair with a code generated here can drive this one.
+              Everything is end-to-end encrypted and requires your own Orion account on both ends;
+              nothing can connect without a pairing code.
               {!authenticated && !settings.enabled && ' Sign in on the Account tab to enable.'}
             </div>
           </div>
@@ -246,7 +272,11 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
               type="checkbox"
               checked={settings.enabled}
               disabled={!authenticated && !settings.enabled}
-              onChange={(e) => setRemoteControlSettings({ enabled: e.target.checked })}
+              onChange={(e) =>
+                // One switch: being controllable is what remote control means
+                // here. Pairing codes still gate every actual connection.
+                setRemoteControlSettings({ enabled: e.target.checked, allowIncoming: e.target.checked })
+              }
             />
             <span />
           </label>
@@ -254,41 +284,21 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
 
         <div className="setting-row">
           <div className="setting-label">
-            <div className="setting-label-title">Allow this machine to be controlled</div>
+            <div className="setting-label-title">Connect over the internet</div>
             <div className="setting-label-desc">
-              Listens for connections from your paired machines so they can drive this Orion
-              instance. Only devices paired with a code generated here — under your own account —
-              can connect. Turn it off to instantly drop every remote session.
-            </div>
-          </div>
-          <label className="provider-toggle" title="Let paired machines control this Orion instance">
-            <input
-              type="checkbox"
-              checked={settings.allowIncoming}
-              disabled={!settings.enabled || !authenticated}
-              onChange={(e) => setRemoteControlSettings({ allowIncoming: e.target.checked })}
-            />
-            <span />
-          </label>
-        </div>
-
-        <div className="setting-row">
-          <div className="setting-label">
-            <div className="setting-label-title">Reach this machine over the internet</div>
-            <div className="setting-label-desc">
-              Off: remote-control traffic stays on your own network — the same Wi-Fi, or a VPN like
-              Tailscale — and does not use Orion Cloud&apos;s relay. Pairing still contacts Orion Cloud
-              briefly to verify that both machines use the same Orion account.
+              On: Orion Cloud relays the encrypted connection, so your other machines and{' '}
+              <code>app.orioncode.xyz</code> can reach this machine from anywhere — no port
+              forwarding. The relay cannot read your traffic.
               <br />
-              On: Orion Cloud brokers the connection, so your machines can reach each other from
-              anywhere without opening a port. It only passes the encrypted bytes along — it cannot
-              read what you send, and it cannot control either machine.
-              {overInternet && relay?.enabled && (
+              Off: your own network only — same Wi-Fi or a VPN like Tailscale — and nothing
+              contacts Orion Cloud&apos;s relay. Turning this off keeps the machine in your web
+              machine list, shown as offline.
+              {overInternet && settings.enabled && (
                 <>
                   {' '}
-                  {relay.online
-                    ? 'This machine is online at Orion Cloud and can be reached by its machine ID.'
-                    : `This machine is not reachable over the internet right now${relay.error ? `: ${relay.error}` : '.'}`}
+                  {relay?.online
+                    ? 'This machine is online at Orion Cloud right now.'
+                    : `This machine is not reachable over the internet right now${relay?.error ? `: ${relay.error}` : '.'}`}
                 </>
               )}
             </div>
@@ -302,8 +312,8 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
             className="provider-toggle"
             title={
               overInternet
-                ? 'Stop using Orion Cloud and go back to your own network only'
-                : 'Let your machines reach each other from anywhere, brokered by Orion Cloud'
+                ? 'Go back to your own network only (the machine stays listed at Orion Cloud as offline)'
+                : 'Let your machines and the web app reach this machine from anywhere'
             }
           >
             <input
@@ -317,6 +327,29 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
             <span />
           </label>
         </div>
+
+        {settings.enabled && authenticated && (
+          <div className="setting-row">
+            <div className="setting-label">
+              <div className="setting-label-title">Remove from Orion Cloud</div>
+              <div className="setting-label-desc">
+                Deletes this machine from your machine list at <code>app.orioncode.xyz</code> and
+                turns off the internet connection. Pairings are unaffected; enabling
+                “Connect over the internet” again re-registers it.
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn secondary small"
+              disabled={busyId === 'relay-deregister'}
+              title="Remove this machine from your Orion Cloud machine list"
+              onClick={() => void handleRelayDeregister()}
+            >
+              <Trash2 size={13} />
+              Remove
+            </button>
+          </div>
+        )}
 
         <div className="setting-row">
           <div className="setting-label">
@@ -353,7 +386,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
       {remoteState?.error && <div className="skills-message error">{remoteState.error}</div>}
       {(error || notice) && <div className={`skills-message${error ? ' error' : ''}`}>{error || notice}</div>}
 
-      {engineReady && settings.enabled && settings.allowIncoming && (
+      {engineReady && settings.enabled && (
         <>
           <div className="settings-group-label">Pair a new device</div>
           <div className="settings-group">
@@ -445,8 +478,8 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
               <div className="setting-row">
                 <div className="setting-label">
                   <div className="setting-label-desc">
-                    No machines yet. On the other machine, enable “Allow this machine to be
-                    controlled” and generate a pairing code, then add it below.
+                    No machines yet. On the other machine, enable remote control and generate a
+                    pairing code, then add it below.
                   </div>
                 </div>
               </div>

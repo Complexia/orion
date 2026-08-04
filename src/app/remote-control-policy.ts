@@ -6,6 +6,10 @@ export const remoteThreadRunError = (modelId: string) =>
     ? 'Claude Code CLI terminal threads cannot be run through Remote Control because their output is only available in the host terminal.'
     : null;
 
+// A pairing code is usable over ANY live inbound route. In internet mode the
+// LAN listener stays up too, so a relay outage must not disable "Generate
+// code" while a LAN/VPN pair would still succeed — this mirrors the engine's
+// own hostAcceptingConnections() (listening || relay listener).
 export const canGenerateRemotePairingCode = ({
   connectionMode,
   hostListening,
@@ -14,7 +18,7 @@ export const canGenerateRemotePairingCode = ({
   connectionMode: 'direct' | 'relay';
   hostListening: boolean;
   relayOnline: boolean;
-}) => (connectionMode === 'relay' ? relayOnline : hostListening);
+}) => hostListening || (connectionMode === 'relay' && relayOnline);
 
 export const remoteControlIsAuthenticated = (
   accountAuthenticated: boolean,

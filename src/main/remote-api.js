@@ -67,6 +67,7 @@ export const fetchRemotePairingProofJson = async ({
  */
 export const fetchRelayApiJson = async ({
   url,
+  method = 'POST',
   token,
   body,
   signal,
@@ -86,12 +87,12 @@ export const fetchRelayApiJson = async ({
 
   try {
     const response = await fetchImpl(url, {
-      method: 'POST',
+      method,
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify(body),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: controller.signal,
     });
     let data = null;

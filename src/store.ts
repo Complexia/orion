@@ -185,7 +185,10 @@ export const defaultWorkspaceSyncSettings: WorkspaceSyncSettings = {
  * section and lets this machine drive its paired hosts. `allowIncoming`
  * additionally lets paired machines drive THIS one (starts a listener on
  * `port`); it is meaningless while `enabled` is off or the user is signed
- * out — the main-process engine enforces both.
+ * out — the main-process engine enforces both. The settings UI keeps the two
+ * in lockstep (enabling remote control implies being controllable — pairing
+ * codes are still required for anything to connect); the field survives for
+ * the engine contract and persisted-state compatibility.
  */
 export type RemoteControlSettings = {
   enabled: boolean;
@@ -2155,6 +2158,13 @@ export const useOrionStore = create<OrionState>()(
         remoteControlSettings: {
           ...defaultRemoteControlSettings,
           ...state.remoteControlSettings,
+          // The settings UI no longer has a separate "allow this machine to
+          // be controlled" toggle: enabling remote control implies it. Lift
+          // configs saved before that simplification so the engine matches
+          // what the UI now shows.
+          allowIncoming:
+            state.remoteControlSettings?.enabled === true ||
+            state.remoteControlSettings?.allowIncoming === true,
         },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,

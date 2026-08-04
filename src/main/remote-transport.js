@@ -34,6 +34,12 @@ const CONNECT_TIMEOUT_MS = 10_000;
 const CLOSE_GRACE_MS = 3000;
 const RELAY_OPEN_TIMEOUT_MS = 15_000;
 const RELAY_HEALTHY_CONNECTION_MS = 30_000;
+// The relay pings the control socket every 30s. A socket that goes this long
+// without ANY inbound frame is half-open (sleep/wake, NAT rebind, network
+// change) — the OS never reports a close for those, so without this watchdog
+// the host believes it is online forever while the relay has long marked it
+// offline. 2.5 ping intervals tolerates one lost ping outright.
+const RELAY_CONTROL_IDLE_TIMEOUT_MS = 75_000;
 // Control messages are tiny (`ping` or a bounded stream id). Enforce the cap
 // in the WebSocket parser, before a hostile relay can materialize an enormous
 // string in JavaScript. The explicit length check below is defense in depth and
@@ -411,6 +417,7 @@ export const createRelayListener = ({
   onStatus,
   openTimeoutMs = RELAY_OPEN_TIMEOUT_MS,
   healthyConnectionMs = RELAY_HEALTHY_CONNECTION_MS,
+  idleTimeoutMs = RELAY_CONTROL_IDLE_TIMEOUT_MS,
   reconnectBaseMs = RECONNECT_BASE_MS,
   reconnectMaxMs = RECONNECT_MAX_MS,
   reconnectRandom = Math.random,
@@ -426,11 +433,42 @@ export const createRelayListener = ({
   const ticketControllers = new Set();
   let controlDispatcher = null;
   let controlHealthyTimer = null;
+  let controlIdleTimer = null;
 
   const clearControlHealthyTimer = (socket = null) => {
     if (!controlHealthyTimer || (socket && controlHealthyTimer.socket !== socket)) return;
     clearTimeout(controlHealthyTimer.timer);
     controlHealthyTimer = null;
+  };
+
+  const clearControlIdleTimer = (socket = null) => {
+    if (!controlIdleTimer || (socket && controlIdleTimer.socket !== socket)) return;
+    clearTimeout(controlIdleTimer.timer);
+    controlIdleTimer = null;
+  };
+
+  // Liveness watchdog: the relay pings every 30s, so a control socket with no
+  // inbound frames for idleTimeoutMs is half-open. `close` never fires for
+  // those sockets — tear it down ourselves and let the backoff reconnect.
+  const armControlIdleTimer = (socket) => {
+    if (stopped || control !== socket) return;
+    clearControlIdleTimer(socket);
+    const timer = setTimeout(() => {
+      if (stopped || control !== socket) return;
+      controlIdleTimer = null;
+      clearControlHealthyTimer(socket);
+      const dispatcher = controlDispatcher;
+      control = null;
+      controlDispatcher = null;
+      try {
+        socket.close();
+      } catch {}
+      void dispatcher?.destroy().catch(() => {});
+      publish(false, 'The relay connection went quiet; reconnecting.');
+      scheduleReconnect();
+    }, idleTimeoutMs);
+    timer.unref?.();
+    controlIdleTimer = { socket, timer };
   };
 
   const issueTicket = async (role) => {
@@ -514,6 +552,7 @@ export const createRelayListener = ({
   const rejectControlMessage = (socket, reason, code = 1008) => {
     if (control !== socket) return;
     clearControlHealthyTimer(socket);
+    clearControlIdleTimer(socket);
     const dispatcher = controlDispatcher;
     control = null;
     controlDispatcher = null;
@@ -628,14 +667,19 @@ export const createRelayListener = ({
       }, Math.max(1, healthyConnectionMs));
       timer.unref?.();
       controlHealthyTimer = { socket, timer };
+      armControlIdleTimer(socket);
       publish(true, null);
     });
-    socket.addEventListener('message', (event) => handleControlMessage(socket, event.data));
+    socket.addEventListener('message', (event) => {
+      armControlIdleTimer(socket);
+      handleControlMessage(socket, event.data);
+    });
     socket.addEventListener('error', () => {});
     socket.addEventListener('close', (event) => {
       if (openTimer) clearTimeout(openTimer);
       openTimer = null;
       clearControlHealthyTimer(socket);
+      clearControlIdleTimer(socket);
       void dispatcher.destroy().catch(() => {});
       if (control !== socket) return;
       control = null;
@@ -655,6 +699,7 @@ export const createRelayListener = ({
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = null;
       clearControlHealthyTimer();
+      clearControlIdleTimer();
       for (const controller of ticketControllers) controller.abort(new Error('Relay listener stopped.'));
       ticketControllers.clear();
       const socket = control;

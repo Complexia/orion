@@ -25,13 +25,16 @@ assert.match(remoteThreadRunError('claude:claude-code-cli'), /output is only ava
 assert.equal(remoteThreadRunError('claude:claude-sonnet-4-5'), null);
 console.log('ok  remote turns reject terminal-only threads before routing');
 
+// A relay outage must not disable pairing while the LAN listener is up: any
+// live inbound route makes a code usable, matching the engine's
+// hostAcceptingConnections().
 assert.equal(
   canGenerateRemotePairingCode({
     connectionMode: 'relay',
     hostListening: true,
     relayOnline: false,
   }),
-  false
+  true
 );
 assert.equal(
   canGenerateRemotePairingCode({
@@ -43,13 +46,29 @@ assert.equal(
 );
 assert.equal(
   canGenerateRemotePairingCode({
+    connectionMode: 'relay',
+    hostListening: false,
+    relayOnline: false,
+  }),
+  false
+);
+assert.equal(
+  canGenerateRemotePairingCode({
     connectionMode: 'direct',
     hostListening: true,
     relayOnline: false,
   }),
   true
 );
-console.log('ok  pairing-code readiness follows the selected connection route');
+assert.equal(
+  canGenerateRemotePairingCode({
+    connectionMode: 'direct',
+    hostListening: false,
+    relayOnline: true,
+  }),
+  false
+);
+console.log('ok  pairing-code readiness follows every live inbound route');
 
 assert.equal(remoteControlIsAuthenticated(true, true), true);
 assert.equal(remoteControlIsAuthenticated(true, false), false);
