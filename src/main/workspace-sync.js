@@ -53,7 +53,11 @@ let knownTranscriptHashes = new Map();
 let serverStateSeeded = false;
 // gitRoot -> complete refs/heads state successfully pushed.
 const pushedBranchStates = new Map();
-// gitRoot -> last auto-publish failure; retried only on explicit "Sync now".
+// gitRoot -> { message, branchState } of the last failed auto publish/push.
+// Retried when the repo's refs move or on explicit "Sync now" — never on the
+// unchanged state that just failed. Without this, a repo whose push can never
+// succeed (e.g. a pack too large for the server) was re-packed and re-uploaded
+// on every pass: gigabytes of pack data rebuilt and buffered each time.
 const publishFailures = new Map();
 // Runtime ownership of local Orion Cloud links. A link without an entry is
 // adopted by the first signed-in account that observes it; a later account
@@ -494,14 +498,16 @@ const syncCode = async (
     ensureCurrentSync(generation, signal);
     if (!branchState) continue; // empty repo — nothing to push yet
 
+    const priorFailure = publishFailures.get(gitRoot);
+    if (priorFailure && !retryFailedPublishes && priorFailure.branchState === branchState) {
+      failures.push(priorFailure.message);
+      continue;
+    }
+
     let link = null;
     try {
       link = await getCloudRepoLinkForOwner(gitRoot, ownerId, { generation, signal });
       if (!link) {
-        if (publishFailures.has(gitRoot) && !retryFailedPublishes) {
-          failures.push(publishFailures.get(gitRoot));
-          continue;
-        }
         const name = path
           .basename(gitRoot)
           .replace(/[^A-Za-z0-9._-]+/g, '-')
@@ -554,7 +560,7 @@ const syncCode = async (
     } catch (error) {
       if (isCancelledSync(error, generation, signal)) throw error;
       const failure = `${path.basename(gitRoot)}: ${error?.message || String(error)}`;
-      publishFailures.set(gitRoot, failure);
+      publishFailures.set(gitRoot, { message: failure, branchState });
       failures.push(failure);
     }
   }
