@@ -986,7 +986,8 @@ const withThreadsGrafted = async (value: string | null): Promise<string | null> 
     }
     parsed.state = { ...parsed.state, threads: storedThreads };
     return JSON.stringify(parsed);
-  } catch {
+  } catch (error) {
+    console.error('Failed to hydrate Orion threads', error);
     // Hydrating without the real transcript snapshot is survivable, but
     // persisting over it is not.
     threadsPersistenceBlocked = true;

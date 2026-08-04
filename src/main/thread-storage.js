@@ -15,7 +15,7 @@ const MANIFEST_VERSION = 2;
 const MANIFEST_FILE = 'manifest.json';
 const LEGACY_BACKUP_FILE = 'orion-threads.v1-backup.json';
 const DEFAULT_PAGE_BYTES = 4 * 1024 * 1024;
-const MAX_PAGE_BYTES = 8 * 1024 * 1024;
+const MAX_REQUESTED_PAGE_BYTES = 8 * 1024 * 1024;
 const PAGE_ENVELOPE_BYTES = 512;
 let initializingStorage = false;
 
@@ -319,7 +319,7 @@ export const readThreadsPage = async ({ offset = 0, revision, maxBytes = DEFAULT
     throw new Error('Invalid Orion threads page revision.');
   }
   const requestedBytes = Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : DEFAULT_PAGE_BYTES;
-  const pageBytes = Math.min(Math.max(requestedBytes, PAGE_ENVELOPE_BYTES * 2), MAX_PAGE_BYTES);
+  const pageBytes = Math.min(Math.max(requestedBytes, PAGE_ENVELOPE_BYTES * 2), MAX_REQUESTED_PAGE_BYTES);
   const manifest = await ensureManifest();
   if (!manifest) {
     return {
@@ -356,11 +356,11 @@ export const readThreadsPage = async ({ offset = 0, revision, maxBytes = DEFAULT
   while (cursor < manifest.entries.length) {
     const thread = await readEntry(manifest.entries[cursor]);
     const threadBytes = Buffer.byteLength(JSON.stringify(thread), 'utf8');
-    if (threadBytes + PAGE_ENVELOPE_BYTES > MAX_PAGE_BYTES) {
-      throw new Error(`Stored Orion thread ${thread.id} exceeds the IPC page limit.`);
-    }
     const separatorBytes = threads.length > 0 ? 1 : 0;
     if (threads.length > 0 && contentBytes + separatorBytes + threadBytes > contentBudget) break;
+    // An individual transcript can exceed the target. Return it alone rather
+    // than making one large agent response prevent every transcript from
+    // hydrating; the response is still bounded by one record, never the corpus.
     threads.push(thread);
     contentBytes += separatorBytes + threadBytes;
     cursor += 1;
