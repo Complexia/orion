@@ -528,7 +528,7 @@ const getOrionRelayUrl = () => {
  * token authenticates THESE calls and never leaves this function: what comes
  * back is a short-lived relay ticket, and that is all the relay ever sees.
  */
-const relayApiRequest = async (apiPath, body, { signal, method } = {}) => {
+const relayApiRequest = async (apiPath, body, { signal, method, allowNotFound = false } = {}) => {
   const session = await readAccountSession();
   if (!session?.token) throw new Error('Sign in to your Orion account first.');
   const { response, data } = await fetchRelayApiJson({
@@ -538,6 +538,7 @@ const relayApiRequest = async (apiPath, body, { signal, method } = {}) => {
     body,
     signal,
   });
+  if (allowNotFound && response.status === 404) return null;
   if (!response.ok) {
     throw new Error(
       data?.error ||
@@ -552,9 +553,13 @@ const relayApiRequest = async (apiPath, body, { signal, method } = {}) => {
 const registerRelayDevice = ({ machineId, name, platform, appVersion, signal }) =>
   relayApiRequest('/api/relay/devices', { machineId, name, platform, appVersion }, { signal });
 
+// Removing a machine that is not registered (or was already removed) is the
+// state the user asked for — treat the route's 404 as success rather than
+// surfacing an error for an idempotent removal.
 const deregisterRelayDevice = ({ machineId, signal }) =>
   relayApiRequest(`/api/relay/devices/${encodeURIComponent(machineId)}`, undefined, {
     method: 'DELETE',
+    allowNotFound: true,
     signal,
   });
 
@@ -1022,7 +1027,18 @@ app.whenReady().then(async () => {
   addAgentEventListener((event) => forwardAgentEventToRemote(event));
   void readPersistedStoreState()
     .then((state) =>
-      state?.remoteControlSettings ? configureRemoteControl(state.remoteControlSettings) : undefined
+      state?.remoteControlSettings
+        ? configureRemoteControl({
+            ...state.remoteControlSettings,
+            // Mirror the store's hydration lift (src/store.ts persist merge):
+            // the UI has no separate allow-incoming toggle anymore, and this
+            // startup path reads the raw persisted JSON before the renderer
+            // has hydrated and reconfigured.
+            allowIncoming:
+              state.remoteControlSettings.enabled === true ||
+              state.remoteControlSettings.allowIncoming === true,
+          })
+        : undefined
     )
     .catch((error) => {
       console.error('Could not restore remote control settings', error);

@@ -2158,13 +2158,6 @@ export const useOrionStore = create<OrionState>()(
         remoteControlSettings: {
           ...defaultRemoteControlSettings,
           ...state.remoteControlSettings,
-          // The settings UI no longer has a separate "allow this machine to
-          // be controlled" toggle: enabling remote control implies it. Lift
-          // configs saved before that simplification so the engine matches
-          // what the UI now shows.
-          allowIncoming:
-            state.remoteControlSettings?.enabled === true ||
-            state.remoteControlSettings?.allowIncoming === true,
         },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
@@ -2191,6 +2184,16 @@ export const useOrionStore = create<OrionState>()(
       }),
       merge: (persisted, current) => {
         const merged = { ...current, ...(persisted as Partial<OrionState>) };
+        // The settings UI no longer has a separate "allow this machine to be
+        // controlled" toggle: enabling remote control implies it (pairing
+        // codes still gate every connection). Lift configs persisted before
+        // that simplification so the engine matches what the UI now shows.
+        if (merged.remoteControlSettings?.enabled === true) {
+          merged.remoteControlSettings = {
+            ...merged.remoteControlSettings,
+            allowIncoming: true,
+          };
+        }
         // The commit/PR message model used to live on epicsSettings; it now
         // also writes thread titles, so it moved to textGenerationSettings.
         // Carry an explicit pick over — the old "Auto (cheapest available)"

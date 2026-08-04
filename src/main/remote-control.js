@@ -585,6 +585,11 @@ export const deregisterRelayMachine = async () => {
   if (typeof deps?.deregisterRelayDevice !== 'function') {
     return { ok: false, error: 'This build cannot manage Orion Cloud registrations.' };
   }
+  // Leave relay mode in the engine's own settings copy as well: the renderer
+  // sends its matching configure({connectionMode:'direct'}) asynchronously,
+  // and a reconcile triggered in between (account refresh, expiry timer)
+  // must not restart the listener and re-register the row we are deleting.
+  settings = { ...settings, connectionMode: 'direct' };
   stopRelayListener();
   closeRelaySessions('This machine was removed from Orion Cloud.');
   relayRegisteredFor = null;
