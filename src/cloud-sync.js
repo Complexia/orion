@@ -19,6 +19,9 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
+import { createWriteStream, openAsBlob } from 'node:fs';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -26,6 +29,17 @@ const execFileAsync = promisify(execFile);
 const MAX_GIT_BUFFER = 512 * 1024 * 1024;
 const BLOB_URL_BATCH = 200;
 const UPLOAD_CONCURRENCY = 6;
+// Every request gets a deadline. A presigned-URL PUT that stalls (server gone,
+// dev server rejecting a large body without draining it) otherwise hangs its
+// fetch forever — pinning the request body in memory and wedging the caller's
+// serialized sync queue behind it.
+const API_TIMEOUT_MS = 60 * 1000;
+const TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
+
+const deadlineSignal = (signal, timeoutMs) => {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+};
 
 async function git(gitRoot, args, options = {}) {
   const { stdout } = await execFileAsync('git', ['-C', gitRoot, ...args], {
@@ -76,6 +90,7 @@ async function fileExists(filePath) {
 async function api(baseUrl, token, apiPath, options = {}) {
   const response = await fetch(new URL(apiPath, baseUrl), {
     ...options,
+    signal: deadlineSignal(options.signal, API_TIMEOUT_MS),
     headers: {
       authorization: `Bearer ${token}`,
       ...(options.body ? { 'content-type': 'application/json' } : {}),
@@ -102,19 +117,42 @@ async function uploadTo(url, body, contentType = 'application/octet-stream', sig
     method: 'PUT',
     headers: { 'content-type': contentType },
     body,
-    signal,
+    signal: deadlineSignal(signal, TRANSFER_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new Error(`Upload failed (${response.status}).`);
   }
 }
 
-async function download(url) {
-  const response = await fetch(url);
+// Uploads a file without reading it into memory: the file-backed Blob streams
+// from disk with a known content-length. Packfiles reach gigabytes; buffering
+// one (plus fetch's copy of the body) is how the main process ballooned to 5GB.
+async function uploadFileTo(url, filePath, contentType, signal) {
+  await uploadTo(url, await openAsBlob(filePath), contentType, signal);
+}
+
+async function download(url, signal) {
+  const response = await fetch(url, { signal: deadlineSignal(signal, TRANSFER_TIMEOUT_MS) });
   if (!response.ok) {
     throw new Error(`Download failed (${response.status}).`);
   }
   return Buffer.from(await response.arrayBuffer());
+}
+
+// Pack downloads can also reach gigabytes — stream them straight to disk.
+async function downloadToFile(url, targetPath, signal) {
+  const response = await fetch(url, { signal: deadlineSignal(signal, TRANSFER_TIMEOUT_MS) });
+  if (!response.ok) {
+    throw new Error(`Download failed (${response.status}).`);
+  }
+  const tempPath = `${targetPath}.orion-tmp-${process.pid}`;
+  try {
+    await pipeline(Readable.fromWeb(response.body), createWriteStream(tempPath));
+    await fs.rename(tempPath, targetPath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true });
+    throw error;
+  }
 }
 
 async function writeFileAtomic(targetPath, data) {
@@ -316,9 +354,19 @@ export async function pushRepo({
     const hash = packHash.trim().split('\n').pop();
     const packPath = path.join(tmpDir, `orion-${hash}.pack`);
     const idxPath = path.join(tmpDir, `orion-${hash}.idx`);
-    const packData = await fs.readFile(packPath);
+    // Never read the pack itself into memory — it can reach gigabytes. The
+    // object count lives in the 12-byte header, and the upload streams the
+    // file from disk.
+    const packSize = (await fs.stat(packPath)).size;
+    const packHeader = Buffer.alloc(12);
+    const packHandle = await fs.open(packPath, 'r');
+    try {
+      await packHandle.read(packHeader, 0, 12, 0);
+    } finally {
+      await packHandle.close();
+    }
     const idxData = await fs.readFile(idxPath);
-    const objectCount = packData.readUInt32BE(8);
+    const objectCount = packHeader.readUInt32BE(8);
     const packName = `pack-${hash}`;
     const hasPack = objectCount > 0;
 
@@ -347,8 +395,8 @@ export async function pushRepo({
     });
 
     if (hasPack) {
-      onProgress(`Uploading pack (${Math.round(packData.length / 1024)} KB)…`);
-      await uploadTo(prepared.packPutUrl, packData, 'application/octet-stream', signal);
+      onProgress(`Uploading pack (${Math.round(packSize / 1024)} KB)…`);
+      await uploadFileTo(prepared.packPutUrl, packPath, 'application/octet-stream', signal);
       await uploadTo(prepared.packIdxPutUrl, idxData, 'application/octet-stream', signal);
     }
 
@@ -403,7 +451,7 @@ export async function pushRepo({
       signal,
       body: JSON.stringify({
         refUpdates,
-        pack: hasPack ? { name: packName, size: packData.length } : null,
+        pack: hasPack ? { name: packName, size: packSize } : null,
         blobs: missing.map((oid) => ({ oid, size: blobSizes.get(oid) ?? 0 })),
       }),
     });
@@ -481,13 +529,9 @@ export async function pullRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
     const idxPath = path.join(packDir, `${pack.name}.idx`);
     if (await fileExists(idxPath)) continue;
     onProgress(`Downloading objects (${Math.round(pack.size / 1024)} KB)…`);
-    const [packData, idxData] = await Promise.all([
-      download(pack.packUrl),
-      download(pack.idxUrl),
-    ]);
     // Pack before idx: git only trusts an idx whose pack is present.
-    await writeFileAtomic(packPath, packData);
-    await writeFileAtomic(idxPath, idxData);
+    await downloadToFile(pack.packUrl, packPath);
+    await writeFileAtomic(idxPath, await download(pack.idxUrl));
     downloadedPacks += 1;
   }
 
