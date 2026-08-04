@@ -2562,9 +2562,12 @@ const App: React.FC = () => {
     [openSavedView]
   );
   const remoteMachines = remoteControlState?.machines ?? EMPTY_REMOTE_MACHINES;
+  // The section only earns its place once there is a *remote* machine to switch
+  // to — a list containing just the machine you're already on says nothing.
   const remoteMachinesVisible = Boolean(
     remoteControlSettings.enabled &&
-      remoteControlIsAuthenticated(accountState.authenticated, remoteControlState?.authenticated)
+      remoteControlIsAuthenticated(accountState.authenticated, remoteControlState?.authenticated) &&
+      remoteMachines.length > 0
   );
   const activeRemoteMachine =
     remoteMachinesVisible && activeRemoteMachineId
@@ -8465,6 +8468,13 @@ const App: React.FC = () => {
       if (command.kind === 'runTurn') {
         const promptText = (command.prompt ?? '').trim();
         if (!promptText) return { ok: false, error: 'Empty prompt.' };
+        // Main already dropped unknown access modes; re-validate anyway so the
+        // thread never stores a value the local picker could not have set.
+        const requestedAccessMode =
+          command.accessMode &&
+          accessModeOptions.some((option) => option.value === command.accessMode)
+            ? command.accessMode
+            : undefined;
         let threadId: string;
         let createdThread = false;
         if (command.threadId) {
@@ -8485,6 +8495,22 @@ const App: React.FC = () => {
           ) {
             return { ok: false, error: 'That thread is already running a turn.' };
           }
+          // Same store action as the local model/access pickers. Unknown model
+          // ids are silently ignored (matching the new-thread path), and the
+          // terminal pseudo-model stays local-only.
+          const patch: Partial<Pick<Thread, 'modelId' | 'accessMode'>> = {};
+          if (
+            command.modelId &&
+            command.modelId !== thread.modelId &&
+            command.modelId !== claudeCodeCliModelId &&
+            agentModelsRef.current.some((model) => model.id === command.modelId)
+          ) {
+            patch.modelId = command.modelId;
+          }
+          if (requestedAccessMode && requestedAccessMode !== thread.accessMode) {
+            patch.accessMode = requestedAccessMode;
+          }
+          if (Object.keys(patch).length > 0) updateThread(thread.id, patch);
           threadId = thread.id;
         } else {
           const project = state.projects.find((candidate) => candidate.id === command.projectId);
@@ -8496,6 +8522,7 @@ const App: React.FC = () => {
             ...(command.modelId && agentModelsRef.current.some((model) => model.id === command.modelId)
               ? { modelId: command.modelId }
               : {}),
+            ...(requestedAccessMode ? { accessMode: requestedAccessMode } : {}),
             select: false,
           });
           createdThread = true;

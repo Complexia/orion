@@ -329,8 +329,9 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
         )}
 
         {/*
-          Machines (remote control): this machine plus every paired host this
-          instance can drive. Absent entirely while remote control is off.
+          Machines (remote control): every paired host this instance can drive,
+          plus a "this machine" row to switch back. Absent entirely while remote
+          control is off or no remote machines are paired.
         */}
         {remoteMachinesVisible && (
           <div className="recent-agents-section machines-section">
