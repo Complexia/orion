@@ -290,6 +290,11 @@ type EpicPrLookupRequest = {
   startedAt: string;
 };
 
+type AgentRunStartupResult = { ok: boolean; runId?: string; error?: string };
+type ThreadTurnStartResult =
+  | { ok: false; error?: string }
+  | { ok: true; startup: Promise<AgentRunStartupResult> };
+
 // What prompted a batch PR-state refresh, which decides how long it must wait
 // since the last one: the background interval or a window focus.
 type EpicPrRefreshReason = 'tick' | 'focus';
@@ -1069,9 +1074,9 @@ const App: React.FC = () => {
   // Startup IPC resolves long before a normal turn ends. Retain its result for
   // a short grace window so a steer whose stop lands just after startup failed
   // can distinguish that failure from a run that completed naturally.
-  const runStartupResults = useRef(new Map<string, Promise<{ ok: boolean; runId?: string; error?: string }>>());
+  const runStartupResults = useRef(new Map<string, Promise<AgentRunStartupResult>>());
   const trackRunStartup = useCallback(
-    (runId: string, startup: Promise<{ ok: boolean; runId?: string; error?: string }>) => {
+    (runId: string, startup: Promise<AgentRunStartupResult>) => {
       runStartupResults.current.set(runId, startup);
       const forgetLater = () => {
         window.setTimeout(() => {
@@ -1100,7 +1105,7 @@ const App: React.FC = () => {
         promptText: string,
         attachments: ImageAttachment[],
         claimStart?: () => Promise<boolean>
-      ) => Promise<{ ok: boolean; error?: string }>)
+      ) => Promise<ThreadTurnStartResult>)
     | null
   >(null);
   // In-flight snapshot refreshes, keyed by `${threadId} ${taskId}`.
@@ -4748,20 +4753,59 @@ const App: React.FC = () => {
     return id;
   };
 
-  // "Start in a rift" on a suggested-task card: spin the suggestion off into
-  // its own epic — the same flow as the create-epic modal — and open a fresh
-  // thread under it with the suggested prompt pre-filled in the composer,
-  // ready to send once the rift workspace is ready.
-  const handleStartSuggestedTask = useCallback((threadId: string) => {
-    if (!epicsEnabled) {
-      toast.error('Enable Epics in Settings before starting a suggested task');
-      return;
-    }
+  // Starting a suggested-task card. 'thread' mode runs the suggestion right
+  // away in a fresh regular thread on the current branch — same repository,
+  // shows up in the sidebar like any other thread. 'rift' mode spins the
+  // suggestion off into its own epic — the same flow as the create-epic modal —
+  // and opens a fresh thread under it with the suggested prompt pre-filled in
+  // the composer, ready to send once the rift workspace is ready.
+  const handleStartSuggestedTask = useCallback((threadId: string, mode: 'thread' | 'rift') => {
     const state = useOrionStore.getState();
     const thread = state.threads.find((candidate) => candidate.id === threadId);
     const suggestion = thread?.suggestedTask;
-    if (!thread || !suggestion || suggestion.startedEpicId) return;
+    if (!thread || !suggestion || suggestion.startedEpicId || suggestion.startedThreadId) return;
     const project = state.projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    if (mode === 'thread') {
+      if (!project) {
+        toast.error('This thread has no project to start the task in');
+        return;
+      }
+      // Keep the source epic association so a suggestion shown inside a rift
+      // starts in that same workspace and remains covered by its launch guards.
+      const newThreadId = createThread(project.id, undefined, { epicId: thread.epicId });
+      updateThread(threadId, { suggestedTask: { ...suggestion, startedThreadId: newThreadId } });
+      setActiveTab('agents');
+      const restoreDraft = (error?: string) => {
+        // The turn never started; keep the prompt as the new thread's draft.
+        composerDraftsRef.current.set(newThreadId, { text: suggestion.text, attachments: [] });
+        if (useOrionStore.getState().selectedThreadId === newThreadId) {
+          setChatInput(suggestion.text);
+        }
+        toast.error(error ?? 'Could not start the suggested task');
+      };
+      const start = startTurnForThreadRef.current?.(newThreadId, suggestion.text, []);
+      void start?.then(
+        async (result) => {
+          if (!result.ok) {
+            restoreDraft(result.error);
+            return;
+          }
+          try {
+            const startup = await result.startup;
+            if (!startup.ok) restoreDraft(startup.error);
+          } catch (error) {
+            restoreDraft(error instanceof Error ? error.message : undefined);
+          }
+        },
+        (error) => restoreDraft(error instanceof Error ? error.message : undefined)
+      );
+      toast.success('Suggested task started in a new thread');
+      return;
+    }
+    if (!epicsEnabled) {
+      toast.error('Enable Epics in Settings before starting a suggested task in a rift');
+      return;
+    }
     const createRift = riftsActive && riftsSettings.autoCreateForEpics && Boolean(project);
     const epicId = addEpic(deriveTitle(suggestion.text), {
       description: suggestion.text,
@@ -4790,6 +4834,7 @@ const App: React.FC = () => {
     riftsActive,
     riftsSettings.autoCreateForEpics,
     setActiveTab,
+    setChatInput,
     setupRiftForEpic,
     updateThread,
   ]);
@@ -6252,7 +6297,7 @@ const App: React.FC = () => {
       promptText: string,
       attachments: ImageAttachment[],
       claimStart?: () => Promise<boolean>
-    ): Promise<{ ok: boolean; error?: string }> => {
+    ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
       if (claimStart && !(await claimStart())) {
         return { ok: false, error: 'The remote command expired before the turn started.' };
@@ -6614,7 +6659,7 @@ const App: React.FC = () => {
         }
       });
 
-      return { ok: true };
+      return { ok: true, startup };
     },
     [
       agentModels,
@@ -6640,7 +6685,7 @@ const App: React.FC = () => {
       promptText: string,
       attachments: ImageAttachment[],
       claimStart?: () => Promise<boolean>
-    ): Promise<{ ok: boolean; error?: string }> => {
+    ): Promise<ThreadTurnStartResult> => {
       const turnStart = await withThreadStartReservation(
         pendingTurnStartsRef.current,
         threadId,
@@ -11045,7 +11090,7 @@ const App: React.FC = () => {
                               onAuthenticateProvider={handleAuthenticateProvider}
                               onSteerQueuedMessage={steerQueuedMessage}
                               suggestedTaskUsesRift={riftsActive && riftsSettings.autoCreateForEpics}
-                              suggestedTaskCanStart={epicsEnabled}
+                              suggestedTaskCanStartRift={epicsEnabled}
                               suggestedCardPosition={suggestedCardState.position}
                               suggestedCardCollapsed={suggestedCardState.collapsed}
                               onMoveSuggestedCard={moveSuggestedCard}

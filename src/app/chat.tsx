@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, Plus, Sparkles, SquareKanban, X, Zap } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, GitBranch, MessageSquare, Plus, Sparkles, SquareKanban, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type SuggestedTask, type Thread, useOrionStore } from '../store';
 import { agentProviders } from '../agentCatalog';
@@ -43,22 +43,23 @@ export const CopyMessageButton: React.FC<{ text: string; className?: string }> =
 // Harness-suggested next task for a thread (Claude's predicted next prompt,
 // emitted after each turn). Presented as a floating, draggable card over the
 // chat area — the same shell as the Tasks card, spawning just below it when
-// both are visible. Starting it spins the suggestion off into its own epic —
-// rift-backed when rifts are active — instead of continuing here.
+// both are visible. Starting it either runs the suggestion in a fresh regular
+// thread on the current branch (the default), or spins it off into its own
+// epic — rift-backed when rifts are active — via the dropdown.
 export const FloatingSuggestedTaskCard: React.FC<{
   suggestion: SuggestedTask;
   usesRift: boolean;
-  canStart: boolean;
+  canStartRift: boolean;
   position: { x: number; y: number } | null;
   onMove: (position: { x: number; y: number }) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
-  onStart: () => void;
+  onStart: (mode: 'thread' | 'rift') => void;
   onDismiss: () => void;
 }> = ({
   suggestion,
   usesRift,
-  canStart,
+  canStartRift,
   position,
   onMove,
   collapsed,
@@ -70,6 +71,25 @@ export const FloatingSuggestedTaskCard: React.FC<{
     position,
     onMove
   );
+  // The card clips its contents (overflow: hidden), so the start menu renders
+  // in-flow below the actions row and grows the card while open.
+  const [startMenuOpen, setStartMenuOpen] = useState(false);
+  const startControlRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!startMenuOpen) return undefined;
+    const handlePointerDownOutside = (event: PointerEvent) => {
+      if (!startControlRef.current?.contains(event.target as Node)) setStartMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setStartMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', handlePointerDownOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDownOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [startMenuOpen]);
   // Until the user drags the card somewhere, it prefers to sit under the Tasks
   // card, moves above it when necessary, and always stays inside the host.
   const [defaultTop, setDefaultTop] = useState<number | null>(null);
@@ -156,23 +176,86 @@ export const FloatingSuggestedTaskCard: React.FC<{
         <div className="tasks-float-body">
           <div className="suggested-task-title">{title}</div>
           <div className="suggested-task-text">{suggestion.text}</div>
-          <div className="suggested-task-actions">
-            {suggestion.startedEpicId ? (
+          {suggestion.startedEpicId || suggestion.startedThreadId ? (
+            <div className="suggested-task-actions">
               <span className="suggested-task-started">
                 <CircleCheck size={13} />
-                Started as an epic — find it in the sidebar
+                {suggestion.startedEpicId
+                  ? 'Started as an epic — find it in the sidebar'
+                  : 'Started as a thread — find it in the sidebar'}
               </span>
-            ) : canStart ? (
-              <button type="button" className="suggested-task-start" onClick={onStart}>
-                <Zap size={13} />
-                {usesRift ? 'Start in a rift' : 'Start as epic'}
-              </button>
-            ) : (
-              <span className="suggested-task-started">
-                Enable Epics in Settings to start this task
-              </span>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div ref={startControlRef}>
+              <div className="suggested-task-actions">
+                <div className="suggested-task-start-split">
+                  <button
+                    type="button"
+                    className="suggested-task-start"
+                    onClick={() => onStart('thread')}
+                  >
+                    <Zap size={13} />
+                    Start task
+                  </button>
+                  <button
+                    type="button"
+                    className="suggested-task-start-caret"
+                    onClick={() => setStartMenuOpen((open) => !open)}
+                    aria-haspopup="menu"
+                    aria-expanded={startMenuOpen}
+                    aria-label="More ways to start"
+                    title="More ways to start"
+                  >
+                    <ChevronDown size={13} />
+                  </button>
+                </div>
+              </div>
+              {startMenuOpen && (
+                <div className="suggested-task-start-menu" role="menu">
+                  <button
+                    type="button"
+                    className="suggested-task-start-option"
+                    role="menuitem"
+                    onClick={() => {
+                      setStartMenuOpen(false);
+                      onStart('thread');
+                    }}
+                  >
+                    <MessageSquare size={13} />
+                    <span className="suggested-task-start-option-text">
+                      <span>Start task</span>
+                      <span className="suggested-task-start-option-hint">
+                        New thread on the current branch
+                      </span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="suggested-task-start-option"
+                    role="menuitem"
+                    disabled={!canStartRift}
+                    title={canStartRift ? undefined : 'Enable Epics in Settings to use this'}
+                    onClick={() => {
+                      setStartMenuOpen(false);
+                      onStart('rift');
+                    }}
+                  >
+                    {usesRift ? <GitBranch size={13} /> : <SquareKanban size={13} />}
+                    <span className="suggested-task-start-option-text">
+                      <span>{usesRift ? 'Start in a rift' : 'Start as epic'}</span>
+                      <span className="suggested-task-start-option-hint">
+                        {canStartRift
+                          ? usesRift
+                            ? 'New epic in an isolated rift workspace'
+                            : 'New epic in this repository'
+                          : 'Enable Epics in Settings to use this'}
+                      </span>
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -817,14 +900,15 @@ export type ChatTranscriptProps = {
   onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
   onAuthenticateProvider: (providerId: string) => void;
   onSteerQueuedMessage: (threadId: string, queuedId: string) => void;
-  /** Suggested-task card: starting creates a rift-backed epic when true. */
+  /** Suggested-task card: the rift option creates a rift-backed epic when true. */
   suggestedTaskUsesRift: boolean;
-  suggestedTaskCanStart: boolean;
+  /** Whether the epic/rift start option is available (Epics enabled). */
+  suggestedTaskCanStartRift: boolean;
   suggestedCardPosition: { x: number; y: number } | null;
   suggestedCardCollapsed: boolean;
   onMoveSuggestedCard: (threadId: string, position: { x: number; y: number }) => void;
   onToggleSuggestedCard: (threadId: string) => void;
-  onStartSuggestedTask: (threadId: string) => void;
+  onStartSuggestedTask: (threadId: string, mode: 'thread' | 'rift') => void;
   onDismissSuggestedTask: (threadId: string) => void;
 };
 
@@ -862,7 +946,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   onAuthenticateProvider,
   onSteerQueuedMessage,
   suggestedTaskUsesRift,
-  suggestedTaskCanStart,
+  suggestedTaskCanStartRift,
   suggestedCardPosition,
   suggestedCardCollapsed,
   onMoveSuggestedCard,
@@ -1217,12 +1301,12 @@ export const ChatTranscript = React.memo(function ChatTranscript({
         <FloatingSuggestedTaskCard
           suggestion={thread.suggestedTask}
           usesRift={suggestedTaskUsesRift}
-          canStart={suggestedTaskCanStart}
+          canStartRift={suggestedTaskCanStartRift}
           position={suggestedCardPosition}
           onMove={handleMoveSuggestedCard}
           collapsed={suggestedCardCollapsed}
           onToggleCollapsed={handleToggleSuggestedCard}
-          onStart={() => onStartSuggestedTask(threadId)}
+          onStart={(mode) => onStartSuggestedTask(threadId, mode)}
           onDismiss={() => onDismissSuggestedTask(threadId)}
         />
       )}
