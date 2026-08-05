@@ -41,6 +41,8 @@ import {
   FlaskConical,
   Menu,
   SlidersHorizontal,
+  SquareSlash,
+  Eraser,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -77,7 +79,6 @@ import type {
 } from './types';
 import {
   inheritedSubagentResumeContext,
-  prependInheritedSubagentResumeContext,
 } from './thread-branching';
 import { Toaster, toast } from 'sonner';
 import {
@@ -178,6 +179,15 @@ import {
   hasThreadReaderSupport,
   isThreadReferenceCandidate,
 } from './app/chatMentions';
+import {
+  addPromptContext,
+  buildSlashCommandCandidates,
+  completedSlashCommand,
+  filterSlashCommands,
+  getSlashToken,
+  type SlashCommandCandidate,
+} from './app/slashCommands';
+import type { SlashCommandInfo } from './types';
 import { withThreadStartReservation } from './app/turnStart';
 import { formatShortTime, getThreadActivityTime } from './app/time';
 import {
@@ -762,6 +772,14 @@ const App: React.FC = () => {
     providerId: AgentProviderId;
     supported: boolean;
   } | null>(null);
+  // Slash-command menu (Claude Code style): the real command list reported by
+  // each project's Claude session, the highlighted row, and the exact draft
+  // dismissed with Escape (any edit reopens the menu).
+  const [slashCommandsByProject, setSlashCommandsByProject] = useState<
+    Record<string, SlashCommandInfo[]>
+  >({});
+  const [slashCommandIndex, setSlashCommandIndex] = useState(0);
+  const [slashDismissedDraft, setSlashDismissedDraft] = useState<string | null>(null);
   // Start offset of a token dismissed with Escape, so it stays closed until
   // the user begins a new mention.
   const chatMentionDismissRef = useRef<number | null>(null);
@@ -1430,6 +1448,7 @@ const App: React.FC = () => {
     // The restored draft has no caret yet, so no mention token can be active.
     setChatMention(null);
     chatMentionDismissRef.current = null;
+    setSlashDismissedDraft(null);
   }, [composerDraftKey]);
 
   // The spawn-request listener mounts once; it reads the live model catalog
@@ -1709,6 +1728,70 @@ const App: React.FC = () => {
   useEffect(() => {
     chatMentionSelectedRef.current?.scrollIntoView({ block: 'nearest' });
   }, [chatMentionIndex, chatMentionListKey]);
+  // Whether the selected thread resolves to a Claude SDK session — directly
+  // (claude provider) or via an Orion orchestrator whose main driver is
+  // Claude. Gates the slash-command menu, /btw hint, and /clear dispatch.
+  const selectedThreadClaudeBacked =
+    selectedAgentModel?.providerId === 'claude' ||
+    ((selectedAgentModel?.providerId === 'orion' || isOrionModelId(selectedThread?.modelId ?? '')) &&
+      findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)?.providerId ===
+        'claude');
+  // Slash-command menu: active while the whole draft is a single "/" token.
+  // The pool is every command available in this composer context (Orion
+  // natives + the project's live Claude list, seeded by a static fallback);
+  // the menu shows the pool filtered by what's typed after the "/".
+  const slashToken = getSlashToken(chatInput.trimStart());
+  const slashCommandPool = useMemo<SlashCommandCandidate[]>(() => {
+    if (!selectedThread || isNativeSubagentThread) return [];
+    if (!chatInput.trimStart().startsWith('/')) return [];
+    const liveCommands = selectedThreadProjectPath
+      ? (slashCommandsByProject[selectedThreadProjectPath] ?? null)
+      : null;
+    return buildSlashCommandCandidates(
+      {
+        providerId: selectedAgentModel?.providerId ?? null,
+        claudeBacked: selectedThreadClaudeBacked,
+        isTerminal: isTerminalThread,
+      },
+      liveCommands
+    );
+  }, [
+    chatInput,
+    isNativeSubagentThread,
+    isTerminalThread,
+    selectedAgentModel?.providerId,
+    selectedThread,
+    selectedThreadClaudeBacked,
+    selectedThreadProjectPath,
+    slashCommandsByProject,
+  ]);
+  const slashCommandCandidates = useMemo<SlashCommandCandidate[]>(
+    () => (slashToken ? filterSlashCommands(slashCommandPool, slashToken.query) : []),
+    [slashCommandPool, slashToken?.query]
+  );
+  const slashMenuOpen =
+    Boolean(slashToken) && slashCommandCandidates.length > 0 && chatInput !== slashDismissedDraft;
+  const slashCommandListKey = slashCommandCandidates
+    .map((candidate) => `${candidate.source}:${candidate.command.name}`)
+    .join('|');
+  useEffect(() => {
+    setSlashCommandIndex(0);
+  }, [slashCommandListKey]);
+  const slashCommandSelectedRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    slashCommandSelectedRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [slashCommandIndex, slashCommandListKey]);
+  // Argument-hint strip under the composer once a known command is completed
+  // (menu closed). /review, /goal, and /btw keep their richer bespoke banners.
+  const completedSlash = useMemo(() => {
+    if (slashMenuOpen || slashCommandPool.length === 0) return null;
+    const candidate = completedSlashCommand(chatInput.trimStart(), slashCommandPool);
+    if (!candidate) return null;
+    if (candidate.source === 'orion' && /^(review|goal|btw)$/.test(candidate.command.name)) {
+      return null;
+    }
+    return candidate;
+  }, [chatInput, slashCommandPool, slashMenuOpen]);
   // Role-model options for Settings → Orchestration: every real model grouped
   // by provider. The Orion pseudo-model can't delegate to itself.
   const orchestrationModelGroups = useMemo(
@@ -2263,6 +2346,42 @@ const App: React.FC = () => {
       setThreadAgentSession(event.threadId, 'claude', event.sessionId);
     });
   }, [setThreadAgentSession]);
+
+  // Live slash-command lists pushed by Claude sessions (on init and on
+  // mid-session commands_changed). Full replacement per project.
+  useEffect(() => {
+    if (!window.orion?.onSlashCommands) return undefined;
+    return window.orion.onSlashCommands(({ projectPath, commands }) => {
+      setSlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+    });
+  }, []);
+
+  // Prefetch the project's command list when a Claude-backed thread is
+  // selected, so the first "/" keystroke shows real commands instead of the
+  // static fallback. Main answers from the live session or its cache; it
+  // never spawns a process for this.
+  useEffect(() => {
+    if (!selectedThreadClaudeBacked || !selectedThreadProjectPath || !selectedThreadId) return;
+    if (slashCommandsByProject[selectedThreadProjectPath]) return;
+    let cancelled = false;
+    const projectPath = selectedThreadProjectPath;
+    void window.orion
+      ?.listSlashCommands?.({ threadId: selectedThreadId, projectPath })
+      .then((result) => {
+        if (cancelled || !result?.ok || !result.commands) return;
+        const commands = result.commands;
+        setSlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedThreadClaudeBacked,
+    selectedThreadId,
+    selectedThreadProjectPath,
+    slashCommandsByProject,
+  ]);
 
   useEffect(() => {
     let mounted = true;
@@ -6489,10 +6608,15 @@ const App: React.FC = () => {
       const turnAttachments = [...taskMediaAttachments, ...attachments];
       const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
       let agentPrompt = buildPromptWithAttachments(promptText, attachments);
+      const preserveSlashCommandStart =
+        model.providerId === 'claude' && promptText.trimStart().startsWith('/');
+      const addAgentContext = (context: string | null) => {
+        if (context) {
+          agentPrompt = addPromptContext(agentPrompt, context, preserveSlashCommandStart);
+        }
+      };
       if (tasksToInject.length > 0) {
-        agentPrompt = agentPrompt
-          ? `${buildLinkedTaskContext(tasksToInject, true)}\n\n${agentPrompt}`
-          : buildLinkedTaskContext(tasksToInject, false);
+        addAgentContext(buildLinkedTaskContext(tasksToInject, Boolean(agentPrompt)));
         const injectedIds = new Set(tasksToInject.map((task) => task.id));
         updateThread(threadId, {
           linkedTasks: (thread.linkedTasks ?? []).map((task) =>
@@ -6505,14 +6629,13 @@ const App: React.FC = () => {
       // independently resumable session), carry the visible child transcript
       // into this first fresh turn. The branched parent still does not absorb
       // every child transcript.
-      agentPrompt = prependInheritedSubagentResumeContext(thread, model.providerId, agentPrompt);
+      addAgentContext(inheritedSubagentResumeContext(thread, model.providerId));
       // @-model mentions in the user's original text: tell the agent which
       // models were referenced so it can delegate to them. Works on any
       // thread, not just Orion ones.
       const mentionedModels = promptText ? parseModelMentions(promptText, agentModels) : [];
       if (mentionedModels.length > 0) {
-        const mentionsContext = buildModelMentionsContext(mentionedModels);
-        agentPrompt = agentPrompt ? `${mentionsContext}\n\n${agentPrompt}` : mentionsContext;
+        addAgentContext(buildModelMentionsContext(mentionedModels));
       }
       // @-thread mentions: hand the agent pointers to the referenced Orion
       // threads (id + metadata), not their transcripts — it browses them on
@@ -6522,16 +6645,17 @@ const App: React.FC = () => {
           mentionedThreads,
           new Map(state.projects.map((project) => [project.id, project.name]))
         );
-        agentPrompt = agentPrompt ? `${threadMentionsContext}\n\n${agentPrompt}` : threadMentionsContext;
+        addAgentContext(threadMentionsContext);
       }
       if (orchestration) {
-        // Prepended last so it sits before the linked-task context when both apply.
+        // Added last: ordinary prompts retain orchestration-first ordering;
+        // slash commands retain the command at byte zero and put context after it.
         const orchestrationContext = buildOrchestrationContext(
           orchestration.roles,
           orchestration.generalInstructions,
           thread.accessMode ?? 'full-access'
         );
-        agentPrompt = agentPrompt ? `${orchestrationContext}\n\n${agentPrompt}` : orchestrationContext;
+        addAgentContext(orchestrationContext);
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
@@ -7863,14 +7987,18 @@ const App: React.FC = () => {
     });
   };
 
-  const sendMessage = async () => {
+  const sendMessage = async (overrideText?: string) => {
     if (!selectedThreadId || !selectedThread) return;
     // Native subagent transcripts are read-only mirrors — nothing to talk to.
     if (selectedThread.subagent) {
       toast.error('This is a read-only subagent transcript. Steer from the parent thread.');
       return;
     }
-    const promptText = chatInput.trim();
+    // Guard against being used directly as an event handler (onClick passes
+    // the event as the first argument) — only real strings override the draft.
+    const forcedText = typeof overrideText === 'string' ? overrideText : null;
+    const draftText = forcedText ?? chatInput;
+    const promptText = draftText.trim();
     // Freshly linked board tasks can be sent on their own — the cards are the
     // prompt. Mid-run they can't (queued follow-ups need their own text).
     const canSendLinkedTasksAlone = !isSending && hasPendingLinkedTasks;
@@ -7891,7 +8019,7 @@ const App: React.FC = () => {
     if (isTerminalThread) {
       if (pendingTurnStartsRef.current.has(selectedThreadId)) return;
       const submittedThreadId = selectedThreadId;
-      const submittedInput = chatInput;
+      const submittedInput = draftText;
       const submittedAttachments = chatAttachments;
       // Clear before the linked-task refresh so edits made during that wait
       // belong to the current composer and are never erased by this submission.
@@ -7921,12 +8049,15 @@ const App: React.FC = () => {
       const tasksToInject = (currentThread?.linkedTasks ?? []).filter((task) => !task.injected);
       let text = buildPromptWithAttachments(promptText, submittedAttachments);
       if (tasksToInject.length > 0) {
-        text = text
-          ? `${buildLinkedTaskContext(tasksToInject, true)}\n\n${text}`
-          : buildLinkedTaskContext(tasksToInject, false);
+        text = addPromptContext(
+          text,
+          buildLinkedTaskContext(tasksToInject, Boolean(text)),
+          true
+        );
       }
       if (currentThread) {
-        text = prependInheritedSubagentResumeContext(currentThread, 'claude', text);
+        const inheritedContext = inheritedSubagentResumeContext(currentThread, 'claude');
+        if (inheritedContext) text = addPromptContext(text, inheritedContext, true);
       }
       if (!text) {
         restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
@@ -7998,18 +8129,21 @@ const App: React.FC = () => {
 
     // `/goal …` — codex goal management. Handled before the mid-run queue
     // branch: pause/clear act on the live run, and set/resume must never be
-    // queued as plain follow-up text.
+    // queued as plain follow-up text. Claude-backed threads fall through so a
+    // custom Claude command named /goal still reaches the CLI's expander.
     const goalMatch = promptText.match(/^\/goal(?:\s+([\s\S]+))?$/i);
-    if (goalMatch) {
+    if (goalMatch && !selectedThreadClaudeBacked) {
       handleGoalCommand(promptText, goalMatch[1]?.trim() ?? '');
       return;
     }
 
     // `/review …` — codex code review (uncommitted / base branch / commit /
     // custom instructions). Also before the queue branch: it must never be
-    // queued as plain follow-up text.
+    // queued as plain follow-up text. Claude-backed threads fall through:
+    // Claude Code has its own /review, expanded CLI-side like any other
+    // slash command.
     const reviewMatch = promptText.match(/^\/review(?:\s+([\s\S]+))?$/i);
-    if (reviewMatch) {
+    if (reviewMatch && !selectedThreadClaudeBacked) {
       handleReviewCommand(promptText, reviewMatch[1]?.trim() ?? '');
       return;
     }
@@ -8033,6 +8167,43 @@ const App: React.FC = () => {
       return;
     }
 
+    // `/clear` — Claude: drop the thread's persistent session so the next
+    // message starts with fresh context. The transcript stays; a divider
+    // marks the boundary. Never sent to the model, never queued.
+    if (selectedThreadClaudeBacked && /^\/clear$/i.test(promptText)) {
+      if (isSending) {
+        toast.error('Stop the run before using /clear.');
+        return;
+      }
+      const clearedThreadId = selectedThreadId;
+      const clearedThread = selectedThread;
+      setChatInput('');
+      setChatMention(null);
+      void window.orion?.clearClaudeSession?.(clearedThreadId).catch(() => {});
+      updateThread(clearedThreadId, {
+        agentSessionIds: { ...clearedThread.agentSessionIds, claude: undefined },
+      });
+      addMessageToThread(clearedThreadId, {
+        role: 'system',
+        content: 'Context cleared — the next message starts a fresh Claude session.',
+      });
+      return;
+    }
+
+    // `/model` — open the model picker instead of sending anything.
+    if (/^\/model$/i.test(promptText)) {
+      if (isSending) {
+        toast.error('Stop the run before switching models.');
+        return;
+      }
+      setChatInput('');
+      setChatMention(null);
+      const providerId = selectedAgentModel?.providerId;
+      if (providerId) setActiveProviderTab(providerId);
+      setModelPickerOpen(true);
+      return;
+    }
+
     // Agent mid-run: hold the message; it dispatches when the current turn ends.
     if (isSending) {
       pinThreadToBottom(selectedThreadId);
@@ -8047,7 +8218,7 @@ const App: React.FC = () => {
     }
 
     const submittedThreadId = selectedThreadId;
-    const submittedInput = chatInput;
+    const submittedInput = draftText;
     const submittedAttachments = chatAttachments;
     setChatInput('');
     setChatMention(null);
@@ -8767,6 +8938,7 @@ const App: React.FC = () => {
     setChatInput(nextValue);
     setChatMention(null);
     chatMentionDismissRef.current = null;
+    setSlashDismissedDraft(null);
     requestAnimationFrame(() => {
       const el = chatInputRef.current;
       if (!el) return;
@@ -8775,8 +8947,63 @@ const App: React.FC = () => {
     });
   };
 
+  // Selecting a slash command replaces the draft with the command. Commands
+  // that take arguments complete to "/name " so the user can type them;
+  // argument-less ones can submit immediately (Claude Code's Enter-runs-it).
+  const insertSlashCommand = (
+    candidate: SlashCommandCandidate | undefined,
+    options?: { submit?: boolean }
+  ) => {
+    if (!candidate) return;
+    const hasArguments = Boolean(candidate.command.argumentHint);
+    const nextValue = `/${candidate.command.name}${hasArguments ? ' ' : ''}`;
+    setSlashDismissedDraft(null);
+    setChatInput(nextValue);
+    if (options?.submit && !hasArguments) {
+      void sendMessage(nextValue);
+      return;
+    }
+    requestAnimationFrame(() => {
+      const el = chatInputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(nextValue.length, nextValue.length);
+    });
+  };
+
   // Handle chat submit: ⏎ sends (or queues mid-run), ⌘⏎ steers mid-run.
   const handleChatKeyDown = (e: React.KeyboardEvent) => {
+    // The open slash-command menu captures navigation keys first. It never
+    // coexists with the @-mention dropdown: the slash token spans the whole
+    // draft and contains no whitespace, so no "@" token can start inside it.
+    if (slashMenuOpen) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const delta = e.key === 'ArrowDown' ? 1 : -1;
+        const count = slashCommandCandidates.length;
+        setSlashCommandIndex((index) => (index + delta + count) % count);
+        return;
+      }
+      // Tab completes; Enter completes and runs argument-less commands
+      // immediately. Shift+Enter keeps its newline meaning.
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        insertSlashCommand(slashCommandCandidates[slashCommandIndex] ?? slashCommandCandidates[0]);
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        insertSlashCommand(slashCommandCandidates[slashCommandIndex] ?? slashCommandCandidates[0], {
+          submit: true,
+        });
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setSlashDismissedDraft(chatInput);
+        return;
+      }
+    }
     // The open @-mention dropdown captures navigation keys first.
     if (chatMentionOpen) {
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -9599,17 +9826,35 @@ const App: React.FC = () => {
             ))}
           </div>
         )}
-        {!isTerminalThread && /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
+        {!slashMenuOpen && completedSlash && (
           <div className="composer-btw-hint">
-            <SquarePen size={12} />
+            <SquareSlash size={12} />
             <span>
-              {selectedAgentModel?.providerId === 'codex'
-                ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
-                : '/review is only available on Codex agents.'}
+              /{completedSlash.command.name}
+              {completedSlash.command.argumentHint ? ` ${completedSlash.command.argumentHint}` : ''}
+              {completedSlash.command.description ? ` — ${completedSlash.command.description}` : ''}
             </span>
           </div>
         )}
-        {!isTerminalThread && /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
+        {!slashMenuOpen &&
+          !isTerminalThread &&
+          // Claude-backed threads run Claude Code's own /review (expanded
+          // CLI-side); the generic command hint above covers it there.
+          !selectedThreadClaudeBacked &&
+          /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
+            <div className="composer-btw-hint">
+              <SquarePen size={12} />
+              <span>
+                {selectedAgentModel?.providerId === 'codex'
+                  ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
+                  : '/review is only available on Codex agents.'}
+              </span>
+            </div>
+          )}
+        {!slashMenuOpen &&
+          !isTerminalThread &&
+          !selectedThreadClaudeBacked &&
+          /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
           <div className="composer-btw-hint">
             <Target size={12} />
             <span>
@@ -9619,7 +9864,7 @@ const App: React.FC = () => {
             </span>
           </div>
         )}
-        {!isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
+        {!slashMenuOpen && !isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
           <div className="composer-btw-hint">
             <Sparkles size={12} />
             <span>
@@ -9632,7 +9877,8 @@ const App: React.FC = () => {
             </span>
           </div>
         )}
-        {selectedAgentModel?.providerId === 'codex' &&
+        {!slashMenuOpen &&
+          selectedAgentModel?.providerId === 'codex' &&
           /^\/review\s*$/i.test(chatInput.trimStart()) && (
             <ComposerPopover className="review-popover">
               <button
@@ -9661,7 +9907,8 @@ const App: React.FC = () => {
               </button>
             </ComposerPopover>
           )}
-        {selectedAgentModel?.providerId === 'codex' &&
+        {!slashMenuOpen &&
+          selectedAgentModel?.providerId === 'codex' &&
           /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
             <ComposerPopover className="review-popover">
               {(gitState?.branches ?? [])
@@ -9693,6 +9940,51 @@ const App: React.FC = () => {
               )}
             </ComposerPopover>
           )}
+        {slashMenuOpen && (
+          <ComposerPopover className="slash-popover">
+            {slashCommandCandidates.map((candidate, index) => {
+              const { command, source } = candidate;
+              const RowIcon =
+                source === 'orion'
+                  ? command.name === 'goal'
+                    ? Target
+                    : command.name === 'review'
+                      ? SquarePen
+                      : command.name === 'btw'
+                        ? Sparkles
+                        : command.name === 'clear'
+                          ? Eraser
+                          : command.name === 'model'
+                            ? Bot
+                            : SquareSlash
+                  : SquareSlash;
+              return (
+                <button
+                  key={`${source}:${command.name}`}
+                  ref={index === slashCommandIndex ? slashCommandSelectedRef : null}
+                  type="button"
+                  role="option"
+                  aria-selected={index === slashCommandIndex}
+                  className={`mention-row ${index === slashCommandIndex ? 'selected' : ''}`}
+                  title={command.description || `/${command.name}`}
+                  onMouseEnter={() => setSlashCommandIndex(index)}
+                  // Keep the textarea focused so selection doesn't blur the composer.
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => insertSlashCommand(candidate, { submit: true })}
+                >
+                  <RowIcon size={16} />
+                  <span className="mention-row-label">
+                    /{command.name}
+                    {command.argumentHint ? (
+                      <span className="slash-row-hint"> {command.argumentHint}</span>
+                    ) : null}
+                  </span>
+                  <span className="mention-row-slug">{command.description}</span>
+                </button>
+              );
+            })}
+          </ComposerPopover>
+        )}
         {chatMentionOpen && (
           <ComposerPopover>
             {chatMentionCandidates.map((candidate, index) => {
@@ -9771,6 +10063,7 @@ const App: React.FC = () => {
           }
           value={chatInput}
           onChange={(e) => {
+            setSlashDismissedDraft(null);
             setChatInput(e.target.value);
             updateChatMention(e.target.value, e.target.selectionStart);
           }}

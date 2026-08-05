@@ -25,6 +25,7 @@
     "test:remote-relay": "node scripts/test-remote-relay.mjs",
     "test:remote-view-races": "node --no-warnings --experimental-strip-types scripts/test-remote-view-races.mjs",
     "test:suggested-tasks": "node scripts/test-suggested-tasks.mjs",
+    "test:slash-commands": "node --no-warnings --experimental-strip-types scripts/test-slash-commands.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",
