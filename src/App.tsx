@@ -579,6 +579,31 @@ const chatMentionCategories: Array<Extract<ChatMentionCandidate, { kind: 'catego
   { kind: 'category', category: 'thread', label: 'Thread', hint: 'reference another thread' },
 ];
 
+// The thread list inside the @-mention dropdown loads this many rows at a time;
+// scrolling (or arrowing) to the bottom appends the next page.
+const CHAT_MENTION_THREAD_PAGE = 20;
+
+// The sidebar's "Recent agents" ordering: running agents are active "now", so
+// they always rank above finished ones. Among running agents, keep start order
+// so the list doesn't reshuffle as they stream; finished agents sort by their
+// last activity (i.e. when they finished) — or by when they were unpinned, so
+// a just-unpinned thread surfaces at the top instead of sinking back to its
+// old chronological spot.
+const compareRecentThreadOrder = (a: Thread, b: Thread) => {
+  const aRunning = a.status === 'running';
+  const bRunning = b.status === 'running';
+  if (aRunning !== bRunning) return aRunning ? -1 : 1;
+  if (aRunning) {
+    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+  }
+  const recentRank = (t: Thread) =>
+    Math.max(
+      getThreadActivityTime(t).getTime(),
+      t.unpinnedAt ? new Date(t.unpinnedAt).getTime() : Number.NEGATIVE_INFINITY
+    );
+  return recentRank(b) - recentRank(a);
+};
+
 const App: React.FC = () => {
   const {
     activeTab,
@@ -768,6 +793,9 @@ const App: React.FC = () => {
     mode?: 'model' | 'thread';
   } | null>(null);
   const [chatMentionIndex, setChatMentionIndex] = useState(0);
+  // How many thread rows the @-mention dropdown currently shows; grows as the
+  // user scrolls and resets whenever the thread query changes.
+  const [chatMentionThreadLimit, setChatMentionThreadLimit] = useState(CHAT_MENTION_THREAD_PAGE);
   const [threadReaderSupport, setThreadReaderSupport] = useState<{
     providerId: AgentProviderId;
     supported: boolean;
@@ -1603,17 +1631,22 @@ const App: React.FC = () => {
   // pre-thread-mentions muscle memory keeps working. Model mode: models on
   // enabled providers, 'orion' excluded (work can't be delegated to the
   // orchestrator itself); an empty query shows the favorites (or everything).
-  // Thread mode: threads sorted by recent activity, searched with the same
-  // scoring as the sidebar's thread search. All lists cap at 8 rows.
+  // Thread mode: every thread in "Recent agents" order, searched with the same
+  // scoring as the sidebar's thread search, lazy-loaded a page at a time
+  // (threadMatchTotal reports the full match count so scrolling knows when to
+  // fetch more). Model lists cap at 8 rows.
   const chatMentionThreadEntryCacheRef = useRef(new WeakMap<Thread, CachedThreadSearchEntry>());
-  const chatMentionCandidates = useMemo<ChatMentionCandidate[]>(() => {
-    if (!chatMention) return [];
+  const { candidates: chatMentionCandidates, threadMatchTotal: chatMentionThreadTotal } = useMemo<{
+    candidates: ChatMentionCandidate[];
+    threadMatchTotal: number;
+  }>(() => {
+    if (!chatMention) return { candidates: [], threadMatchTotal: 0 };
     const query = chatMention.query.toLowerCase();
 
     if (chatMention.mode === 'thread') {
       // Hide unresolvable references for terminal threads and providers whose
       // installed CLI cannot receive Orion's read_thread tool.
-      if (!canReferenceThreadsFromComposer) return [];
+      if (!canReferenceThreadsFromComposer) return { candidates: [], threadMatchTotal: 0 };
       const projectById = new Map(projects.map((project) => [project.id, project]));
       // The composing thread can't usefully reference itself.
       const base = threads.filter((thread) =>
@@ -1625,17 +1658,20 @@ const App: React.FC = () => {
       );
       const trimmedQuery = chatMention.query.trim();
       if (!trimmedQuery) {
-        return base
-          .slice()
-          .sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime())
-          .slice(0, 8)
-          .map((thread) => ({
-            kind: 'thread' as const,
-            thread,
-            projectName: projectById.get(thread.projectId)?.name ?? 'Unknown project',
-          }));
+        return {
+          candidates: base
+            .slice()
+            .sort(compareRecentThreadOrder)
+            .slice(0, chatMentionThreadLimit)
+            .map((thread) => ({
+              kind: 'thread' as const,
+              thread,
+              projectName: projectById.get(thread.projectId)?.name ?? 'Unknown project',
+            })),
+          threadMatchTotal: base.length,
+        };
       }
-      return base
+      const scored = base
         .map((thread) => {
           const project = projectById.get(thread.projectId);
           const projectName = project?.name ?? 'Unknown project';
@@ -1655,9 +1691,13 @@ const App: React.FC = () => {
           (a, b) =>
             b.score - a.score ||
             getThreadActivityTime(b.thread).getTime() - getThreadActivityTime(a.thread).getTime()
-        )
-        .slice(0, 8)
-        .map(({ thread, projectName }) => ({ kind: 'thread' as const, thread, projectName }));
+        );
+      return {
+        candidates: scored
+          .slice(0, chatMentionThreadLimit)
+          .map(({ thread, projectName }) => ({ kind: 'thread' as const, thread, projectName })),
+        threadMatchTotal: scored.length,
+      };
     }
 
     const base = agentModels.filter(
@@ -1670,14 +1710,20 @@ const App: React.FC = () => {
     );
     if (!query) {
       if (!chatMention.mode) {
-        return !canReferenceThreadsFromComposer
-          ? chatMentionCategories.filter((candidate) => candidate.category === 'model')
-          : chatMentionCategories;
+        return {
+          candidates: !canReferenceThreadsFromComposer
+            ? chatMentionCategories.filter((candidate) => candidate.category === 'model')
+            : chatMentionCategories,
+          threadMatchTotal: 0,
+        };
       }
       const favorites = base.filter((model) => model.favorite);
-      return (favorites.length > 0 ? favorites : base)
-        .slice(0, 8)
-        .map((model) => ({ kind: 'model' as const, model }));
+      return {
+        candidates: (favorites.length > 0 ? favorites : base)
+          .slice(0, 8)
+          .map((model) => ({ kind: 'model' as const, model })),
+        threadMatchTotal: 0,
+      };
     }
     // Kind rows that prefix-match keep the root level reachable by typing
     // (e.g. "@th" highlights Thread).
@@ -1698,18 +1744,39 @@ const App: React.FC = () => {
       )
       .slice(0, 8)
       .map((model) => ({ kind: 'model' as const, model }));
-    return [...categories, ...models];
+    return { candidates: [...categories, ...models], threadMatchTotal: 0 };
   }, [
     agentModels,
     canReferenceThreadsFromComposer,
     chatMention,
+    chatMentionThreadLimit,
     enabledProviderIdSet,
     projects,
     selectedThreadId,
     threads,
   ]);
+  const chatMentionHasMoreThreads =
+    chatMention?.mode === 'thread' && chatMentionThreadTotal > chatMentionCandidates.length;
+  // A new thread query starts back at the first page.
+  const chatMentionThreadQuery = chatMention?.mode === 'thread' ? chatMention.query.trim() : null;
+  useEffect(() => {
+    setChatMentionThreadLimit(CHAT_MENTION_THREAD_PAGE);
+  }, [chatMentionThreadQuery]);
+  // Nearing the bottom of the dropdown loads the next page of threads.
+  const handleChatMentionScroll = useCallback(
+    (event: React.UIEvent<HTMLDivElement>) => {
+      if (!chatMentionHasMoreThreads) return;
+      const el = event.currentTarget;
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 48) {
+        setChatMentionThreadLimit((limit) => limit + CHAT_MENTION_THREAD_PAGE);
+      }
+    },
+    [chatMentionHasMoreThreads]
+  );
   const chatMentionOpen = Boolean(chatMention) && chatMentionCandidates.length > 0;
-  // Reset the highlight to the top whenever the candidate list changes.
+  // Reset the highlight to the top whenever the candidate list changes —
+  // except when lazy loading merely appends thread rows, which should leave
+  // the highlight (and the user's scroll position) where they are.
   const chatMentionListKey = chatMentionCandidates
     .map((candidate) =>
       candidate.kind === 'category'
@@ -1719,13 +1786,28 @@ const App: React.FC = () => {
           : `thread:${candidate.thread.id}`
     )
     .join('|');
+  const prevChatMentionListKeyRef = useRef('');
+  const chatMentionListAppendedRef = useRef(false);
   useEffect(() => {
-    setChatMentionIndex(0);
+    const prev = prevChatMentionListKeyRef.current;
+    prevChatMentionListKeyRef.current = chatMentionListKey;
+    const appended =
+      prev !== '' && chatMentionListKey !== prev && chatMentionListKey.startsWith(`${prev}|`);
+    chatMentionListAppendedRef.current = appended;
+    if (!appended) setChatMentionIndex(0);
   }, [chatMentionListKey]);
   // The dropdown's height is clamped to the space around the composer, so
   // keyboard navigation has to keep the highlighted row scrolled into view.
+  // Skip the scroll when rows were appended without the highlight moving
+  // (wheel-driven lazy load) so the list doesn't jump back to the highlight.
   const chatMentionSelectedRef = useRef<HTMLButtonElement | null>(null);
+  const prevChatMentionIndexRef = useRef(0);
   useEffect(() => {
+    const indexChanged = prevChatMentionIndexRef.current !== chatMentionIndex;
+    prevChatMentionIndexRef.current = chatMentionIndex;
+    const appended = chatMentionListAppendedRef.current;
+    chatMentionListAppendedRef.current = false;
+    if (appended && !indexChanged) return;
     chatMentionSelectedRef.current?.scrollIntoView({ block: 'nearest' });
   }, [chatMentionIndex, chatMentionListKey]);
   // Whether the selected thread resolves to a Claude SDK session — directly
@@ -1913,26 +1995,7 @@ const App: React.FC = () => {
         // Children never appear top-level; they nest under their parent's row.
         // Pinned threads live in the Pinned section instead.
         .filter((t) => !t.hiddenFromRecent && !t.pinnedAt && !childThreadIds.has(t.id))
-        .sort((a, b) => {
-          // Running agents are active "now", so they always rank above
-          // finished ones. Among running agents, keep start order so the list
-          // doesn't reshuffle as they stream; finished agents sort by their
-          // last activity (i.e. when they finished) — or by when they were
-          // unpinned, so a just-unpinned thread surfaces at the top instead
-          // of sinking back to its old chronological spot.
-          const aRunning = a.status === 'running';
-          const bRunning = b.status === 'running';
-          if (aRunning !== bRunning) return aRunning ? -1 : 1;
-          if (aRunning) {
-            return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-          }
-          const recentRank = (t: Thread) =>
-            Math.max(
-              getThreadActivityTime(t).getTime(),
-              t.unpinnedAt ? new Date(t.unpinnedAt).getTime() : Number.NEGATIVE_INFINITY
-            );
-          return recentRank(b) - recentRank(a);
-        }),
+        .sort(compareRecentThreadOrder),
     [childThreadIds, threads]
   );
 
@@ -9011,6 +9074,13 @@ const App: React.FC = () => {
         e.preventDefault();
         const delta = e.key === 'ArrowDown' ? 1 : -1;
         const count = chatMentionCandidates.length;
+        // At the bottom with more threads unloaded, arrowing down fetches the
+        // next page and steps onto its first row instead of wrapping to the top.
+        if (delta === 1 && chatMentionIndex === count - 1 && chatMentionHasMoreThreads) {
+          setChatMentionThreadLimit((limit) => limit + CHAT_MENTION_THREAD_PAGE);
+          setChatMentionIndex(count);
+          return;
+        }
         setChatMentionIndex((index) => (index + delta + count) % count);
         return;
       }
@@ -9444,6 +9514,76 @@ const App: React.FC = () => {
     [openThreadInSplit]
   );
 
+  // A sidebar thread dropped on the composer links it as an @thread mention —
+  // the same token the @ dropdown inserts — rather than opening a split pane.
+  // Only drags the composer can turn into a working reference are intercepted;
+  // anything else falls through to the panel's split-view handlers above.
+  const [composerThreadDropActive, setComposerThreadDropActive] = useState(false);
+  const composerAcceptsThreadDrop =
+    canReferenceThreadsFromComposer && !isNativeSubagentThread && !selectedThreadRiftUnavailable;
+
+  const handleComposerThreadDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!isThreadDrag(event) || !composerAcceptsThreadDrop) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = 'copy';
+      setComposerThreadDropActive(true);
+      // The panel's split-drop hint is already up from the travel across the
+      // main view; the composer takes over while the drag is above it.
+      setThreadDropActive(false);
+    },
+    [composerAcceptsThreadDrop]
+  );
+
+  const handleComposerThreadDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!isThreadDrag(event)) return;
+    // Ignore transitions between the composer's own children.
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setComposerThreadDropActive(false);
+  }, []);
+
+  const handleComposerThreadDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!isThreadDrag(event) || !composerAcceptsThreadDrop) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setComposerThreadDropActive(false);
+      const threadId = event.dataTransfer.getData(THREAD_DRAG_MIME);
+      const thread = threads.find((t) => t.id === threadId);
+      if (
+        !thread ||
+        !isThreadReferenceCandidate(
+          thread.id,
+          selectedThreadId,
+          isClaudeCodeCliModelId(thread.modelId)
+        )
+      ) {
+        return;
+      }
+      // Insert at the caret (the textarea keeps its selection while unfocused),
+      // padding with spaces so the token stays a standalone word.
+      const token = `@${threadMentionToken(thread)}`;
+      const el = chatInputRef.current;
+      const start = el?.selectionStart ?? chatInput.length;
+      const end = el?.selectionEnd ?? start;
+      const before = chatInput.slice(0, start);
+      const after = chatInput.slice(end);
+      const inserted = `${before && !/\s$/.test(before) ? ' ' : ''}${token}${/^\s/.test(after) ? '' : ' '}`;
+      setChatInput(before + inserted + after);
+      setChatMention(null);
+      chatMentionDismissRef.current = null;
+      const caret = start + inserted.length;
+      requestAnimationFrame(() => {
+        const input = chatInputRef.current;
+        if (!input) return;
+        input.focus();
+        input.setSelectionRange(caret, caret);
+      });
+    },
+    [chatInput, composerAcceptsThreadDrop, selectedThreadId, threads]
+  );
+
   // Width every composer chip would take if they all stayed on the row. Depends
   // only on the labels, so it never changes as a result of collapsing them —
   // the compact row can't measure the full one, and a measured switch would
@@ -9768,7 +9908,12 @@ const App: React.FC = () => {
         onSelect={selectThread}
         split={threadPanes.length > 1}
       />
-      <div className="composer-shell">
+      <div
+        className={`composer-shell${composerThreadDropActive ? ' thread-drop-target' : ''}`}
+        onDragOver={handleComposerThreadDragOver}
+        onDragLeave={handleComposerThreadDragLeave}
+        onDrop={handleComposerThreadDrop}
+      >
         {chatAttachments.length > 0 && (
           <div className="composer-attachments">
             {chatAttachments.map((attachment) => (
@@ -9987,7 +10132,7 @@ const App: React.FC = () => {
           </ComposerPopover>
         )}
         {chatMentionOpen && (
-          <ComposerPopover>
+          <ComposerPopover onScroll={handleChatMentionScroll}>
             {chatMentionCandidates.map((candidate, index) => {
               const rowProps = {
                 ref: index === chatMentionIndex ? chatMentionSelectedRef : null,

@@ -1,4 +1,4 @@
-import { ReactNode, useLayoutEffect, useRef, useState } from 'react';
+import { ReactNode, UIEventHandler, useLayoutEffect, useRef, useState } from 'react';
 
 // Composer dropdowns (@-mentions, the /review pickers) hang off the composer
 // shell and prefer to open upward. A composer full of text can be tall enough
@@ -14,9 +14,11 @@ type Layout = { below: boolean; maxHeight: number; hidden: boolean };
 
 export const ComposerPopover = ({
   className = '',
+  onScroll,
   children,
 }: {
   className?: string;
+  onScroll?: UIEventHandler<HTMLDivElement>;
   children: ReactNode;
 }) => {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -94,6 +96,7 @@ export const ComposerPopover = ({
       role="listbox"
       className={`mention-popover${layout.below ? ' below' : ''}${className ? ` ${className}` : ''}`}
       style={{ maxHeight: layout.maxHeight, visibility: layout.hidden ? 'hidden' : undefined }}
+      onScroll={onScroll}
     >
       {children}
     </div>
