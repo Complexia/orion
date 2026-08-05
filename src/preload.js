@@ -80,6 +80,14 @@ contextBridge.exposeInMainWorld('orion', {
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),
   supportsThreadReader: (providerId) => ipcRenderer.invoke('agent:supportsThreadReader', providerId),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
+  // Claude slash commands (built-ins + .claude/commands + skills + plugins)
+  listSlashCommands: (input) => ipcRenderer.invoke('agent:listSlashCommands', input),
+  clearClaudeSession: (threadId) => ipcRenderer.invoke('agent:clearClaudeSession', threadId),
+  onSlashCommands: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('agent:slashCommands', listener);
+    return () => ipcRenderer.removeListener('agent:slashCommands', listener);
+  },
   stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),
   isRunFinalizing: (runId) => ipcRenderer.invoke('agent:isRunFinalizing', runId),
   // Codex goal ops (pause/clear/status) for threads with no live goal run.

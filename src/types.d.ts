@@ -90,6 +90,16 @@ export type RiftStorageReleaseResult = {
  * ~/.claude/skills-disabled (deactivated by Orion). The filesystem is the only
  * source of truth — nothing about skills is persisted in the Orion store.
  */
+/** A slash command reported by the Claude CLI (mirror of the SDK's SlashCommand). */
+export type SlashCommandInfo = {
+  /** Command name without the leading slash. */
+  name: string;
+  description: string;
+  /** Placeholder shown after the name, e.g. "<objective>" — empty when the command takes no arguments. */
+  argumentHint: string;
+  aliases?: string[];
+};
+
 export type SkillEntry = {
   /** Directory name; mutations also carry `path` and `enabled` to identify duplicate IDs exactly. */
   id: string;
@@ -982,6 +992,16 @@ type OrionComputerUsePermissions = {
         /** terminateBackground: also dispose the thread's persistent claude session (kills background subagents). Steer omits this. */
         options?: { terminateBackground?: boolean }
       ) => Promise<boolean>;
+      /** Claude slash commands (built-ins + .claude/commands + skills + plugins) known for a thread/project. */
+      listSlashCommands: (input: { threadId?: string | null; projectPath?: string | null }) => Promise<{
+        ok: boolean;
+        commands?: SlashCommandInfo[];
+        source?: 'live' | 'cache';
+      }>;
+      /** Push of the latest slash-command list whenever a Claude session reports one. Replace, don't merge. */
+      onSlashCommands: (cb: (event: { projectPath: string; commands: SlashCommandInfo[] }) => void) => () => void;
+      /** `/clear`: dispose only the thread's persistent Claude SDK session so the next turn starts fresh. */
+      clearClaudeSession: (threadId: string) => Promise<boolean>;
       /** True while a forgotten run's terminal event is still being prepared (steer lost-race handoff). */
       isRunFinalizing?: (runId: string) => Promise<boolean>;
       /** Dispose any persistent agent runtime owned by a deleted thread. */
