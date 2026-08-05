@@ -119,8 +119,10 @@ import { ModelPickerPopover } from './app/ModelPickerPopover';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import {
   claimRemoteSideEffect,
+  claimRemoteThreadStart,
   mergeSynchronouslyTrackedRuns,
   persistSuccessfulRemoteCommand,
+  remoteAgentSettingsPatch,
   remoteControlIsAuthenticated,
   remoteThreadRunError,
   remoteThreadRuntime,
@@ -1104,7 +1106,8 @@ const App: React.FC = () => {
         threadId: string,
         promptText: string,
         attachments: ImageAttachment[],
-        claimStart?: () => Promise<boolean>
+        claimStart?: () => Promise<boolean>,
+        applyClaimedSettings?: () => void
       ) => Promise<ThreadTurnStartResult>)
     | null
   >(null);
@@ -6299,10 +6302,11 @@ const App: React.FC = () => {
       threadId: string,
       promptText: string,
       attachments: ImageAttachment[],
-      claimStart?: () => Promise<boolean>
+      claimStart?: () => Promise<boolean>,
+      applyClaimedSettings?: () => void
     ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
-      if (claimStart && !(await claimStart())) {
+      if (claimStart && !(await claimRemoteThreadStart(claimStart, applyClaimedSettings))) {
         return { ok: false, error: 'The remote command expired before the turn started.' };
       }
       let state = useOrionStore.getState();
@@ -6687,12 +6691,20 @@ const App: React.FC = () => {
       threadId: string,
       promptText: string,
       attachments: ImageAttachment[],
-      claimStart?: () => Promise<boolean>
+      claimStart?: () => Promise<boolean>,
+      applyClaimedSettings?: () => void
     ): Promise<ThreadTurnStartResult> => {
       const turnStart = await withThreadStartReservation(
         pendingTurnStartsRef.current,
         threadId,
-        () => startTurnForThreadUnlocked(threadId, promptText, attachments, claimStart)
+        () =>
+          startTurnForThreadUnlocked(
+            threadId,
+            promptText,
+            attachments,
+            claimStart,
+            applyClaimedSettings
+          )
       );
       return turnStart.acquired
         ? turnStart.value
@@ -8468,15 +8480,25 @@ const App: React.FC = () => {
       if (command.kind === 'runTurn') {
         const promptText = (command.prompt ?? '').trim();
         if (!promptText) return { ok: false, error: 'Empty prompt.' };
-        // Main already dropped unknown access modes; re-validate anyway so the
-        // thread never stores a value the local picker could not have set.
+        // Main already dropped unknown access modes / effort values; re-validate
+        // here so the thread never stores a value the local picker could not set.
         const requestedAccessMode =
           command.accessMode &&
           accessModeOptions.some((option) => option.value === command.accessMode)
             ? command.accessMode
             : undefined;
+        const requestedReasoningEffort = command.reasoningEffort;
+        const requestedCodexServiceTier =
+          command.codexServiceTier === 'default' || command.codexServiceTier === 'priority'
+            ? command.codexServiceTier
+            : undefined;
+        const requestedClaudeContextWindow =
+          command.claudeContextWindow === '200k' || command.claudeContextWindow === '1m'
+            ? command.claudeContextWindow
+            : undefined;
         let threadId: string;
         let createdThread = false;
+        let applyClaimedSettings: (() => void) | undefined;
         if (command.threadId) {
           const thread = state.threads.find((candidate) => candidate.id === command.threadId);
           if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
@@ -8498,7 +8520,18 @@ const App: React.FC = () => {
           // Same store action as the local model/access pickers. Unknown model
           // ids are silently ignored (matching the new-thread path), and the
           // terminal pseudo-model stays local-only.
-          const patch: Partial<Pick<Thread, 'modelId' | 'accessMode'>> = {};
+          const patch: Partial<
+            Pick<
+              Thread,
+              | 'modelId'
+              | 'accessMode'
+              | 'codexReasoningEffort'
+              | 'codexServiceTier'
+              | 'claudeReasoningEffort'
+              | 'claudeContextWindow'
+              | 'grokReasoningEffort'
+            >
+          > = {};
           if (
             command.modelId &&
             command.modelId !== thread.modelId &&
@@ -8510,7 +8543,24 @@ const App: React.FC = () => {
           if (requestedAccessMode && requestedAccessMode !== thread.accessMode) {
             patch.accessMode = requestedAccessMode;
           }
-          if (Object.keys(patch).length > 0) updateThread(thread.id, patch);
+          // Apply provider-specific agent settings against the model that will
+          // actually run (pending model switch, else the thread's current one).
+          const targetModelId = patch.modelId ?? thread.modelId;
+          const targetModel = findAgentModel(agentModelsRef.current, targetModelId);
+          Object.assign(
+            patch,
+            remoteAgentSettingsPatch(thread, targetModel, {
+              reasoningEffort: requestedReasoningEffort,
+              codexServiceTier: requestedCodexServiceTier,
+              claudeContextWindow: requestedClaudeContextWindow,
+            }) as Partial<Thread>
+          );
+          if (Object.keys(patch).length > 0) {
+            // Renderer preparation (including linked-task refresh below) may
+            // outlive the remote command. Commit controller-requested thread
+            // settings only after main atomically claims the command.
+            applyClaimedSettings = () => updateThread(thread.id, patch);
+          }
           threadId = thread.id;
         } else {
           const project = state.projects.find((candidate) => candidate.id === command.projectId);
@@ -8526,6 +8576,18 @@ const App: React.FC = () => {
             select: false,
           });
           createdThread = true;
+          // createThread inherits effort from the last project thread; overlay
+          // any controller-requested settings for the model that actually ran.
+          const created = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+          if (created) {
+            const targetModel = findAgentModel(agentModelsRef.current, created.modelId);
+            const settingsPatch = remoteAgentSettingsPatch(created, targetModel, {
+              reasoningEffort: requestedReasoningEffort,
+              codexServiceTier: requestedCodexServiceTier,
+              claudeContextWindow: requestedClaudeContextWindow,
+            }) as Partial<Thread>;
+            if (Object.keys(settingsPatch).length > 0) updateThread(threadId, settingsPatch);
+          }
         }
         const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
         const unsupportedError = thread ? remoteThreadRunError(thread.modelId) : null;
@@ -8534,7 +8596,13 @@ const App: React.FC = () => {
           return { ok: false, ...(createdThread ? {} : { threadId }), error: unsupportedError };
         }
         const start = thread
-          ? startTurnForThreadRef.current?.(threadId, promptText, [], claimStart)
+          ? startTurnForThreadRef.current?.(
+              threadId,
+              promptText,
+              [],
+              claimStart,
+              applyClaimedSettings
+            )
           : undefined;
         if (!start) {
           if (createdThread) useOrionStore.getState().deleteThread(threadId);

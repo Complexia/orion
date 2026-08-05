@@ -2080,6 +2080,38 @@ if (
     assert.equal((await invalidAccessSeen).command.accessMode, undefined);
     console.log('ok  runTurn passes valid accessMode through and drops unknown values');
 
+    const validEffortSeen = host.waitFor('commandSeen');
+    channel.send({
+      t: 'runTurn',
+      reqId: 'effort-1',
+      projectId: 'p1',
+      prompt: 'run with high reasoning',
+      reasoningEffort: 'high',
+      codexServiceTier: 'priority',
+      claudeContextWindow: '1m',
+    });
+    assert.equal((await nextMessage()).message.ok, true);
+    const validEffortCommand = (await validEffortSeen).command;
+    assert.equal(validEffortCommand.reasoningEffort, 'high');
+    assert.equal(validEffortCommand.codexServiceTier, 'priority');
+    assert.equal(validEffortCommand.claudeContextWindow, '1m');
+    const invalidEffortSeen = host.waitFor('commandSeen');
+    channel.send({
+      t: 'runTurn',
+      reqId: 'effort-2',
+      projectId: 'p1',
+      prompt: 'run with unknown effort',
+      reasoningEffort: 'ludicrous',
+      codexServiceTier: 'turbo',
+      claudeContextWindow: '10m',
+    });
+    assert.equal((await nextMessage()).message.ok, true, 'unknown effort fields must not fail the turn');
+    const invalidEffortCommand = (await invalidEffortSeen).command;
+    assert.equal(invalidEffortCommand.reasoningEffort, undefined);
+    assert.equal(invalidEffortCommand.codexServiceTier, undefined);
+    assert.equal(invalidEffortCommand.claudeContextWindow, undefined);
+    console.log('ok  runTurn passes valid reasoning/tier/context through and drops unknown values');
+
     channel.send({ t: 'definitely-not-a-request', reqId: 'unknown-1' });
     const unknown = (await nextMessage()).message;
     assert.equal(unknown.t, 'res');

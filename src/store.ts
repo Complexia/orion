@@ -1711,6 +1711,7 @@ export const useOrionStore = create<OrionState>()(
           codexServiceTier: lastProjectThread?.codexServiceTier,
           claudeReasoningEffort: lastProjectThread?.claudeReasoningEffort,
           claudeContextWindow: lastProjectThread?.claudeContextWindow,
+          grokReasoningEffort: lastProjectThread?.grokReasoningEffort,
           createdAt: new Date().toISOString(),
           parentThreadId: options?.parentThreadId,
           spawnId: options?.spawnId,
