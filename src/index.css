@@ -4641,6 +4641,31 @@ body {
   box-shadow: var(--shadow-md), 0 0 0 3px var(--accent-soft);
 }
 
+/* Dragging a sidebar thread over the composer links it as an @thread mention;
+   dropping anywhere else in the main view opens a split pane instead. */
+.composer-shell.thread-drop-target {
+  border-color: rgb(77 141 255 / 70%);
+  box-shadow: var(--shadow-md), 0 0 0 3px var(--accent-soft);
+}
+
+.composer-shell.thread-drop-target::after {
+  content: 'Drop to link thread';
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  transform: translate(-50%, -100%);
+  padding: 6px 12px;
+  border: 1px solid rgb(77 141 255 / 40%);
+  border-radius: var(--radius-lg);
+  background: rgb(26 26 30 / 94%);
+  box-shadow: var(--shadow-md);
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 6;
+}
+
 .composer-attachments {
   display: flex;
   flex-wrap: wrap;
