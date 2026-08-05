@@ -33,6 +33,11 @@ export const resolveClaudeBinary = () => {
 };
 
 export const claudeSdkSessions = new Map(); // threadId -> session
+// Slash commands reported by the CLI (built-ins, .claude/commands, skills,
+// plugins). Keyed by projectPath — custom commands are user+project scoped, so
+// every thread in a project shares one list. Survives session eviction; the
+// next live session's init refreshes it.
+export const claudeSlashCommandCache = new Map(); // projectPath -> SlashCommandInfo[]
 // Sessions removed from claudeSdkSessions but whose SDK/CLI process has not
 // acknowledged AbortController.abort() yet. Destructive workspace teardown
 // waits for every entry for the thread instead of mistaking "removed from the
@@ -641,6 +646,74 @@ export const claudeSessionSubagentTracker = (session) => {
   return session.subagentTracker;
 };
 
+// Normalize SDK SlashCommand objects to the plain shape the renderer caches;
+// drops anything without a usable name and dedupes by name (skills and custom
+// commands can shadow each other — e.g. a project and a user skill both named
+// "verify" — and the CLI resolves the first one the same way).
+export const normalizeSlashCommands = (commands) => {
+  const seen = new Set();
+  return (Array.isArray(commands) ? commands : [])
+    .map((command) => ({
+      name: typeof command?.name === 'string' ? command.name.replace(/^\//, '').trim() : '',
+      description: typeof command?.description === 'string' ? command.description : '',
+      argumentHint: typeof command?.argumentHint === 'string' ? command.argumentHint : '',
+      ...(Array.isArray(command?.aliases) && command.aliases.length > 0
+        ? { aliases: command.aliases.map((alias) => String(alias).replace(/^\//, '')) }
+        : {}),
+    }))
+    .filter((command) => {
+      if (!command.name || seen.has(command.name)) return false;
+      seen.add(command.name);
+      return true;
+    });
+};
+
+export const pushSlashCommands = (sender, projectPath, commands) => {
+  const normalized = normalizeSlashCommands(commands);
+  claudeSlashCommandCache.set(projectPath, normalized);
+  if (sender && !sender.isDestroyed()) {
+    sender.send('agent:slashCommands', { projectPath, commands: normalized });
+  }
+};
+
+export const refreshClaudeSlashCommands = async (session) => {
+  if (!session.query || session.ended || session.disposed) return null;
+  try {
+    // supportedCommands() is a control-protocol request; guard with a timeout
+    // so a wedged CLI can't hold anything hostage (nothing awaits this on the
+    // turn path, but listClaudeSlashCommands does).
+    const commands = await Promise.race([
+      session.query.supportedCommands(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+    ]);
+    pushSlashCommands(session.sender, session.projectPath, commands);
+    return claudeSlashCommandCache.get(session.projectPath) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+// Renderer pull (agent:listSlashCommands). Prefers a live session for the
+// thread; falls back to the project cache (possibly stale after eviction —
+// the next real turn's init refreshes it). Never spawns a process.
+export const listClaudeSlashCommands = async ({ sender, threadId, projectPath }) => {
+  const session = threadId ? claudeSdkSessions.get(threadId) : null;
+  if (session && !session.ended && !session.disposed && session.query) {
+    // Pulls come from the currently open renderer. Persistent sessions can
+    // outlive a closed BrowserWindow, so future commands_changed pushes must
+    // follow the new webContents rather than the destroyed original sender.
+    if (sender && !sender.isDestroyed()) {
+      session.sender = sender;
+      session.createParams.sender = sender;
+    }
+    const commands = await refreshClaudeSlashCommands(session);
+    if (commands) return { ok: true, commands, source: 'live' };
+  }
+  const cached = projectPath ? claudeSlashCommandCache.get(projectPath) : null;
+  if (cached) return { ok: true, commands: cached, source: 'cache' };
+  return { ok: false };
+};
+
 export const handleClaudeSessionMessage = async (session, message) => {
   session.lastActivityAt = Date.now();
   if (!session.sessionId) {
@@ -659,7 +732,18 @@ export const handleClaudeSessionMessage = async (session, message) => {
       }
     }
   }
-  if (message?.type === 'system' && message.subtype === 'init') session.sawInit = true;
+  if (message?.type === 'system' && message.subtype === 'init') {
+    session.sawInit = true;
+    // Fetch the full command list (init's slash_commands is names-only — no
+    // descriptions or argument hints). Fire-and-forget; pushed to the
+    // renderer + cached per project on resolve.
+    void refreshClaudeSlashCommands(session);
+  }
+  if (message?.type === 'system' && message.subtype === 'commands_changed') {
+    // Mid-session change (e.g. skills discovered as the agent works). The SDK
+    // contract is REPLACE, not merge.
+    pushSlashCommands(session.sender, session.projectPath, message.commands);
+  }
 
   // The harness's predicted next user prompt (promptSuggestions). It arrives
   // after the turn's result — the turn is already finalized — so retain and
@@ -1149,8 +1233,12 @@ export const createClaudeSdkSession = ({
 
 export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSnapshot }) => {
   const threadId = input.threadId;
+  // A slash command must be the very start of the prompt or the CLI won't
+  // expand it, so the ultrathink keyword is skipped for command prompts.
   const prompt =
-    input.claudeReasoningEffort === 'ultrathink' ? `ultrathink\n\n${input.prompt}` : input.prompt;
+    input.claudeReasoningEffort === 'ultrathink' && !input.prompt.trimStart().startsWith('/')
+      ? `ultrathink\n\n${input.prompt}`
+      : input.prompt;
 
   // The window can close and reopen (macOS keeps the app alive) while
   // sessions persist; a session bound to the old, destroyed webContents would

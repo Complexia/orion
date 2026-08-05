@@ -31,7 +31,7 @@ import {
   pushRepo,
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
-import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, runClaudeSdkTurn } from './main/claude-driver.js';
+import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn } from './main/claude-driver.js';
 import { codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
@@ -5015,6 +5015,21 @@ ipcMain.handle('agent:listModels', async (_event, input) => {
 
 ipcMain.handle('agent:supportsThreadReader', async (_event, providerId) =>
   providerSupportsThreadReader(providerId)
+);
+
+ipcMain.handle('agent:listSlashCommands', async (event, input) =>
+  listClaudeSlashCommands({
+    sender: event.sender,
+    threadId: typeof input?.threadId === 'string' ? input.threadId : null,
+    projectPath: typeof input?.projectPath === 'string' ? input.projectPath : null,
+  })
+);
+
+// `/clear` in the composer: tear down only the thread's persistent Claude SDK
+// session (not the terminal PTY / goal ops that full thread disposal reaps),
+// so the next turn starts a fresh conversation.
+ipcMain.handle('agent:clearClaudeSession', (_event, threadId) =>
+  typeof threadId === 'string' && threadId ? disposeClaudeSdkSession(threadId) : false
 );
 
 ipcMain.handle('providers:getStatus', async () => getProviderStatuses());

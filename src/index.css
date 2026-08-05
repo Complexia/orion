@@ -5293,6 +5293,21 @@ body {
   white-space: nowrap;
 }
 
+/* Slash-command menu: argument hint rendered dimmed after the command name. */
+.slash-row-hint {
+  opacity: 0.55;
+  font-weight: 400;
+}
+
+/* Command descriptions are longer than model slugs — give them more room. */
+.slash-popover .mention-row {
+  grid-template-columns: 24px minmax(0, auto) minmax(0, 1fr);
+}
+
+.slash-popover .mention-row-slug {
+  text-align: right;
+}
+
 .codex-settings-anchor {
   position: relative;
   min-width: 0;
