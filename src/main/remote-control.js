@@ -1530,6 +1530,28 @@ const sanitizeAccessMode = (value) =>
     ? value
     : undefined;
 
+// Provider-agnostic reasoning effort on the wire. The renderer maps it onto
+// the thread field for the turn's model (codex / claude / grok). Unknown
+// values are dropped so older hosts and newer controllers stay compatible.
+const REASONING_EFFORTS = new Set([
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'ultra',
+  'max',
+  'ultracode',
+  'ultrathink',
+]);
+const sanitizeReasoningEffort = (value) =>
+  typeof value === 'string' && REASONING_EFFORTS.has(value) ? value : undefined;
+
+const sanitizeCodexServiceTier = (value) =>
+  value === 'default' || value === 'priority' ? value : undefined;
+
+const sanitizeClaudeContextWindow = (value) =>
+  value === '200k' || value === '1m' ? value : undefined;
+
 // Shape every entry explicitly: the discovered catalog is an internal object
 // (per-provider CLI details may grow fields) and must not be serialized
 // verbatim onto the wire.
@@ -1704,6 +1726,9 @@ const handleHostRequest = async (session, message) => {
             epicId: typeof message?.epicId === 'string' ? message.epicId : undefined,
             modelId: typeof message?.modelId === 'string' ? message.modelId : undefined,
             accessMode: sanitizeAccessMode(message?.accessMode),
+            reasoningEffort: sanitizeReasoningEffort(message?.reasoningEffort),
+            codexServiceTier: sanitizeCodexServiceTier(message?.codexServiceTier),
+            claudeContextWindow: sanitizeClaudeContextWindow(message?.claudeContextWindow),
             source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
           },
           Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS,
@@ -2532,9 +2557,23 @@ export const fetchRemoteThread = async ({ machineId, threadId } = {}) => {
   }
 };
 
-export const runRemoteTurn = async ({ machineId, threadId, projectId, epicId, prompt, modelId, accessMode } = {}) => {
+export const runRemoteTurn = async ({
+  machineId,
+  threadId,
+  projectId,
+  epicId,
+  prompt,
+  modelId,
+  accessMode,
+  reasoningEffort,
+  codexServiceTier,
+  claudeContextWindow,
+} = {}) => {
   try {
     const requestedAccessMode = sanitizeAccessMode(accessMode);
+    const requestedReasoningEffort = sanitizeReasoningEffort(reasoningEffort);
+    const requestedCodexServiceTier = sanitizeCodexServiceTier(codexServiceTier);
+    const requestedClaudeContextWindow = sanitizeClaudeContextWindow(claudeContextWindow);
     const response = await clientRequest(
       String(machineId ?? ''),
       {
@@ -2544,6 +2583,11 @@ export const runRemoteTurn = async ({ machineId, threadId, projectId, epicId, pr
         ...(epicId ? { epicId: String(epicId) } : {}),
         ...(modelId ? { modelId: String(modelId) } : {}),
         ...(requestedAccessMode ? { accessMode: requestedAccessMode } : {}),
+        ...(requestedReasoningEffort ? { reasoningEffort: requestedReasoningEffort } : {}),
+        ...(requestedCodexServiceTier ? { codexServiceTier: requestedCodexServiceTier } : {}),
+        ...(requestedClaudeContextWindow
+          ? { claudeContextWindow: requestedClaudeContextWindow }
+          : {}),
         prompt: String(prompt ?? ''),
       },
       (Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS) +

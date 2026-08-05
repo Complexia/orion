@@ -3,9 +3,11 @@ import { createLatestOperationGate } from '../src/app/remote-operation-gate.ts';
 import {
   canGenerateRemotePairingCode,
   claimRemoteSideEffect,
+  claimRemoteThreadStart,
   mergeSynchronouslyTrackedRuns,
   parseRemotePortDraft,
   persistSuccessfulRemoteCommand,
+  remoteAgentSettingsPatch,
   remoteControlIsAuthenticated,
   remoteThreadRunError,
   remoteThreadRuntime,
@@ -24,6 +26,69 @@ assert.equal(remoteThreadRuntime('claude:claude-sonnet-4-5'), 'agent');
 assert.match(remoteThreadRunError('claude:claude-code-cli'), /output is only available in the host terminal/i);
 assert.equal(remoteThreadRunError('claude:claude-sonnet-4-5'), null);
 console.log('ok  remote turns reject terminal-only threads before routing');
+
+{
+  const emptyThread = {};
+  const grokModel = {
+    id: 'grok:grok-4.5',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.5',
+    slug: 'grok-4.5',
+  };
+  const claudeModel = {
+    id: 'claude:claude-opus-5',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Opus 5',
+    slug: 'claude-opus-5',
+  };
+  const codexModel = {
+    id: 'codex:gpt-5.6-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-5.6 Sol',
+    slug: 'gpt-5.6-sol',
+  };
+
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, grokModel, { reasoningEffort: 'high' }),
+    { grokReasoningEffort: 'high' }
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch({ grokReasoningEffort: 'high' }, grokModel, { reasoningEffort: 'high' }),
+    {}
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, grokModel, { reasoningEffort: 'ultra' }),
+    {},
+    'grok must not accept codex-only ultra'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, claudeModel, {
+      reasoningEffort: 'xhigh',
+      claudeContextWindow: '200k',
+    }),
+    // opus-5 is 1M-only, so 200k is clamped up
+    { claudeReasoningEffort: 'xhigh', claudeContextWindow: '1m' }
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, codexModel, {
+      reasoningEffort: 'ultra',
+      codexServiceTier: 'priority',
+    }),
+    { codexReasoningEffort: 'ultra', codexServiceTier: 'priority' }
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, codexModel, {
+      reasoningEffort: 'ultrathink',
+      codexServiceTier: 'turbo',
+    }),
+    {},
+    'codex must drop claude-only effort and unknown tiers'
+  );
+  console.log('ok  remote agent settings map onto the right thread fields per provider');
+}
 
 // A relay outage must not disable pairing while the LAN listener is up: any
 // live inbound route makes a code usable, matching the engine's
@@ -136,6 +201,33 @@ assert.deepEqual(
   'the reservation should release when startup exits'
 );
 console.log('ok  per-thread start reservation spans remote command claiming');
+
+let claimedSetting = 'low';
+assert.equal(
+  await claimRemoteThreadStart(
+    async () => false,
+    () => {
+      claimedSetting = 'high';
+    }
+  ),
+  false
+);
+assert.equal(
+  claimedSetting,
+  'low',
+  'an expired or revoked run must not apply its requested thread settings'
+);
+assert.equal(
+  await claimRemoteThreadStart(
+    async () => true,
+    () => {
+      claimedSetting = 'high';
+    }
+  ),
+  true
+);
+assert.equal(claimedSetting, 'high');
+console.log('ok  remote run settings apply only after the atomic start claim succeeds');
 
 let claims = 0;
 assert.equal(

@@ -249,6 +249,24 @@ export type RemoteCommandRequest = {
     epicId?: string;
     modelId?: string;
     accessMode?: 'read-only' | 'workspace-write' | 'full-access';
+    /**
+     * Provider-agnostic reasoning effort. Main drops unknown values; the
+     * renderer maps the rest onto codex/claude/grok thread fields for the
+     * turn's model.
+     */
+    reasoningEffort?:
+      | 'low'
+      | 'medium'
+      | 'high'
+      | 'xhigh'
+      | 'ultra'
+      | 'max'
+      | 'ultracode'
+      | 'ultrathink';
+    /** Codex-only service tier. Ignored for other providers. */
+    codexServiceTier?: 'default' | 'priority';
+    /** Claude-only context window. Ignored for other providers. */
+    claudeContextWindow?: '200k' | '1m';
     source?: { machineId: string; machineName: string };
   };
 };
@@ -1168,6 +1186,17 @@ type OrionComputerUsePermissions = {
         epicId?: string;
         modelId?: string;
         accessMode?: 'read-only' | 'workspace-write' | 'full-access';
+        reasoningEffort?:
+          | 'low'
+          | 'medium'
+          | 'high'
+          | 'xhigh'
+          | 'ultra'
+          | 'max'
+          | 'ultracode'
+          | 'ultrathink';
+        codexServiceTier?: 'default' | 'priority';
+        claudeContextWindow?: '200k' | '1m';
         prompt: string;
       }) => Promise<{ ok: boolean; threadId?: string; error?: string }>;
       remoteStopTurn?: (input: {
