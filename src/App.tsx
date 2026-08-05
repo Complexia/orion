@@ -2358,8 +2358,9 @@ const App: React.FC = () => {
 
   // Prefetch the project's command list when a Claude-backed thread is
   // selected, so the first "/" keystroke shows real commands instead of the
-  // static fallback. Main answers from the live session or its cache; it
-  // never spawns a process for this.
+  // static fallback. Main answers from a live session or its cache; for a
+  // cold project it boots a short-lived promptless CLI to harvest the list
+  // (a couple of seconds — the fallback covers the gap).
   useEffect(() => {
     if (!selectedThreadClaudeBacked || !selectedThreadProjectPath || !selectedThreadId) return;
     if (slashCommandsByProject[selectedThreadProjectPath]) return;

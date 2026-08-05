@@ -996,7 +996,7 @@ type OrionComputerUsePermissions = {
       listSlashCommands: (input: { threadId?: string | null; projectPath?: string | null }) => Promise<{
         ok: boolean;
         commands?: SlashCommandInfo[];
-        source?: 'live' | 'cache';
+        source?: 'live' | 'cache' | 'harvest';
       }>;
       /** Push of the latest slash-command list whenever a Claude session reports one. Replace, don't merge. */
       onSlashCommands: (cb: (event: { projectPath: string; commands: SlashCommandInfo[] }) => void) => () => void;

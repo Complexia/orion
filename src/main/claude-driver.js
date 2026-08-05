@@ -38,6 +38,10 @@ export const claudeSdkSessions = new Map(); // threadId -> session
 // every thread in a project shares one list. Survives session eviction; the
 // next live session's init refreshes it.
 export const claudeSlashCommandCache = new Map(); // projectPath -> SlashCommandInfo[]
+// Cold-project harvests in flight (short-lived promptless CLI boots that only
+// call supportedCommands()). Deduped per project so a burst of renderer pulls
+// shares one spawn.
+export const claudeSlashCommandHarvests = new Map(); // projectPath -> Promise<SlashCommandInfo[] | null>
 // Sessions removed from claudeSdkSessions but whose SDK/CLI process has not
 // acknowledged AbortController.abort() yet. Destructive workspace teardown
 // waits for every entry for the thread instead of mistaking "removed from the
@@ -650,6 +654,10 @@ export const claudeSessionSubagentTracker = (session) => {
 // drops anything without a usable name and dedupes by name (skills and custom
 // commands can shadow each other — e.g. a project and a user skill both named
 // "verify" — and the CLI resolves the first one the same way).
+// Commands the CLI reports but that only function in server-launched sessions;
+// listing them in Orion's menu would offer commands that can never work.
+const INTERNAL_CLAUDE_COMMANDS = new Set(['workflow-launch-exec']);
+
 export const normalizeSlashCommands = (commands) => {
   const seen = new Set();
   return (Array.isArray(commands) ? commands : [])
@@ -663,6 +671,7 @@ export const normalizeSlashCommands = (commands) => {
     }))
     .filter((command) => {
       if (!command.name || seen.has(command.name)) return false;
+      if (command.name.startsWith('__') || INTERNAL_CLAUDE_COMMANDS.has(command.name)) return false;
       seen.add(command.name);
       return true;
     });
@@ -693,9 +702,58 @@ export const refreshClaudeSlashCommands = async (session) => {
   }
 };
 
+// A project with no session yet still deserves the real command list: boot the
+// CLI with a prompt stream that never yields, ask supportedCommands() (a
+// control request — no user turn, no model call, no tokens), cache + push the
+// answer, and abort the process. settingSources matches real sessions so
+// custom commands, skills, and plugin commands all appear; strictMcpConfig
+// keeps the user's MCP servers from being spawned for a menu prefetch (their
+// prompt-commands arrive later from the first real session's init).
+export const harvestClaudeSlashCommands = ({ sender, projectPath }) => {
+  const inFlight = claudeSlashCommandHarvests.get(projectPath);
+  if (inFlight) return inFlight;
+  const harvest = (async () => {
+    const abortController = new AbortController();
+    try {
+      const [sdk, claudeBinary] = await Promise.all([loadClaudeSdk(), resolveClaudeBinary()]);
+      const query = sdk.query({
+        prompt: (async function* () {
+          await new Promise(() => {});
+        })(),
+        options: {
+          cwd: projectPath,
+          settingSources: ['user', 'project', 'local'],
+          strictMcpConfig: true,
+          ...(claudeBinary ? { pathToClaudeCodeExecutable: claudeBinary } : {}),
+          abortController,
+          env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+        },
+      });
+      const commands = await Promise.race([
+        query.supportedCommands(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('slash command harvest timed out')), 20000)
+        ),
+      ]);
+      pushSlashCommands(sender, projectPath, commands);
+      return claudeSlashCommandCache.get(projectPath) ?? null;
+    } catch {
+      return null;
+    } finally {
+      try {
+        abortController.abort();
+      } catch {}
+      claudeSlashCommandHarvests.delete(projectPath);
+    }
+  })();
+  claudeSlashCommandHarvests.set(projectPath, harvest);
+  return harvest;
+};
+
 // Renderer pull (agent:listSlashCommands). Prefers a live session for the
-// thread; falls back to the project cache (possibly stale after eviction —
-// the next real turn's init refreshes it). Never spawns a process.
+// thread, then the project cache (possibly stale after eviction — the next
+// real turn's init refreshes it), then any live sibling session in the same
+// project, and finally a one-shot harvest boot for cold projects.
 export const listClaudeSlashCommands = async ({ sender, threadId, projectPath }) => {
   const session = threadId ? claudeSdkSessions.get(threadId) : null;
   if (session && !session.ended && !session.disposed && session.query) {
@@ -711,6 +769,18 @@ export const listClaudeSlashCommands = async ({ sender, threadId, projectPath })
   }
   const cached = projectPath ? claudeSlashCommandCache.get(projectPath) : null;
   if (cached) return { ok: true, commands: cached, source: 'cache' };
+  if (!projectPath) return { ok: false };
+  // Command lists are project-scoped, so any sibling thread's session answers
+  // for this thread too — cheaper than booting a harvest process.
+  for (const sibling of claudeSdkSessions.values()) {
+    if (sibling.projectPath !== projectPath || sibling.ended || sibling.disposed || !sibling.query)
+      continue;
+    const commands = await refreshClaudeSlashCommands(sibling);
+    if (commands) return { ok: true, commands, source: 'live' };
+    break;
+  }
+  const harvested = await harvestClaudeSlashCommands({ sender, projectPath });
+  if (harvested) return { ok: true, commands: harvested, source: 'harvest' };
   return { ok: false };
 };
 
