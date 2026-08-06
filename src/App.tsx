@@ -8769,6 +8769,37 @@ const App: React.FC = () => {
     // Delivered into the live turn: record the fully prepared instruction in
     // the transcript and consume the linked-task context exactly once.
     pinThreadToBottom(threadId);
+    // Split the transcript at the steer point. The run streams into one
+    // agent-run bubble, so appending the user message alone would leave it
+    // pinned under a bubble that keeps growing above it (and the composer's
+    // "Starting agent..." placeholder showing for a run already in flight).
+    // Close out the current bubble first; after the user message lands below,
+    // retarget the run's output to a fresh bubble so the rest of the turn
+    // renders in reading order. A bubble with no output yet moves below the
+    // steered message instead — closing it would leave an empty zero-second
+    // "Response" above the steer point. (Steering a retained background run
+    // hits this: the driver opens a fresh turn and its `started {background}`
+    // event can create the tracked bubble before this IPC reply resolves.)
+    flushChunkBuffers();
+    const trackedRun = runOutputMessages.current.get(target.runId);
+    const splitRun = trackedRun && trackedRun.threadId === threadId ? trackedRun : undefined;
+    const splitMessage = splitRun
+      ? useOrionStore
+          .getState()
+          .threads.find((thread) => thread.id === threadId)
+          ?.messages.find((message) => message.id === splitRun.messageId)
+      : undefined;
+    const moveSplitMessage =
+      !!splitMessage &&
+      splitMessage.content.length === 0 &&
+      (splitMessage.activities?.length ?? 0) === 0;
+    if (splitMessage && !moveSplitMessage) {
+      updateThreadMessage(threadId, splitMessage.id, {
+        status: 'done',
+        completedAt: new Date().toISOString(),
+        statusText: 'Steered — the agent continues below.',
+      });
+    }
     if (prepared.tasksToInject.length > 0) {
       const injectedIds = new Set(prepared.tasksToInject.map((task) => task.id));
       const currentLinkedTasks =
@@ -8794,6 +8825,35 @@ const App: React.FC = () => {
           }
         : {}),
     });
+    if (splitMessage && moveSplitMessage) {
+      // Same run, same bubble — it just hasn't streamed anything yet, so
+      // repositioning it below the steered message keeps reading order
+      // without leaving an empty closed bubble behind. No retarget needed.
+      const currentMessages =
+        useOrionStore.getState().threads.find((thread) => thread.id === threadId)?.messages ?? [];
+      const bubble = currentMessages.find((message) => message.id === splitMessage.id);
+      if (bubble) {
+        updateThread(threadId, {
+          messages: [...currentMessages.filter((message) => message.id !== bubble.id), bubble],
+        });
+      }
+    } else if (splitMessage) {
+      const continuationMessageId = addMessageToThread(threadId, {
+        role: 'agent',
+        content: '',
+        kind: 'agent-run',
+        status: 'running',
+        statusText: "I'm working on this now.",
+        startedAt: new Date().toISOString(),
+        activities: [],
+        ...(splitMessage.command ? { command: splitMessage.command } : {}),
+        ...(splitMessage.modelId ? { modelId: splitMessage.modelId } : {}),
+      });
+      runOutputMessages.current.set(target.runId, {
+        threadId,
+        messageId: continuationMessageId,
+      });
+    }
   };
 
   const steerWithContent = (
