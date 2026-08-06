@@ -1266,8 +1266,8 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                       disabled={!steerReady}
                       title={
                         steerReady
-                          ? 'Interrupt the agent and send this now'
-                          : 'Steer becomes available once the agent reports its session'
+                          ? 'Send into the running turn now — the agent picks it up without losing its work'
+                          : 'Steer is unavailable — sends when the current turn ends'
                       }
                     >
                       <Zap size={12} />
