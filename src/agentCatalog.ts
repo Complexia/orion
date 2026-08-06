@@ -4,6 +4,7 @@ import {
   CursorBrandIcon,
   GrokBrandIcon,
   KimiBrandIcon,
+  MuseBrandIcon,
   OpenCodeBrandIcon,
   OrionBrandIcon,
   type ProviderIconComponent,
@@ -16,6 +17,7 @@ export type AgentProviderId =
   | 'claude'
   | 'cursor'
   | 'kimi'
+  | 'muse'
   | 'opencode';
 
 export type AgentModel = {
@@ -48,6 +50,14 @@ export type ClaudeReasoningEffort =
   | 'ultrathink';
 export type ClaudeContextWindow = '200k' | '1m';
 export type GrokReasoningEffort = 'low' | 'medium' | 'high';
+export type MuseReasoningEffort =
+  | 'none'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'ultra';
 
 export type CodexReasoningOption = {
   value: CodexReasoningEffort;
@@ -147,6 +157,24 @@ export const grokReasoningOptions: Array<{
   { value: 'low', label: 'Low', description: 'Quick, fast implementations' },
   { value: 'medium', label: 'Medium', description: 'Balanced effort with standard implementation and testing' },
   { value: 'high', label: 'High', default: true, description: 'Highest implementation quality with extensive reasoning' },
+];
+
+// Muse Code's reasoning-effort tiers, the wire values `muse exec
+// --reasoning-effort` accepts. The CLI defaults to high.
+export const defaultMuseReasoningEffort: MuseReasoningEffort = 'high';
+
+export const museReasoningOptions: Array<{
+  value: MuseReasoningEffort;
+  label: string;
+  default?: boolean;
+}> = [
+  { value: 'none', label: 'None' },
+  { value: 'minimal', label: 'Minimal' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High', default: true },
+  { value: 'xhigh', label: 'Extra High' },
+  { value: 'ultra', label: 'Ultra' },
 ];
 
 export type ProviderOptionDef = {
@@ -316,6 +344,18 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       placeholder: '--add-dir /path',
     },
   ],
+  // Muse turns run over `muse exec` (headless JSONL); flags land between
+  // `exec` and the prompt argument.
+  muse: [
+    {
+      key: 'extraArgs',
+      label: 'Extra CLI flags',
+      description:
+        'Appended to every `muse exec` invocation, before the prompt. Quotes are respected.',
+      type: 'string',
+      placeholder: '--sandbox-network enabled',
+    },
+  ],
   opencode: [extraArgsOption('opencode')],
 };
 
@@ -338,6 +378,7 @@ export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; 
   claude: { queue: true, steer: true },
   cursor: { queue: true, steer: false },
   kimi: { queue: true, steer: false },
+  muse: { queue: true, steer: false },
   opencode: { queue: true, steer: false },
 };
 
@@ -347,6 +388,7 @@ export const agentProviders: AgentProvider[] = [
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },
   { id: 'claude', label: 'Claude', icon: ClaudeBrandIcon },
   { id: 'kimi', label: 'Kimi', icon: KimiBrandIcon },
+  { id: 'muse', label: 'Muse', icon: MuseBrandIcon },
   { id: 'cursor', label: 'Cursor', icon: CursorBrandIcon },
   { id: 'opencode', label: 'OpenCode', icon: OpenCodeBrandIcon },
 ];
@@ -530,6 +572,15 @@ export const fallbackAgentModels: AgentModel[] = [
     label: 'K2.7 Coding Highspeed',
     slug: 'kimi-code/kimi-for-coding-highspeed',
     shortcut: '⌘3',
+  },
+  {
+    id: 'muse:muse-spark-1.2',
+    providerId: 'muse',
+    providerLabel: 'Muse',
+    label: 'Muse Spark 1.2',
+    slug: 'muse-spark-1.2',
+    shortcut: '⌘1',
+    favorite: true,
   },
   {
     id: 'cursor:composer-2.5',

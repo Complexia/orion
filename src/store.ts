@@ -434,6 +434,18 @@ export type SuggestedTask = {
   createdAt: string;
   /** Run generation that produced this suggestion. */
   turnRunId: string;
+  /**
+   * Self-contained prompt for starting this task in a fresh session, written
+   * by a read-only fork of the source session (which has the context the terse
+   * suggestion text leaves out). Start sends this; `text` stays the card copy.
+   */
+  detailedPrompt?: string;
+  /**
+   * Progress of the detailed-prompt fork. Unset when no fork was started
+   * (non-Claude thread, no session yet); Start then falls back to `text` plus
+   * a no-context preamble.
+   */
+  detailedPromptStatus?: 'pending' | 'ready' | 'failed';
   /** Epic created from this suggestion, once the user started it in a rift. */
   startedEpicId?: string;
   /** Thread created from this suggestion, once the user started it on the current branch. */
@@ -452,6 +464,7 @@ export type Thread = {
   claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
   claudeContextWindow?: '200k' | '1m';
   grokReasoningEffort?: 'low' | 'medium' | 'high';
+  museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
   createdAt: string;
   /** Removed from the sidebar Recent agents list (still listed under its project). */
   hiddenFromRecent?: boolean;
@@ -511,7 +524,7 @@ export type OpenFile = {
   isDirty: boolean;
 };
 
-export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'opencode';
+export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'muse' | 'opencode';
 
 export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
 
@@ -556,6 +569,7 @@ export const defaultProviderSettings: ProviderSettings = {
   claude: { enabled: true },
   cursor: { enabled: true },
   kimi: { enabled: true },
+  muse: { enabled: true },
   opencode: { enabled: true },
 };
 
@@ -1712,6 +1726,7 @@ export const useOrionStore = create<OrionState>()(
           claudeReasoningEffort: lastProjectThread?.claudeReasoningEffort,
           claudeContextWindow: lastProjectThread?.claudeContextWindow,
           grokReasoningEffort: lastProjectThread?.grokReasoningEffort,
+          museReasoningEffort: lastProjectThread?.museReasoningEffort,
           createdAt: new Date().toISOString(),
           parentThreadId: options?.parentThreadId,
           spawnId: options?.spawnId,

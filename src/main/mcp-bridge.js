@@ -308,6 +308,7 @@ export const registerMcpBridgeForRun = async ({
       command,
       args,
       pluginDir,
+      tokenRoot,
       release: () => {
         mcpBridgeSessions.delete(token);
         void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});
@@ -315,6 +316,81 @@ export const registerMcpBridgeForRun = async ({
     };
   } catch (error) {
     console.error('Orion MCP bridge unavailable:', error);
+    return null;
+  }
+};
+
+// Muse reads MCP servers only from `<config root>/muse/settings.json`
+// (`mcp_servers`, a map of Claude-style {transport, command, args, env}
+// entries) and `muse exec` has no per-run config flag — so each muse run gets
+// a synthetic XDG_CONFIG_HOME under the run's token directory. The override
+// leaks into the model's shell commands, where XDG-aware tools (git, gh)
+// resolve config through it, so every non-muse entry of the real root is
+// symlinked through. Inside muse/ every file except settings.json is
+// symlinked too (auth.json token refreshes land in the real file);
+// settings.json is the user's own settings plus the bridge entry. Muse scrubs
+// its own environment from MCP server children, so ELECTRON_RUN_AS_NODE must
+// travel in the entry's env map (all verified live on muse 0.1.0).
+export const museUserConfigRoot = () =>
+  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+
+export const writeMuseMcpConfigRoot = async (orionMcp) => {
+  if (!orionMcp?.tokenRoot) return null;
+  try {
+    const syntheticRoot = path.join(orionMcp.tokenRoot, 'muse-xdg');
+    const syntheticMuseDir = path.join(syntheticRoot, 'muse');
+    await fs.mkdir(syntheticMuseDir, { recursive: true, mode: 0o700 });
+
+    const realRoot = museUserConfigRoot();
+    const mirror = async (sourceDir, targetDir, skip) => {
+      let entries = [];
+      try {
+        entries = await fs.readdir(sourceDir);
+      } catch {
+        return;
+      }
+      await Promise.all(
+        entries
+          .filter((name) => !skip.has(name))
+          .map((name) =>
+            fs.symlink(path.join(sourceDir, name), path.join(targetDir, name)).catch(() => {})
+          )
+      );
+    };
+    await mirror(realRoot, syntheticRoot, new Set(['muse']));
+    await mirror(path.join(realRoot, 'muse'), syntheticMuseDir, new Set(['settings.json']));
+
+    let settings = {};
+    try {
+      const parsed = JSON.parse(
+        await fs.readFile(path.join(realRoot, 'muse', 'settings.json'), 'utf-8')
+      );
+      if (isPlainRecord(parsed)) settings = parsed;
+    } catch {}
+    await fs.writeFile(
+      path.join(syntheticMuseDir, 'settings.json'),
+      `${JSON.stringify(
+        {
+          schema_version: 1,
+          ...settings,
+          mcp_servers: {
+            ...(isPlainRecord(settings.mcp_servers) ? settings.mcp_servers : {}),
+            orion: {
+              transport: 'stdio',
+              command: orionMcp.command,
+              args: orionMcp.args,
+              env: { ELECTRON_RUN_AS_NODE: '1' },
+            },
+          },
+        },
+        null,
+        2
+      )}\n`,
+      { mode: 0o600 }
+    );
+    return syntheticRoot;
+  } catch (error) {
+    console.error('Muse MCP config root unavailable:', error);
     return null;
   }
 };

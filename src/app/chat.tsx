@@ -176,6 +176,16 @@ export const FloatingSuggestedTaskCard: React.FC<{
         <div className="tasks-float-body">
           <div className="suggested-task-title">{title}</div>
           <div className="suggested-task-text">{suggestion.text}</div>
+          {!suggestion.startedEpicId &&
+            !suggestion.startedThreadId &&
+            suggestion.detailedPromptStatus === 'pending' && (
+              <div
+                className="suggested-task-preparing"
+                title="A fork of this session is writing a self-contained prompt for the new agent. Starting now sends the short text instead."
+              >
+                Writing detailed prompt for the new agent…
+              </div>
+            )}
           {suggestion.startedEpicId || suggestion.startedThreadId ? (
             <div className="suggested-task-actions">
               <span className="suggested-task-started">
@@ -564,7 +574,7 @@ export const PROVIDER_AUTH_ERROR_PATTERNS: RegExp[] = [
   /\bunauthenticated\b/i,
   /\b401\b[^\n]{0,40}unauthorized/i,
   /unauthorized[^\n]{0,40}\b401\b/i,
-  /run\s+`?(codex|cursor-agent|grok|opencode|claude|kimi)\s+(auth\s+)?login/i,
+  /run\s+`?(codex|cursor-agent|grok|opencode|claude|kimi|muse)\s+(auth\s+)?login/i,
   /please (log ?in|sign ?in)/i,
 ];
 

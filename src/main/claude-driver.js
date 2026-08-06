@@ -570,10 +570,13 @@ export const updateClaudeBackgroundSettle = (session) => {
 export const finalizeClaudeTurn = async (session, resultMessage) => {
   const turn = session.activeTurns.shift();
   if (!turn) return;
+  const continuesSameRun = session.activeTurns.some((activeTurn) => activeTurn.runId === turn.runId);
   // prompt_suggestion is emitted after this result, when the turn is no
   // longer in activeTurns. Retain the exact owner so the renderer can reject
-  // it if another foreground or harness-initiated turn starts first.
-  session.pendingSuggestionRunId = turn.runId;
+  // it if another foreground or harness-initiated turn starts first. A
+  // continued result owner must not surface a suggestion for its partial
+  // result boundary while that same visible run is still active.
+  session.pendingSuggestionRunId = continuesSameRun ? null : turn.runId;
   // The turn is forgotten but its terminal event still awaits git
   // summarization below — advertise the gap so a racing steer can wait for
   // the real outcome (agent:isRunFinalizing).

@@ -1,4 +1,6 @@
 import path from 'node:path';
+import os from 'node:os';
+import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { loginShell, resolveCommandPath, runShellCommand, shellQuote } from './shell-env.js';
 
@@ -48,6 +50,31 @@ export const providerUpdaterConfigs = [
     verifyAfterUpdate: true,
     authCommands: [['login']],
     statusCommand: ['provider', 'list'],
+  },
+  {
+    id: 'muse',
+    label: 'Muse Code',
+    command: 'muse',
+    // `muse` is a self-updating launcher script, so routine version reads must
+    // explicitly disable its automatic update path. There is no separate
+    // update subcommand, so the managed update run forces an immediate check
+    // (MUSE_UPDATE_INTERVAL_SECONDS=0) and makes the install synchronous
+    // (MUSE_SYNC_UPDATE=1) — otherwise verification would race the detached
+    // download. The channel manifest and `muse --version` both carry the
+    // R-suffixed build ("0.1.0-R708.1"); the
+    // versionPattern pins version extraction to that form on both sides,
+    // because comparing the bare semver against the suffixed build would flag
+    // a phantom update forever.
+    latestVersionUrl: 'https://api.meta.ai/muse-code/channels/muse-stable',
+    versionPattern: /\d+\.\d+\.\d+-R[\d.]+/,
+    versionEnv: { MUSE_NO_AUTO_UPDATE: '1' },
+    updateCommands: [['--version']],
+    probeUpdateCommand: false,
+    updateEnv: { MUSE_UPDATE_INTERVAL_SECONDS: '0', MUSE_SYNC_UPDATE: '1' },
+    verifyAfterUpdate: true,
+    authCommands: [['login']],
+    // Auth status comes from the credential file (see getProviderAuthStatus)
+    // — the CLI has no status subcommand.
   },
   {
     id: 'opencode',
@@ -103,7 +130,7 @@ export const isProviderUpdateCancelled = (error) =>
 
 export const runStreamingShellCommand = (command, options = {}) =>
   new Promise((resolve, reject) => {
-    const { signal, onOutput } = options;
+    const { signal, onOutput, env } = options;
     if (signal?.aborted) {
       const error = new Error('Provider update cancelled.');
       error.name = 'AbortError';
@@ -118,6 +145,7 @@ export const runStreamingShellCommand = (command, options = {}) =>
         ...process.env,
         FORCE_COLOR: '0',
         NO_COLOR: '1',
+        ...(env || {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       // A separate process group lets Abort terminate installer children such
@@ -208,12 +236,23 @@ export const runStreamingShellCommand = (command, options = {}) =>
     signal?.addEventListener('abort', abort, { once: true });
   });
 
-export const readCliVersion = async (command) => {
+// A config's versionPattern narrows what counts as the version in CLI and
+// remote output. Muse needs it: `muse --version` prints both the bare semver
+// and the full channel build ("Muse Code 0.1.0 (0.1.0-R708.1)"), and only the
+// R-suffixed build compares correctly against the release channel.
+export const extractVersion = (text, versionPattern) =>
+  (versionPattern ? String(text || '').match(versionPattern)?.[0] : null) ?? parseVersion(text);
+
+export const readCliVersion = async (command, versionPattern, env) => {
   try {
-    const { stdout, stderr } = await runShellCommand(`${shellQuote(command)} --version`, 8000);
-    return parseVersion(`${stdout}\n${stderr}`);
+    const { stdout, stderr } = await runShellCommand(
+      `${shellQuote(command)} --version`,
+      8000,
+      env
+    );
+    return extractVersion(`${stdout}\n${stderr}`, versionPattern);
   } catch (error) {
-    return parseVersion(getProcessErrorMessage(error));
+    return extractVersion(getProcessErrorMessage(error), versionPattern);
   }
 };
 
@@ -226,11 +265,11 @@ export const readNpmLatestVersion = async (packageName) => {
   }
 };
 
-export const readRemoteLatestVersion = async (url) => {
+export const readRemoteLatestVersion = async (url, versionPattern) => {
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
     if (!response.ok) return null;
-    return parseVersion(await response.text());
+    return extractVersion(await response.text(), versionPattern);
   } catch {
     return null;
   }
@@ -258,6 +297,48 @@ export const parseJsonFromOutput = (output) => {
   }
 };
 
+// muse stores credentials at $XDG_CONFIG_HOME/muse/auth.json (or
+// ~/.config/muse; MUSE_AUTH_PATH overrides), written by `muse login` (Meta
+// account OAuth) or `muse auth set` (API key). The CLI has no status
+// subcommand, so authentication is read straight off that file. META_API_KEY
+// in the environment always takes priority over the stored login.
+export const museAuthFilePath = () =>
+  process.env.MUSE_AUTH_PATH ||
+  path.join(
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+    'muse',
+    'auth.json'
+  );
+
+export const getMuseAuthStatus = async () => {
+  if (process.env.META_API_KEY) {
+    return {
+      authenticated: true,
+      status: 'authenticated',
+      label: 'Authenticated',
+      detail: 'META_API_KEY',
+    };
+  }
+  try {
+    const parsed = JSON.parse(await readFile(museAuthFilePath(), 'utf8'));
+    const meta = parsed?.providers?.meta;
+    const authenticated = Boolean(meta?.access_token || meta?.api_key);
+    return {
+      authenticated,
+      status: authenticated ? 'authenticated' : 'unauthenticated',
+      label: authenticated ? 'Authenticated' : 'Not authenticated',
+      detail: typeof meta?.user_email === 'string' ? meta.user_email : undefined,
+    };
+  } catch {
+    return {
+      authenticated: false,
+      status: 'unauthenticated',
+      label: 'Not authenticated',
+      detail: 'Run muse login.',
+    };
+  }
+};
+
 export const getProviderAuthStatus = async (config) => {
   if (!(await resolveCommandPath(config.command))) {
     return {
@@ -266,6 +347,10 @@ export const getProviderAuthStatus = async (config) => {
       label: 'Not installed',
       detail: `${config.command} is not installed.`,
     };
+  }
+
+  if (config.id === 'muse') {
+    return getMuseAuthStatus();
   }
 
   if (!config.statusCommand) {
@@ -390,7 +475,11 @@ export const checkProviderUpdate = async (config, enabledProviderIds = null) => 
 
   if (!commandPath) return base;
 
-  const currentVersion = await readCliVersion(config.command);
+  const currentVersion = await readCliVersion(
+    config.command,
+    config.versionPattern,
+    config.versionEnv
+  );
   const withCurrentVersion = { ...base, currentVersion };
 
   if (config.checkCommand) {
@@ -443,7 +532,7 @@ export const checkProviderUpdate = async (config, enabledProviderIds = null) => 
   }
 
   if (config.latestVersionUrl) {
-    const latestVersion = await readRemoteLatestVersion(config.latestVersionUrl);
+    const latestVersion = await readRemoteLatestVersion(config.latestVersionUrl, config.versionPattern);
     const updateAvailable =
       enabled && currentVersion && latestVersion
         ? compareVersionStrings(currentVersion, latestVersion) < 0
@@ -492,6 +581,8 @@ export const checkProviderUpdates = (input = {}) => {
 export const getProviderStatuses = async () => checkProviderUpdates();
 
 export const resolveProviderUpdateCommand = async (config) => {
+  if (config.probeUpdateCommand === false) return config.updateCommands[0] ?? null;
+
   for (const args of config.updateCommands) {
     try {
       await runShellCommand([config.command, ...args, '--help'].map(shellQuote).join(' '), 8000);
@@ -534,7 +625,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
 
   const updateCommand = [config.command, ...args].map(shellQuote).join(' ');
   const runUpdateCommand = (command) =>
-    runStreamingShellCommand(command, { signal, onOutput });
+    runStreamingShellCommand(command, { signal, onOutput, env: config.updateEnv });
 
   try {
     onPhase?.('updating');
@@ -556,7 +647,11 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
 
     if (config.verifyAfterUpdate && expectedLatestVersion) {
       onPhase?.('verifying');
-      const installedVersion = await readCliVersion(config.command);
+      const installedVersion = await readCliVersion(
+        config.command,
+        config.versionPattern,
+        config.versionEnv
+      );
       if (
         !installedVersion ||
         compareVersionStrings(installedVersion, expectedLatestVersion) < 0
