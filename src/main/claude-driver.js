@@ -570,10 +570,13 @@ export const updateClaudeBackgroundSettle = (session) => {
 export const finalizeClaudeTurn = async (session, resultMessage) => {
   const turn = session.activeTurns.shift();
   if (!turn) return;
+  const continuesSameRun = session.activeTurns.some((activeTurn) => activeTurn.runId === turn.runId);
   // prompt_suggestion is emitted after this result, when the turn is no
   // longer in activeTurns. Retain the exact owner so the renderer can reject
-  // it if another foreground or harness-initiated turn starts first.
-  session.pendingSuggestionRunId = turn.runId;
+  // it if another foreground or harness-initiated turn starts first. A
+  // continued result owner must not surface a suggestion for its partial
+  // result boundary while that same visible run is still active.
+  session.pendingSuggestionRunId = continuesSameRun ? null : turn.runId;
   // The turn is forgotten but its terminal event still awaits git
   // summarization below — advertise the gap so a racing steer can wait for
   // the real outcome (agent:isRunFinalizing).
@@ -1187,9 +1190,10 @@ export const createClaudeSdkSession = ({
     // Task notifications that arrived while no turn was active; flushed as
     // activities into the next turn that opens.
     pendingTaskNotifications: [],
-    // How many `result` messages the CLI still owes (one per pushed user turn
-    // and per harness-initiated synthetic turn). When this hits zero, any
-    // turn still queued can never finalize on its own — see
+    // How many `result` messages the CLI still owes (one per pushed user turn,
+    // except a steer folded into an already active turn, and per harness-
+    // initiated synthetic turn). When this hits zero, any turn still queued
+    // can never finalize on its own — see
     // interruptClaudeSdkRun, which uses it to recover instead of interrupting.
     resultsOwed: 0,
     backgroundTasks: new Map(), // task_id -> { taskType, description }
@@ -1217,10 +1221,10 @@ export const createClaudeSdkSession = ({
     lastActivityAt: Date.now(),
   };
 
-  session.pushUserMessage = (text) => {
+  session.pushUserMessage = (text, { expectResult = true } = {}) => {
     if (session.firstPrompt === null) session.firstPrompt = text;
     session.lastActivityAt = Date.now();
-    session.resultsOwed += 1;
+    if (expectResult) session.resultsOwed += 1;
     inputQueue.push({
       type: 'user',
       message: { role: 'user', content: [{ type: 'text', text }] },
@@ -1425,6 +1429,51 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
   // the model) surface in this turn — the model reads them here anyway.
   flushPendingClaudeTaskNotifications(session, turn);
   return { ok: true, runId };
+};
+
+// Proper steering (Claude Code semantics): push the instruction into the
+// live session's input stream WITHOUT interrupting anything. During an active
+// turn Claude folds the queued instruction into that turn and emits one result
+// for the combined work, so the existing owner and result debt must be reused.
+// With only a retained background handle, there is no active owner to fold
+// into: open one and use normal result accounting. Returns false when no live
+// session holds the run — the caller falls back to queueing the message for
+// end-of-turn dispatch.
+export const steerClaudeSdkRun = (runId, text) => {
+  for (const session of claudeSdkSessions.values()) {
+    const activeOwner = session.activeTurns.find((turn) => turn.runId === runId);
+    const retainedOwner = session.backgroundRunId === runId;
+    const ownsRun = Boolean(activeOwner) || retainedOwner;
+    if (!ownsRun) continue;
+    if (session.ended || session.disposed || !session.query) return false;
+    session.pendingSuggestionRunId = null;
+    if (activeOwner) {
+      // This push is part of the result already owed by activeOwner. If the
+      // CLI has crossed the result boundary before it consumes the input, its
+      // next assistant event opens a synthetic turn and accounts for that
+      // observed result in handleClaudeSessionMessage.
+      session.pushUserMessage(text, { expectResult: false });
+      return true;
+    }
+    clearClaudeBackgroundRun(session);
+    const turn = createClaudeTurnState(
+      runId,
+      session.lastTurnEndSnapshot
+    );
+    session.activeTurns.push(turn);
+    updateClaudeBackgroundSettle(session);
+    emitAgentEvent(session.sender, {
+      runId,
+      threadId: session.threadId,
+      type: 'started',
+      background: true,
+      command: 'claude — steered background work',
+    });
+    flushPendingClaudeTaskNotifications(session, turn);
+    session.pushUserMessage(text);
+    return true;
+  }
+  return false;
 };
 
 export const interruptClaudeSdkRun = async (runId, { terminateBackground = false } = {}) => {

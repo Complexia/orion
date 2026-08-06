@@ -92,6 +92,7 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('agent:slashCommands', listener);
     return () => ipcRenderer.removeListener('agent:slashCommands', listener);
   },
+  steerAgentTurn: (runId, text) => ipcRenderer.invoke('agent:steerTurn', runId, text),
   stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),
   isRunFinalizing: (runId) => ipcRenderer.invoke('agent:isRunFinalizing', runId),
   // Codex goal ops (pause/clear/status) for threads with no live goal run.

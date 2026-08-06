@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-const [appSource, chatSource, claudeDriverSource] = await Promise.all([
+const [appSource, chatSource, claudeDriverSource, mainSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/app/chat.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/main/claude-driver.js', import.meta.url), 'utf8'),
+  readFile(new URL('../src/main.js', import.meta.url), 'utf8'),
 ]);
 
 const section = (source, start, end) => {
@@ -66,6 +67,69 @@ assert.match(
   'A successfully delivered terminal turn must invalidate the previous suggestion'
 );
 
+const startPromptBuilder = section(
+  appSource,
+  'const suggestedTaskStartPrompt = (suggestion: SuggestedTask): string => {',
+  'const getStoredThreadTitle'
+);
+assert.match(
+  startPromptBuilder,
+  /suggestion\.detailedPromptStatus === 'ready' && detailed\) return detailed;/,
+  'Only a completed detailed prompt may be sent to a fresh agent'
+);
+assert.match(
+  startPromptBuilder,
+  /`\$\{suggestion\.text\}\\n\\n`[\s\S]*you do not have that session's conversation[\s\S]*first investigate the repository/,
+  'Missing, pending, and failed detailed prompts must use an annotated short-text fallback'
+);
+assert.match(
+  appSource,
+  /suggestedTaskPromptResumeFallbackMarker\s*=\s*['"]_Could not resume the previous session; starting a fresh one\._['"]/,
+  'Detailed-prompt generation must recognize the Claude resume-fallback marker'
+);
+
+const promptForkCancellation = section(
+  appSource,
+  '  const canceledSuggestionPromptRunIds = useRef(new Set<string>());',
+  '  // Defined after the agent-event effect that calls it'
+);
+assert.match(
+  promptForkCancellation,
+  /suggestionPromptRuns\.current\.delete\(runId\)[\s\S]*canceledSuggestionPromptRunIds\.current\.add\(runId\)[\s\S]*stopAgentTurn\?\.\(runId\)/,
+  'Canceling a prompt fork must untrack and stop it while quarantining late events'
+);
+
+const disposeThreadRuntime = section(
+  appSource,
+  '  const disposeThreadRuntime = useCallback(async (threadId: string) => {',
+  '  const deleteThreadWithRuntime'
+);
+assert.match(
+  disposeThreadRuntime,
+  /cancelSuggestionPromptRuns\(threadId\)[\s\S]*detailedPromptStatus === 'pending'[\s\S]*detailedPromptStatus: 'failed'[\s\S]*await window\.orion\?\.disposeAgentThread\?\.\(threadId\)/,
+  'Disposing a thread runtime must cancel and settle prompt forks before awaiting teardown'
+);
+assert.match(
+  disposeThreadRuntime,
+  /\}, \[cancelSuggestionPromptRuns, updateThread\]\);/,
+  'Runtime disposal must retain the prompt-run settlement dependencies'
+);
+const mainRuntimeDisposal = section(
+  mainSource,
+  'async function disposeAgentThreadRuntime(threadId) {',
+  "ipcMain.handle('agent:disposeThread'"
+);
+assert.match(
+  mainRuntimeDisposal,
+  /starting\.aborted = true;[\s\S]*starting\.abortError = 'The thread runtime was disposed during agent startup\.';/,
+  'Main-owned runtime disposal must distinguish startup cancellation from a normal stop'
+);
+assert.match(
+  mainSource,
+  /const abortedStartup = startingAgentRuns\.get\(runId\);[\s\S]*abortedStartup\?\.aborted[\s\S]*abortedStartup\.abortError[\s\S]*return \{ ok: false, error: abortedStartup\.abortError \};/,
+  'A startup aborted by runtime disposal must resolve unsuccessfully so hidden runs can settle'
+);
+
 const startSuggestedTask = section(
   appSource,
   "  const handleStartSuggestedTask = useCallback((threadId: string, mode: 'thread' | 'rift') => {",
@@ -86,7 +150,11 @@ assert.doesNotMatch(
   /createThread\(|addEpic\(/,
   'Duplicate-start rejection must happen before either start mode creates anything'
 );
-const epicsGuard = section(startSuggestedTask, 'if (!epicsEnabled) {', 'const createRift').trim();
+const epicsGuard = section(
+  startSuggestedTask,
+  'if (!epicsEnabled) {',
+  "if (suggestion.detailedPromptStatus === 'pending') {"
+).trim();
 assert.match(
   epicsGuard,
   /^if \(!epicsEnabled\) \{[\s\S]*toast\.error\([\s\S]*\);\s*return;\s*\}$/,
@@ -105,8 +173,13 @@ assert.doesNotMatch(
 );
 assert.match(
   threadMode,
-  /const newThreadId = createThread\(project\.id, undefined, \{ epicId: thread\.epicId \}\);[\s\S]*startedThreadId: newThreadId[\s\S]*startTurnForThreadRef\.current\?\.\(newThreadId, suggestion\.text, \[\]\)/,
-  'Thread mode must preserve the source epic workspace before running the suggested prompt'
+  /const newThreadId = createThread\(project\.id, undefined, \{ epicId: thread\.epicId \}\);[\s\S]*startedThreadId: newThreadId[\s\S]*startTurnForThreadRef\.current\?\.\(newThreadId, startPrompt, \[\]\)/,
+  'Thread mode must preserve the source epic workspace before running the selected prompt'
+);
+assert.match(
+  threadMode,
+  /detailedPromptStatus === 'pending'[\s\S]*cancelSuggestionPromptRuns\(threadId, suggestion\.turnRunId\)[\s\S]*createThread\(/,
+  'Starting the fallback in thread mode must cancel its unusable pending prompt fork'
 );
 assert.match(
   threadMode,
@@ -115,8 +188,18 @@ assert.match(
 );
 assert.match(
   threadMode,
-  /const restoreDraft = \(error\?: string\) => \{[\s\S]*composerDraftsRef\.current\.set\(newThreadId, \{ text: suggestion\.text, attachments: \[\] \}\)[\s\S]*setChatInput\(suggestion\.text\)[\s\S]*toast\.error/,
+  /const restoreDraft = \(error\?: string\) => \{[\s\S]*composerDraftsRef\.current\.set\(newThreadId, \{ text: startPrompt, attachments: \[\] \}\)[\s\S]*setChatInput\(startPrompt\)[\s\S]*toast\.error/,
   'A failed thread-mode start must preserve and show the prompt as the composer draft'
+);
+assert.match(
+  section(startSuggestedTask, 'if (!epicsEnabled) {', 'const createRift'),
+  /return;\s*\}[\s\S]*detailedPromptStatus === 'pending'[\s\S]*cancelSuggestionPromptRuns\(threadId, suggestion\.turnRunId\)/,
+  'Starting the fallback in Rift mode must cancel its unusable pending prompt fork'
+);
+assert.match(
+  startSuggestedTask,
+  /const createRift[\s\S]*description: startPrompt[\s\S]*text: startPrompt/,
+  'Rift mode must use the selected prompt for its epic and composer draft'
 );
 assert.match(
   startTurn,
@@ -130,8 +213,24 @@ assert.match(
 );
 assert.match(
   appSource,
-  /const handleDismissSuggestedTask = useCallback\([\s\S]*\}, \[updateThread\]\);/,
+  /const handleDismissSuggestedTask = useCallback\([\s\S]*cancelSuggestionPromptRuns\(threadId\)[\s\S]*\}, \[cancelSuggestionPromptRuns, updateThread\]\);/,
   'The dismiss callback must keep a memoized identity'
+);
+
+const suggestionPromptEvents = section(
+  appSource,
+  '      // Suggested-task detailed-prompt forks:',
+  '      // Goal state belongs to the thread'
+);
+assert.match(
+  suggestionPromptEvents,
+  /buffer\.includes\(suggestedTaskPromptResumeFallbackMarker\)[\s\S]*detailedPrompt: undefined[\s\S]*detailedPromptStatus: 'failed'[\s\S]*cancelSuggestionPromptRuns/,
+  'A failed session resume must reject and cancel the context-free prompt retry'
+);
+assert.match(
+  appSource,
+  /canceledSuggestionPromptRunIds\.current\.has\(event\.runId\)[\s\S]*event\.type === 'done' \|\| event\.type === 'error'[\s\S]*return;/,
+  'Late events from canceled prompt forks must stay out of the normal turn lifecycle'
 );
 
 const turnEventHandler = section(
@@ -183,8 +282,8 @@ assert.doesNotMatch(
 );
 assert.match(
   claudeDriverSource,
-  /const turn = session\.activeTurns\.shift\(\);[\s\S]*session\.pendingSuggestionRunId = turn\.runId;/,
-  'Finalization must retain the completed turn as the next suggestion owner'
+  /const turn = session\.activeTurns\.shift\(\);[\s\S]*session\.pendingSuggestionRunId = continuesSameRun \? null : turn\.runId;/,
+  'Finalization must retain only a fully completed visible turn as the next suggestion owner'
 );
 assert.ok(
   (claudeDriverSource.match(/session\.pendingSuggestionRunId = null;/g) ?? []).length >= 3,

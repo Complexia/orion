@@ -31,7 +31,7 @@ import {
   pushRepo,
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
-import { claudeSdkSessions, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn } from './main/claude-driver.js';
+import { claudeSdkSessions, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
@@ -6312,8 +6312,17 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // A stop/steer raced the startup above and aborted the run before any
     // process existed — honor it instead of launching a run the renderer
     // already settled and untracked.
-    if (startingAgentRuns.get(runId)?.aborted) {
+    const abortedStartup = startingAgentRuns.get(runId);
+    if (abortedStartup?.aborted) {
       orionMcp?.release();
+      // A normal stop is already settled by the renderer and retains the
+      // historical successful-startup result. Runtime disposal can also come
+      // directly from main-owned Rift cleanup, though, so report that distinct
+      // abort as a startup failure and let hidden renderer runs settle even
+      // when no terminal event can be emitted.
+      if (abortedStartup.abortError) {
+        return { ok: false, error: abortedStartup.abortError };
+      }
       return { ok: true, runId };
     }
 
@@ -6331,6 +6340,15 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
   } finally {
     startingAgentRuns.delete(runId);
   }
+});
+
+// Steer = deliver a follow-up into the run in flight without interrupting
+// it. Only providers with a live mid-turn input channel support this (claude's
+// persistent SDK session); false tells the renderer to queue the message for
+// end-of-turn dispatch instead. Never kills a process.
+ipcMain.handle('agent:steerTurn', (_event, runId, text) => {
+  if (typeof runId !== 'string' || typeof text !== 'string' || !text) return false;
+  return steerClaudeSdkRun(runId, text);
 });
 
 ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
@@ -6435,6 +6453,7 @@ async function disposeAgentThreadRuntime(threadId) {
     if (starting.threadId !== threadId) continue;
     starting.aborted = true;
     starting.terminateBackground = true;
+    starting.abortError = 'The thread runtime was disposed during agent startup.';
     cancelledStartup = true;
   }
   invalidateTerminalSession(threadId);

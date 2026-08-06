@@ -3382,6 +3382,13 @@ body {
   overflow-wrap: break-word;
 }
 
+.suggested-task-preparing {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
 .suggested-task-actions {
   display: flex;
   justify-content: flex-end;

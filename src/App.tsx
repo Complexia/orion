@@ -65,6 +65,7 @@ import {
   type OrchestrationRoleId,
   type Project,
   type ProviderId,
+  type SuggestedTask,
   type Thread,
   type ThreadGoal,
   type TurnTokenStats,
@@ -80,6 +81,7 @@ import type {
 import {
   inheritedSubagentResumeContext,
 } from './thread-branching';
+import { createThreadSteeringCoordinator } from './app/thread-steering';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
@@ -399,6 +401,27 @@ const threadWorkingDir = (epics: Epic[], thread: { epicId?: string } | undefined
   // hard launch guard.
   if (epic?.riftReleased || epic?.riftRequest || epic?.riftCleanupPending) return null;
   return epic?.riftPath ? (epic.riftWorkingDir ?? epic.riftPath) : project.path;
+};
+
+// The prompt Start sends for a suggested task. The detailed prompt written by
+// the source-session fork when the suggestion arrived; if that fork is still
+// running, failed, or never ran, fall back to the short suggestion text with a
+// preamble telling the fresh agent it lacks the source session's context (so
+// it investigates what the task refers to instead of guessing).
+const suggestedTaskPromptResumeFallbackMarker =
+  '_Could not resume the previous session; starting a fresh one._';
+
+const suggestedTaskStartPrompt = (suggestion: SuggestedTask): string => {
+  const detailed = suggestion.detailedPrompt?.trim();
+  if (suggestion.detailedPromptStatus === 'ready' && detailed) return detailed;
+  return (
+    `${suggestion.text}\n\n` +
+    'Context: this task was suggested at the end of a previous agent session in this ' +
+    "repository, and you do not have that session's conversation. If the task references " +
+    'something you cannot immediately place, first investigate the repository (recent ' +
+    'changes, failing tests or commands, related files) to work out what it refers to, ' +
+    'then address it.'
+  );
 };
 
 const getStoredThreadTitle = (threadId: string) =>
@@ -1127,29 +1150,32 @@ const App: React.FC = () => {
   // their owning run id, so a late result from an older generation can never
   // repopulate a card after foreground or harness-initiated continuation.
   const latestTurnRunIdsRef = useRef(new Map<string, string>());
-  // Startup IPC resolves long before a normal turn ends. Retain its result for
-  // a short grace window so a steer whose stop lands just after startup failed
-  // can distinguish that failure from a run that completed naturally.
-  const runStartupResults = useRef(new Map<string, Promise<AgentRunStartupResult>>());
-  const trackRunStartup = useCallback(
-    (runId: string, startup: Promise<AgentRunStartupResult>) => {
-      runStartupResults.current.set(runId, startup);
-      const forgetLater = () => {
-        window.setTimeout(() => {
-          if (runStartupResults.current.get(runId) === startup) {
-            runStartupResults.current.delete(runId);
-          }
-        }, 10_000);
-      };
-      void startup.then(forgetLater, forgetLater);
-      return startup;
-    },
-    []
-  );
   // `/btw` side-question runs, routed to a thread's btwExchanges instead of
   // its transcript. Kept separate from runOutputMessages so aside runs never
   // touch thread status, queued-message dispatch, or the active-run map.
   const btwRuns = useRef(new Map<string, { threadId: string; exchangeId: string }>());
+  // Suggested-task detailed-prompt runs (read-only session forks, like /btw
+  // but silent): their answer accumulates in `buffer` and lands on the
+  // thread's suggestedTask when done — nothing renders while they stream.
+  const suggestionPromptRuns = useRef(
+    new Map<string, { threadId: string; turnRunId: string; buffer: string }>()
+  );
+  // A stopped hidden fork can still have queued renderer events. Swallow those
+  // until its terminal event so they can never enter the normal turn handler.
+  const canceledSuggestionPromptRunIds = useRef(new Set<string>());
+  const cancelSuggestionPromptRuns = useCallback((threadId: string, turnRunId?: string) => {
+    for (const [runId, tracked] of suggestionPromptRuns.current) {
+      if (tracked.threadId !== threadId || (turnRunId && tracked.turnRunId !== turnRunId)) continue;
+      suggestionPromptRuns.current.delete(runId);
+      canceledSuggestionPromptRunIds.current.add(runId);
+      void window.orion?.stopAgentTurn?.(runId);
+    }
+  }, []);
+  // Defined after the agent-event effect that calls it (same pattern as
+  // startTurnForThreadRef).
+  const requestSuggestedTaskPromptRef = useRef<
+    ((threadId: string, turnRunId: string, suggestionText: string) => void) | null
+  >(null);
   // Provider-native subagents streamed by main (subagent/subagent-chunk/
   // subagent-activity events): `${parentThreadId}:${providerId}:${subagentId}`
   // → the child thread + agent-run message their transcript streams into.
@@ -1171,6 +1197,13 @@ const App: React.FC = () => {
   // competing mutations for the same thread/task pair.
   const linkedTaskUnlinksRef = useRef(new Map<string, Promise<boolean>>());
   const pendingTurnStartsRef = useRef(new Set<string>());
+  // A steer reserves its thread synchronously, before linked-task refreshes or
+  // transcript saves yield. This preserves submission order and prevents two
+  // steers from consuming the same uninjected Board context.
+  const steeringCoordinatorRef = useRef(createThreadSteeringCoordinator());
+  const cancelPendingSteers = useCallback((threadIds: Iterable<string>) => {
+    steeringCoordinatorRef.current.cancel(threadIds);
+  }, []);
   const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
   // Each pane scrolls its own transcript, so the DOM refs and the pinned/offset
@@ -2295,12 +2328,25 @@ const App: React.FC = () => {
   const resolveUtilityTurn = useCallback(() => utilityTurnRef.current, []);
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
+    // Runtime disposal can abort a hidden prompt fork during main-process
+    // startup without producing a terminal event. Untrack/stop it here and
+    // settle the persisted card before awaiting IPC so it cannot remain
+    // indefinitely in "Writing detailed prompt…" after the runtime is gone.
+    cancelSuggestionPromptRuns(threadId);
+    const suggestion = useOrionStore
+      .getState()
+      .threads.find((thread) => thread.id === threadId)?.suggestedTask;
+    if (suggestion?.detailedPromptStatus === 'pending') {
+      updateThread(threadId, {
+        suggestedTask: { ...suggestion, detailedPromptStatus: 'failed' },
+      });
+    }
     try {
       await window.orion?.disposeAgentThread?.(threadId);
     } catch (error) {
       console.error('Could not dispose agent thread runtime', error);
     }
-  }, []);
+  }, [cancelSuggestionPromptRuns, updateThread]);
 
   const deleteThreadWithRuntime = useCallback(
     async (threadId: string) => {
@@ -3652,6 +3698,13 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!window.orion?.onAgentTurnEvent) return undefined;
     const unsubscribe = window.orion.onAgentTurnEvent((event) => {
+      if (canceledSuggestionPromptRunIds.current.has(event.runId)) {
+        if (event.type === 'done' || event.type === 'error') {
+          canceledSuggestionPromptRunIds.current.delete(event.runId);
+        }
+        return;
+      }
+
       // `/btw` aside runs stream into their exchange, not the transcript.
       // Their `session` events are deliberately dropped: the fork's id must
       // never replace the thread's real session id.
@@ -3688,6 +3741,54 @@ const App: React.FC = () => {
         return;
       }
 
+      // Suggested-task detailed-prompt forks: buffer the answer off-screen and
+      // attach it to the suggestion when done. Like /btw, every other event of
+      // these runs (started/session/…) is swallowed so the fork never touches
+      // thread state — in particular `started` must not clear the suggestion.
+      const suggestionPromptRun = suggestionPromptRuns.current.get(event.runId);
+      if (suggestionPromptRun) {
+        if (event.type === 'chunk' && event.chunk) {
+          suggestionPromptRun.buffer += event.chunk;
+          if (suggestionPromptRun.buffer.includes(suggestedTaskPromptResumeFallbackMarker)) {
+            const thread = useOrionStore
+              .getState()
+              .threads.find((candidate) => candidate.id === suggestionPromptRun.threadId);
+            if (thread?.suggestedTask?.turnRunId === suggestionPromptRun.turnRunId) {
+              updateThread(suggestionPromptRun.threadId, {
+                suggestedTask: {
+                  ...thread.suggestedTask,
+                  detailedPrompt: undefined,
+                  detailedPromptStatus: 'failed',
+                },
+              });
+            }
+            // A fresh retry has no source conversation, so it cannot write a
+            // trustworthy detailed prompt. Stop it and ignore its late events.
+            cancelSuggestionPromptRuns(
+              suggestionPromptRun.threadId,
+              suggestionPromptRun.turnRunId
+            );
+          }
+        }
+        if (event.type === 'done' || event.type === 'error') {
+          suggestionPromptRuns.current.delete(event.runId);
+          const detailed = event.type === 'done' ? suggestionPromptRun.buffer.trim() : '';
+          const thread = useOrionStore
+            .getState()
+            .threads.find((candidate) => candidate.id === suggestionPromptRun.threadId);
+          // Only land on the exact suggestion that requested it; a newer turn
+          // or a dismissal has made this answer stale.
+          if (thread?.suggestedTask?.turnRunId === suggestionPromptRun.turnRunId) {
+            updateThread(suggestionPromptRun.threadId, {
+              suggestedTask: detailed
+                ? { ...thread.suggestedTask, detailedPrompt: detailed, detailedPromptStatus: 'ready' }
+                : { ...thread.suggestedTask, detailedPromptStatus: 'failed' },
+            });
+          }
+        }
+        return;
+      }
+
       // Goal state belongs to the thread, not to the transcript message. Stop
       // deliberately untracks a run before IPC so late text/result events
       // cannot rewrite the stopped message; the persisted paused-goal update
@@ -3702,6 +3803,9 @@ const App: React.FC = () => {
       if (event.type === 'started') {
         latestTurnRunIdsRef.current.set(event.threadId, event.runId);
         updateThread(event.threadId, { suggestedTask: undefined });
+        // The superseded suggestion's detailed-prompt fork has nowhere to
+        // land its answer anymore — kill it instead of letting it finish.
+        cancelSuggestionPromptRuns(event.threadId);
       }
 
       // The harness's predicted next prompt for this thread, emitted after
@@ -3722,6 +3826,10 @@ const App: React.FC = () => {
             turnRunId: event.runId,
           },
         });
+        // The suggestion text alone is meaningless to a fresh agent ("check if
+        // that failure is preexisting" — which failure?). Ask a fork of this
+        // session, which has the context, to write the actual start prompt.
+        requestSuggestedTaskPromptRef.current?.(event.threadId, event.runId, event.suggestion);
         return;
       }
 
@@ -3919,31 +4027,6 @@ const App: React.FC = () => {
 
       const tracked = runOutputMessages.current.get(event.runId);
       if (!tracked) {
-        // A steer interrupt can lose the race with the run settling on its
-        // own: the message was untracked before this terminal event arrived.
-        // Keep late chunks as well as the terminal outcome. A failed CLI run
-        // emits its trailing stderr immediately before `error`; after steer
-        // untracks the message, dropping that chunk would lose both the real
-        // diagnostic and the text used to recognize authentication failures.
-        if (steeringRunsRef.current.has(event.runId)) {
-          const raced = steerLostRaceOutcomes.current.get(event.runId) ?? {
-            chunks: '',
-          };
-          if (event.type === 'chunk' && event.chunk) {
-            raced.chunks += event.chunk;
-            steerLostRaceOutcomes.current.set(event.runId, raced);
-          } else if (event.type === 'done' || event.type === 'error') {
-            steerLostRaceOutcomes.current.set(event.runId, {
-              ...raced,
-              type: event.type,
-              error: event.error,
-              providerId: event.providerId,
-              changedFiles: event.changedFiles,
-              stats: event.stats,
-              pendingBackgroundTasks: event.pendingBackgroundTasks,
-            });
-          }
-        }
         // A persistent claude session can start a turn on its own when a
         // background subagent finishes (task notification re-invokes the
         // model). Grow the transcript with a fresh agent message for it.
@@ -4112,6 +4195,7 @@ const App: React.FC = () => {
     addMessageToThread,
     appendToThreadMessage,
     appendToBtwExchange,
+    cancelSuggestionPromptRuns,
     clearActiveRun,
     flushChunkBuffers,
     notifyThreadFinished,
@@ -4133,6 +4217,13 @@ const App: React.FC = () => {
             error: 'Interrupted before Orion received the answer.',
           });
         }
+      }
+      // A detailed-prompt fork interrupted by the restart never completes;
+      // Start falls back to the annotated short text.
+      if (thread.suggestedTask?.detailedPromptStatus === 'pending') {
+        updateThread(thread.id, {
+          suggestedTask: { ...thread.suggestedTask, detailedPromptStatus: 'failed' },
+        });
       }
       if (thread.status !== 'running') continue;
       const lastMessage = thread.messages.at(-1);
@@ -5013,10 +5104,16 @@ const App: React.FC = () => {
     const suggestion = thread?.suggestedTask;
     if (!thread || !suggestion || suggestion.startedEpicId || suggestion.startedThreadId) return;
     const project = state.projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    // The card shows the short suggestion text, but a fresh agent needs the
+    // self-contained prompt formulated by the source session's fork.
+    const startPrompt = suggestedTaskStartPrompt(suggestion);
     if (mode === 'thread') {
       if (!project) {
         toast.error('This thread has no project to start the task in');
         return;
+      }
+      if (suggestion.detailedPromptStatus === 'pending') {
+        cancelSuggestionPromptRuns(threadId, suggestion.turnRunId);
       }
       // Keep the source epic association so a suggestion shown inside a rift
       // starts in that same workspace and remains covered by its launch guards.
@@ -5025,13 +5122,13 @@ const App: React.FC = () => {
       setActiveTab('agents');
       const restoreDraft = (error?: string) => {
         // The turn never started; keep the prompt as the new thread's draft.
-        composerDraftsRef.current.set(newThreadId, { text: suggestion.text, attachments: [] });
+        composerDraftsRef.current.set(newThreadId, { text: startPrompt, attachments: [] });
         if (useOrionStore.getState().selectedThreadId === newThreadId) {
-          setChatInput(suggestion.text);
+          setChatInput(startPrompt);
         }
         toast.error(error ?? 'Could not start the suggested task');
       };
-      const start = startTurnForThreadRef.current?.(newThreadId, suggestion.text, []);
+      const start = startTurnForThreadRef.current?.(newThreadId, startPrompt, []);
       void start?.then(
         async (result) => {
           if (!result.ok) {
@@ -5054,9 +5151,14 @@ const App: React.FC = () => {
       toast.error('Enable Epics in Settings before starting a suggested task in a rift');
       return;
     }
+    if (suggestion.detailedPromptStatus === 'pending') {
+      cancelSuggestionPromptRuns(threadId, suggestion.turnRunId);
+    }
     const createRift = riftsActive && riftsSettings.autoCreateForEpics && Boolean(project);
+    // Title stays derived from the short card text; the description carries
+    // the detailed prompt so the epic itself explains the task's context.
     const epicId = addEpic(deriveTitle(suggestion.text), {
-      description: suggestion.text,
+      description: startPrompt,
       ...(project ? { repositoryProjectId: project.id } : {}),
       ...(createRift && project
         ? { riftRequest: { projectId: project.id, projectPath: project.path } }
@@ -5068,7 +5170,7 @@ const App: React.FC = () => {
       // Pre-fill the new thread's composer with the suggested prompt; the
       // draft-swap effect loads it once the thread becomes selected.
       const newThreadId = createThread(project.id, undefined, { epicId });
-      composerDraftsRef.current.set(newThreadId, { text: suggestion.text, attachments: [] });
+      composerDraftsRef.current.set(newThreadId, { text: startPrompt, attachments: [] });
     }
     setActiveTab('agents');
     setEpicsSectionOpen(true);
@@ -5077,6 +5179,7 @@ const App: React.FC = () => {
     );
   }, [
     addEpic,
+    cancelSuggestionPromptRuns,
     createThread,
     epicsEnabled,
     riftsActive,
@@ -5088,8 +5191,10 @@ const App: React.FC = () => {
   ]);
 
   const handleDismissSuggestedTask = useCallback((threadId: string) => {
+    // Dismissing also kills the suggestion's in-flight detailed-prompt fork.
+    cancelSuggestionPromptRuns(threadId);
     updateThread(threadId, { suggestedTask: undefined });
-  }, [updateThread]);
+  }, [cancelSuggestionPromptRuns, updateThread]);
 
   // Shared setup for the epic git handlers: the directory the epic's git
   // actions act on. The rift workspace wins when one exists; otherwise the
@@ -6840,58 +6945,55 @@ const App: React.FC = () => {
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
 
-      const startup = trackRunStartup(
+      const startup = window.orion.runAgentTurn({
         runId,
-        window.orion.runAgentTurn({
-          runId,
-          threadId,
-          epicId: thread.epicId,
-          projectPath: workingDir,
-          prompt: agentPrompt,
-          modelId: model.id,
-          accessMode: thread.accessMode ?? 'full-access',
-          resumeSessionId: thread.agentSessionIds?.[model.providerId],
-          // Branched thread's first turn per provider: fork the inherited
-          // session instead of resuming the parent's in place.
-          forkSession: Boolean(
-            thread.agentSessionIds?.[model.providerId] && thread.pendingForkProviders?.includes(model.providerId)
-          ),
-          providerOptions: normalizedProviderSettings[model.providerId]?.options,
-          // Kimi's ACP adapter accepts native image content blocks. Preserve
-          // the text/path context as a fallback, but also pass the attachment
-          // metadata so main can read the bytes without routing them through
-          // the renderer or relying on Kimi to reproduce a Unicode file path.
-          ...(model.providerId === 'kimi' && turnAttachments.length > 0 ? { attachments: turnAttachments } : {}),
-          ...(model.providerId === 'codex'
-            ? {
-                codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
-                codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
-              }
-            : {}),
-          ...(model.providerId === 'claude'
-            ? {
-                claudeReasoningEffort: thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
-                claudeContextWindow: getEffectiveClaudeContextWindow(
-                  model,
-                  thread.claudeContextWindow ?? defaultClaudeContextWindow
-                ),
-              }
-            : {}),
-          ...(model.providerId === 'grok'
-            ? {
-                grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort,
-              }
-            : {}),
-          ...(model.providerId === 'muse'
-            ? {
-                museReasoningEffort: thread.museReasoningEffort ?? defaultMuseReasoningEffort,
-              }
-            : {}),
-          ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
-          ...(mentionedThreads.length > 0 ? { hasThreadMentions: true } : {}),
-          ...(orchestration ? { orchestration } : {}),
-        })
-      );
+        threadId,
+        epicId: thread.epicId,
+        projectPath: workingDir,
+        prompt: agentPrompt,
+        modelId: model.id,
+        accessMode: thread.accessMode ?? 'full-access',
+        resumeSessionId: thread.agentSessionIds?.[model.providerId],
+        // Branched thread's first turn per provider: fork the inherited
+        // session instead of resuming the parent's in place.
+        forkSession: Boolean(
+          thread.agentSessionIds?.[model.providerId] && thread.pendingForkProviders?.includes(model.providerId)
+        ),
+        providerOptions: normalizedProviderSettings[model.providerId]?.options,
+        // Kimi's ACP adapter accepts native image content blocks. Preserve
+        // the text/path context as a fallback, but also pass the attachment
+        // metadata so main can read the bytes without routing them through
+        // the renderer or relying on Kimi to reproduce a Unicode file path.
+        ...(model.providerId === 'kimi' && turnAttachments.length > 0 ? { attachments: turnAttachments } : {}),
+        ...(model.providerId === 'codex'
+          ? {
+              codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
+              codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
+            }
+          : {}),
+        ...(model.providerId === 'claude'
+          ? {
+              claudeReasoningEffort: thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
+              claudeContextWindow: getEffectiveClaudeContextWindow(
+                model,
+                thread.claudeContextWindow ?? defaultClaudeContextWindow
+              ),
+            }
+          : {}),
+        ...(model.providerId === 'grok'
+          ? {
+              grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort,
+            }
+          : {}),
+        ...(model.providerId === 'muse'
+          ? {
+              museReasoningEffort: thread.museReasoningEffort ?? defaultMuseReasoningEffort,
+            }
+          : {}),
+        ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
+        ...(mentionedThreads.length > 0 ? { hasThreadMentions: true } : {}),
+        ...(orchestration ? { orchestration } : {}),
+      });
       void startup.then((result) => {
         if (result.ok && result.runId) {
           if (result.runId !== runId) {
@@ -6929,7 +7031,6 @@ const App: React.FC = () => {
       updateThreadMessage,
       clearActiveRun,
       pushLinkedTaskStatus,
-      trackRunStartup,
       refreshLinkedTasksBeforeDispatch,
     ]
   );
@@ -7204,6 +7305,9 @@ const App: React.FC = () => {
       }
       const pendingSpawnIds: string[] = [];
 
+      // Invalidate async steering preparation before releasing any run owner;
+      // otherwise a late fallback can enqueue a fresh turn after this stop.
+      cancelPendingSteers(threadIds);
       // Untrack and mark every run in the subtree stopped BEFORE the IPC
       // calls: interrupted result events can otherwise race in and mark them
       // Finished.
@@ -7257,6 +7361,7 @@ const App: React.FC = () => {
       flushChunkBuffers,
       disposeThreadRuntime,
       markUntrackedRunStopped,
+      cancelPendingSteers,
     ]
   );
 
@@ -7433,6 +7538,130 @@ const App: React.FC = () => {
     },
     [agentModels, normalizedProviderSettings, addBtwExchange, flushChunkBuffers, updateBtwExchange]
   );
+
+  // Expands a fresh suggestion into the self-contained prompt that Start will
+  // send. Runs on a read-only fork of the source Claude session (the /btw
+  // machinery), which has the full conversation context the terse suggestion
+  // text leaves out. Entirely silent: bails without marking anything when a
+  // fork can't run (non-Claude driver, no session id yet, rift busy), and the
+  // card's Start button then falls back to the annotated short text.
+  const requestSuggestedTaskPrompt = useCallback(
+    (threadId: string, turnRunId: string, suggestionText: string) => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((candidate) => candidate.id === threadId);
+      const suggestion = thread?.suggestedTask;
+      if (!thread || !suggestion || suggestion.turnRunId !== turnRunId) return;
+      // A queued follow-up dispatches immediately after this event and its
+      // `started` clears the suggestion — don't pay for a doomed fork.
+      if (thread.queuedMessages?.length) return;
+      const project = state.projects.find((candidate) => candidate.id === thread.projectId);
+      if (!project) return;
+      const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
+      if (
+        (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) ||
+        threadEpic?.riftRequest ||
+        threadEpic?.riftCleanupPending ||
+        threadEpic?.riftReleased ||
+        riftRemovalThreadIdsRef.current.has(thread.id) ||
+        (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
+      ) {
+        return;
+      }
+      const workingDir = threadWorkingDir(state.epics, thread, project);
+      if (!workingDir) return;
+      let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      // Orion threads run on their configured main-driver model; resolve the
+      // pseudo-model exactly as startTurnForThread does so the fork resumes
+      // the Claude session that actually produced the suggestion.
+      if (model?.providerId === 'orion' || isOrionModelId(thread.modelId)) {
+        const roleModels = {
+          ...defaultOrchestrationSettings.models,
+          ...state.orchestrationSettings?.models,
+        };
+        model = findAgentModel(agentModels, roleModels.mainDriver);
+      }
+      if (!model || model.providerId !== 'claude' || model.available === false) return;
+      if (normalizedProviderSettings.claude?.enabled === false) return;
+      if (!window.orion?.runAgentTurn) return;
+      const sessionId = thread.agentSessionIds?.claude;
+      if (!sessionId) return;
+
+      const prompt =
+        'The harness suggested a follow-up task for this session: ' +
+        `"${suggestionText}"\n\n` +
+        'Orion may start that task in a brand-new agent session with NO access to this ' +
+        'conversation. Write the prompt that new agent will receive. Make it fully ' +
+        'self-contained: briefly state the background (what this session was working on ' +
+        'and what was observed), name the exact files, commands, errors, or outputs the ' +
+        'task refers to, then state the task and what a good outcome looks like. Keep it ' +
+        'to a few short paragraphs. Answer from the conversation context alone — do not ' +
+        'use any tools and do not ask questions. Reply with ONLY the prompt text itself: ' +
+        'no preamble, no commentary — this exchange is a side conversation the main ' +
+        'session will never see.';
+
+      const runId = crypto.randomUUID();
+      suggestionPromptRuns.current.set(runId, { threadId, turnRunId, buffer: '' });
+      updateThread(threadId, {
+        suggestedTask: { ...suggestion, detailedPromptStatus: 'pending' },
+      });
+      const markFailed = () => {
+        suggestionPromptRuns.current.delete(runId);
+        const current = useOrionStore
+          .getState()
+          .threads.find((candidate) => candidate.id === threadId)?.suggestedTask;
+        if (current?.turnRunId === turnRunId) {
+          updateThread(threadId, {
+            suggestedTask: { ...current, detailedPromptStatus: 'failed' },
+          });
+        }
+      };
+      void window.orion
+        .runAgentTurn({
+          runId,
+          threadId,
+          epicId: thread.epicId,
+          projectPath: workingDir,
+          prompt,
+          modelId: model.id,
+          // Plan mode: the fork must never mutate the repo.
+          accessMode: 'read-only',
+          resumeSessionId: sessionId,
+          forkSession: true,
+          aside: true,
+          providerOptions: normalizedProviderSettings.claude?.options,
+          // Formulating the prompt is cheap recall over context the fork
+          // already holds — low effort keeps it fast on every turn end.
+          claudeReasoningEffort: 'low',
+          claudeContextWindow: getEffectiveClaudeContextWindow(
+            model,
+            thread.claudeContextWindow ?? defaultClaudeContextWindow
+          ),
+        })
+        .then(
+          (result) => {
+            if (result.ok && result.runId) {
+              if (result.runId !== runId) {
+                const tracked = suggestionPromptRuns.current.get(runId);
+                suggestionPromptRuns.current.delete(runId);
+                if (tracked) {
+                  suggestionPromptRuns.current.set(result.runId, tracked);
+                } else if (canceledSuggestionPromptRunIds.current.delete(runId)) {
+                  // Start may cancel while IPC is still assigning the final
+                  // run id. Carry the quarantine across that remap too.
+                  canceledSuggestionPromptRunIds.current.add(result.runId);
+                  void window.orion?.stopAgentTurn?.(result.runId);
+                }
+              }
+            } else {
+              markFailed();
+            }
+          },
+          () => markFailed()
+        );
+    },
+    [agentModels, normalizedProviderSettings, updateThread]
+  );
+  requestSuggestedTaskPromptRef.current = requestSuggestedTaskPrompt;
 
   // `/goal` — codex goal runs. The whole pursuit (codex auto-continues turns
   // until the goal completes, blocks, or hits budget) is one agent-run
@@ -8369,44 +8598,19 @@ const App: React.FC = () => {
     setAccessModeOpen(false);
   };
 
-  // Steering = interrupt the running CLI and immediately resume its session
-  // with the new instruction. Needs the harness to have reported a session id
-  // (arrives within the first events of a run).
+  // Steering = deliver a follow-up into the run in flight WITHOUT
+  // interrupting it — the same behavior as typing while Claude Code works.
+  // The claude session folds a mid-turn user message into the running turn
+  // at its next loop boundary, so nothing in flight is lost; providers
+  // without a live mid-turn channel don't support steer (their follow-ups
+  // queue and dispatch when the current turn ends).
   // Optional chain: 'orion' has no follow-up-support entry (steering an
   // orchestrated thread would bypass the driver resolution), so treat it as
   // unsupported instead of crashing mid-run.
   const steerSupported =
     isSending && !!selectedAgentModel && providerFollowUpSupport[selectedAgentModel.providerId]?.steer === true;
-  const steerReady =
-    steerSupported && !!selectedAgentModel && !!selectedThread?.agentSessionIds?.[selectedAgentModel.providerId];
+  const steerReady = steerSupported && !!window.orion?.steerAgentTurn;
 
-  // Runs with an interrupt in flight. Steering claude can take a few seconds
-  // (interrupt ack + finalize wait, possibly a session teardown), and the run
-  // must stay mapped as active for that whole window — otherwise the composer
-  // reads as idle and a message submitted mid-wait starts a new turn inside
-  // the very session the interrupt may be about to dispose, which would kill
-  // or falsely complete it. Kept active, that submission queues instead.
-  const steeringRunsRef = useRef<Set<string>>(new Set());
-  // Terminal events that arrived for a steered run after it was untracked but
-  // before the stop IPC resolved — the run settled on its own and lost the
-  // race. Consumed by steerWithContent so the real outcome (including a
-  // failure) survives instead of being reported as a clean finish.
-  const steerLostRaceOutcomes = useRef<
-    Map<
-      string,
-      {
-        // Chunks can arrive before the terminal event, so `type` stays
-        // optional until the run's final outcome is stashed.
-        type?: 'done' | 'error';
-        chunks: string;
-        error?: string;
-        providerId?: string;
-        changedFiles?: ChangedFileSummary[];
-        stats?: TurnTokenStats;
-        pendingBackgroundTasks?: string[];
-      }
-    >
-  >(new Map());
   const steerTargetForThread = (threadId: string) => {
     const runId = activeRunsByThreadRef.current[threadId];
     const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
@@ -8418,213 +8622,191 @@ const App: React.FC = () => {
       !thread ||
       !agentModel ||
       providerFollowUpSupport[agentModel.providerId]?.steer !== true ||
-      !thread.agentSessionIds?.[agentModel.providerId] ||
-      !window.orion?.stopAgentTurn ||
-      steeringRunsRef.current.has(runId)
+      !window.orion?.steerAgentTurn
     ) {
       return null;
     }
-    return { runId };
+    return { runId, agentModel };
   };
   const canSteerNow = () => !!selectedThreadId && !!steerTargetForThread(selectedThreadId);
 
-  const steerWithContent = async (
+  const performSteerWithContent = async (
+    threadId: string,
+    promptText: string,
+    attachments: ImageAttachment[],
+    cancelled: () => boolean
+  ) => {
+    if (!promptText && attachments.length === 0) return;
+    // Fallback for every path that can't inject: hold the message and let the
+    // queue-dispatch effect send it — immediately if the thread is idle,
+    // otherwise the moment the current turn ends. Never interrupts anything.
+    const queueForTurnEnd = () => {
+      if (cancelled()) return;
+      pinThreadToBottom(threadId);
+      queueMessageToThread(threadId, { text: promptText, attachments });
+    };
+    const target = steerTargetForThread(threadId);
+    if (!target) {
+      queueForTurnEnd();
+      return;
+    }
+    let prepared:
+      | {
+          agentPrompt: string;
+          tasksToInject: LinkedBoardTask[];
+          turnAttachments: ImageAttachment[];
+          userContent: string;
+        }
+      | undefined;
+    try {
+      // Steering is still a real dispatch: refresh newly linked Board tasks
+      // and resolve mention tokens exactly as an ordinary turn does before
+      // handing the text to Claude's live input stream.
+      await refreshLinkedTasksBeforeDispatch(threadId);
+      if (cancelled()) return;
+      if (activeRunsByThreadRef.current[threadId] !== target.runId) {
+        queueForTurnEnd();
+        return;
+      }
+      let state = useOrionStore.getState();
+      let thread = state.threads.find((candidate) => candidate.id === threadId);
+      if (!thread) {
+        queueForTurnEnd();
+        return;
+      }
+      const mentionedThreads = promptText
+        ? parseThreadMentions(promptText, state.threads, threadId)
+        : [];
+      if (mentionedThreads.length > 0) {
+        const supportsThreadReader =
+          (await window.orion?.supportsThreadReader?.(target.agentModel.providerId)) === true;
+        if (cancelled()) return;
+        if (activeRunsByThreadRef.current[threadId] !== target.runId) {
+          queueForTurnEnd();
+          return;
+        }
+        if (!supportsThreadReader || !(await flushOrionThreadsSave())) {
+          queueForTurnEnd();
+          return;
+        }
+        if (cancelled()) return;
+        if (activeRunsByThreadRef.current[threadId] !== target.runId) {
+          queueForTurnEnd();
+          return;
+        }
+        state = useOrionStore.getState();
+        thread = state.threads.find((candidate) => candidate.id === threadId);
+        if (!thread) {
+          queueForTurnEnd();
+          return;
+        }
+      }
+
+      const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
+      const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
+      const turnAttachments = [...taskMediaAttachments, ...attachments];
+      let agentPrompt = buildPromptWithAttachments(promptText, attachments);
+      const preserveSlashCommandStart = promptText.trimStart().startsWith('/');
+      const addAgentContext = (context: string | null) => {
+        if (context) {
+          agentPrompt = addPromptContext(agentPrompt, context, preserveSlashCommandStart);
+        }
+      };
+      if (tasksToInject.length > 0) {
+        addAgentContext(buildLinkedTaskContext(tasksToInject, Boolean(agentPrompt)));
+      }
+      addAgentContext(inheritedSubagentResumeContext(thread, target.agentModel.providerId));
+      const mentionedModels = promptText ? parseModelMentions(promptText, agentModels) : [];
+      if (mentionedModels.length > 0) {
+        addAgentContext(buildModelMentionsContext(mentionedModels));
+      }
+      if (mentionedThreads.length > 0) {
+        addAgentContext(
+          buildThreadMentionsContext(
+            mentionedThreads,
+            new Map(state.projects.map((project) => [project.id, project.name]))
+          )
+        );
+      }
+      prepared = {
+        agentPrompt,
+        tasksToInject,
+        turnAttachments,
+        userContent: promptText || (attachments.length > 0 ? 'Attached image' : ''),
+      };
+    } catch {
+      prepared = undefined;
+    }
+    if (cancelled()) return;
+    if (!prepared) {
+      queueForTurnEnd();
+      return;
+    }
+    // Preparation may have outlived the run it targeted. A natural finish
+    // becomes an ordinary queued follow-up; Stop is distinguished by the
+    // generation check above and discards the pending steer instead.
+    if (activeRunsByThreadRef.current[threadId] !== target.runId) {
+      queueForTurnEnd();
+      return;
+    }
+    let injected = false;
+    try {
+      injected =
+        (await window.orion?.steerAgentTurn?.(
+          target.runId,
+          prepared.agentPrompt
+        )) === true;
+    } catch {
+      injected = false;
+    }
+    if (cancelled()) return;
+    // The run settled (or its session vanished) before the push could land —
+    // the message becomes an ordinary follow-up turn instead.
+    if (!injected) {
+      queueForTurnEnd();
+      return;
+    }
+    // Delivered into the live turn: record the fully prepared instruction in
+    // the transcript and consume the linked-task context exactly once.
+    pinThreadToBottom(threadId);
+    if (prepared.tasksToInject.length > 0) {
+      const injectedIds = new Set(prepared.tasksToInject.map((task) => task.id));
+      const currentLinkedTasks =
+        useOrionStore.getState().threads.find((thread) => thread.id === threadId)?.linkedTasks ?? [];
+      updateThread(threadId, {
+        linkedTasks: currentLinkedTasks.map((task) =>
+          injectedIds.has(task.id) ? { ...task, injected: true } : task
+        ),
+      });
+      pushLinkedTaskStatus(threadId, 'running');
+    }
+    addMessageToThread(threadId, {
+      role: 'user',
+      content: prepared.userContent,
+      attachments: prepared.turnAttachments,
+      ...(prepared.tasksToInject.length > 0
+        ? {
+            linkedTasks: prepared.tasksToInject.map((task) => ({
+              id: task.id,
+              title: task.title,
+              description: task.description,
+            })),
+          }
+        : {}),
+    });
+  };
+
+  const steerWithContent = (
     threadId: string,
     promptText: string,
     attachments: ImageAttachment[]
-  ) => {
-    const target = steerTargetForThread(threadId);
-    if (!target) return;
-    if (!promptText && attachments.length === 0) return;
-
-    const { runId } = target;
-    steeringRunsRef.current.add(runId);
-    // Untrack the transcript message before killing so the dying process's
-    // tail events can't write into it; the run itself stays in
-    // activeRunsByThread until the interrupt settles (see steeringRunsRef).
-    const tracked = runOutputMessages.current.get(runId);
-    const trackedMessage = tracked
-      ? useOrionStore
-          .getState()
-          .threads.find((thread) => thread.id === tracked.threadId)
-          ?.messages.find((message) => message.id === tracked.messageId)
-      : undefined;
-    runOutputMessages.current.delete(runId);
-    flushChunkBuffers();
-    if (tracked) {
-      updateThreadMessage(tracked.threadId, tracked.messageId, {
-        status: 'stopped',
-        completedAt: new Date().toISOString(),
-        statusText: 'Interrupted — steered to a new instruction.',
-      });
-    }
-    try {
-      const interrupted = await window.orion.stopAgentTurn(runId);
-      if (!interrupted) {
-        // stopAgentTurn returns false only when main no longer knows the
-        // run — no claude session holds it as an active turn and no child
-        // process maps to it — i.e. the run settled naturally between the
-        // untracking above and the interrupt landing. Its final done/error
-        // event was discarded by the untracked-event guard, so nothing else
-        // will ever clear the active-run mapping or the thread status.
-        // Reattaching here (the old failure path) marked the dead run's
-        // message and thread as running again with no future event to clear
-        // them, wedging the thread permanently. Settle the thread instead
-        // and hand the prompt back — with the run's real outcome, which the
-        // untracked-event guard stashed when it discarded the terminal event.
-        // Main forgets a run at the START of finalize, before it awaits the
-        // changed-file summary and emits the terminal event — so the outcome
-        // may still be in flight when the stop resolved false. Main tracks
-        // that gap (agent:isRunFinalizing): while it reports the run as
-        // finalizing, a terminal event is guaranteed, so keep waiting for the
-        // stash (the steering marker stays set here, so the guard keeps
-        // stashing). Terminal events are sent before the finalizing flag
-        // clears and IPC preserves ordering, so once isRunFinalizing resolves
-        // false the stash is authoritative: still empty means no outcome is
-        // coming (e.g. the run settled via background-settled).
-        let outcome = steerLostRaceOutcomes.current.get(runId);
-        while (!outcome?.type) {
-          const finalizing = await window.orion.isRunFinalizing?.(runId);
-          outcome = steerLostRaceOutcomes.current.get(runId);
-          if (outcome?.type || !finalizing) break;
-          await new Promise((resolve) => window.setTimeout(resolve, 100));
-          outcome = steerLostRaceOutcomes.current.get(runId);
-        }
-        steerLostRaceOutcomes.current.delete(runId);
-        let startupError: string | undefined;
-        let startupFailureAlreadyHandled = false;
-        try {
-          const startupResult = await runStartupResults.current.get(runId);
-          if (startupResult && !startupResult.ok) {
-            startupError = startupResult.error ?? 'The agent failed to start.';
-            // startTurnForThread's startup continuation has already written
-            // this error into the transcript; the steer handoff only needs to
-            // preserve its status, not append the same diagnostic twice.
-            startupFailureAlreadyHandled = true;
-          }
-        } catch (error) {
-          startupError = error instanceof Error ? error.message : 'The agent failed to start.';
-        }
-        const failed = outcome?.type === 'error' || Boolean(startupError);
-        const failureError = outcome?.error ?? startupError;
-        // A racing done event can carry background agents main still awaits;
-        // mirror the normal done handler — waiting caption, thread kept in
-        // the working state, and the run handle retained so Stop keeps
-        // working while those agents may modify the workspace.
-        const waitingOn = (!failed && outcome?.pendingBackgroundTasks) || [];
-        const waiting = waitingOn.length > 0;
-        if (tracked) {
-          if (outcome?.chunks) {
-            appendToThreadMessage(tracked.threadId, tracked.messageId, outcome.chunks);
-          }
-          if (failed && failureError && !startupFailureAlreadyHandled) {
-            appendToThreadMessage(tracked.threadId, tracked.messageId, `\n\n${failureError}`);
-          }
-          const errorThread = useOrionStore.getState().threads.find((thread) => thread.id === tracked.threadId);
-          const looksLoggedOut =
-            failed && (isProviderAuthErrorText(failureError) || isProviderAuthErrorText(outcome?.chunks));
-          const rawAuthProviderId = looksLoggedOut
-            ? (outcome?.providerId ?? errorThread?.modelId.split(':')[0])
-            : undefined;
-          const authProviderId = rawAuthProviderId === 'orion' ? undefined : rawAuthProviderId;
-          updateThreadMessage(tracked.threadId, tracked.messageId, {
-            status: failed ? 'error' : 'done',
-            completedAt: new Date().toISOString(),
-            statusText: failed
-              ? authProviderId
-                ? 'The agent is logged out.'
-                : 'Failed before the steer could interrupt it.'
-              : waiting
-                ? `Waiting on ${waitingOn.length} background ${waitingOn.length === 1 ? 'agent' : 'agents'}…`
-                : 'Finished before the steer could interrupt it.',
-            ...(failed && failureError ? { error: failureError } : {}),
-            ...(authProviderId ? { authProviderId } : {}),
-            ...(outcome?.changedFiles ? { changedFiles: outcome.changedFiles } : {}),
-            ...(outcome?.stats ? { stats: outcome.stats } : {}),
-          });
-        }
-        if (activeRunsByThreadRef.current[threadId] === runId) {
-          updateThread(threadId, {
-            status: failed ? 'error' : waiting ? 'running' : 'done',
-          });
-          if (waiting) {
-            // Mirror the normal done handler: the thread remains running, so
-            // runningAgentCount cannot reveal that the foreground turn wrote
-            // files which the visible Code tree now needs to re-list.
-            setTreeTurnRefreshTick((t) => t + 1);
-          }
-          // The normal done/error handlers were bypassed (the event was
-          // stashed, not handled) — mirror their side effects, or a linked
-          // Board task stays 'running' forever and no finish notification
-          // fires. Skipped while waiting on background agents, matching the
-          // normal done handler.
-          if (!waiting) {
-            notifyThreadFinished(threadId, failed ? 'error' : 'done');
-            const finalResponse =
-              !failed && tracked
-                ? useOrionStore
-                    .getState()
-                    .threads.find((thread) => thread.id === tracked.threadId)
-                    ?.messages.find((message) => message.id === tracked.messageId)
-                    ?.content.trim()
-                : undefined;
-            pushLinkedTaskStatus(threadId, failed ? 'error' : 'finished', finalResponse || undefined);
-          }
-        }
-        if (!waiting) clearActiveRun(runId);
-        restoreComposerDraft(threadId, promptText, attachments);
-        toast.error(
-          failed
-            ? 'The agent failed before it could be steered — your message is back in the composer.'
-            : 'The agent finished before it could be steered — your message is back in the composer.'
-        );
-        return;
-      }
-      // Give the CLI a beat to flush its session file before we resume it.
-      await new Promise((resolve) => window.setTimeout(resolve, 300));
-    } catch (error) {
-      // A genuine interrupt failure (IPC error): the run may still be live in
-      // main. The prompt may already have been removed from the composer or
-      // its queued bubble. Put it back, and reattach the transcript only if
-      // this is still the active run (Stop/background settlement may have won
-      // the race while the IPC was pending).
-      restoreComposerDraft(threadId, promptText, attachments);
-      if (activeRunsByThreadRef.current[threadId] === runId && tracked) {
-        runOutputMessages.current.set(runId, tracked);
-        updateThreadMessage(tracked.threadId, tracked.messageId, {
-          status: trackedMessage?.status ?? 'running',
-          completedAt: trackedMessage?.completedAt,
-          statusText: trackedMessage?.statusText ?? "I'm working on this now.",
-        });
-        updateThread(tracked.threadId, { status: 'running' });
-      }
-      toast.error(error instanceof Error ? error.message : 'Could not steer the active agent.');
-      return;
-    } finally {
-      steeringRunsRef.current.delete(runId);
-      // A successfully interrupted run's own terminal event may have been
-      // stashed during the flush wait above; it was not lost to a race.
-      steerLostRaceOutcomes.current.delete(runId);
-    }
-    // Someone else settled the run mid-wait (Stop, background-settled):
-    // restarting now would contradict that, so hand the prompt back to the
-    // composer instead of silently dropping it.
-    if (activeRunsByThreadRef.current[threadId] !== runId) {
-      restoreComposerDraft(threadId, promptText, attachments);
-      return;
-    }
-    clearActiveRun(runId);
-    const result = await startTurnForThread(threadId, promptText, attachments);
-    if (!result.ok) {
-      toast.error(result.error);
-      updateThread(threadId, { status: 'error' });
-      restoreComposerDraft(threadId, promptText, attachments);
-    } else {
-      // The interrupted and replacement runs are swapped in one render, so
-      // runningAgentCount never falls. Explicitly surface files written by
-      // the interrupted turn while the Code tree remains visible.
-      setTreeTurnRefreshTick((t) => t + 1);
-    }
+  ): Promise<void> => {
+    // enqueue captures cancellation identity and publishes the reservation
+    // synchronously. Later submissions preserve user order through preflight,
+    // IPC dispatch, and linked-task consumption.
+    return steeringCoordinatorRef.current.enqueue(threadId, (cancelled) =>
+      performSteerWithContent(threadId, promptText, attachments, cancelled)
+    );
   };
 
   // Composer ⚡ / ⌘⏎: steer with the current draft.
@@ -8640,8 +8822,8 @@ const App: React.FC = () => {
     await steerWithContent(selectedThreadId, promptText, attachments);
   };
 
-  // "Steer now" on a queued transcript bubble: promote that message to an
-  // immediate interrupt-and-resume instead of waiting for the turn to end.
+  // "Steer now" on a queued transcript bubble: deliver that message into the
+  // running turn immediately instead of waiting for the turn to end.
   const steerQueuedMessageRef = useRef<(threadId: string, queuedId: string) => Promise<void>>(
     async () => {}
   );
@@ -8687,6 +8869,10 @@ const App: React.FC = () => {
     }
     if (runsToStop.length === 0) return false;
 
+    // Stop cancellation is synchronous with the user's action. Any steering
+    // refresh/save/IPC completion carrying an older generation must now exit
+    // without restoring its prompt to the queue.
+    cancelPendingSteers(threadIds);
     // Stop means "halt everything": clear every queued follow-up before any
     // active mapping is released, otherwise the queue-dispatch effect can
     // immediately start another turn. A local button restores only the root
@@ -9531,8 +9717,7 @@ const App: React.FC = () => {
           isTerminal: agentModel?.id === claudeCodeCliModelId,
           isSending: paneSending,
           steerSupported: paneSteerSupported,
-          steerReady:
-            paneSteerSupported && !!agentModel && !!thread.agentSessionIds?.[agentModel.providerId],
+          steerReady: paneSteerSupported && !!window.orion?.steerAgentTurn,
           // Retargeting an empty thread's project runs through the composer's
           // handler, which only ever addresses the focused thread.
           canChangeProject: focused && canChangeSelectedThreadProject,
@@ -10668,8 +10853,8 @@ const App: React.FC = () => {
                       disabled={!steerReady}
                       title={
                         steerReady
-                          ? 'Steer — interrupt the agent and redirect it now (⌘⏎)'
-                          : 'Steer becomes available once the agent reports its session'
+                          ? 'Steer — the agent picks this up mid-run without losing its work (⌘⏎)'
+                          : 'Steer is unavailable — the message will queue instead'
                       }
                     >
                       <Zap size={14} />

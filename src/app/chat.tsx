@@ -176,6 +176,16 @@ export const FloatingSuggestedTaskCard: React.FC<{
         <div className="tasks-float-body">
           <div className="suggested-task-title">{title}</div>
           <div className="suggested-task-text">{suggestion.text}</div>
+          {!suggestion.startedEpicId &&
+            !suggestion.startedThreadId &&
+            suggestion.detailedPromptStatus === 'pending' && (
+              <div
+                className="suggested-task-preparing"
+                title="A fork of this session is writing a self-contained prompt for the new agent. Starting now sends the short text instead."
+              >
+                Writing detailed prompt for the new agent…
+              </div>
+            )}
           {suggestion.startedEpicId || suggestion.startedThreadId ? (
             <div className="suggested-task-actions">
               <span className="suggested-task-started">
@@ -1256,8 +1266,8 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                       disabled={!steerReady}
                       title={
                         steerReady
-                          ? 'Interrupt the agent and send this now'
-                          : 'Steer becomes available once the agent reports its session'
+                          ? 'Send into the running turn now — the agent picks it up without losing its work'
+                          : 'Steer is unavailable — sends when the current turn ends'
                       }
                     >
                       <Zap size={12} />

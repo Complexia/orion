@@ -434,6 +434,18 @@ export type SuggestedTask = {
   createdAt: string;
   /** Run generation that produced this suggestion. */
   turnRunId: string;
+  /**
+   * Self-contained prompt for starting this task in a fresh session, written
+   * by a read-only fork of the source session (which has the context the terse
+   * suggestion text leaves out). Start sends this; `text` stays the card copy.
+   */
+  detailedPrompt?: string;
+  /**
+   * Progress of the detailed-prompt fork. Unset when no fork was started
+   * (non-Claude thread, no session yet); Start then falls back to `text` plus
+   * a no-context preamble.
+   */
+  detailedPromptStatus?: 'pending' | 'ready' | 'failed';
   /** Epic created from this suggestion, once the user started it in a rift. */
   startedEpicId?: string;
   /** Thread created from this suggestion, once the user started it on the current branch. */
