@@ -208,6 +208,7 @@ import type {
   GitRepoState,
   NewEpicRiftBranches,
   OrionAccountState,
+  ProviderUpdateProgress,
   ProviderUpdateState,
   RiftSweepDialogState,
   SettingsTab,
@@ -1088,6 +1089,8 @@ const App: React.FC = () => {
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
   const [providerUpdatesChecking, setProviderUpdatesChecking] = useState(false);
   const [providerUpdatesRunning, setProviderUpdatesRunning] = useState(false);
+  const [providerUpdateProgress, setProviderUpdateProgress] = useState<ProviderUpdateProgress | null>(null);
+  const providerUpdateInvocationRef = useRef(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
@@ -2398,6 +2401,33 @@ const App: React.FC = () => {
     });
   }, [refreshAgentModels, refreshProviderUpdates]);
 
+  useEffect(() => {
+    let active = true;
+    void window.orion?.getActiveProviderUpdate?.().then((progress) => {
+      if (!active || !progress) return;
+      setProviderUpdateProgress(progress);
+      setProviderUpdatesRunning(
+        providerUpdateInvocationRef.current || progress.status === 'running' || progress.status === 'cancelling'
+      );
+    });
+    if (!window.orion?.onProviderUpdateProgress) {
+      return () => {
+        active = false;
+      };
+    }
+    const unsubscribe = window.orion.onProviderUpdateProgress((progress) => {
+      if (!active) return;
+      setProviderUpdateProgress(progress);
+      setProviderUpdatesRunning(
+        providerUpdateInvocationRef.current || progress.status === 'running' || progress.status === 'cancelling'
+      );
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
+
   // Claude Code CLI terminal threads: main discovers the live CLI session id
   // from claude's on-disk session store (the interactive TUI ignores
   // --session-id) and pushes it here. Stored on the thread so later spawns
@@ -2998,13 +3028,18 @@ const App: React.FC = () => {
   const handleUpdateProviders = useCallback(async () => {
     if (!window.orion?.updateProviders || providerUpdatesRunning) return;
 
+    providerUpdateInvocationRef.current = true;
+    setProviderUpdateProgress(null);
     setProviderUpdatesRunning(true);
     try {
       const result = await window.orion.updateProviders({ enabledProviderIds });
       setProviderUpdateState(result.state);
-      await refreshAgentModels();
+      await refreshAgentModels(true);
 
-      if (result.ok) {
+      if (result.cancelled) {
+        toast.info('Provider updates cancelled');
+        void refreshProviderUpdates();
+      } else if (result.ok) {
         toast.success('Provider CLIs updated');
       } else {
         toast.error(result.error ?? 'Some provider updates failed');
@@ -3012,9 +3047,16 @@ const App: React.FC = () => {
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Could not update provider CLIs');
     } finally {
+      providerUpdateInvocationRef.current = false;
       setProviderUpdatesRunning(false);
     }
-  }, [enabledProviderIds, providerUpdatesRunning, refreshAgentModels]);
+  }, [enabledProviderIds, providerUpdatesRunning, refreshAgentModels, refreshProviderUpdates]);
+
+  const handleCancelProviderUpdate = useCallback(async () => {
+    if (!window.orion?.cancelProviderUpdate || !providerUpdateProgress) return;
+    const result = await window.orion.cancelProviderUpdate(providerUpdateProgress.operationId);
+    if (!result.ok) toast.error(result.error ?? 'Could not stop the provider update');
+  }, [providerUpdateProgress]);
 
   const handleAppUpdateClick = useCallback(async () => {
     if (!appUpdateState || appUpdateBusy) return;
@@ -9111,6 +9153,10 @@ const App: React.FC = () => {
     setSettingsTab('account');
     setSettingsOpen(true);
   }, []);
+  const openProviderSettings = useCallback(() => {
+    setSettingsTab('providers');
+    setSettingsOpen(true);
+  }, []);
   const openSettings = useCallback(() => setSettingsOpen(true), []);
   const sidebarFooterProps = useMemo<SidebarFooterProps>(
     () => ({
@@ -9204,6 +9250,7 @@ const App: React.FC = () => {
     providerUpdateState,
     providerUpdatesChecking,
     providerUpdatesRunning,
+    providerUpdateProgress,
     appUpdateState,
     appUpdateBusy,
     setSettingsOpen,
@@ -9242,6 +9289,8 @@ const App: React.FC = () => {
     utilityReasoningOptions,
     resolvedUtilityReasoningEffort,
     refreshProviderUpdates,
+    handleUpdateProviders,
+    handleCancelProviderUpdate,
     handleAppUpdateClick,
     handleRequestComputerUsePermission,
     handleOpenChromeDebugSetup,
@@ -11088,20 +11137,28 @@ const App: React.FC = () => {
         </div>
       </div>
 
-      {!settingsOpen && availableProviderUpdates.length > 0 && (
+      {!settingsOpen && (availableProviderUpdates.length > 0 || providerUpdatesRunning) && (
         <div className="provider-update-banner" role="status">
-          <div className="provider-update-copy" title={providerUpdateTooltip}>
+          <button
+            type="button"
+            className="provider-update-copy"
+            title={providerUpdatesRunning ? 'Open provider update progress' : providerUpdateTooltip}
+            onClick={openProviderSettings}
+          >
             <RefreshCw size={14} className={providerUpdatesRunning ? 'spinning' : ''} />
-            <span>{providerUpdateSummary}</span>
-          </div>
+            <span>
+              {providerUpdatesRunning
+                ? (providerUpdateProgress?.message ?? 'Updating provider CLIs…')
+                : providerUpdateSummary}
+            </span>
+          </button>
           <button
             type="button"
             className="provider-update-button"
-            onClick={handleUpdateProviders}
-            disabled={providerUpdatesRunning}
+            onClick={providerUpdatesRunning ? openProviderSettings : handleUpdateProviders}
             aria-busy={providerUpdatesRunning}
           >
-            Update providers
+            {providerUpdatesRunning ? 'View progress' : 'Update providers'}
           </button>
         </div>
       )}

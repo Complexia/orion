@@ -124,6 +124,13 @@ contextBridge.exposeInMainWorld('orion', {
   },
   checkProviderUpdates: (input) => ipcRenderer.invoke('providers:checkUpdates', input),
   updateProviders: (input) => ipcRenderer.invoke('providers:updateAll', input),
+  getActiveProviderUpdate: () => ipcRenderer.invoke('providers:getActiveUpdate'),
+  cancelProviderUpdate: (operationId) => ipcRenderer.invoke('providers:cancelUpdate', operationId),
+  onProviderUpdateProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('providers:updateProgress', listener);
+    return () => ipcRenderer.removeListener('providers:updateProgress', listener);
+  },
   authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
   onProviderAuthenticated: (callback) => {
     const listener = (_event, payload) => callback(payload);

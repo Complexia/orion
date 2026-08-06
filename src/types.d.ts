@@ -22,6 +22,20 @@ type AppUpdateState = {
   error?: string | null;
 };
 
+type ProviderUpdateProgress = {
+  operationId: string;
+  status: 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+  phase: 'checking' | 'starting' | 'updating' | 'downloading' | 'installing' | 'verifying' | 'complete' | 'error' | 'cancelled';
+  message: string;
+  output: string;
+  providerId: string | null;
+  providerLabel: string | null;
+  current: number;
+  total: number;
+  percent: number | null;
+  updatedAt: string;
+};
+
 /**
  * One rift directory found under a `.rifts/<repo>` root.
  *
@@ -839,12 +853,16 @@ type OrionComputerUsePermissions = {
       }>;
       updateProviders: (input?: { enabledProviderIds?: string[] }) => Promise<{
         ok: boolean;
+        cancelled?: boolean;
+        busy?: boolean;
+        operationId?: string;
         error?: string;
         results: Array<{
           id: string;
           label: string;
           command: string;
           ok: boolean;
+          cancelled?: boolean;
           skipped?: boolean;
           message?: string;
           output?: string;
@@ -874,6 +892,14 @@ type OrionComputerUsePermissions = {
           }>;
         };
       }>;
+      getActiveProviderUpdate: () => Promise<ProviderUpdateProgress | null>;
+      cancelProviderUpdate: (operationId?: string | null) => Promise<{
+        ok: boolean;
+        error?: string;
+      }>;
+      onProviderUpdateProgress: (
+        callback: (event: ProviderUpdateProgress) => void
+      ) => () => void;
       authenticateProvider: (providerId: string) => Promise<{
         ok: boolean;
         error?: string;

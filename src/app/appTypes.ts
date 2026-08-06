@@ -88,6 +88,20 @@ export type ProviderUpdateState = {
   providers: ProviderUpdateItem[];
 };
 
+export type ProviderUpdateProgress = {
+  operationId: string;
+  status: 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+  phase: 'checking' | 'starting' | 'updating' | 'downloading' | 'installing' | 'verifying' | 'complete' | 'error' | 'cancelled';
+  message: string;
+  output: string;
+  providerId: string | null;
+  providerLabel: string | null;
+  current: number;
+  total: number;
+  percent: number | null;
+  updatedAt: string;
+};
+
 export type AppUpdateState = {
   status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'restarting' | 'not-available' | 'error';
   currentVersion: string;

@@ -43,7 +43,7 @@ import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex
 import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import { getAgentModels, invalidateAgentModelsCache, listAgentModelsWithAvailability } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
-import { authenticateProviderTool, checkProviderUpdate, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
+import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
 import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents, stringifySummary } from './main/stream-adapters.js';
@@ -156,6 +156,59 @@ const disposeAllTitleGenerations = () => {
   );
   if (shutdowns.length > 0) trackAgentShutdown(Promise.all(shutdowns));
 };
+const PROVIDER_UPDATE_PROGRESS_OUTPUT_LIMIT = 24_000;
+let activeProviderUpdate = null;
+let lastProviderUpdateProgress = null;
+const providerUpdateOutputTail = (current, chunk) => {
+  const combined = `${current || ''}${chunk || ''}`;
+  return combined.length > PROVIDER_UPDATE_PROGRESS_OUTPUT_LIMIT
+    ? combined.slice(-PROVIDER_UPDATE_PROGRESS_OUTPUT_LIMIT)
+    : combined;
+};
+const cleanProviderUpdateOutput = (value) =>
+  String(value || '')
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '\n');
+const providerUpdateProgressMessage = (output, fallback) => {
+  const lines = cleanProviderUpdateOutput(output)
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.at(-1) || fallback;
+};
+const providerUpdatePercent = (output) => {
+  const matches = [...cleanProviderUpdateOutput(output).matchAll(/(?:^|\s)(100|\d{1,2}(?:\.\d+)?)%/g)];
+  if (matches.length === 0) return null;
+  const percent = Number(matches.at(-1)?.[1]);
+  return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null;
+};
+const publishProviderUpdateProgress = (operation, patch) => {
+  const progress = {
+    ...(operation.lastProgress || {}),
+    operationId: operation.id,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  operation.lastProgress = progress;
+  lastProviderUpdateProgress = progress;
+  sendToAllWindows('providers:updateProgress', progress);
+  return progress;
+};
+const cancelActiveProviderUpdate = (operationId = null) => {
+  const operation = activeProviderUpdate;
+  if (!operation || (operationId && operation.id !== operationId)) return false;
+  if (operation.controller.signal.aborted) return true;
+  publishProviderUpdateProgress(operation, {
+    status: 'cancelling',
+    message: operation.lastProgress?.providerLabel
+      ? `Stopping ${operation.lastProgress.providerLabel} update…`
+      : 'Stopping provider updates…',
+  });
+  operation.controller.abort();
+  return true;
+};
+const waitForProviderUpdateShutdown = () =>
+  activeProviderUpdate?.promise?.catch(() => {}) ?? Promise.resolve();
 const pendingRiftSetupError = (input) => {
   if (typeof input?.epicId !== 'string') return null;
   if (pendingRiftEpicIds.has(input.epicId)) {
@@ -1256,6 +1309,7 @@ app.on('window-all-closed', () => {
   disposeAllTerminalSessions();
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
+  cancelActiveProviderUpdate();
   reapActiveAgentRuns();
   if (process.platform !== 'darwin') {
     app.quit();
@@ -1275,6 +1329,7 @@ const disposeForQuit = () => {
   disposeAllTerminalSessions();
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
+  cancelActiveProviderUpdate();
   reapActiveAgentRuns();
 };
 
@@ -1285,6 +1340,7 @@ const disposeForQuit = () => {
 const waitForPendingQuitWork = () =>
   Promise.all([
     waitForPendingAgentShutdowns(),
+    waitForProviderUpdateShutdown(),
     waitForPendingRiftCreations(),
     waitForRemoteControlPersistence(),
   ])
@@ -5036,49 +5092,210 @@ ipcMain.handle('providers:getStatus', async () => getProviderStatuses());
 
 ipcMain.handle('providers:checkUpdates', async (_event, input) => checkProviderUpdates(input));
 
+ipcMain.handle('providers:getActiveUpdate', () =>
+  activeProviderUpdate?.lastProgress ?? lastProviderUpdateProgress
+);
+
+ipcMain.handle('providers:cancelUpdate', (_event, operationId) => {
+  const cancelled = cancelActiveProviderUpdate(
+    typeof operationId === 'string' ? operationId : null
+  );
+  return cancelled
+    ? { ok: true }
+    : { ok: false, error: 'That provider update is no longer running.' };
+});
+
 ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
-  const enabledProviderIds = normalizeEnabledProviderIds(input);
-  const results = [];
-
-  for (const config of providerUpdaterConfigs) {
-    if (enabledProviderIds && !enabledProviderIds.has(config.id)) {
-      results.push({
-        id: config.id,
-        label: config.label,
-        command: config.command,
-        ok: true,
-        skipped: true,
-        message: `${config.label} is disabled.`,
-      });
-      continue;
-    }
-
-    const state = await checkProviderUpdate(config, enabledProviderIds);
-    if (!state.updateAvailable) {
-      results.push({
-        id: config.id,
-        label: config.label,
-        command: config.command,
-        ok: true,
-        skipped: true,
-        message: `${config.label} has no available update.`,
-      });
-      continue;
-    }
-
-    results.push(await updateProviderTool(config, state.latestVersion));
+  if (activeProviderUpdate) {
+    return {
+      ok: false,
+      busy: true,
+      operationId: activeProviderUpdate.id,
+      error: 'Provider updates are already running.',
+      results: [],
+      state: await checkProviderUpdates(input),
+    };
   }
 
-  invalidateAgentModelsCache();
-  const state = await checkProviderUpdates(input);
-  const failed = results.filter((result) => !result.ok);
-
-  return {
-    ok: failed.length === 0,
-    results,
-    state,
-    ...(failed.length > 0 ? { error: failed.map((result) => result.error).filter(Boolean).join('\n') } : {}),
+  const operation = {
+    id: crypto.randomUUID(),
+    controller: new AbortController(),
+    promise: null,
+    lastProgress: null,
   };
+  activeProviderUpdate = operation;
+
+  const run = async () => {
+    const enabledProviderIds = normalizeEnabledProviderIds(input);
+    const results = [];
+    publishProviderUpdateProgress(operation, {
+      status: 'running',
+      phase: 'checking',
+      message: 'Checking provider updates…',
+      output: '',
+      providerId: null,
+      providerLabel: null,
+      current: 0,
+      total: 0,
+      percent: null,
+    });
+
+    const checkedState = await checkProviderUpdates(input);
+    const stateById = new Map(checkedState.providers.map((provider) => [provider.id, provider]));
+    const updateConfigs = providerUpdaterConfigs.filter(
+      (config) => stateById.get(config.id)?.updateAvailable === true
+    );
+    let completedUpdates = 0;
+
+    publishProviderUpdateProgress(operation, {
+      phase: updateConfigs.length > 0 ? 'starting' : 'complete',
+      message:
+        updateConfigs.length > 0
+          ? `Preparing ${updateConfigs.length} provider update${updateConfigs.length === 1 ? '' : 's'}…`
+          : 'Provider CLIs are already up to date.',
+      total: updateConfigs.length,
+    });
+
+    for (const config of providerUpdaterConfigs) {
+      if (operation.controller.signal.aborted) break;
+
+      if (enabledProviderIds && !enabledProviderIds.has(config.id)) {
+        results.push({
+          id: config.id,
+          label: config.label,
+          command: config.command,
+          ok: true,
+          skipped: true,
+          message: `${config.label} is disabled.`,
+        });
+        continue;
+      }
+
+      const providerState = stateById.get(config.id);
+      if (!providerState?.updateAvailable) {
+        results.push({
+          id: config.id,
+          label: config.label,
+          command: config.command,
+          ok: true,
+          skipped: true,
+          message: `${config.label} has no available update.`,
+        });
+        continue;
+      }
+
+      let progressOutput = '';
+      let phase = 'updating';
+      const publishCurrentProvider = (message, percent = null) =>
+        publishProviderUpdateProgress(operation, {
+          status: operation.controller.signal.aborted ? 'cancelling' : 'running',
+          phase,
+          providerId: config.id,
+          providerLabel: config.label,
+          message,
+          output: cleanProviderUpdateOutput(progressOutput),
+          current: completedUpdates,
+          total: updateConfigs.length,
+          percent,
+        });
+
+      publishCurrentProvider(`Updating ${config.label}…`);
+      const result = await updateProviderTool(config, providerState.latestVersion, {
+        signal: operation.controller.signal,
+        onPhase: (nextPhase) => {
+          phase = nextPhase;
+          const message =
+            nextPhase === 'verifying'
+              ? `Verifying ${config.label}…`
+              : nextPhase === 'installing'
+                ? `Installing ${config.label}…`
+                : `Updating ${config.label}…`;
+          publishCurrentProvider(message);
+        },
+        onOutput: ({ chunk }) => {
+          progressOutput = providerUpdateOutputTail(progressOutput, chunk);
+          const cleanOutput = cleanProviderUpdateOutput(progressOutput);
+          if (/download(?:ing)?|fetching/i.test(cleanOutput)) phase = 'downloading';
+          publishCurrentProvider(
+            providerUpdateProgressMessage(cleanOutput, `Updating ${config.label}…`),
+            providerUpdatePercent(cleanOutput)
+          );
+        },
+      });
+      results.push(result);
+
+      if (result.cancelled) {
+        publishProviderUpdateProgress(operation, {
+          status: 'cancelled',
+          phase: 'cancelled',
+          message: `${config.label} update cancelled.`,
+          output: cleanProviderUpdateOutput(result.output || progressOutput),
+          percent: null,
+        });
+        break;
+      }
+
+      completedUpdates += 1;
+      publishProviderUpdateProgress(operation, {
+        status: 'running',
+        phase: result.ok ? 'complete' : 'error',
+        message: result.ok
+          ? `${config.label} updated successfully.`
+          : (result.error ?? `${config.label} update failed.`),
+        output: cleanProviderUpdateOutput(result.output || progressOutput),
+        current: completedUpdates,
+        percent: result.ok ? 100 : null,
+      });
+    }
+
+    const cancelled = operation.controller.signal.aborted || results.some((result) => result.cancelled);
+    invalidateAgentModelsCache();
+    const state = cancelled ? checkedState : await checkProviderUpdates(input);
+    const failed = results.filter((result) => !result.ok && !result.cancelled);
+    const response = {
+      ok: !cancelled && failed.length === 0,
+      cancelled,
+      operationId: operation.id,
+      results,
+      state,
+      ...(failed.length > 0
+        ? { error: failed.map((result) => result.error).filter(Boolean).join('\n') }
+        : {}),
+    };
+
+    publishProviderUpdateProgress(operation, {
+      status: cancelled ? 'cancelled' : failed.length > 0 ? 'failed' : 'completed',
+      phase: cancelled ? 'cancelled' : failed.length > 0 ? 'error' : 'complete',
+      message: cancelled
+        ? 'Provider updates cancelled.'
+        : failed.length > 0
+          ? (response.error || 'Some provider updates failed.')
+          : updateConfigs.length > 0
+            ? 'Provider CLIs updated.'
+            : 'Provider CLIs are already up to date.',
+      current: completedUpdates,
+      total: updateConfigs.length,
+      percent: cancelled || failed.length > 0 ? null : 100,
+    });
+    return response;
+  };
+
+  operation.promise = run().catch((error) => {
+    publishProviderUpdateProgress(operation, {
+      status: operation.controller.signal.aborted ? 'cancelled' : 'failed',
+      phase: operation.controller.signal.aborted ? 'cancelled' : 'error',
+      message: operation.controller.signal.aborted
+        ? 'Provider updates cancelled.'
+        : getProcessErrorMessage(error),
+      percent: null,
+    });
+    throw error;
+  });
+  try {
+    return await operation.promise;
+  } finally {
+    if (activeProviderUpdate === operation) activeProviderUpdate = null;
+  }
 });
 
 ipcMain.handle('providers:authenticate', async (event, providerId) => {
