@@ -84,6 +84,130 @@ export const getProcessErrorMessage = (error) => {
   return output || error?.message || String(error);
 };
 
+export const getProviderUpdateError = (error) => {
+  const stderr = String(error?.stderr || '').trim();
+  if (stderr) return stderr;
+  return error?.message || String(error);
+};
+
+const PROVIDER_UPDATE_OUTPUT_LIMIT = 8 * 1024 * 1024;
+const appendProviderUpdateOutput = (current, chunk) => {
+  const combined = `${current}${chunk}`;
+  return combined.length > PROVIDER_UPDATE_OUTPUT_LIMIT
+    ? combined.slice(-PROVIDER_UPDATE_OUTPUT_LIMIT)
+    : combined;
+};
+
+export const isProviderUpdateCancelled = (error) =>
+  error?.name === 'AbortError' || error?.code === 'ABORT_ERR' || error?.cancelled === true;
+
+export const runStreamingShellCommand = (command, options = {}) =>
+  new Promise((resolve, reject) => {
+    const { signal, onOutput } = options;
+    if (signal?.aborted) {
+      const error = new Error('Provider update cancelled.');
+      error.name = 'AbortError';
+      error.code = 'ABORT_ERR';
+      error.cancelled = true;
+      reject(error);
+      return;
+    }
+
+    const child = spawn(loginShell, ['-lc', command], {
+      env: {
+        ...process.env,
+        FORCE_COLOR: '0',
+        NO_COLOR: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // A separate process group lets Abort terminate installer children such
+      // as curl/npm as well as the login shell that launched them.
+      detached: process.platform !== 'win32',
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let cancelled = false;
+    let forceKillTimer = null;
+
+    const emitOutput = (stream, buffer) => {
+      const chunk = buffer.toString();
+      if (stream === 'stderr') stderr = appendProviderUpdateOutput(stderr, chunk);
+      else stdout = appendProviderUpdateOutput(stdout, chunk);
+      try {
+        onOutput?.({ stream, chunk });
+      } catch {}
+    };
+
+    const killProcessGroup = (signalName) => {
+      if (!child.pid) return;
+      try {
+        if (process.platform === 'win32') child.kill(signalName);
+        else process.kill(-child.pid, signalName);
+      } catch {
+        try {
+          child.kill(signalName);
+        } catch {}
+      }
+    };
+
+    const abort = () => {
+      if (settled || cancelled) return;
+      cancelled = true;
+      killProcessGroup('SIGTERM');
+      forceKillTimer = setTimeout(() => killProcessGroup('SIGKILL'), 2000);
+      forceKillTimer.unref?.();
+    };
+
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      signal?.removeEventListener('abort', abort);
+      if (error) reject(error);
+      else resolve(result);
+    };
+
+    child.stdout?.on('data', (buffer) => emitOutput('stdout', buffer));
+    child.stderr?.on('data', (buffer) => emitOutput('stderr', buffer));
+    child.once('spawn', () => {
+      if (cancelled) killProcessGroup('SIGTERM');
+      else if (signal?.aborted) abort();
+    });
+    child.on('error', (error) => {
+      error.stdout = stdout;
+      error.stderr = stderr;
+      finish(error);
+    });
+    child.on('close', (code, processSignal) => {
+      if (cancelled || signal?.aborted) {
+        const error = new Error('Provider update cancelled.');
+        error.name = 'AbortError';
+        error.code = 'ABORT_ERR';
+        error.cancelled = true;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        finish(error);
+        return;
+      }
+      if (code === 0) {
+        finish(null, { stdout, stderr });
+        return;
+      }
+      const error = new Error(
+        processSignal
+          ? `Provider updater terminated by ${processSignal}.`
+          : `Provider updater exited with code ${code ?? 'unknown'}.`
+      );
+      error.code = code;
+      error.signal = processSignal;
+      error.stdout = stdout;
+      error.stderr = stderr;
+      finish(error);
+    });
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+
 export const readCliVersion = async (command) => {
   try {
     const { stdout, stderr } = await runShellCommand(`${shellQuote(command)} --version`, 8000);
@@ -383,7 +507,8 @@ export const resolveProviderUpdateCommand = async (config) => {
   return config.updateCommands[0] ?? null;
 };
 
-export const updateProviderTool = async (config, expectedLatestVersion = null) => {
+export const updateProviderTool = async (config, expectedLatestVersion = null, options = {}) => {
+  const { signal, onOutput, onPhase } = options;
   const commandPath = await resolveCommandPath(config.command);
   if (!commandPath) {
     return {
@@ -408,9 +533,12 @@ export const updateProviderTool = async (config, expectedLatestVersion = null) =
   }
 
   const updateCommand = [config.command, ...args].map(shellQuote).join(' ');
+  const runUpdateCommand = (command) =>
+    runStreamingShellCommand(command, { signal, onOutput });
 
   try {
-    const { stdout, stderr } = await runShellCommand(updateCommand, 180000);
+    onPhase?.('updating');
+    const { stdout, stderr } = await runUpdateCommand(updateCommand);
     const outputParts = [`${stdout}\n${stderr}`.trim()].filter(Boolean);
     const manualInstallCommand = config.manualInstallCommandPattern
       ? outputParts[0]?.match(config.manualInstallCommandPattern)?.[1]?.trim()
@@ -420,12 +548,14 @@ export const updateProviderTool = async (config, expectedLatestVersion = null) =
     // stdin is not a TTY. Run that command explicitly so the background
     // update path performs the install instead of reporting a no-op success.
     if (manualInstallCommand) {
-      const manualResult = await runShellCommand(manualInstallCommand, 180000);
+      onPhase?.('installing');
+      const manualResult = await runUpdateCommand(manualInstallCommand);
       const manualOutput = `${manualResult.stdout}\n${manualResult.stderr}`.trim();
       if (manualOutput) outputParts.push(manualOutput);
     }
 
     if (config.verifyAfterUpdate && expectedLatestVersion) {
+      onPhase?.('verifying');
       const installedVersion = await readCliVersion(config.command);
       if (
         !installedVersion ||
@@ -452,10 +582,23 @@ export const updateProviderTool = async (config, expectedLatestVersion = null) =
       output: outputParts.join('\n\n'),
     };
   } catch (error) {
+    if (isProviderUpdateCancelled(error)) {
+      return {
+        id: config.id,
+        label: config.label,
+        command: config.command,
+        ok: false,
+        cancelled: true,
+        error: `${config.label} update cancelled.`,
+        output: `${error?.stdout || ''}\n${error?.stderr || ''}`.trim(),
+      };
+    }
+
     if (config.packageName) {
       try {
         const fallbackCommand = `npm install -g ${shellQuote(`${config.packageName}@latest`)}`;
-        const { stdout, stderr } = await runShellCommand(fallbackCommand, 180000);
+        onPhase?.('installing');
+        const { stdout, stderr } = await runUpdateCommand(fallbackCommand);
         return {
           id: config.id,
           label: config.label,
@@ -464,12 +607,24 @@ export const updateProviderTool = async (config, expectedLatestVersion = null) =
           output: `${stdout}\n${stderr}`.trim(),
         };
       } catch (fallbackError) {
+        if (isProviderUpdateCancelled(fallbackError)) {
+          return {
+            id: config.id,
+            label: config.label,
+            command: config.command,
+            ok: false,
+            cancelled: true,
+            error: `${config.label} update cancelled.`,
+            output: `${fallbackError?.stdout || ''}\n${fallbackError?.stderr || ''}`.trim(),
+          };
+        }
         return {
           id: config.id,
           label: config.label,
           command: config.command,
           ok: false,
-          error: getProcessErrorMessage(fallbackError),
+          error: getProviderUpdateError(fallbackError),
+          output: `${fallbackError?.stdout || ''}\n${fallbackError?.stderr || ''}`.trim(),
         };
       }
     }
@@ -479,7 +634,8 @@ export const updateProviderTool = async (config, expectedLatestVersion = null) =
       label: config.label,
       command: config.command,
       ok: false,
-      error: getProcessErrorMessage(error),
+      error: getProviderUpdateError(error),
+      output: `${error?.stdout || ''}\n${error?.stderr || ''}`.trim(),
     };
   }
 };

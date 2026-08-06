@@ -16,6 +16,7 @@ import {
   RefreshCw,
   Settings,
   Sparkles,
+  Square,
   SquareArrowOutUpRight,
   SquareKanban,
   Trash2,
@@ -61,6 +62,7 @@ import type {
   EpicPrStatus,
   OrionAccountState,
   ProviderUpdateItem,
+  ProviderUpdateProgress,
   ProviderUpdateState,
   RiftSweepDialogState,
   SettingsTab,
@@ -133,6 +135,7 @@ export type SettingsPageProps = {
   providerUpdateState: ProviderUpdateState | null;
   providerUpdatesChecking: boolean;
   providerUpdatesRunning: boolean;
+  providerUpdateProgress: ProviderUpdateProgress | null;
   appUpdateState: AppUpdateState | null;
   appUpdateBusy: boolean;
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -172,6 +175,8 @@ export type SettingsPageProps = {
   utilityReasoningOptions: Array<{ value: string; label: string }>;
   resolvedUtilityReasoningEffort: string | null;
   refreshProviderUpdates: () => Promise<void>;
+  handleUpdateProviders: () => Promise<void>;
+  handleCancelProviderUpdate: () => Promise<void>;
   handleAppUpdateClick: () => Promise<void>;
   handleRequestComputerUsePermission: (kind: OrionComputerUsePermissionKind) => Promise<void>;
   handleOpenChromeDebugSetup: () => Promise<void>;
@@ -228,6 +233,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     providerUpdateState,
     providerUpdatesChecking,
     providerUpdatesRunning,
+    providerUpdateProgress,
     appUpdateState,
     appUpdateBusy,
     setSettingsOpen,
@@ -266,6 +272,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     utilityReasoningOptions,
     resolvedUtilityReasoningEffort,
     refreshProviderUpdates,
+    handleUpdateProviders,
+    handleCancelProviderUpdate,
     handleAppUpdateClick,
     handleRequestComputerUsePermission,
     handleOpenChromeDebugSetup,
@@ -325,6 +333,28 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     appUpdateState.status === 'checking' ||
     appUpdateState.status === 'downloading' ||
     appUpdateState.status === 'restarting';
+  const providerUpdateActive =
+    providerUpdateProgress?.status === 'running' || providerUpdateProgress?.status === 'cancelling';
+  const providerUpdateCancellable = providerUpdateActive;
+  const providerProgressPercent =
+    typeof providerUpdateProgress?.percent === 'number'
+      ? Math.max(0, Math.min(100, providerUpdateProgress.percent))
+      : null;
+  const providerBatchProgress = providerUpdateProgress?.total
+    ? `${Math.min(providerUpdateProgress.current + (providerUpdateActive ? 1 : 0), providerUpdateProgress.total)} of ${providerUpdateProgress.total}`
+    : null;
+  const providerProgressActivityLabel =
+    providerUpdateProgress?.phase === 'checking'
+      ? 'Checking…'
+      : providerUpdateProgress?.phase === 'starting'
+        ? 'Preparing…'
+        : providerUpdateProgress?.phase === 'installing'
+          ? 'Installing…'
+          : providerUpdateProgress?.phase === 'verifying'
+            ? 'Verifying…'
+            : providerUpdateProgress?.phase === 'downloading'
+              ? 'Downloading…'
+              : 'Updating…';
 
   return (
     <div className="settings-page">
@@ -997,8 +1027,88 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     <RefreshCw size={13} className={providerUpdatesChecking ? 'spinning' : ''} />
                     <span>{providerUpdatesChecking ? 'Checking...' : 'Check for updates'}</span>
                   </button>
+                  {!providerUpdateActive && (providerUpdateState?.updatesAvailable ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      className="providers-action-btn primary"
+                      onClick={() => {
+                        void handleUpdateProviders();
+                      }}
+                    >
+                      <RefreshCw size={13} />
+                      <span>Update providers</span>
+                    </button>
+                  )}
                 </div>
               </div>
+              {(providerUpdatesRunning || providerUpdateProgress) && (
+                <section
+                  className={`provider-update-progress-card ${providerUpdateProgress?.status ?? 'running'}`}
+                >
+                  <div className="provider-update-progress-head">
+                    <div className="provider-update-progress-title">
+                      <RefreshCw size={15} className={providerUpdateActive ? 'spinning' : ''} />
+                      <div>
+                        <strong>
+                          {providerUpdateProgress?.providerLabel ??
+                            (providerUpdateActive ? 'Updating providers' : 'Provider update')}
+                        </strong>
+                        <span aria-live="polite">
+                          {providerUpdateProgress?.message ?? 'Starting provider update…'}
+                        </span>
+                      </div>
+                    </div>
+                    {providerUpdateCancellable && (
+                      <button
+                        type="button"
+                        className="provider-update-abort"
+                        onClick={() => {
+                          void handleCancelProviderUpdate();
+                        }}
+                        disabled={providerUpdateProgress?.status === 'cancelling'}
+                      >
+                        <Square size={11} fill="currentColor" />
+                        {providerUpdateProgress?.status === 'cancelling' ? 'Stopping…' : 'Abort update'}
+                      </button>
+                    )}
+                  </div>
+                  <div
+                    className={`provider-update-progress-track${providerProgressPercent === null && providerUpdateActive ? ' indeterminate' : ''}`}
+                    role="progressbar"
+                    aria-label="Provider download progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    {...(providerProgressPercent !== null ? { 'aria-valuenow': providerProgressPercent } : {})}
+                  >
+                    <span
+                      style={
+                        providerProgressPercent !== null
+                          ? { width: `${providerProgressPercent}%` }
+                          : undefined
+                      }
+                    />
+                  </div>
+                  <div className="provider-update-progress-meta">
+                    <span>{providerBatchProgress ?? 'Preparing update'}</span>
+                    <span>
+                      {providerProgressPercent !== null
+                        ? `${Math.round(providerProgressPercent)}%`
+                        : providerUpdateActive
+                          ? providerProgressActivityLabel
+                          : providerUpdateProgress?.status === 'completed'
+                            ? 'Complete'
+                            : providerUpdateProgress?.status === 'cancelled'
+                              ? 'Cancelled'
+                              : providerUpdateProgress?.status === 'failed'
+                                ? 'Failed'
+                                : ''}
+                    </span>
+                  </div>
+                  {providerUpdateProgress?.output && (
+                    <pre className="provider-update-output">{providerUpdateProgress.output}</pre>
+                  )}
+                </section>
+              )}
               {agentProviders
                 // Orion is a pseudo-provider (the orchestrator), not an
                 // installable CLI — no row in Providers.
