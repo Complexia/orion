@@ -588,6 +588,8 @@ body {
   font-size: 12px;
   font-weight: 650;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 0;
   border: 0;
   background: transparent;
@@ -607,6 +609,7 @@ body {
 }
 
 .provider-update-copy span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1124,6 +1127,15 @@ body {
   animation: provider-update-progress-slide 1.2s ease-in-out infinite;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .provider-update-progress-track.indeterminate > span {
+    width: 100%;
+    opacity: 0.5;
+    animation: none;
+    transition: none;
+  }
+}
+
 .provider-update-progress-meta {
   justify-content: space-between;
   gap: 12px;
@@ -1144,7 +1156,7 @@ body {
   font-size: 10.5px;
   line-height: 1.45;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 @keyframes provider-update-progress-slide {

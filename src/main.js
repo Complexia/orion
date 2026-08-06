@@ -157,6 +157,7 @@ const disposeAllTitleGenerations = () => {
   if (shutdowns.length > 0) trackAgentShutdown(Promise.all(shutdowns));
 };
 const PROVIDER_UPDATE_PROGRESS_OUTPUT_LIMIT = 24_000;
+const PROVIDER_UPDATE_PROGRESS_INTERVAL_MS = 100;
 let activeProviderUpdate = null;
 let lastProviderUpdateProgress = null;
 const providerUpdateOutputTail = (current, chunk) => {
@@ -170,14 +171,14 @@ const cleanProviderUpdateOutput = (value) =>
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
     .replace(/\r/g, '\n');
 const providerUpdateProgressMessage = (output, fallback) => {
-  const lines = cleanProviderUpdateOutput(output)
+  const lines = String(output || '')
     .split(/\n+/)
     .map((line) => line.trim())
     .filter(Boolean);
   return lines.at(-1) || fallback;
 };
 const providerUpdatePercent = (output) => {
-  const matches = [...cleanProviderUpdateOutput(output).matchAll(/(?:^|\s)(100|\d{1,2}(?:\.\d+)?)%/g)];
+  const matches = [...String(output || '').matchAll(/(?:^|\s)(100|\d{1,2}(?:\.\d+)?)%/g)];
   if (matches.length === 0) return null;
   const percent = Number(matches.at(-1)?.[1]);
   return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null;
@@ -1309,7 +1310,6 @@ app.on('window-all-closed', () => {
   disposeAllTerminalSessions();
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
-  cancelActiveProviderUpdate();
   reapActiveAgentRuns();
   if (process.platform !== 'darwin') {
     app.quit();
@@ -5117,11 +5117,24 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
     };
   }
 
+  const operationId = crypto.randomUUID();
   const operation = {
-    id: crypto.randomUUID(),
+    id: operationId,
     controller: new AbortController(),
     promise: null,
-    lastProgress: null,
+    lastProgress: {
+      operationId,
+      status: 'running',
+      phase: 'checking',
+      message: 'Checking provider updates…',
+      output: '',
+      providerId: null,
+      providerLabel: null,
+      current: 0,
+      total: 0,
+      percent: null,
+      updatedAt: new Date().toISOString(),
+    },
   };
   activeProviderUpdate = operation;
 
@@ -5186,14 +5199,19 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
 
       let progressOutput = '';
       let phase = 'updating';
-      const publishCurrentProvider = (message, percent = null) =>
+      let lastOutputPublishAt = 0;
+      const publishCurrentProvider = (
+        message,
+        percent = null,
+        cleanOutput = cleanProviderUpdateOutput(progressOutput)
+      ) =>
         publishProviderUpdateProgress(operation, {
           status: operation.controller.signal.aborted ? 'cancelling' : 'running',
           phase,
           providerId: config.id,
           providerLabel: config.label,
           message,
-          output: cleanProviderUpdateOutput(progressOutput),
+          output: cleanOutput,
           current: completedUpdates,
           total: updateConfigs.length,
           percent,
@@ -5214,11 +5232,15 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
         },
         onOutput: ({ chunk }) => {
           progressOutput = providerUpdateOutputTail(progressOutput, chunk);
+          const now = Date.now();
+          if (now - lastOutputPublishAt < PROVIDER_UPDATE_PROGRESS_INTERVAL_MS) return;
+          lastOutputPublishAt = now;
           const cleanOutput = cleanProviderUpdateOutput(progressOutput);
           if (/download(?:ing)?|fetching/i.test(cleanOutput)) phase = 'downloading';
           publishCurrentProvider(
             providerUpdateProgressMessage(cleanOutput, `Updating ${config.label}…`),
-            providerUpdatePercent(cleanOutput)
+            providerUpdatePercent(cleanOutput),
+            cleanOutput
           );
         },
       });

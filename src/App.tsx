@@ -2403,13 +2403,16 @@ const App: React.FC = () => {
 
   useEffect(() => {
     let active = true;
-    void window.orion?.getActiveProviderUpdate?.().then((progress) => {
-      if (!active || !progress) return;
-      setProviderUpdateProgress(progress);
-      setProviderUpdatesRunning(
-        providerUpdateInvocationRef.current || progress.status === 'running' || progress.status === 'cancelling'
-      );
-    });
+    void window.orion?.getActiveProviderUpdate?.().then(
+      (progress) => {
+        if (!active || !progress) return;
+        setProviderUpdateProgress(progress);
+        setProviderUpdatesRunning(
+          providerUpdateInvocationRef.current || progress.status === 'running' || progress.status === 'cancelling'
+        );
+      },
+      () => {}
+    );
     if (!window.orion?.onProviderUpdateProgress) {
       return () => {
         active = false;
@@ -3054,8 +3057,12 @@ const App: React.FC = () => {
 
   const handleCancelProviderUpdate = useCallback(async () => {
     if (!window.orion?.cancelProviderUpdate || !providerUpdateProgress) return;
-    const result = await window.orion.cancelProviderUpdate(providerUpdateProgress.operationId);
-    if (!result.ok) toast.error(result.error ?? 'Could not stop the provider update');
+    try {
+      const result = await window.orion.cancelProviderUpdate(providerUpdateProgress.operationId);
+      if (!result.ok) toast.error(result.error ?? 'Could not stop the provider update');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not stop the provider update');
+    }
   }, [providerUpdateProgress]);
 
   const handleAppUpdateClick = useCallback(async () => {

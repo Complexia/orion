@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -14,6 +14,27 @@ assert.equal(
   'updateTimeoutMs' in kimiConfig,
   false,
   'provider downloads should remain user-controlled instead of timing out'
+);
+
+const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+const windowAllClosedHandler = mainSource.match(
+  /app\.on\('window-all-closed',[\s\S]*?\n}\);/
+)?.[0];
+assert.ok(windowAllClosedHandler, 'the last-window lifecycle handler should remain present');
+assert.doesNotMatch(
+  windowAllClosedHandler,
+  /cancelActiveProviderUpdate\(/,
+  'closing the last macOS window should not cancel a provider update'
+);
+assert.match(
+  mainSource,
+  /lastProgress: \{[\s\S]*?phase: 'checking',[\s\S]*?output: '',[\s\S]*?current: 0,[\s\S]*?total: 0,[\s\S]*?percent: null,/,
+  'a provider operation should have a complete progress payload before it can be cancelled'
+);
+assert.match(
+  mainSource,
+  /now - lastOutputPublishAt < PROVIDER_UPDATE_PROGRESS_INTERVAL_MS/,
+  'streamed provider output should be rate-limited before publishing progress'
 );
 
 const fixtureDir = await mkdtemp(path.join(os.tmpdir(), 'orion-provider-update-'));

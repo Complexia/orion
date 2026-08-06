@@ -335,10 +335,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     appUpdateState.status === 'restarting';
   const providerUpdateActive =
     providerUpdateProgress?.status === 'running' || providerUpdateProgress?.status === 'cancelling';
-  const providerUpdateCancellable =
-    providerUpdateActive &&
-    providerUpdateProgress?.phase !== 'complete' &&
-    providerUpdateProgress?.phase !== 'error';
+  const providerUpdateCancellable = providerUpdateActive;
   const providerProgressPercent =
     typeof providerUpdateProgress?.percent === 'number'
       ? Math.max(0, Math.min(100, providerUpdateProgress.percent))
@@ -1047,7 +1044,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               {(providerUpdatesRunning || providerUpdateProgress) && (
                 <section
                   className={`provider-update-progress-card ${providerUpdateProgress?.status ?? 'running'}`}
-                  aria-live="polite"
                 >
                   <div className="provider-update-progress-head">
                     <div className="provider-update-progress-title">
@@ -1057,7 +1053,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                           {providerUpdateProgress?.providerLabel ??
                             (providerUpdateActive ? 'Updating providers' : 'Provider update')}
                         </strong>
-                        <span>{providerUpdateProgress?.message ?? 'Starting provider update…'}</span>
+                        <span aria-live="polite">
+                          {providerUpdateProgress?.message ?? 'Starting provider update…'}
+                        </span>
                       </div>
                     </div>
                     {providerUpdateCancellable && (
