@@ -59,6 +59,7 @@ const branchCopy = (
     claudeReasoningEffort: source.claudeReasoningEffort,
     claudeContextWindow: source.claudeContextWindow,
     grokReasoningEffort: source.grokReasoningEffort,
+    museReasoningEffort: source.museReasoningEffort,
     createdAt,
     // A new branch is a top-level Recent entry even when its source was a
     // hidden child (or had previously been removed from Recent).

@@ -38,7 +38,7 @@ import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from 
 import { commandForModel } from './main/command-for-model.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
-import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup } from './main/mcp-bridge.js';
+import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
@@ -5592,6 +5592,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       model.providerId === 'opencode'
         ? openCodeMcpConfigContent(orionMcp, process.env.OPENCODE_CONFIG_CONTENT)
         : null;
+    // Muse takes the bridge through a synthetic XDG config root (its settings
+    // file is the only MCP intake); built once per runTurn so a resume
+    // fallback reattempt reuses it, and removed with the token dir on release.
+    const museConfigRoot =
+      model.providerId === 'muse' ? await writeMuseMcpConfigRoot(orionMcp) : null;
     // The renderer's capability probe only establishes that this provider can
     // accept the bridge. A referenced-thread turn also needs this run's shim,
     // socket token, and provider-specific plugin/config registration to have
@@ -5600,7 +5605,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const effectiveThreadReaderBridgeReady = isEffectiveThreadReaderBridgeReady(
       model.providerId,
       Boolean(orionMcp),
-      Boolean(openCodeConfig)
+      Boolean(openCodeConfig),
+      Boolean(museConfigRoot)
     );
     if (
       isRequiredThreadReaderBridgeMissing(
@@ -5632,6 +5638,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         FORCE_COLOR: '0',
         NO_COLOR: '1',
         ...(openCodeConfig ? { OPENCODE_CONFIG_CONTENT: openCodeConfig } : {}),
+        ...(museConfigRoot ? { XDG_CONFIG_HOME: museConfigRoot } : {}),
       },
       // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
       // take no input.
@@ -7128,6 +7135,7 @@ const runOneShotAgentText = async (
     ...(model.providerId === 'codex' ? { codexReasoningEffort: effort } : {}),
     ...(model.providerId === 'claude' ? { claudeReasoningEffort: effort } : {}),
     ...(model.providerId === 'grok' ? { grokReasoningEffort: effort } : {}),
+    ...(model.providerId === 'muse' ? { museReasoningEffort: effort } : {}),
   });
 
   const commandString = args.map(shellQuote).join(' ');

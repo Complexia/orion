@@ -92,8 +92,10 @@ import {
   defaultClaudeContextWindow,
   defaultCodexServiceTier,
   defaultGrokReasoningEffort,
+  defaultMuseReasoningEffort,
   getEffectiveCodexReasoningEffort,
   grokReasoningOptions,
+  museReasoningOptions,
   fallbackAgentModels,
   findAgentModel,
   isClaudeCodeCliModelId,
@@ -106,6 +108,7 @@ import {
   type CodexReasoningEffort,
   type CodexServiceTier,
   type GrokReasoningEffort,
+  type MuseReasoningEffort,
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
@@ -383,6 +386,7 @@ const UTILITY_MODEL_PREFERENCE = [
   'cursor:composer-2.5',
   'claude:claude-haiku-4-5',
   'kimi:kimi-code/kimi-for-coding',
+  'muse:muse-spark-1.2',
 ];
 
 // Threads grouped under an epic that has a rift workspace (experimental Rifts
@@ -440,6 +444,7 @@ const threadShellSignature = (thread: Thread): string => {
     thread.claudeReasoningEffort,
     thread.claudeContextWindow,
     thread.grokReasoningEffort,
+    thread.museReasoningEffort,
     thread.createdAt,
     thread.hiddenFromRecent ? '1' : '0',
     thread.pinnedAt,
@@ -1538,6 +1543,9 @@ const App: React.FC = () => {
   const selectedGrokReasoning = selectedThread?.grokReasoningEffort ?? defaultGrokReasoningEffort;
   const selectedGrokReasoningLabel =
     grokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
+  const selectedMuseReasoning = selectedThread?.museReasoningEffort ?? defaultMuseReasoningEffort;
+  const selectedMuseReasoningLabel =
+    museReasoningOptions.find((option) => option.value === selectedMuseReasoning)?.label ?? 'High';
   const selectedAccessMode = selectedThread?.accessMode ?? 'full-access';
   const selectedAccessModeLabel =
     accessModeOptions.find((option) => option.value === selectedAccessMode)?.label ?? 'Full access';
@@ -1545,7 +1553,8 @@ const App: React.FC = () => {
     !isTerminalThread &&
     (selectedAgentModel?.providerId === 'codex' ||
       selectedAgentModel?.providerId === 'claude' ||
-      selectedAgentModel?.providerId === 'grok');
+      selectedAgentModel?.providerId === 'grok' ||
+      selectedAgentModel?.providerId === 'muse');
   const normalizedProviderSettings = useMemo(
     () => ({
       ...defaultProviderSettings,
@@ -2259,6 +2268,7 @@ const App: React.FC = () => {
       return toOptions(codexReasoningOptionsForModel(resolvedUtilityModel));
     if (resolvedUtilityModel.providerId === 'claude') return toOptions(claudeReasoningOptions);
     if (resolvedUtilityModel.providerId === 'grok') return toOptions(grokReasoningOptions);
+    if (resolvedUtilityModel.providerId === 'muse') return toOptions(museReasoningOptions);
     return [];
   }, [resolvedUtilityModel]);
   // A hidden turn writes a title or a commit message, so an unset effort — and
@@ -6872,6 +6882,11 @@ const App: React.FC = () => {
                 grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort,
               }
             : {}),
+          ...(model.providerId === 'muse'
+            ? {
+                museReasoningEffort: thread.museReasoningEffort ?? defaultMuseReasoningEffort,
+              }
+            : {}),
           ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
           ...(mentionedThreads.length > 0 ? { hasThreadMentions: true } : {}),
           ...(orchestration ? { orchestration } : {}),
@@ -8814,6 +8829,7 @@ const App: React.FC = () => {
               | 'claudeReasoningEffort'
               | 'claudeContextWindow'
               | 'grokReasoningEffort'
+              | 'museReasoningEffort'
             >
           > = {};
           if (
@@ -9653,9 +9669,11 @@ const App: React.FC = () => {
         estimateChipWidth(
           selectedAgentModel?.providerId === 'grok'
             ? selectedGrokReasoningLabel
-            : selectedAgentModel?.providerId === 'claude'
-              ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
-              : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`,
+            : selectedAgentModel?.providerId === 'muse'
+              ? selectedMuseReasoningLabel
+              : selectedAgentModel?.providerId === 'claude'
+                ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
+                : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`,
           7.4,
           52
         )
@@ -9764,7 +9782,33 @@ const App: React.FC = () => {
   // Popover bodies, lifted out of their chips so the overflow menu can show the
   // same options inline instead of duplicating them.
   const agentSettingsOptions = selectedThread && shouldShowAgentSettings ? (
-    selectedAgentModel?.providerId === 'grok' ? (
+    selectedAgentModel?.providerId === 'muse' ? (
+      <div className="codex-settings-section">
+        <div className="codex-settings-heading">Reasoning</div>
+        <div className="codex-settings-options">
+          {museReasoningOptions.map((option) => {
+            const selected = selectedMuseReasoning === option.value;
+            return (
+              <button
+                key={option.value}
+                className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                onClick={() =>
+                  updateThread(selectedThread.id, {
+                    museReasoningEffort: option.value as MuseReasoningEffort,
+                  })
+                }
+              >
+                <span className="settings-check">{selected && <Check size={17} />}</span>
+                <span>
+                  {option.label}
+                  {option.default ? ' (default)' : ''}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    ) : selectedAgentModel?.providerId === 'grok' ? (
       <div className="codex-settings-section">
         <div className="codex-settings-heading">Reasoning</div>
         <div className="codex-settings-options">
@@ -9949,9 +9993,11 @@ const App: React.FC = () => {
   const agentSettingsSummary =
     selectedAgentModel?.providerId === 'grok'
       ? selectedGrokReasoningLabel
-      : selectedAgentModel?.providerId === 'claude'
-        ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
-        : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`;
+      : selectedAgentModel?.providerId === 'muse'
+        ? selectedMuseReasoningLabel
+        : selectedAgentModel?.providerId === 'claude'
+          ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
+          : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`;
 
   // The composer belongs to the focused pane: one thread takes input at a
   // time and clicking any pane moves it there. Built once, outside the pane
@@ -10521,7 +10567,9 @@ const App: React.FC = () => {
                         ? 'Claude reasoning and context window'
                         : selectedAgentModel?.providerId === 'grok'
                           ? 'Grok reasoning effort'
-                          : 'Codex reasoning and service tier'
+                          : selectedAgentModel?.providerId === 'muse'
+                            ? 'Muse reasoning effort'
+                            : 'Codex reasoning and service tier'
                     }
                   >
                     <span>
@@ -10529,9 +10577,11 @@ const App: React.FC = () => {
                         ? selectedClaudeReasoningLabel
                         : selectedAgentModel?.providerId === 'grok'
                           ? selectedGrokReasoningLabel
-                          : selectedCodexReasoningLabel}
+                          : selectedAgentModel?.providerId === 'muse'
+                            ? selectedMuseReasoningLabel
+                            : selectedCodexReasoningLabel}
                     </span>
-                    {selectedAgentModel?.providerId !== 'grok' && (
+                    {selectedAgentModel?.providerId !== 'grok' && selectedAgentModel?.providerId !== 'muse' && (
                       <>
                         <span className="control-dot">·</span>
                         <span>

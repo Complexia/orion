@@ -119,12 +119,43 @@ export const forkKimiSessionDir = async (sessionId) => {
   return newId;
 };
 
+// Muse sessions live at $XDG_DATA_HOME/muse/sessions/<yyyy>/<mm>/<dd>/<id>/
+// with the event log in session.jsonl; `muse exec --session-id` resolves the
+// id across the dated directories. Every log record embeds the session id in
+// its stream field, so the copy's log is rewritten to the new id (verified
+// live on muse 0.1.0: the copy resumes with full history, parent untouched).
+export const forkMuseSessionDir = async (sessionId) => {
+  const sessionsRoot = path.join(
+    process.env.XDG_DATA_HOME || path.join(app.getPath('home'), '.local', 'share'),
+    'muse',
+    'sessions'
+  );
+  const entries = await fs.readdir(sessionsRoot, { recursive: true });
+  const relativePath = entries.find(
+    (entry) => entry === sessionId || entry.endsWith(`${path.sep}${sessionId}`)
+  );
+  if (!relativePath) return null;
+  const sourceDir = path.join(sessionsRoot, relativePath);
+  if (!(await fs.stat(sourceDir).then((stat) => stat.isDirectory()).catch(() => false))) {
+    return null;
+  }
+
+  const newId = crypto.randomUUID();
+  const newDir = path.join(path.dirname(sourceDir), newId);
+  await fs.cp(sourceDir, newDir, { recursive: true });
+  const logPath = path.join(newDir, 'session.jsonl');
+  const log = await fs.readFile(logPath, 'utf8');
+  await fs.writeFile(logPath, log.split(sessionId).join(newId));
+  return newId;
+};
+
 export const forkSessionOnDisk = async (providerId, sessionId) => {
   try {
     if (providerId === 'codex') return await forkCodexSessionFile(sessionId);
     if (providerId === 'cursor') return await forkCursorChatDir(sessionId);
     if (providerId === 'grok') return await forkGrokSessionDir(sessionId);
     if (providerId === 'kimi') return await forkKimiSessionDir(sessionId);
+    if (providerId === 'muse') return await forkMuseSessionDir(sessionId);
   } catch (error) {
     console.error(`Failed to fork ${providerId} session ${sessionId}`, error);
   }

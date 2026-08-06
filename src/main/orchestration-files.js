@@ -47,6 +47,7 @@ export const buildOrchestrationBlock = (orchestration) => {
     '   - cursor: `cursor-agent --print --trust --workspace <cwd> --model <slug> <access flags> "<task>"`',
     '   - grok: `grok --cwd <cwd> --model <slug> <access flags> --single "<task>"`',
     '   - kimi: `kimi -m <slug> -p "<task>"` — prompt mode auto-approves every tool and cannot be sandboxed, so only delegate to kimi when the access mode is Full access.',
+    '   - muse: `muse exec --model <slug> <access flags> "<task>"`',
     '',
     '   Iterate: inspect stdout when the command finishes, and follow up with a refined invocation if the result is incomplete.'
   );
