@@ -320,20 +320,24 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
 };
 
 // What each harness supports for messages sent while a run is in flight.
-// queue: hold the message and send it as the next turn (session resume).
-// steer: interrupt the running process and immediately resume the same
-// harness session with the new instruction. The non-interactive CLI modes
-// Orion uses accept no stdin mid-run, so interrupt+resume is the steer path;
-// opencode has no session resume wired, so it is queue-only.
+// queue: hold the message and send it as the next turn (session resume);
+// dispatches automatically the moment the current turn ends.
+// steer: deliver the message INTO the running turn without interrupting it —
+// the same behavior as typing while Claude Code works. This needs a live
+// mid-turn input channel: only claude has one (its persistent SDK session
+// folds a mid-turn user message into the running turn). The other harnesses
+// run one-shot per turn (codex exec, cursor-agent --print, opencode run) or
+// hold a single-prompt ACP dialog (grok, kimi), so a follow-up cannot reach
+// the running turn — it queues and sends when that turn finishes. Steer must
+// never kill the running process; that is Stop's job.
 export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; steer: boolean }> = {
   // Steering an orchestrated thread would bypass the driver resolution.
   orion: { queue: true, steer: false },
-  grok: { queue: true, steer: true },
-  codex: { queue: true, steer: true },
+  grok: { queue: true, steer: false },
+  codex: { queue: true, steer: false },
   claude: { queue: true, steer: true },
-  cursor: { queue: true, steer: true },
-  // kimi resumes over ACP session/load, so interrupt+resume steering works.
-  kimi: { queue: true, steer: true },
+  cursor: { queue: true, steer: false },
+  kimi: { queue: true, steer: false },
   opencode: { queue: true, steer: false },
 };
 

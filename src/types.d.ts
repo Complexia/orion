@@ -1059,9 +1059,16 @@ type OrionComputerUsePermissions = {
         /** True when prompt context contains resolvable @thread references and requires read_thread. */
         hasThreadMentions?: boolean;
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
+      /**
+       * Steer: deliver a follow-up into the run in flight without interrupting
+       * it (claude folds a mid-turn user message into the running turn, like
+       * typing while Claude Code works). False = no live mid-turn channel holds
+       * this run — queue the message for end-of-turn dispatch instead.
+       */
+      steerAgentTurn?: (runId: string, text: string) => Promise<boolean>;
       stopAgentTurn: (
         runId: string,
-        /** terminateBackground: also dispose the thread's persistent claude session (kills background subagents). Steer omits this. */
+        /** terminateBackground: also dispose the thread's persistent claude session (kills background subagents). */
         options?: { terminateBackground?: boolean }
       ) => Promise<boolean>;
       /** Claude slash commands (built-ins + .claude/commands + skills + plugins) known for a thread/project. */
@@ -1074,7 +1081,7 @@ type OrionComputerUsePermissions = {
       onSlashCommands: (cb: (event: { projectPath: string; commands: SlashCommandInfo[] }) => void) => () => void;
       /** `/clear`: dispose only the thread's persistent Claude SDK session so the next turn starts fresh. */
       clearClaudeSession: (threadId: string) => Promise<boolean>;
-      /** True while a forgotten run's terminal event is still being prepared (steer lost-race handoff). */
+      /** True while a forgotten run's terminal event is still being prepared. */
       isRunFinalizing?: (runId: string) => Promise<boolean>;
       /** Dispose any persistent agent runtime owned by a deleted thread. */
       disposeAgentThread: (threadId: string) => Promise<boolean>;

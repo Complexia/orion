@@ -183,8 +183,8 @@ assert.doesNotMatch(
 );
 assert.match(
   claudeDriverSource,
-  /const turn = session\.activeTurns\.shift\(\);[\s\S]*session\.pendingSuggestionRunId = turn\.runId;/,
-  'Finalization must retain the completed turn as the next suggestion owner'
+  /const turn = session\.activeTurns\.shift\(\);[\s\S]*session\.pendingSuggestionRunId = continuesSameRun \? null : turn\.runId;/,
+  'Finalization must retain only a fully completed visible turn as the next suggestion owner'
 );
 assert.ok(
   (claudeDriverSource.match(/session\.pendingSuggestionRunId = null;/g) ?? []).length >= 3,
