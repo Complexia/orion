@@ -8769,6 +8769,23 @@ const App: React.FC = () => {
     // Delivered into the live turn: record the fully prepared instruction in
     // the transcript and consume the linked-task context exactly once.
     pinThreadToBottom(threadId);
+    // Split the transcript at the steer point. The run streams into one
+    // agent-run bubble, so appending the user message alone would leave it
+    // pinned under a bubble that keeps growing above it (and the composer's
+    // "Starting agent..." placeholder showing for a run already in flight).
+    // Close out the current bubble first; after the user message lands below,
+    // retarget the run's output to a fresh bubble so the rest of the turn
+    // renders in reading order.
+    flushChunkBuffers();
+    const trackedRun = runOutputMessages.current.get(target.runId);
+    const splitRun = trackedRun && trackedRun.threadId === threadId ? trackedRun : undefined;
+    if (splitRun) {
+      updateThreadMessage(threadId, splitRun.messageId, {
+        status: 'done',
+        completedAt: new Date().toISOString(),
+        statusText: 'Steered — the agent continues below.',
+      });
+    }
     if (prepared.tasksToInject.length > 0) {
       const injectedIds = new Set(prepared.tasksToInject.map((task) => task.id));
       const currentLinkedTasks =
@@ -8794,6 +8811,27 @@ const App: React.FC = () => {
           }
         : {}),
     });
+    if (splitRun) {
+      const closedMessage = useOrionStore
+        .getState()
+        .threads.find((thread) => thread.id === threadId)
+        ?.messages.find((message) => message.id === splitRun.messageId);
+      const continuationMessageId = addMessageToThread(threadId, {
+        role: 'agent',
+        content: '',
+        kind: 'agent-run',
+        status: 'running',
+        statusText: "I'm working on this now.",
+        startedAt: new Date().toISOString(),
+        activities: [],
+        ...(closedMessage?.command ? { command: closedMessage.command } : {}),
+        ...(closedMessage?.modelId ? { modelId: closedMessage.modelId } : {}),
+      });
+      runOutputMessages.current.set(target.runId, {
+        threadId,
+        messageId: continuationMessageId,
+      });
+    }
   };
 
   const steerWithContent = (
