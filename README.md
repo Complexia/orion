@@ -55,6 +55,11 @@ npm run make   # produces distributables
 
 ## Release
 
+Release tooling is pinned to Node.js 24.18.1. Run `nvm use` after entering the
+repository so native packaging dependencies and the deploy process use the same
+Node ABI. The deploy command checks both the Node major and the macOS DMG native
+dependency before changing the package version.
+
 Create `.env.release.local` from `.env.release.example`, then run:
 
 ```bash

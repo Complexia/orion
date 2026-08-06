@@ -7,10 +7,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { verifyReleaseRuntime } from './check-release-runtime.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-await loadEnvFile(path.join(rootDir, '.env.release.local'));
 
 const args = parseArgs(process.argv.slice(2));
 const platform = args.platform ?? process.platform;
@@ -19,6 +18,13 @@ const osName = platform === 'darwin' ? 'macos' : platform === 'win32' ? 'windows
 if (args.resumeNotaryId && args.resumeUpload) {
   throw new Error('Use either --resume-notary-id or --resume-upload, not both.');
 }
+
+verifyReleaseRuntime({
+  platform,
+  requireNativePackaging: !args.resumeNotaryId && !args.resumeUpload,
+});
+
+await loadEnvFile(path.join(rootDir, '.env.release.local'));
 
 const bump = args.bump ?? (args.resumeNotaryId || args.resumeUpload ? 'none' : 'patch');
 const isMacRelease = platform === 'darwin';

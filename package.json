@@ -1,15 +1,19 @@
 {
   "name": "orion",
   "productName": "Orion",
-  "version": "1.0.88",
+  "version": "1.0.89",
   "description": "Orion - Agentic IDE",
   "main": ".vite/build/main.js",
   "private": true,
+  "engines": {
+    "node": "24.x"
+  },
   "scripts": {
     "start": "electron-forge start",
     "package": "electron-forge package",
     "make": "electron-forge make",
     "deploy": "node scripts/deploy.mjs",
+    "test:release-runtime": "node scripts/test-release-runtime.mjs",
     "update-rifts": "node scripts/update-rifts.mjs",
     "test:rift-storage": "node scripts/test-rift-storage.mjs",
     "test:skills": "electron scripts/test-skills.mjs",
