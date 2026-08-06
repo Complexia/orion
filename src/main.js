@@ -31,7 +31,8 @@ import {
   pushRepo,
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
-import { disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn } from './main/claude-driver.js';
+import { claudeSdkSessions, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn } from './main/claude-driver.js';
+import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
@@ -7499,6 +7500,48 @@ ipcMain.handle('skills:reveal', async (_event, input) =>
 );
 
 ipcMain.handle('skills:openFolder', async () => openSkillsFolder());
+
+// --- Dev servers (Settings → Dev Servers) --------------------------------------
+
+ipcMain.handle('devServers:list', async (_event, input) => {
+  // Snapshot the live registries here — the scanner module stays free of
+  // main.js state. Ancestry roots: agent CLI children and thread PTYs.
+  const agentPidThreads = [];
+  for (const run of activeAgentRuns.values()) {
+    if (run?.child?.pid) agentPidThreads.push({ pid: run.child.pid, threadId: run.threadId });
+  }
+  const terminalPidThreads = [];
+  for (const [threadId, session] of terminalSessions) {
+    if (session?.pty?.pid && !session.exited) terminalPidThreads.push({ pid: session.pty.pid, threadId });
+  }
+  // Claude SDK sessions spawn their CLI internally (no pid we can see), so
+  // they contribute a cwd match instead of an ancestry root.
+  const sessionThreadCwds = [];
+  for (const [threadId, session] of claudeSdkSessions) {
+    if (session?.projectPath && !session.ended && !session.disposed) {
+      sessionThreadCwds.push({ cwd: session.projectPath, threadId });
+    }
+  }
+  return listDevServers({
+    roots: Array.isArray(input?.roots) ? input.roots.filter((root) => typeof root === 'string') : [],
+    agentPidThreads,
+    terminalPidThreads,
+    sessionThreadCwds,
+  });
+});
+
+ipcMain.handle('devServers:open', async (_event, input) => {
+  try {
+    await shell.openExternal(devServerUrlForPort(input?.port));
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('devServers:kill', async (_event, input) =>
+  killDevServers({ targets: Array.isArray(input?.targets) ? input.targets : [] })
+);
 
 ipcMain.handle('path:basename', (_e, p) => path.basename(p));
 ipcMain.handle('path:dirname', (_e, p) => path.dirname(p));

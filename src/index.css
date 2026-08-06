@@ -7669,6 +7669,165 @@ body {
 }
 
 /* ============================================================
+   Dev servers (Settings > Dev Servers)
+   ============================================================ */
+
+.dev-servers-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0 16px 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.dev-servers-list-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px;
+}
+
+.dev-servers-selected-count {
+  flex: 1;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.dev-server-check {
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.dev-server-check:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.dev-server-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 6px;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast), opacity var(--transition-fast);
+}
+
+.dev-server-row + .dev-server-row {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.dev-server-row:hover {
+  background: rgb(255 255 255 / 4%);
+}
+
+/* A row mid-kill stays visible but reads as on its way out. */
+.dev-server-row.busy {
+  opacity: 0.55;
+}
+
+.dev-server-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dev-server-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dev-server-name {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+/* Ports double as "open in browser" affordances. */
+.dev-server-port {
+  padding: 1px 7px;
+  border: none;
+  border-radius: 999px;
+  background: rgb(77 141 255 / 12%);
+  color: var(--accent);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.dev-server-port:hover {
+  background: rgb(77 141 255 / 20%);
+}
+
+.dev-server-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--success);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.dev-server-live-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+.dev-server-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dev-server-stats {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Click-through to the thread that owns the server. */
+.dev-server-thread {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  max-width: 160px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.dev-server-thread:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.dev-server-thread.active {
+  border-color: rgb(52 211 153 / 35%);
+}
+
+/* ============================================================
    Remote control (Settings > Remote Control, sidebar Machines,
    remote machine view)
    ============================================================ */

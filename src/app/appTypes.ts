@@ -157,6 +157,7 @@ export type SettingsTab =
   | 'skills'
   | 'split-view'
   | 'computer-use'
+  | 'dev-servers'
   | 'storage'
   | 'cosmetics'
   | 'experimental';
