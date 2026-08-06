@@ -176,6 +176,16 @@ export const FloatingSuggestedTaskCard: React.FC<{
         <div className="tasks-float-body">
           <div className="suggested-task-title">{title}</div>
           <div className="suggested-task-text">{suggestion.text}</div>
+          {!suggestion.startedEpicId &&
+            !suggestion.startedThreadId &&
+            suggestion.detailedPromptStatus === 'pending' && (
+              <div
+                className="suggested-task-preparing"
+                title="A fork of this session is writing a self-contained prompt for the new agent. Starting now sends the short text instead."
+              >
+                Writing detailed prompt for the new agent…
+              </div>
+            )}
           {suggestion.startedEpicId || suggestion.startedThreadId ? (
             <div className="suggested-task-actions">
               <span className="suggested-task-started">

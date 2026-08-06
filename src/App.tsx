@@ -65,6 +65,7 @@ import {
   type OrchestrationRoleId,
   type Project,
   type ProviderId,
+  type SuggestedTask,
   type Thread,
   type ThreadGoal,
   type TurnTokenStats,
@@ -399,6 +400,27 @@ const threadWorkingDir = (epics: Epic[], thread: { epicId?: string } | undefined
   // hard launch guard.
   if (epic?.riftReleased || epic?.riftRequest || epic?.riftCleanupPending) return null;
   return epic?.riftPath ? (epic.riftWorkingDir ?? epic.riftPath) : project.path;
+};
+
+// The prompt Start sends for a suggested task. The detailed prompt written by
+// the source-session fork when the suggestion arrived; if that fork is still
+// running, failed, or never ran, fall back to the short suggestion text with a
+// preamble telling the fresh agent it lacks the source session's context (so
+// it investigates what the task refers to instead of guessing).
+const suggestedTaskPromptResumeFallbackMarker =
+  '_Could not resume the previous session; starting a fresh one._';
+
+const suggestedTaskStartPrompt = (suggestion: SuggestedTask): string => {
+  const detailed = suggestion.detailedPrompt?.trim();
+  if (suggestion.detailedPromptStatus === 'ready' && detailed) return detailed;
+  return (
+    `${suggestion.text}\n\n` +
+    'Context: this task was suggested at the end of a previous agent session in this ' +
+    "repository, and you do not have that session's conversation. If the task references " +
+    'something you cannot immediately place, first investigate the repository (recent ' +
+    'changes, failing tests or commands, related files) to work out what it refers to, ' +
+    'then address it.'
+  );
 };
 
 const getStoredThreadTitle = (threadId: string) =>
@@ -1150,6 +1172,28 @@ const App: React.FC = () => {
   // its transcript. Kept separate from runOutputMessages so aside runs never
   // touch thread status, queued-message dispatch, or the active-run map.
   const btwRuns = useRef(new Map<string, { threadId: string; exchangeId: string }>());
+  // Suggested-task detailed-prompt runs (read-only session forks, like /btw
+  // but silent): their answer accumulates in `buffer` and lands on the
+  // thread's suggestedTask when done — nothing renders while they stream.
+  const suggestionPromptRuns = useRef(
+    new Map<string, { threadId: string; turnRunId: string; buffer: string }>()
+  );
+  // A stopped hidden fork can still have queued renderer events. Swallow those
+  // until its terminal event so they can never enter the normal turn handler.
+  const canceledSuggestionPromptRunIds = useRef(new Set<string>());
+  const cancelSuggestionPromptRuns = useCallback((threadId: string, turnRunId?: string) => {
+    for (const [runId, tracked] of suggestionPromptRuns.current) {
+      if (tracked.threadId !== threadId || (turnRunId && tracked.turnRunId !== turnRunId)) continue;
+      suggestionPromptRuns.current.delete(runId);
+      canceledSuggestionPromptRunIds.current.add(runId);
+      void window.orion?.stopAgentTurn?.(runId);
+    }
+  }, []);
+  // Defined after the agent-event effect that calls it (same pattern as
+  // startTurnForThreadRef).
+  const requestSuggestedTaskPromptRef = useRef<
+    ((threadId: string, turnRunId: string, suggestionText: string) => void) | null
+  >(null);
   // Provider-native subagents streamed by main (subagent/subagent-chunk/
   // subagent-activity events): `${parentThreadId}:${providerId}:${subagentId}`
   // → the child thread + agent-run message their transcript streams into.
@@ -2295,12 +2339,25 @@ const App: React.FC = () => {
   const resolveUtilityTurn = useCallback(() => utilityTurnRef.current, []);
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
+    // Runtime disposal can abort a hidden prompt fork during main-process
+    // startup without producing a terminal event. Untrack/stop it here and
+    // settle the persisted card before awaiting IPC so it cannot remain
+    // indefinitely in "Writing detailed prompt…" after the runtime is gone.
+    cancelSuggestionPromptRuns(threadId);
+    const suggestion = useOrionStore
+      .getState()
+      .threads.find((thread) => thread.id === threadId)?.suggestedTask;
+    if (suggestion?.detailedPromptStatus === 'pending') {
+      updateThread(threadId, {
+        suggestedTask: { ...suggestion, detailedPromptStatus: 'failed' },
+      });
+    }
     try {
       await window.orion?.disposeAgentThread?.(threadId);
     } catch (error) {
       console.error('Could not dispose agent thread runtime', error);
     }
-  }, []);
+  }, [cancelSuggestionPromptRuns, updateThread]);
 
   const deleteThreadWithRuntime = useCallback(
     async (threadId: string) => {
@@ -3652,6 +3709,13 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!window.orion?.onAgentTurnEvent) return undefined;
     const unsubscribe = window.orion.onAgentTurnEvent((event) => {
+      if (canceledSuggestionPromptRunIds.current.has(event.runId)) {
+        if (event.type === 'done' || event.type === 'error') {
+          canceledSuggestionPromptRunIds.current.delete(event.runId);
+        }
+        return;
+      }
+
       // `/btw` aside runs stream into their exchange, not the transcript.
       // Their `session` events are deliberately dropped: the fork's id must
       // never replace the thread's real session id.
@@ -3688,6 +3752,54 @@ const App: React.FC = () => {
         return;
       }
 
+      // Suggested-task detailed-prompt forks: buffer the answer off-screen and
+      // attach it to the suggestion when done. Like /btw, every other event of
+      // these runs (started/session/…) is swallowed so the fork never touches
+      // thread state — in particular `started` must not clear the suggestion.
+      const suggestionPromptRun = suggestionPromptRuns.current.get(event.runId);
+      if (suggestionPromptRun) {
+        if (event.type === 'chunk' && event.chunk) {
+          suggestionPromptRun.buffer += event.chunk;
+          if (suggestionPromptRun.buffer.includes(suggestedTaskPromptResumeFallbackMarker)) {
+            const thread = useOrionStore
+              .getState()
+              .threads.find((candidate) => candidate.id === suggestionPromptRun.threadId);
+            if (thread?.suggestedTask?.turnRunId === suggestionPromptRun.turnRunId) {
+              updateThread(suggestionPromptRun.threadId, {
+                suggestedTask: {
+                  ...thread.suggestedTask,
+                  detailedPrompt: undefined,
+                  detailedPromptStatus: 'failed',
+                },
+              });
+            }
+            // A fresh retry has no source conversation, so it cannot write a
+            // trustworthy detailed prompt. Stop it and ignore its late events.
+            cancelSuggestionPromptRuns(
+              suggestionPromptRun.threadId,
+              suggestionPromptRun.turnRunId
+            );
+          }
+        }
+        if (event.type === 'done' || event.type === 'error') {
+          suggestionPromptRuns.current.delete(event.runId);
+          const detailed = event.type === 'done' ? suggestionPromptRun.buffer.trim() : '';
+          const thread = useOrionStore
+            .getState()
+            .threads.find((candidate) => candidate.id === suggestionPromptRun.threadId);
+          // Only land on the exact suggestion that requested it; a newer turn
+          // or a dismissal has made this answer stale.
+          if (thread?.suggestedTask?.turnRunId === suggestionPromptRun.turnRunId) {
+            updateThread(suggestionPromptRun.threadId, {
+              suggestedTask: detailed
+                ? { ...thread.suggestedTask, detailedPrompt: detailed, detailedPromptStatus: 'ready' }
+                : { ...thread.suggestedTask, detailedPromptStatus: 'failed' },
+            });
+          }
+        }
+        return;
+      }
+
       // Goal state belongs to the thread, not to the transcript message. Stop
       // deliberately untracks a run before IPC so late text/result events
       // cannot rewrite the stopped message; the persisted paused-goal update
@@ -3702,6 +3814,9 @@ const App: React.FC = () => {
       if (event.type === 'started') {
         latestTurnRunIdsRef.current.set(event.threadId, event.runId);
         updateThread(event.threadId, { suggestedTask: undefined });
+        // The superseded suggestion's detailed-prompt fork has nowhere to
+        // land its answer anymore — kill it instead of letting it finish.
+        cancelSuggestionPromptRuns(event.threadId);
       }
 
       // The harness's predicted next prompt for this thread, emitted after
@@ -3722,6 +3837,10 @@ const App: React.FC = () => {
             turnRunId: event.runId,
           },
         });
+        // The suggestion text alone is meaningless to a fresh agent ("check if
+        // that failure is preexisting" — which failure?). Ask a fork of this
+        // session, which has the context, to write the actual start prompt.
+        requestSuggestedTaskPromptRef.current?.(event.threadId, event.runId, event.suggestion);
         return;
       }
 
@@ -4112,6 +4231,7 @@ const App: React.FC = () => {
     addMessageToThread,
     appendToThreadMessage,
     appendToBtwExchange,
+    cancelSuggestionPromptRuns,
     clearActiveRun,
     flushChunkBuffers,
     notifyThreadFinished,
@@ -4133,6 +4253,13 @@ const App: React.FC = () => {
             error: 'Interrupted before Orion received the answer.',
           });
         }
+      }
+      // A detailed-prompt fork interrupted by the restart never completes;
+      // Start falls back to the annotated short text.
+      if (thread.suggestedTask?.detailedPromptStatus === 'pending') {
+        updateThread(thread.id, {
+          suggestedTask: { ...thread.suggestedTask, detailedPromptStatus: 'failed' },
+        });
       }
       if (thread.status !== 'running') continue;
       const lastMessage = thread.messages.at(-1);
@@ -5013,10 +5140,16 @@ const App: React.FC = () => {
     const suggestion = thread?.suggestedTask;
     if (!thread || !suggestion || suggestion.startedEpicId || suggestion.startedThreadId) return;
     const project = state.projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    // The card shows the short suggestion text, but a fresh agent needs the
+    // self-contained prompt formulated by the source session's fork.
+    const startPrompt = suggestedTaskStartPrompt(suggestion);
     if (mode === 'thread') {
       if (!project) {
         toast.error('This thread has no project to start the task in');
         return;
+      }
+      if (suggestion.detailedPromptStatus === 'pending') {
+        cancelSuggestionPromptRuns(threadId, suggestion.turnRunId);
       }
       // Keep the source epic association so a suggestion shown inside a rift
       // starts in that same workspace and remains covered by its launch guards.
@@ -5025,13 +5158,13 @@ const App: React.FC = () => {
       setActiveTab('agents');
       const restoreDraft = (error?: string) => {
         // The turn never started; keep the prompt as the new thread's draft.
-        composerDraftsRef.current.set(newThreadId, { text: suggestion.text, attachments: [] });
+        composerDraftsRef.current.set(newThreadId, { text: startPrompt, attachments: [] });
         if (useOrionStore.getState().selectedThreadId === newThreadId) {
-          setChatInput(suggestion.text);
+          setChatInput(startPrompt);
         }
         toast.error(error ?? 'Could not start the suggested task');
       };
-      const start = startTurnForThreadRef.current?.(newThreadId, suggestion.text, []);
+      const start = startTurnForThreadRef.current?.(newThreadId, startPrompt, []);
       void start?.then(
         async (result) => {
           if (!result.ok) {
@@ -5054,9 +5187,14 @@ const App: React.FC = () => {
       toast.error('Enable Epics in Settings before starting a suggested task in a rift');
       return;
     }
+    if (suggestion.detailedPromptStatus === 'pending') {
+      cancelSuggestionPromptRuns(threadId, suggestion.turnRunId);
+    }
     const createRift = riftsActive && riftsSettings.autoCreateForEpics && Boolean(project);
+    // Title stays derived from the short card text; the description carries
+    // the detailed prompt so the epic itself explains the task's context.
     const epicId = addEpic(deriveTitle(suggestion.text), {
-      description: suggestion.text,
+      description: startPrompt,
       ...(project ? { repositoryProjectId: project.id } : {}),
       ...(createRift && project
         ? { riftRequest: { projectId: project.id, projectPath: project.path } }
@@ -5068,7 +5206,7 @@ const App: React.FC = () => {
       // Pre-fill the new thread's composer with the suggested prompt; the
       // draft-swap effect loads it once the thread becomes selected.
       const newThreadId = createThread(project.id, undefined, { epicId });
-      composerDraftsRef.current.set(newThreadId, { text: suggestion.text, attachments: [] });
+      composerDraftsRef.current.set(newThreadId, { text: startPrompt, attachments: [] });
     }
     setActiveTab('agents');
     setEpicsSectionOpen(true);
@@ -5077,6 +5215,7 @@ const App: React.FC = () => {
     );
   }, [
     addEpic,
+    cancelSuggestionPromptRuns,
     createThread,
     epicsEnabled,
     riftsActive,
@@ -5088,8 +5227,10 @@ const App: React.FC = () => {
   ]);
 
   const handleDismissSuggestedTask = useCallback((threadId: string) => {
+    // Dismissing also kills the suggestion's in-flight detailed-prompt fork.
+    cancelSuggestionPromptRuns(threadId);
     updateThread(threadId, { suggestedTask: undefined });
-  }, [updateThread]);
+  }, [cancelSuggestionPromptRuns, updateThread]);
 
   // Shared setup for the epic git handlers: the directory the epic's git
   // actions act on. The rift workspace wins when one exists; otherwise the
@@ -7433,6 +7574,130 @@ const App: React.FC = () => {
     },
     [agentModels, normalizedProviderSettings, addBtwExchange, flushChunkBuffers, updateBtwExchange]
   );
+
+  // Expands a fresh suggestion into the self-contained prompt that Start will
+  // send. Runs on a read-only fork of the source Claude session (the /btw
+  // machinery), which has the full conversation context the terse suggestion
+  // text leaves out. Entirely silent: bails without marking anything when a
+  // fork can't run (non-Claude driver, no session id yet, rift busy), and the
+  // card's Start button then falls back to the annotated short text.
+  const requestSuggestedTaskPrompt = useCallback(
+    (threadId: string, turnRunId: string, suggestionText: string) => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((candidate) => candidate.id === threadId);
+      const suggestion = thread?.suggestedTask;
+      if (!thread || !suggestion || suggestion.turnRunId !== turnRunId) return;
+      // A queued follow-up dispatches immediately after this event and its
+      // `started` clears the suggestion — don't pay for a doomed fork.
+      if (thread.queuedMessages?.length) return;
+      const project = state.projects.find((candidate) => candidate.id === thread.projectId);
+      if (!project) return;
+      const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
+      if (
+        (thread.epicId && riftSetupEpicIdsRef.current[thread.epicId]) ||
+        threadEpic?.riftRequest ||
+        threadEpic?.riftCleanupPending ||
+        threadEpic?.riftReleased ||
+        riftRemovalThreadIdsRef.current.has(thread.id) ||
+        (thread.epicId && riftRemovalEpicIdsRef.current.has(thread.epicId))
+      ) {
+        return;
+      }
+      const workingDir = threadWorkingDir(state.epics, thread, project);
+      if (!workingDir) return;
+      let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+      // Orion threads run on their configured main-driver model; resolve the
+      // pseudo-model exactly as startTurnForThread does so the fork resumes
+      // the Claude session that actually produced the suggestion.
+      if (model?.providerId === 'orion' || isOrionModelId(thread.modelId)) {
+        const roleModels = {
+          ...defaultOrchestrationSettings.models,
+          ...state.orchestrationSettings?.models,
+        };
+        model = findAgentModel(agentModels, roleModels.mainDriver);
+      }
+      if (!model || model.providerId !== 'claude' || model.available === false) return;
+      if (normalizedProviderSettings.claude?.enabled === false) return;
+      if (!window.orion?.runAgentTurn) return;
+      const sessionId = thread.agentSessionIds?.claude;
+      if (!sessionId) return;
+
+      const prompt =
+        'The harness suggested a follow-up task for this session: ' +
+        `"${suggestionText}"\n\n` +
+        'Orion may start that task in a brand-new agent session with NO access to this ' +
+        'conversation. Write the prompt that new agent will receive. Make it fully ' +
+        'self-contained: briefly state the background (what this session was working on ' +
+        'and what was observed), name the exact files, commands, errors, or outputs the ' +
+        'task refers to, then state the task and what a good outcome looks like. Keep it ' +
+        'to a few short paragraphs. Answer from the conversation context alone — do not ' +
+        'use any tools and do not ask questions. Reply with ONLY the prompt text itself: ' +
+        'no preamble, no commentary — this exchange is a side conversation the main ' +
+        'session will never see.';
+
+      const runId = crypto.randomUUID();
+      suggestionPromptRuns.current.set(runId, { threadId, turnRunId, buffer: '' });
+      updateThread(threadId, {
+        suggestedTask: { ...suggestion, detailedPromptStatus: 'pending' },
+      });
+      const markFailed = () => {
+        suggestionPromptRuns.current.delete(runId);
+        const current = useOrionStore
+          .getState()
+          .threads.find((candidate) => candidate.id === threadId)?.suggestedTask;
+        if (current?.turnRunId === turnRunId) {
+          updateThread(threadId, {
+            suggestedTask: { ...current, detailedPromptStatus: 'failed' },
+          });
+        }
+      };
+      void window.orion
+        .runAgentTurn({
+          runId,
+          threadId,
+          epicId: thread.epicId,
+          projectPath: workingDir,
+          prompt,
+          modelId: model.id,
+          // Plan mode: the fork must never mutate the repo.
+          accessMode: 'read-only',
+          resumeSessionId: sessionId,
+          forkSession: true,
+          aside: true,
+          providerOptions: normalizedProviderSettings.claude?.options,
+          // Formulating the prompt is cheap recall over context the fork
+          // already holds — low effort keeps it fast on every turn end.
+          claudeReasoningEffort: 'low',
+          claudeContextWindow: getEffectiveClaudeContextWindow(
+            model,
+            thread.claudeContextWindow ?? defaultClaudeContextWindow
+          ),
+        })
+        .then(
+          (result) => {
+            if (result.ok && result.runId) {
+              if (result.runId !== runId) {
+                const tracked = suggestionPromptRuns.current.get(runId);
+                suggestionPromptRuns.current.delete(runId);
+                if (tracked) {
+                  suggestionPromptRuns.current.set(result.runId, tracked);
+                } else if (canceledSuggestionPromptRunIds.current.delete(runId)) {
+                  // Start may cancel while IPC is still assigning the final
+                  // run id. Carry the quarantine across that remap too.
+                  canceledSuggestionPromptRunIds.current.add(result.runId);
+                  void window.orion?.stopAgentTurn?.(result.runId);
+                }
+              }
+            } else {
+              markFailed();
+            }
+          },
+          () => markFailed()
+        );
+    },
+    [agentModels, normalizedProviderSettings, updateThread]
+  );
+  requestSuggestedTaskPromptRef.current = requestSuggestedTaskPrompt;
 
   // `/goal` — codex goal runs. The whole pursuit (codex auto-continues turns
   // until the goal completes, blocks, or hits budget) is one agent-run

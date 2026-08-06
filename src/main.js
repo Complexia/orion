@@ -6312,8 +6312,17 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // A stop/steer raced the startup above and aborted the run before any
     // process existed — honor it instead of launching a run the renderer
     // already settled and untracked.
-    if (startingAgentRuns.get(runId)?.aborted) {
+    const abortedStartup = startingAgentRuns.get(runId);
+    if (abortedStartup?.aborted) {
       orionMcp?.release();
+      // A normal stop is already settled by the renderer and retains the
+      // historical successful-startup result. Runtime disposal can also come
+      // directly from main-owned Rift cleanup, though, so report that distinct
+      // abort as a startup failure and let hidden renderer runs settle even
+      // when no terminal event can be emitted.
+      if (abortedStartup.abortError) {
+        return { ok: false, error: abortedStartup.abortError };
+      }
       return { ok: true, runId };
     }
 
@@ -6435,6 +6444,7 @@ async function disposeAgentThreadRuntime(threadId) {
     if (starting.threadId !== threadId) continue;
     starting.aborted = true;
     starting.terminateBackground = true;
+    starting.abortError = 'The thread runtime was disposed during agent startup.';
     cancelledStartup = true;
   }
   invalidateTerminalSession(threadId);
