@@ -60,6 +60,9 @@ repository so native packaging dependencies and the deploy process use the same
 Node ABI. The deploy command checks both the Node major and the macOS DMG native
 dependency before changing the package version.
 
+To verify the pinned Node runtime and native DMG dependency without building,
+bumping, or publishing a release, run `bun run deploy -- --check-runtime`.
+
 Create `.env.release.local` from `.env.release.example`, then run:
 
 ```bash

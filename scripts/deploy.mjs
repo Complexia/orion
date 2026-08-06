@@ -7,9 +7,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { verifyReleaseRuntime } from './check-release-runtime.mjs';
+import { relaunchWithPinnedNode, verifyReleaseRuntime } from './check-release-runtime.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+relaunchWithPinnedNode({ rootDir });
 
 const args = parseArgs(process.argv.slice(2));
 const platform = args.platform ?? process.platform;
@@ -23,6 +25,11 @@ verifyReleaseRuntime({
   platform,
   requireNativePackaging: !args.resumeNotaryId && !args.resumeUpload,
 });
+
+if (args.checkRuntime) {
+  console.log(`Orion release runtime ready: Node.js ${process.versions.node} (ABI ${process.versions.modules})`);
+  process.exit(0);
+}
 
 await loadEnvFile(path.join(rootDir, '.env.release.local'));
 
@@ -205,6 +212,7 @@ function parseArgs(argv) {
     else if (value === '--resume-notary-id') parsed.resumeNotaryId = argv[++index];
     else if (value.startsWith('--resume-notary-id=')) parsed.resumeNotaryId = value.split('=')[1];
     else if (value === '--resume-upload') parsed.resumeUpload = true;
+    else if (value === '--check-runtime') parsed.checkRuntime = true;
     else throw new Error(`Unknown argument: ${value}`);
   }
   return parsed;

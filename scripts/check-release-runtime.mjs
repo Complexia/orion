@@ -1,10 +1,64 @@
 #!/usr/bin/env node
 
+import fs from 'node:fs';
+import os from 'node:os';
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const require = createRequire(import.meta.url);
 
 export const REQUIRED_NODE_MAJOR = 24;
+
+export function relaunchWithPinnedNode({
+  nodeVersion = process.versions.node,
+  rootDir,
+  argv = process.argv.slice(2),
+  env = process.env,
+  pinnedNodeVersion,
+  spawn = spawnSync,
+  exit = process.exit,
+} = {}) {
+  if (!rootDir) throw new Error('rootDir is required to locate Orion\'s pinned Node.js runtime.');
+
+  const pinnedVersion = pinnedNodeVersion
+    ?? fs.readFileSync(path.join(rootDir, '.nvmrc'), 'utf8').trim();
+  if (nodeVersion === pinnedVersion) return false;
+
+  const executableName = process.platform === 'win32' ? 'node.exe' : 'node';
+  const candidates = [
+    env.NVM_BIN && path.join(env.NVM_BIN, executableName),
+    env.NVM_DIR && path.join(env.NVM_DIR, 'versions', 'node', `v${pinnedVersion}`, 'bin', executableName),
+    path.join(os.homedir(), '.nvm', 'versions', 'node', `v${pinnedVersion}`, 'bin', executableName),
+    executableName,
+  ].filter((candidate, index, all) => candidate && all.indexOf(candidate) === index);
+
+  const pinnedNode = candidates.find((candidate) => {
+    const probe = spawn(candidate, ['-p', 'process.versions.node'], {
+      cwd: rootDir,
+      encoding: 'utf8',
+      env,
+    });
+    return probe.status === 0 && probe.stdout.trim() === pinnedVersion;
+  });
+
+  if (!pinnedNode) {
+    throw new Error(
+      `Orion releases require Node.js ${pinnedVersion}, but this process is using Node.js ${nodeVersion}. `
+      + 'Install the pinned version with "nvm install" and retry.',
+    );
+  }
+
+  console.log(`Re-launching Orion deploy with Node.js ${pinnedVersion}`);
+  const result = spawn(pinnedNode, [path.join(rootDir, 'scripts', 'deploy.mjs'), ...argv], {
+    cwd: rootDir,
+    stdio: 'inherit',
+    env,
+  });
+  if (result.error) throw result.error;
+  exit(result.status ?? 1);
+  return true;
+}
 
 export function verifyReleaseRuntime({
   nodeVersion = process.versions.node,
@@ -16,7 +70,7 @@ export function verifyReleaseRuntime({
   if (nodeMajor !== REQUIRED_NODE_MAJOR) {
     throw new Error(
       `Orion releases require Node.js ${REQUIRED_NODE_MAJOR}.x, but this process is using Node.js ${nodeVersion}. `
-      + 'Run "nvm use" in the Orion repository before deploying.',
+      + 'Run "nvm install" in the Orion repository before deploying.',
     );
   }
 
