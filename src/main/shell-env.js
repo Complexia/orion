@@ -34,13 +34,14 @@ export const syncPathFromUserShell = async () => {
   }
 };
 
-export const runShellCommand = async (command, timeout = 30000) => {
+export const runShellCommand = async (command, timeout = 30000, env = {}) => {
   const { stdout, stderr } = await execFileAsync(loginShell, ['-lc', command], {
     timeout,
     env: {
       ...process.env,
       FORCE_COLOR: '0',
       NO_COLOR: '1',
+      ...env,
     },
     maxBuffer: 1024 * 1024 * 8,
   });

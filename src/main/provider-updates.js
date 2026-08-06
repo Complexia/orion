@@ -55,19 +55,21 @@ export const providerUpdaterConfigs = [
     id: 'muse',
     label: 'Muse Code',
     command: 'muse',
-    // `muse` is a self-updating launcher script, so any invocation is the
-    // update command; there is no separate update subcommand. On its own it
-    // only re-checks the channel hourly and installs in a background fork, so
-    // the update run forces an immediate check (MUSE_UPDATE_INTERVAL_SECONDS=0)
-    // and makes the install synchronous (MUSE_SYNC_UPDATE=1) — otherwise the
-    // verify step would race the detached download. The channel manifest and
-    // `muse --version` both carry the R-suffixed build ("0.1.0-R708.1"); the
+    // `muse` is a self-updating launcher script, so routine version reads must
+    // explicitly disable its automatic update path. There is no separate
+    // update subcommand, so the managed update run forces an immediate check
+    // (MUSE_UPDATE_INTERVAL_SECONDS=0) and makes the install synchronous
+    // (MUSE_SYNC_UPDATE=1) — otherwise verification would race the detached
+    // download. The channel manifest and `muse --version` both carry the
+    // R-suffixed build ("0.1.0-R708.1"); the
     // versionPattern pins version extraction to that form on both sides,
     // because comparing the bare semver against the suffixed build would flag
     // a phantom update forever.
     latestVersionUrl: 'https://api.meta.ai/muse-code/channels/muse-stable',
     versionPattern: /\d+\.\d+\.\d+-R[\d.]+/,
+    versionEnv: { MUSE_NO_AUTO_UPDATE: '1' },
     updateCommands: [['--version']],
+    probeUpdateCommand: false,
     updateEnv: { MUSE_UPDATE_INTERVAL_SECONDS: '0', MUSE_SYNC_UPDATE: '1' },
     verifyAfterUpdate: true,
     authCommands: [['login']],
@@ -241,9 +243,13 @@ export const runStreamingShellCommand = (command, options = {}) =>
 export const extractVersion = (text, versionPattern) =>
   (versionPattern ? String(text || '').match(versionPattern)?.[0] : null) ?? parseVersion(text);
 
-export const readCliVersion = async (command, versionPattern) => {
+export const readCliVersion = async (command, versionPattern, env) => {
   try {
-    const { stdout, stderr } = await runShellCommand(`${shellQuote(command)} --version`, 8000);
+    const { stdout, stderr } = await runShellCommand(
+      `${shellQuote(command)} --version`,
+      8000,
+      env
+    );
     return extractVersion(`${stdout}\n${stderr}`, versionPattern);
   } catch (error) {
     return extractVersion(getProcessErrorMessage(error), versionPattern);
@@ -469,7 +475,11 @@ export const checkProviderUpdate = async (config, enabledProviderIds = null) => 
 
   if (!commandPath) return base;
 
-  const currentVersion = await readCliVersion(config.command, config.versionPattern);
+  const currentVersion = await readCliVersion(
+    config.command,
+    config.versionPattern,
+    config.versionEnv
+  );
   const withCurrentVersion = { ...base, currentVersion };
 
   if (config.checkCommand) {
@@ -571,6 +581,8 @@ export const checkProviderUpdates = (input = {}) => {
 export const getProviderStatuses = async () => checkProviderUpdates();
 
 export const resolveProviderUpdateCommand = async (config) => {
+  if (config.probeUpdateCommand === false) return config.updateCommands[0] ?? null;
+
   for (const args of config.updateCommands) {
     try {
       await runShellCommand([config.command, ...args, '--help'].map(shellQuote).join(' '), 8000);
@@ -635,7 +647,11 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
 
     if (config.verifyAfterUpdate && expectedLatestVersion) {
       onPhase?.('verifying');
-      const installedVersion = await readCliVersion(config.command, config.versionPattern);
+      const installedVersion = await readCliVersion(
+        config.command,
+        config.versionPattern,
+        config.versionEnv
+      );
       if (
         !installedVersion ||
         compareVersionStrings(installedVersion, expectedLatestVersion) < 0

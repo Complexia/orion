@@ -814,10 +814,11 @@ export const countDiffLines = (text) => {
 // grok's stream ends with an explicit {"type":"end","stopReason":...} event,
 // but the process (or a background process it spawned that inherited its
 // pipes) can outlive it — treat the event itself as the completion signal.
-// muse's equivalent is the run.terminal.* record (completed or failed).
+// muse's successful equivalent is run.terminal.completed. Failed terminal
+// records remain on the process-exit path so they cannot finalize as success.
 export const isTerminalJsonEvent = (providerId, value) =>
   (providerId === 'grok' && value?.type === 'end') ||
-  (providerId === 'muse' && String(value?.payload_type || '').startsWith('run.terminal'));
+  (providerId === 'muse' && value?.payload_type === 'run.terminal.completed');
 
 export const sendsJsonEvents = (providerId) =>
   ['claude', 'codex', 'cursor', 'grok', 'kimi', 'muse'].includes(providerId);
