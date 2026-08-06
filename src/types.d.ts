@@ -133,6 +133,42 @@ export type SkillImportResult = {
   error?: string;
 };
 
+// A process holding a listening TCP socket inside one of the user's project
+// or rift roots (Settings > Dev Servers). Rebuilt from lsof/ps on every scan.
+export type DevServerEntry = {
+  pid: number;
+  /** Process short name from lsof (e.g. "node", "bun"). */
+  command: string;
+  /** Full command line from ps; falls back to `command` when ps omits it. */
+  commandLine: string;
+  /** Listening TCP ports, deduped and ascending. */
+  ports: number[];
+  /** Working directory; the join key for renderer-side thread attribution. */
+  cwd: string | null;
+  cpuPercent: number | null;
+  memoryBytes: number | null;
+  /** Epoch ms derived from ps etime; second precision. */
+  startedAt: number | null;
+  /** Thread attribution resolved in the main process, when possible. */
+  threadId: string | null;
+  /** How threadId was resolved: live run ancestry, thread PTY ancestry, or Claude session cwd. */
+  threadSource: 'agent' | 'terminal' | 'session' | null;
+};
+
+export type DevServersListResult = {
+  ok: boolean;
+  servers: DevServerEntry[];
+  error?: string;
+};
+
+export type DevServerKillOutcome = {
+  pid: number;
+  ok: boolean;
+  /** The process was already gone before it was signalled. */
+  alreadyExited?: boolean;
+  error?: string;
+};
+
 // A running orchestrator agent asked main to spawn a subagent; the renderer
 // resolves the model fuzzily (id, slug, or label), creates a child thread,
 // runs it, and reports back via reportSubagentResult.
@@ -763,6 +799,16 @@ type OrionComputerUsePermissions = {
       }>;
       revealSkill?: (input: { id: string; path: string; enabled: boolean }) => Promise<{ ok: boolean; error?: string }>;
       openSkillsFolder?: () => Promise<{ ok: boolean; error?: string }>;
+      /** `roots` are project/rift directories; servers outside them (and unattributed to a thread) are excluded. */
+      listDevServers?: (input?: { roots?: string[] }) => Promise<DevServersListResult>;
+      /** Opens a validated localhost HTTP URL for a listed dev-server port. */
+      openDevServer?: (input: { port: number }) => Promise<{ ok: boolean; error?: string }>;
+      /** `port` re-verifies each pid still holds it, so a stale row cannot kill a recycled pid. */
+      killDevServers?: (input: { targets: Array<{ pid: number; port: number | null }> }) => Promise<{
+        ok: boolean;
+        results: DevServerKillOutcome[];
+        error?: string;
+      }>;
       getPathForFile?: (file: File) => string;
       saveImageAttachment: (input: {
         name: string;

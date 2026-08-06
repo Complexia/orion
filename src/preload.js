@@ -75,6 +75,10 @@ contextBridge.exposeInMainWorld('orion', {
   deleteSkill: (input) => ipcRenderer.invoke('skills:delete', input),
   revealSkill: (input) => ipcRenderer.invoke('skills:reveal', input),
   openSkillsFolder: () => ipcRenderer.invoke('skills:openFolder'),
+  // Dev servers (Settings > Dev Servers)
+  listDevServers: (input) => ipcRenderer.invoke('devServers:list', input),
+  openDevServer: (input) => ipcRenderer.invoke('devServers:open', input),
+  killDevServers: (input) => ipcRenderer.invoke('devServers:kill', input),
 
   // Agent runtime
   listAgentModels: (input) => ipcRenderer.invoke('agent:listModels', input),

@@ -14,6 +14,7 @@ import {
   Play,
   Plug,
   RefreshCw,
+  Server,
   Settings,
   Sparkles,
   SquareArrowOutUpRight,
@@ -53,6 +54,7 @@ import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
 import SkillsSettings from './SkillsSettings';
+import DevServersSettings from './DevServersSettings';
 import RemoteControlSettings from './RemoteControlSettings';
 import { orchestrationRoleMeta } from './promptContext';
 import { formatShortTime } from './time';
@@ -348,6 +350,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               label: 'Computer Use',
               Icon: MousePointerClick,
             },
+            { id: 'dev-servers', label: 'Dev Servers', Icon: Server },
             { id: 'storage', label: 'Storage', Icon: HardDrive },
             { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
             { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
@@ -381,13 +384,14 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'skills' && 'SKILLS'}
           {settingsTab === 'split-view' && 'SPLIT VIEW'}
           {settingsTab === 'computer-use' && 'COMPUTER USE'}
+          {settingsTab === 'dev-servers' && 'DEV SERVERS'}
           {settingsTab === 'storage' && 'STORAGE'}
           {settingsTab === 'cosmetics' && 'COSMETICS'}
           {settingsTab === 'experimental' && 'EXPERIMENTAL'}
         </div>
 
         <div
-          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' || settingsTab === 'skills' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
+          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
         >
           {settingsTab === 'account' && (
             <>
@@ -1284,6 +1288,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'skills' && (
             <SkillsSettings formatBytes={formatBytes} onOpenInEditor={handleOpenSkillInEditor} />
           )}
+
+          {settingsTab === 'dev-servers' && <DevServersSettings formatBytes={formatBytes} />}
 
           {settingsTab === 'remote-control' && (
             <RemoteControlSettings
