@@ -841,7 +841,7 @@ type OrionComputerUsePermissions = {
       }>;
       listAgentModels: (input?: { force?: boolean }) => Promise<Array<{
         id: string;
-        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'opencode';
+        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'muse' | 'opencode';
         providerLabel: string;
         label: string;
         slug: string;
@@ -1015,6 +1015,7 @@ type OrionComputerUsePermissions = {
         claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
         claudeContextWindow?: '200k' | '1m';
         grokReasoningEffort?: 'low' | 'medium' | 'high';
+        museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
         resumeSessionId?: string;
         /** Fork resumeSessionId into a new session instead of resuming it in place (branched threads). */
         forkSession?: boolean;

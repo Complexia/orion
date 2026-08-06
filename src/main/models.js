@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { checkCommandAvailable, execFileAsync, shellPathSyncPromise } from './shell-env.js';
 
 export const defaultCodexReasoningEffort = 'medium';
@@ -12,6 +15,8 @@ export const codexReasoningEffortForModel = (model, effort) => {
 };
 export const defaultCodexServiceTier = 'default';
 export const defaultClaudeReasoningEffort = 'high';
+// Matches the muse CLI's own --reasoning-effort default.
+export const defaultMuseReasoningEffort = 'high';
 export const defaultClaudeContextWindow = '200k';
 export const claudeOneMillionContextModels = new Set([
   'claude-opus-4-8',
@@ -127,6 +132,22 @@ export const kimiFallbackModels = [
     slug: 'kimi-code/kimi-for-coding-highspeed',
     command: 'kimi',
     shortcut: '⌘3',
+  },
+];
+
+// Muse Code (Meta) launched with the single Muse Spark model; the CLI caches
+// the provider's live catalog on disk after each run, which listMuseModels
+// reads to replace this block.
+export const museFallbackModels = [
+  {
+    id: 'muse:muse-spark-1.2',
+    providerId: 'muse',
+    providerLabel: 'Muse',
+    label: 'Muse Spark 1.2',
+    slug: 'muse-spark-1.2',
+    command: 'muse',
+    shortcut: '⌘1',
+    favorite: true,
   },
 ];
 
@@ -310,6 +331,7 @@ export const agentModels = [
     command: 'claude',
   },
   ...kimiFallbackModels,
+  ...museFallbackModels,
   ...cursorFallbackModels,
   {
     id: 'opencode:anthropic/claude-sonnet-4-6',
@@ -477,6 +499,54 @@ export const listKimiModels = async () => {
   }
 };
 
+// Muse Code has no models subcommand, but it caches each provider profile's
+// live catalog under its XDG data dir after every run (rows carry model_id,
+// display_label, visibility, is_default). Reading that cache costs no process
+// spawn and needs no auth; a user who has never run muse just keeps the
+// static fallback.
+export const museModelCatalogDir = () =>
+  path.join(
+    process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'),
+    'muse',
+    'model-catalog'
+  );
+
+export const listMuseModels = async () => {
+  if (!(await checkCommandAvailable('muse'))) return [];
+  try {
+    const catalogDir = museModelCatalogDir();
+    const files = (await fs.readdir(catalogDir)).filter((name) => name.endsWith('.json'));
+    const rows = [];
+    for (const name of files) {
+      try {
+        const parsed = JSON.parse(await fs.readFile(path.join(catalogDir, name), 'utf8'));
+        if (Array.isArray(parsed?.rows)) rows.push(...parsed.rows);
+      } catch {}
+    }
+    return rows
+      .filter(
+        (row) =>
+          row &&
+          typeof row.model_id === 'string' &&
+          row.model_id &&
+          row.visibility !== 'hidden'
+      )
+      .sort((a, b) => (a.display_order ?? 0) - (b.display_order ?? 0))
+      .map((row, index) => ({
+        id: `muse:${row.model_id}`,
+        providerId: 'muse',
+        providerLabel: 'Muse',
+        label: humanizeModelSlug(row.display_label || row.model_id),
+        slug: row.model_id,
+        command: 'muse',
+        ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+        favorite: row.is_default === true,
+      }));
+  } catch {
+    return [];
+  }
+};
+
 // Replace a provider's static catalog block with its discovered models,
 // keeping the block's position in the picker order.
 export const spliceProviderModels = (models, providerId, replacements) => {
@@ -495,12 +565,14 @@ export const discoverAgentModels = async () => {
   // request models as soon as its window loads, so do not let that first
   // request cache fallback catalogs before the interactive-shell PATH arrives.
   await shellPathSyncPromise;
-  const [discoveredCursorModels, discoveredKimiModels] = await Promise.all([
+  const [discoveredCursorModels, discoveredKimiModels, discoveredMuseModels] = await Promise.all([
     listCursorAgentModels(),
     listKimiModels(),
+    listMuseModels(),
   ]);
   let models = spliceProviderModels(agentModels, 'cursor', discoveredCursorModels);
   models = spliceProviderModels(models, 'kimi', discoveredKimiModels);
+  models = spliceProviderModels(models, 'muse', discoveredMuseModels);
   return models;
 };
 

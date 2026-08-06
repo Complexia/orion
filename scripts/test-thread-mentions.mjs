@@ -187,6 +187,25 @@ assert.equal(
   true,
   'providers without inline OpenCode config only require bridge registration'
 );
+assert.equal(
+  isEffectiveThreadReaderBridgeReady('muse', true, false, false),
+  false,
+  'Muse registration is ineffective when its synthetic settings root cannot be built'
+);
+assert.equal(
+  isRequiredThreadReaderBridgeMissing(
+    'muse',
+    true,
+    isEffectiveThreadReaderBridgeReady('muse', true, false, false)
+  ),
+  true,
+  'referenced-thread Muse turns must fail closed when the settings root is unavailable'
+);
+assert.equal(
+  isEffectiveThreadReaderBridgeReady('muse', true, false, true),
+  true,
+  'Muse may dispatch after registration and the synthetic settings root both succeed'
+);
 
 const multiword = 'Compare @previous release with this one';
 const queryStart = multiword.indexOf('@');

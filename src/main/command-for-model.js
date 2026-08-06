@@ -1,5 +1,5 @@
 import { app } from 'electron';
-import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, parseExtraArgs } from './models.js';
+import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, defaultMuseReasoningEffort, parseExtraArgs } from './models.js';
 import { codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
 
 export const commandForModel = (model, input) => {
@@ -278,6 +278,42 @@ export const commandForModel = (model, input) => {
       ...resumeArgs,
       ...extraArgs,
       '--single',
+      prompt,
+    ];
+  }
+
+  if (model.providerId === 'muse') {
+    // Muse Code turns run over `muse exec --json` (headless JSONL events on
+    // stdout); the cwd becomes the workspace root, so no path flag is needed.
+    // Approval prompts cannot be answered headlessly, so approval is always
+    // off and the access mode maps onto muse's sandbox/write/shell switches:
+    // full access lifts the sandbox entirely (--yolo, which also trusts the
+    // workspace), workspace write keeps the OS sandbox on and trusts the
+    // workspace's own skills/rules, and read only additionally disables the
+    // shell and all filesystem writes. `--session-id <id>` appends the turn
+    // to that session's event log, which is muse's resume (verified live on
+    // 0.1.0: reruns with the same id continue the prior conversation).
+    const effortArgs = [
+      '--reasoning-effort',
+      input.museReasoningEffort || defaultMuseReasoningEffort,
+    ];
+    const accessArgs =
+      accessMode === 'full-access'
+        ? ['--yolo']
+        : accessMode === 'read-only'
+          ? ['--disable-approval', '--disable-write', '--disable-shell']
+          : ['--disable-approval', '--trust-workspace'];
+    const resumeArgs = resumeSessionId ? ['--session-id', resumeSessionId] : [];
+    return [
+      'muse',
+      'exec',
+      '--json',
+      '--model',
+      modelArg,
+      ...effortArgs,
+      ...accessArgs,
+      ...resumeArgs,
+      ...extraArgs,
       prompt,
     ];
   }

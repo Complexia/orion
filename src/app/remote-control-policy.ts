@@ -11,6 +11,7 @@ export const remoteThreadRunError = (modelId: string) =>
     : null;
 
 const GROK_REASONING = new Set(['low', 'medium', 'high']);
+const MUSE_REASONING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']);
 const CLAUDE_REASONING = new Set([
   'low',
   'medium',
@@ -30,6 +31,7 @@ type RemoteAgentSettingsThread = {
   claudeReasoningEffort?: string;
   claudeContextWindow?: string;
   grokReasoningEffort?: string;
+  museReasoningEffort?: string;
 };
 
 type RemoteAgentSettingsModel = {
@@ -59,6 +61,10 @@ export const remoteAgentSettingsPatch = (
     if (model.providerId === 'grok') {
       if (GROK_REASONING.has(input.reasoningEffort) && thread.grokReasoningEffort !== input.reasoningEffort) {
         patch.grokReasoningEffort = input.reasoningEffort;
+      }
+    } else if (model.providerId === 'muse') {
+      if (MUSE_REASONING.has(input.reasoningEffort) && thread.museReasoningEffort !== input.reasoningEffort) {
+        patch.museReasoningEffort = input.reasoningEffort;
       }
     } else if (model.providerId === 'claude') {
       if (

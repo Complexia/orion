@@ -13,6 +13,12 @@ export const extractSessionIdFromJsonEvent = (providerId, value) => {
   if (providerId === 'grok') {
     return typeof value.sessionId === 'string' && value.sessionId ? value.sessionId : null;
   }
+  if (providerId === 'muse') {
+    // Every muse exec event names its session stream.
+    return value.stream?.kind === 'session' && typeof value.stream.id === 'string'
+      ? value.stream.id
+      : null;
+  }
   // claude / cursor stream-json events carry session_id (init event onwards)
   return typeof value.session_id === 'string' && value.session_id ? value.session_id : null;
 };
@@ -650,6 +656,115 @@ export const extractKimiTextFromJsonEvent = (value) => {
   return '';
 };
 
+// muse exec --json emits an event-sourced JSONL stream: every line is an
+// envelope { payload_type, payload, stream: {kind:'session', id} } where
+// payload_type is dotted (runtime.command.accepted, task.lifecycle.*,
+// run.output.delta, tool.result, run.terminal.completed|failed). Assistant
+// text streams as run.output.delta and is repeated whole on the run.terminal
+// event, so the terminal text is only used when nothing streamed.
+export const extractMuseTextFromJsonEvent = (value, context = {}) => {
+  const payloadType = value?.payload_type;
+  const payload = value?.payload;
+  if (!payloadType || !payload || typeof payload !== 'object') return '';
+  if (payloadType === 'run.output.delta' && typeof payload.text === 'string') {
+    return payload.text;
+  }
+  if (payloadType.startsWith('run.terminal')) {
+    if (payload.terminal !== 'completed') {
+      const reason = payload.reason || payload.text;
+      return typeof reason === 'string' && reason ? `${reason}\n` : '';
+    }
+    if (!context.textSeen && typeof payload.text === 'string') return payload.text;
+  }
+  return '';
+};
+
+// No reasoning payloads have been observed from muse-spark yet; match any
+// reasoning/thought-flavored output payload so thoughts land in the
+// Reasoning activity instead of the transcript if the stream adds them.
+export const extractMuseReasoningFromJsonEvent = (value) => {
+  const payloadType = String(value?.payload_type || '');
+  if (!/reasoning|thought|thinking/.test(payloadType)) return '';
+  const payload = value?.payload;
+  if (!payload || typeof payload !== 'object') return '';
+  if (typeof payload.text === 'string') return payload.text;
+  if (typeof payload.chunk === 'string') return payload.chunk;
+  return '';
+};
+
+// Tool runs surface as task.lifecycle events for tasks whose task_kind is
+// tool.<name> (only the proposed event carries the kind), and their result as
+// a task.lifecycle.output chunk — a JSON blob with command/description/
+// exit_code/output for bash. Model-response and reminder tasks share the same
+// lifecycle payloads and are noise, so rows are keyed by task_id and only
+// created for tool tasks; later lifecycle events re-emit under the same key
+// and update the row in place.
+export const extractMuseActivitiesFromJsonEvent = (value) => {
+  const payloadType = value?.payload_type;
+  const payload = value?.payload;
+  if (!payloadType || !payload || typeof payload !== 'object') return [];
+
+  if (payloadType === 'task.lifecycle.proposed') {
+    const taskKind = String(payload.event?.task_kind || '');
+    if (!taskKind.startsWith('tool.')) return [];
+    const name = taskKind.slice('tool.'.length);
+    return [
+      {
+        key: payload.task_id,
+        type: 'tool',
+        title: `Tool - ${name}`,
+        status: 'running',
+      },
+    ];
+  }
+
+  if (payloadType === 'task.lifecycle.output') {
+    const chunk = payload.event?.chunk;
+    if (typeof chunk !== 'string' || !chunk.trim()) return [];
+    let parsed = null;
+    try {
+      parsed = JSON.parse(chunk);
+    } catch {}
+    if (parsed && typeof parsed === 'object' && typeof parsed.command === 'string') {
+      const failed = typeof parsed.exit_code === 'number' && parsed.exit_code !== 0;
+      const activity = {
+        key: payload.task_id,
+        type: 'command',
+        title: `Command - ${stringifySummary(parsed.command, 80)}`,
+        detail: stringifySummary(parsed.description || parsed.command),
+        input: formatToolInput(parsed.command),
+        status: failed ? 'error' : 'done',
+      };
+      const output = formatToolOutput(parsed.output);
+      if (output) activity.output = output;
+      if (typeof parsed.exit_code === 'number') activity.exitCode = parsed.exit_code;
+      return [activity];
+    }
+    return [
+      {
+        key: payload.task_id,
+        type: 'tool',
+        title: 'Tool - output',
+        output: formatToolOutput(chunk),
+        status: 'done',
+      },
+    ];
+  }
+
+  if (payloadType === 'run.terminal.failed' || (payloadType.startsWith('run.terminal') && payload.terminal === 'failed')) {
+    return [
+      {
+        type: 'error',
+        title: 'Run failed',
+        detail: stringifySummary(payload.reason ?? payload.text ?? '', 300),
+        status: 'error',
+      },
+    ];
+  }
+
+  return [];
+};
+
 export const providerJsonAdapters = {
   claude: {
     text: extractClaudeTextFromJsonEvent,
@@ -676,6 +791,11 @@ export const providerJsonAdapters = {
     reasoning: () => '',
     activities: () => [],
   },
+  muse: {
+    text: extractMuseTextFromJsonEvent,
+    reasoning: extractMuseReasoningFromJsonEvent,
+    activities: extractMuseActivitiesFromJsonEvent,
+  },
 };
 
 export const genericJsonAdapter = {
@@ -694,8 +814,11 @@ export const countDiffLines = (text) => {
 // grok's stream ends with an explicit {"type":"end","stopReason":...} event,
 // but the process (or a background process it spawned that inherited its
 // pipes) can outlive it — treat the event itself as the completion signal.
+// muse's successful equivalent is run.terminal.completed. Failed terminal
+// records remain on the process-exit path so they cannot finalize as success.
 export const isTerminalJsonEvent = (providerId, value) =>
-  providerId === 'grok' && value?.type === 'end';
+  (providerId === 'grok' && value?.type === 'end') ||
+  (providerId === 'muse' && value?.payload_type === 'run.terminal.completed');
 
 export const sendsJsonEvents = (providerId) =>
-  ['claude', 'codex', 'cursor', 'grok', 'kimi'].includes(providerId);
+  ['claude', 'codex', 'cursor', 'grok', 'kimi', 'muse'].includes(providerId);
