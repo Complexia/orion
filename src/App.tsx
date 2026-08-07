@@ -161,6 +161,7 @@ import {
 import { resolveOrionMainDriverModel } from './app/orionDriver';
 import {
   accessModeOptions,
+  buildGeneralInstructionsContext,
   buildLinkedTaskContext,
   buildModelMentionsContext,
   buildOrchestrationContext,
@@ -3110,17 +3111,27 @@ const App: React.FC = () => {
     }
   }, []);
 
+  // Reads race: a status scan of the previously active project (large repos
+  // take seconds) can resolve after the fast read for the project the user
+  // just switched to, and would overwrite the pill and picker with the wrong
+  // repository's branches. Only the latest request may write state.
+  const gitRefreshSeqRef = useRef(0);
   const refreshGitState = useCallback(async () => {
     const projectPath = activeWorkingDir;
+    const seq = ++gitRefreshSeqRef.current;
     if (!projectPath || !window.orion?.getGitState) {
       setGitState(null);
+      setGitLoading(false);
       return;
     }
 
     setGitLoading(true);
     try {
-      setGitState(await window.orion.getGitState(projectPath));
+      const state = await window.orion.getGitState(projectPath);
+      if (seq !== gitRefreshSeqRef.current) return;
+      setGitState(state);
     } catch (error) {
+      if (seq !== gitRefreshSeqRef.current) return;
       setGitState({
         ok: false,
         branches: [],
@@ -3128,7 +3139,7 @@ const App: React.FC = () => {
         error: error instanceof Error ? error.message : 'Unable to read git state',
       });
     } finally {
-      setGitLoading(false);
+      if (seq === gitRefreshSeqRef.current) setGitLoading(false);
     }
   }, [activeWorkingDir]);
 
@@ -3136,16 +3147,32 @@ const App: React.FC = () => {
     void refreshGitState();
   }, [refreshGitState]);
 
+  // A checkout in an outside terminal doesn't notify the app; re-read when
+  // the window regains focus so the pill matches the repository's real HEAD.
+  useEffect(() => {
+    const onFocus = () => void refreshGitState();
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [refreshGitState]);
+
+  // Same stale-response race as refreshGitState: only the latest request may
+  // write, so a slow read for the previous project can't repaint the cloud
+  // pill after a project switch.
+  const cloudRefreshSeqRef = useRef(0);
   const refreshCloudState = useCallback(async () => {
     const projectPath = activeWorkingDir;
+    const seq = ++cloudRefreshSeqRef.current;
     if (!projectPath || !window.orion?.getCloudState) {
       setCloudState(null);
       return;
     }
 
     try {
-      setCloudState(await window.orion.getCloudState(projectPath));
+      const state = await window.orion.getCloudState(projectPath);
+      if (seq !== cloudRefreshSeqRef.current) return;
+      setCloudState(state);
     } catch (error) {
+      if (seq !== cloudRefreshSeqRef.current) return;
       setCloudState({
         ok: false,
         error: error instanceof Error ? error.message : 'Unable to read Orion Cloud state',
@@ -7211,6 +7238,17 @@ const App: React.FC = () => {
           thread.accessMode ?? 'full-access'
         );
         addAgentContext(orchestrationContext);
+      } else {
+        // The user's general instructions bind every model run through Orion,
+        // not just the orchestrator — a global CLAUDE.md scoped to the app.
+        // Orchestrated turns already carry them in the block above. Added last
+        // so the block sits topmost on ordinary prompts.
+        addAgentContext(
+          buildGeneralInstructionsContext(
+            state.orchestrationSettings?.generalInstructions ??
+              defaultOrchestrationSettings.generalInstructions
+          )
+        );
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
@@ -11531,7 +11569,12 @@ const App: React.FC = () => {
                     type="button"
                     className="shell-branch-trigger"
                     onClick={() => {
-                      if (!activeRiftUnavailable) setBranchPickerOpen((open) => !open);
+                      if (activeRiftUnavailable) return;
+                      const opening = !branchPickerOpen;
+                      setBranchPickerOpen(opening);
+                      // The list can be stale (branch switched or created in a
+                      // terminal since the last read) — re-read on open.
+                      if (opening) void refreshGitState();
                     }}
                     disabled={activeRiftUnavailable || gitLoading || repositoryOperationBusy || !gitState?.ok}
                     title={gitState?.error ?? gitState?.root ?? 'Git state'}
@@ -12396,6 +12439,7 @@ const App: React.FC = () => {
                                   focused={pane.focused}
                                   resumeSessionId={pane.thread.agentSessionIds?.claude}
                                   forkSession={pane.thread.pendingForkProviders?.includes('claude')}
+                                  generalInstructions={normalizedOrchestrationSettings.generalInstructions}
                                 />
                               </React.Suspense>
                             )
