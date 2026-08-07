@@ -114,6 +114,7 @@ import {
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
+import { epicHasActionableCommitWork } from './app/epicGit';
 import { epicThreadRows } from './app/epicThreads';
 import { AgentsSidebar, type AgentsSidebarModel, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { ThreadPane } from './app/ThreadPane';
@@ -1092,10 +1093,10 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!epicPrBaseDialog) setEpicPrBaseBranchPickerOpen(false);
   }, [epicPrBaseDialog]);
-  // Live workspace status behind the epic git buttons: "Commit & push" greys
-  // out when the workspace is clean and fully pushed. PR lifecycle is kept in
-  // the persisted epic instead so URL-only refreshes and workspace reads do
-  // not create competing caches.
+  // Live workspace status behind the epic git buttons: the active commit mode
+  // greys out when it has no work it can perform. PR lifecycle is kept in the
+  // persisted epic instead so URL-only refreshes and workspace reads do not
+  // create competing caches.
   const [epicGitStatuses, setEpicGitStatuses] = useState<
     Record<
       string,
@@ -1896,8 +1897,18 @@ const App: React.FC = () => {
     () => (slashToken ? filterSlashCommands(slashCommandPool, slashToken.query) : []),
     [slashCommandPool, slashToken?.query]
   );
+  // Codex's one-click /review presets outrank the generic slash menu: a bare
+  // "/review" draft goes straight to the preset popover so a single click
+  // dispatches the review instead of first re-completing the command.
+  const codexReviewPresetsActive =
+    selectedAgentModel?.providerId === 'codex' &&
+    !isTerminalThread &&
+    /^\/review\s*$/i.test(chatInput.trimStart());
   const slashMenuOpen =
-    Boolean(slashToken) && slashCommandCandidates.length > 0 && chatInput !== slashDismissedDraft;
+    Boolean(slashToken) &&
+    slashCommandCandidates.length > 0 &&
+    chatInput !== slashDismissedDraft &&
+    !codexReviewPresetsActive;
   const slashCommandListKey = slashCommandCandidates
     .map((candidate) => `${candidate.source}:${candidate.command.name}`)
     .join('|');
@@ -2226,9 +2237,13 @@ const App: React.FC = () => {
     ? projectForGitRoot(selectedEpic.gitRoot, selectedEpic.repositoryProjectId)
     : null;
   const selectedEpicGitStatus = selectedEpic ? epicGitStatuses[selectedEpic.id] : undefined;
-  // Fail open: until the first status arrives, the commit button stays enabled.
-  const selectedEpicHasWorkToPush =
-    !selectedEpicGitStatus || selectedEpicGitStatus.hasChangesToCommit || selectedEpicGitStatus.hasUnpushedCommits;
+  // Fail open until the first status arrives. In commit-only mode, an
+  // unpushed commit is not actionable because this button deliberately cannot
+  // push it; only fresh workspace changes can produce another local commit.
+  const selectedEpicHasActionableCommitWork = epicHasActionableCommitWork(
+    selectedEpicGitStatus,
+    Boolean(selectedEpic?.commitWithoutPush)
+  );
   const selectedEpicPrStatus = epicPrStatus(selectedEpic);
   const selectedEpicPrBadge = !selectedEpicPrStatus
     ? null
@@ -2822,9 +2837,13 @@ const App: React.FC = () => {
     },
     [selectProject]
   );
+  const [epicSelectionNonce, setEpicSelectionNonce] = useState(0);
   const selectEpicFromSidebar = useCallback(
     (id: string | null) => {
       setActiveRemoteMachineId(null);
+      // Every click into an epic restarts its status poll (and PR lookup),
+      // even when the epic id is unchanged, e.g. returning from a thread.
+      if (id) setEpicSelectionNonce((n) => n + 1);
       selectEpic(id);
     },
     [selectEpic]
@@ -4138,6 +4157,12 @@ const App: React.FC = () => {
         } else {
           updateThread(tracked.threadId, { status: 'done' });
           notifyThreadFinished(tracked.threadId, 'done');
+          // A successful end means the in-flight checklist task is finished
+          // even if the agent never sent the closing update — stop the spinner
+          // and let the widget read n/n instead of "ended mid-task".
+          useOrionStore
+            .getState()
+            .completeInProgressPlanEntries(tracked.threadId, tracked.messageId);
           // Turn finished — surface the work on the board (In Review column)
           // with the response the user sees in this completed agent message.
           const finalResponse = useOrionStore
@@ -5393,7 +5418,7 @@ const App: React.FC = () => {
     // refreshEpicGitStatus is recreated every render; depending on it would
     // refire the effect every render and defeat the refresh loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedEpicGitPollKey, selectedEpicGitBusy, activeRiftUnavailable, selectedEpicRemovalPending]);
+  }, [selectedEpicGitPollKey, selectedEpicGitBusy, activeRiftUnavailable, selectedEpicRemovalPending, epicSelectionNonce]);
 
   // The sidebar and archive both colour epic icons by PR state, so include
   // settled epics as well as active ones. Merged PRs are immutable and need no
@@ -5576,6 +5601,11 @@ const App: React.FC = () => {
     }
 
     let committed = false;
+    // Read the tick fresh at call time — it may have been toggled after the
+    // dialog opened, and a PR needs a push, so commit-only suppresses auto-PR.
+    const skipPush = Boolean(
+      useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id)?.commitWithoutPush
+    );
     markEpicGitBusy(epic.id, 'commit', epicGitWorkspaceKey(epic));
     try {
       const trimmedMessage = message.trim();
@@ -5586,6 +5616,7 @@ const App: React.FC = () => {
         ...(trimmedMessage ? { modelId: null } : resolveUtilityTurn()),
         epicName: epic.name,
         ...(trimmedMessage ? { message: trimmedMessage } : {}),
+        ...(skipPush ? { skipPush: true } : {}),
         ...claim,
       });
       if (result.ok || result.committed) {
@@ -5593,14 +5624,25 @@ const App: React.FC = () => {
       }
       if (result.ok) {
         committed = true;
-        toast.success(`Committed and pushed ${result.branch ?? 'branch'}`, {
-          description: result.message?.split('\n')[0],
-        });
+        toast.success(
+          skipPush
+            ? `Committed on ${result.branch ?? 'branch'} (not pushed)`
+            : `Committed and pushed ${result.branch ?? 'branch'}`,
+          {
+            description: result.message?.split('\n')[0],
+          }
+        );
         // Refresh only when the shell is showing the directory just committed
         // (the epic's rift, or its repository when it has none).
         if (projectPath === activeWorkingDir || (project && activeThreadProject?.id === project.id)) {
           await refreshGitState();
         }
+      } else if (result.aborted) {
+        toast.info(
+          result.committed
+            ? 'Push aborted — the commit was created and remains local'
+            : 'Commit aborted'
+        );
       } else {
         toast.error(result.error ?? 'Commit and push failed');
       }
@@ -5613,7 +5655,7 @@ const App: React.FC = () => {
     // "Auto create PR on commit": a successful commit carries straight on into
     // the pull request, so the user can start the commit and navigate away.
     // Runs after the busy marker clears — the PR's own guards read it.
-    if (committed) await runEpicAutoPr(epic.id);
+    if (committed && !skipPush) await runEpicAutoPr(epic.id);
   };
 
   // Follow-up PR for an epic whose auto-create-PR tick is on. Reads the epic
@@ -5864,6 +5906,8 @@ const App: React.FC = () => {
               }
             : undefined
         );
+      } else if (result.aborted) {
+        toast.info('Opening the pull request was aborted');
       } else {
         toast.error(result.error ?? 'Could not open a pull request');
       }
@@ -10272,8 +10316,11 @@ const App: React.FC = () => {
         {!slashMenuOpen &&
           !isTerminalThread &&
           // Claude-backed threads run Claude Code's own /review (expanded
-          // CLI-side); the generic command hint above covers it there.
+          // CLI-side); the generic command hint above covers it there. While
+          // the preset popover is up it already explains the choices, so the
+          // long banner would only stack noise above the composer.
           !selectedThreadClaudeBacked &&
+          !codexReviewPresetsActive &&
           /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
             <div className="composer-btw-hint">
               <SquarePen size={12} />
@@ -10310,9 +10357,7 @@ const App: React.FC = () => {
             </span>
           </div>
         )}
-        {!slashMenuOpen &&
-          selectedAgentModel?.providerId === 'codex' &&
-          /^\/review\s*$/i.test(chatInput.trimStart()) && (
+        {codexReviewPresetsActive && (
             <ComposerPopover className="review-popover">
               <button
                 type="button"
@@ -10399,7 +10444,6 @@ const App: React.FC = () => {
                   role="option"
                   aria-selected={index === slashCommandIndex}
                   className={`mention-row ${index === slashCommandIndex ? 'selected' : ''}`}
-                  title={command.description || `/${command.name}`}
                   onMouseEnter={() => setSlashCommandIndex(index)}
                   // Keep the textarea focused so selection doesn't blur the composer.
                   onMouseDown={(e) => e.preventDefault()}
@@ -11618,7 +11662,7 @@ const App: React.FC = () => {
                             activeRiftUnavailable ||
                             riftRemovalEpicIds[selectedEpic.id] ||
                             (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
-                            !selectedEpicHasWorkToPush ||
+                            !selectedEpicHasActionableCommitWork ||
                             selectedEpicHasRunningAgents
                           }
                           onClick={() => {
@@ -11628,27 +11672,42 @@ const App: React.FC = () => {
                           title={
                             selectedEpicHasRunningAgents
                               ? 'Agents are still running in this epic — wait for them to finish before committing'
-                              : !selectedEpicHasWorkToPush
-                                ? 'Nothing to commit — the workspace is clean and fully pushed'
-                                : epicPromptGitMessages
-                                  ? 'Stage all changes, write or generate a commit message, then commit and push'
-                                  : 'Stage all changes, generate a commit message, then commit and push'
+                              : !selectedEpicHasActionableCommitWork
+                                ? selectedEpic.commitWithoutPush && selectedEpicGitStatus?.hasUnpushedCommits
+                                  ? 'Nothing new to commit — earlier commits remain local'
+                                  : 'Nothing to commit — the workspace is clean and fully pushed'
+                                : selectedEpic.commitWithoutPush
+                                  ? epicPromptGitMessages
+                                    ? 'Stage all changes, write or generate a commit message, then commit without pushing'
+                                    : 'Stage all changes, generate a commit message, then commit without pushing'
+                                  : epicPromptGitMessages
+                                    ? 'Stage all changes, write or generate a commit message, then commit and push'
+                                    : 'Stage all changes, generate a commit message, then commit and push'
                           }
                         >
                           <GitCommit size={14} />
-                          {selectedEpicGitBusy === 'commit' ? 'Committing…' : 'Commit & push'}
+                          {selectedEpicGitBusy === 'commit'
+                            ? 'Committing…'
+                            : selectedEpic.commitWithoutPush
+                              ? 'Commit'
+                              : 'Commit & push'}
                         </button>
                         <label
-                          className="inline-flex items-center gap-1.5 cursor-pointer select-none group"
+                          className={`inline-flex items-center gap-1.5 select-none group ${
+                            selectedEpic.commitWithoutPush ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+                          }`}
                           title={
-                            selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
-                              ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
-                              : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
+                            selectedEpic.commitWithoutPush
+                              ? 'A pull request needs a push — untick “Only commit” first'
+                              : selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
+                                ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
+                                : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
                           }
                         >
                           <input
                             type="checkbox"
                             className="peer sr-only"
+                            disabled={Boolean(selectedEpic.commitWithoutPush)}
                             checked={Boolean(selectedEpic.autoPrAfterCommit)}
                             onChange={(e) =>
                               updateEpic(selectedEpic.id, {
@@ -11664,6 +11723,37 @@ const App: React.FC = () => {
                           </span>
                           <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
                             Auto create PR on commit
+                          </span>
+                        </label>
+                        <label
+                          className={`inline-flex items-center gap-1.5 select-none group ${
+                            selectedEpicOperationBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+                          }`}
+                          title={
+                            selectedEpicOperationBusy
+                              ? 'Wait for the current git action to finish before changing commit mode'
+                              : 'Commit stays local — nothing is pushed until this is unticked'
+                          }
+                        >
+                          <input
+                            type="checkbox"
+                            className="peer sr-only"
+                            disabled={selectedEpicOperationBusy}
+                            checked={Boolean(selectedEpic.commitWithoutPush)}
+                            onChange={(e) =>
+                              updateEpic(selectedEpic.id, {
+                                commitWithoutPush: e.target.checked,
+                              })
+                            }
+                          />
+                          <span
+                            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
+                            aria-hidden
+                          >
+                            <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
+                          </span>
+                          <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
+                            Only commit (don’t push)
                           </span>
                         </label>
                       </div>
@@ -11749,12 +11839,33 @@ const App: React.FC = () => {
                         {riftSetupEpicIds[selectedEpic.id]
                           ? 'Creating the epic’s rift workspace and branch…'
                           : selectedEpicGitBusy === 'commit'
-                            ? 'Staging all changes and writing a commit message, then pushing…'
+                            ? selectedEpic.commitWithoutPush
+                              ? 'Staging all changes and writing a commit message, then committing…'
+                              : 'Staging all changes and writing a commit message, then pushing…'
                             : selectedEpicGitBusy === 'pr-branches'
                               ? 'Fetching the branches on origin…'
                               : selectedEpicGitBusy === 'settle'
                                 ? 'Checking the workspace and pull request state…'
                                 : 'Writing the PR message and opening the pull request…'}
+                        {(selectedEpicGitBusy === 'commit' || selectedEpicGitBusy === 'pr') &&
+                          window.orion?.epicAbortGitOperation && (
+                            <button
+                              type="button"
+                              className="btn"
+                              onClick={() =>
+                                void window.orion
+                                  .epicAbortGitOperation({ epicId: selectedEpic.id })
+                                  .catch(() => {})
+                              }
+                              title={
+                                selectedEpicGitBusy === 'commit'
+                                  ? 'Abort this commit — a commit that already landed stays local; the push is cancelled'
+                                  : 'Abort opening this pull request'
+                              }
+                            >
+                              Abort
+                            </button>
+                          )}
                       </div>
                     )}
 

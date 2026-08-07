@@ -119,11 +119,11 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
             onClick={(e) => e.stopPropagation()}
           >
             <h2 id="epic-commit-title" className="modal-title">
-              Commit &amp; push
+              {epicCommitDialog.epic.commitWithoutPush ? 'Commit' : 'Commit & push'}
             </h2>
             <p className="modal-subtitle">
               Stages everything in {epicCommitDialog.epic.riftPath ? 'this epic’s rift' : 'the repository'}, then
-              pushes.
+              {epicCommitDialog.epic.commitWithoutPush ? ' commits without pushing.' : ' pushes.'}
             </p>
             <form
               className="modal-form"
@@ -161,7 +161,7 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 </button>
                 <button type="submit" className="btn">
                   <GitCommit size={14} />
-                  Commit &amp; push
+                  {epicCommitDialog.epic.commitWithoutPush ? 'Commit' : 'Commit & push'}
                 </button>
               </div>
             </form>

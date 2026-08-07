@@ -2152,7 +2152,7 @@ const readLocalDefaultBranch = async (gitRoot) => {
 // entries. Without a model — or when the turn comes back empty because the
 // model is unavailable or errored — this degrades to the mechanical
 // "Update N files" summary rather than blocking the commit.
-const writeGitCommitMessage = async ({ gitRoot, entries, epicName, modelId, reasoningEffort }) => {
+const writeGitCommitMessage = async ({ gitRoot, entries, epicName, modelId, reasoningEffort, signal }) => {
   if (modelId) {
     const context = await readStagedGitChangesContext(gitRoot, entries);
     const prompt =
@@ -2163,7 +2163,7 @@ const writeGitCommitMessage = async ({ gitRoot, entries, epicName, modelId, reas
       'message — no quotes, no code fences, no commentary.\n\n' +
       context;
     const generated = cleanGeneratedGitMessage(
-      await runOneShotForModelId(modelId, prompt, gitRoot, { reasoningEffort })
+      await runOneShotForModelId(modelId, prompt, gitRoot, { reasoningEffort, signal })
     );
     if (generated) return generated;
   }
@@ -2297,14 +2297,55 @@ const hasLocalCommitsToPush = async (gitRoot, branch, baseBranch) => {
   return false;
 };
 
-ipcMain.handle('epic:commitAndPush', async (_event, input) => {
+// One in-flight commit/PR operation per epic, abortable from the renderer.
+// Only network-bound children (push, fetch, gh) and the model turn receive the
+// abort signal; local git steps (add/commit) run to completion with checkpoint
+// checks between them, so a kill can never leave a stale .git/index.lock.
+const epicGitOperations = new Map(); // epicId -> { controller, kind, finish }
+
+const beginEpicGitOperation = (event, epicId, kind) => {
+  if (epicGitOperations.has(epicId)) return null;
+  const controller = new AbortController();
+  // A window reload mid-operation must not orphan the child process or leak
+  // the registry entry (which would permanently block this epic).
+  const onDestroyed = () => controller.abort();
+  event.sender.once('destroyed', onDestroyed);
+  const entry = {
+    controller,
+    kind,
+    finish: () => {
+      event.sender.removeListener('destroyed', onDestroyed);
+      epicGitOperations.delete(epicId);
+    },
+  };
+  epicGitOperations.set(epicId, entry);
+  return entry;
+};
+
+const isAbortError = (error) => error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
+
+ipcMain.handle('epic:abortGitOperation', (_event, input) => {
+  const entry = epicGitOperations.get(typeof input?.epicId === 'string' ? input.epicId : '');
+  if (!entry) return { ok: false };
+  entry.controller.abort();
+  return { ok: true, kind: entry.kind };
+});
+
+ipcMain.handle('epic:commitAndPush', async (event, input) => {
   let gitRoot = '';
   let branch = '';
   let committed = false;
+  let operation = null;
   try {
     if (typeof input?.epicId !== 'string' || !input.epicId) {
       return { ok: false, error: 'Missing epic id.' };
     }
+    operation = beginEpicGitOperation(event, input.epicId, 'commit');
+    if (!operation) {
+      return { ok: false, error: 'A git action is already running for this epic.' };
+    }
+    const { signal } = operation.controller;
+    const skipPush = Boolean(input?.skipPush);
     const riftSetupError = pendingRiftSetupError(input);
     if (riftSetupError) {
       return { ok: false, error: riftSetupError };
@@ -2351,12 +2392,20 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
             error: `${branch} has local commits, but this epic has not claimed it. Make this epic's first commit here to claim the branch.`,
           };
         }
+        if (skipPush) {
+          return {
+            ok: false,
+            gitRoot,
+            branch,
+            error: "No new changes to commit. Earlier commits remain unpushed (commit-only is on).",
+          };
+        }
         const setupErrorBeforePush = pendingRiftSetupError(input);
         if (setupErrorBeforePush) {
           return { ok: false, gitRoot, branch, error: setupErrorBeforePush };
         }
-        await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
-        return { ok: true, gitRoot, branch, message: 'Pushed existing local commits' };
+        await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
+        return { ok: true, gitRoot, branch, message: 'Pushed existing local commits', pushed: true };
       }
       return { ok: false, error: 'No local changes to commit.' };
     }
@@ -2376,7 +2425,13 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
         epicName: input?.epicName,
         modelId: input?.modelId,
         reasoningEffort: input?.reasoningEffort,
+        signal,
       });
+    }
+    // An aborted message turn returns '' and would fall back to the mechanical
+    // message — distinguish "user aborted" from "model failed" before committing.
+    if (signal.aborted) {
+      return { ok: false, aborted: true, gitRoot, branch };
     }
 
     // Re-verify what the commit will actually land, and where: `git commit`
@@ -2402,19 +2457,35 @@ ipcMain.handle('epic:commitAndPush', async (_event, input) => {
     if (setupErrorBeforeCommit) {
       return { ok: false, gitRoot, branch, error: setupErrorBeforeCommit };
     }
+    if (signal.aborted) {
+      return { ok: false, aborted: true, gitRoot, branch };
+    }
 
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
     committed = true;
-    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
+    if (skipPush) {
+      return { ok: true, gitRoot, branch, message, committed: true, pushed: false };
+    }
+    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
 
-    return { ok: true, gitRoot, branch, message };
+    return { ok: true, gitRoot, branch, message, pushed: true };
   } catch (error) {
+    if (isAbortError(error) || operation?.controller.signal.aborted) {
+      return {
+        ok: false,
+        aborted: true,
+        ...(gitRoot ? { gitRoot, branch } : {}),
+        ...(committed ? { committed: true } : {}),
+      };
+    }
     return {
       ok: false,
       ...(gitRoot ? { gitRoot, branch } : {}),
       ...(committed ? { committed: true } : {}),
       error: error?.stderr?.toString().trim() || error?.message || String(error),
     };
+  } finally {
+    operation?.finish();
   }
 });
 
@@ -2508,13 +2579,19 @@ ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
   }
 });
 
-ipcMain.handle('epic:createPr', async (_event, input) => {
+ipcMain.handle('epic:createPr', async (event, input) => {
   let gitRoot = '';
   let branch = '';
+  let operation = null;
   try {
     if (typeof input?.epicId !== 'string' || !input.epicId) {
       return { ok: false, error: 'Missing epic id.' };
     }
+    operation = beginEpicGitOperation(event, input.epicId, 'pr');
+    if (!operation) {
+      return { ok: false, error: 'A git action is already running for this epic.' };
+    }
+    const { signal } = operation.controller;
     const riftSetupError = pendingRiftSetupError(input);
     if (riftSetupError) {
       return { ok: false, error: riftSetupError };
@@ -2595,7 +2672,7 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
       const { stdout } = await execFileAsync(
         'gh',
         ['pr', 'view', '--json', 'url,state'],
-        { cwd: gitRoot }
+        { cwd: gitRoot, signal }
       );
       const existing = JSON.parse(stdout);
       if (existing?.url && existing?.state === 'OPEN') {
@@ -2625,7 +2702,10 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     if (setupErrorBeforePush) {
       return { ok: false, gitRoot, branch, error: setupErrorBeforePush };
     }
-    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch]);
+    if (signal.aborted) {
+      return { ok: false, aborted: true, gitRoot, branch };
+    }
+    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
 
     let title = '';
     let body = '';
@@ -2645,14 +2725,18 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
       // the PR: fall through to the static title/body.
       let fetchedCurrentBase = false;
       try {
-        await execFileAsync('git', [
-          '-C',
-          gitRoot,
-          'fetch',
-          '--no-tags',
-          'origin',
-          `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
-        ]);
+        await execFileAsync(
+          'git',
+          [
+            '-C',
+            gitRoot,
+            'fetch',
+            '--no-tags',
+            'origin',
+            `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
+          ],
+          { signal }
+        );
         fetchedCurrentBase = true;
       } catch {}
 
@@ -2689,6 +2773,7 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
         const text = cleanGeneratedGitMessage(
           await runOneShotForModelId(input.modelId, prompt, gitRoot, {
             reasoningEffort: input?.reasoningEffort,
+            signal,
           })
         );
         if (text) {
@@ -2711,19 +2796,27 @@ ipcMain.handle('epic:createPr', async (_event, input) => {
     if (setupErrorBeforeCreate) {
       return { ok: false, gitRoot, branch, error: setupErrorBeforeCreate };
     }
+    if (signal.aborted) {
+      return { ok: false, aborted: true, gitRoot, branch };
+    }
     const { stdout } = await execFileAsync(
       'gh',
       ['pr', 'create', '--head', branch, '--base', baseBranch, '--title', title, '--body', body],
-      { cwd: gitRoot }
+      { cwd: gitRoot, signal }
     );
     const url = stdout.match(/https?:\/\/\S+/)?.[0] ?? '';
     return { ok: true, url, title, gitRoot, branch, baseBranch };
   } catch (error) {
+    if (isAbortError(error) || operation?.controller.signal.aborted) {
+      return { ok: false, aborted: true, ...(gitRoot ? { gitRoot, branch } : {}) };
+    }
     return {
       ok: false,
       ...(gitRoot ? { gitRoot, branch } : {}),
       error: error?.stderr?.toString().trim() || error?.message || String(error),
     };
+  } finally {
+    operation?.finish();
   }
 });
 

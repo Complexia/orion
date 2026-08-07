@@ -4086,13 +4086,15 @@ body {
   animation: plan-spin 0.9s linear infinite;
 }
 
-/* Same ring as the spinner, frozen: the task is where the run stopped. */
+/* Solid muted ring: the task is where the run stopped. Deliberately not the
+   spinner's broken ring — a gray "spinner" reads as still running. */
 .agent-plan-halted {
   width: 8px;
   height: 8px;
   border-radius: 999px;
   border: 1.5px solid var(--text-muted);
-  border-top-color: transparent;
+  background: var(--text-muted);
+  opacity: 0.6;
 }
 
 @keyframes plan-spin {
@@ -5497,9 +5499,11 @@ body {
   font-weight: 400;
 }
 
-/* Command descriptions are longer than model slugs — give them more room. */
+/* Command descriptions are longer than model slugs — give them more room.
+   Cap the name+hint column so a long argument hint (e.g. codex /review)
+   ellipsizes instead of crushing the description out of the row. */
 .slash-popover .mention-row {
-  grid-template-columns: 24px minmax(0, auto) minmax(0, 1fr);
+  grid-template-columns: 24px fit-content(55%) minmax(0, 1fr);
 }
 
 .slash-popover .mention-row-slug {

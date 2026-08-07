@@ -33,6 +33,12 @@ export type Epic = {
    */
   autoPrAfterCommit?: boolean;
   /**
+   * "Only commit (don't push)" under "Commit & push": a successful commit
+   * stays local — no push, and auto-PR is suppressed since a PR needs a push.
+   * Per epic, and persisted so it holds for that epic's later commits.
+   */
+  commitWithoutPush?: boolean;
+  /**
    * Last known lifecycle state of prUrl's pull request. Persisted so the
    * sidebar can colour every epic's icon on first paint instead of waiting on
    * a round of `gh pr view` calls.
@@ -776,6 +782,12 @@ interface OrionState {
     messageId: string,
     activity: Omit<AgentActivity, 'id' | 'ts'>
   ) => void;
+  /**
+   * A run that ended successfully has finished whatever task it was on, even
+   * when the agent skipped the final checklist update — flip lingering
+   * in-progress plan entries to completed so the widget can't spin forever.
+   */
+  completeInProgressPlanEntries: (threadId: string, messageId: string) => void;
   queueMessageToThread: (threadId: string, message: Omit<QueuedMessage, 'id'>) => string;
   removeQueuedThreadMessage: (threadId: string, messageId: string) => void;
   addBtwExchange: (threadId: string, question: string) => string;
@@ -2065,6 +2077,44 @@ export const useOrionStore = create<OrionState>()(
             ),
           };
         }),
+
+      completeInProgressPlanEntries: (threadId, messageId) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId
+              ? {
+                  ...thread,
+                  messages: thread.messages.map((message) => {
+                    if (message.id !== messageId || !message.activities?.length) return message;
+                    let changed = false;
+                    const activities = message.activities.map((activity) => {
+                      if (
+                        activity.type !== 'plan' ||
+                        !activity.plan?.some((entry) => entry.status === 'in_progress')
+                      ) {
+                        return activity;
+                      }
+                      changed = true;
+                      const plan = activity.plan.map((entry) =>
+                        entry.status === 'in_progress'
+                          ? { ...entry, status: 'completed' as const }
+                          : entry
+                      );
+                      const completed = plan.filter((entry) => entry.status === 'completed').length;
+                      const allDone = completed === plan.length;
+                      return {
+                        ...activity,
+                        plan,
+                        ...(allDone ? { status: 'done' as const } : {}),
+                        title: `Tasks (${completed}/${plan.length})`,
+                      };
+                    });
+                    return changed ? { ...message, activities } : message;
+                  }),
+                }
+              : thread
+          ),
+        })),
 
       queueMessageToThread: (threadId, message) => {
         const id = crypto.randomUUID();
