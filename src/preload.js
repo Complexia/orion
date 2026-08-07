@@ -155,6 +155,10 @@ contextBridge.exposeInMainWorld('orion', {
   pushToCloud: (projectPath) => ipcRenderer.invoke('cloud:push', projectPath),
   pullFromCloud: (projectPath) => ipcRenderer.invoke('cloud:pull', projectPath),
   openCloudRepoInBrowser: (projectPath) => ipcRenderer.invoke('cloud:openInBrowser', projectPath),
+  deployToCloud: (projectPath) => ipcRenderer.invoke('cloud:deploy', projectPath),
+  getCloudAppState: (projectPath) => ipcRenderer.invoke('cloud:getAppState', projectPath),
+  openCloudAppInBrowser: (projectPath) => ipcRenderer.invoke('cloud:openAppInBrowser', projectPath),
+  precheckCloudDeploy: (projectPath) => ipcRenderer.invoke('cloud:deployPrecheck', projectPath),
   openExternalUrl: (url) => ipcRenderer.invoke('app:openExternalUrl', url),
 
   // Orion board tasks (kanban on the web app)

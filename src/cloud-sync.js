@@ -605,6 +605,29 @@ export async function pullRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
   return { ok: true, repo: info.repo, branches, merge, downloadedPacks, downloadedLoose };
 }
 
+// --- Deployments (Orion Cloud hosts the repo as an app) ----------------------
+
+/**
+ * Queue a build+deploy of the repo's current HEAD. The server builds on Railway
+ * and hosts at https://<slug>.andromedus.dev, so this returns as soon as the
+ * app row exists — `status` is usually `queued` here and settles via
+ * {@link getAppState}. A 402 (free plan's app limit) reaches the caller as an
+ * error with `.status`/`.data` so the UI can show the server's own message.
+ */
+export async function deployApp({ repoId, baseUrl, token, signal }) {
+  const result = await api(baseUrl, token, `/api/git/repos/${repoId}/deploy`, {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({}),
+  });
+  return result.app ?? null;
+}
+
+export async function getAppState({ repoId, baseUrl, token, signal }) {
+  const result = await api(baseUrl, token, `/api/git/repos/${repoId}/app`, { signal });
+  return result.app ?? null;
+}
+
 // --- State for the UI -----------------------------------------------------------
 
 export async function getCloudState({ gitRoot, baseUrl, token }) {
@@ -648,6 +671,9 @@ export async function getCloudState({ gitRoot, baseUrl, token }) {
       refs: state.refs,
       currentBranch: branch,
       sync,
+      // Deployed app for this repo, if any. Older Orion Web deployments omit
+      // the field entirely, so absent and "never deployed" both read as null.
+      app: state.app ?? null,
     };
   } catch (error) {
     if (error.status === 404) {

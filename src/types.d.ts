@@ -334,6 +334,17 @@ export type RemoteCommandRequest = {
 declare global {
 type OrionCloudSyncStatus = 'synced' | 'ahead' | 'behind' | 'diverged' | 'unknown';
 
+type OrionCloudAppStatus = 'queued' | 'building' | 'deployed' | 'failed';
+
+/** An Orion Cloud app: the repo built on Railway and hosted at `url`. */
+type OrionCloudApp = {
+  slug: string;
+  url: string;
+  status: OrionCloudAppStatus;
+  error: string | null;
+  commitOid?: string | null;
+};
+
 type OrionCloudState = {
   ok: boolean;
   authenticated?: boolean;
@@ -346,6 +357,36 @@ type OrionCloudState = {
   currentBranch?: string | null;
   sync?: OrionCloudSyncStatus;
   webUrl?: string | null;
+  /** Absent on Orion Web deployments that predate app hosting. */
+  app?: OrionCloudApp | null;
+  error?: string;
+};
+
+type OrionCloudDeployResult = {
+  ok: boolean;
+  app?: OrionCloudApp | null;
+  needsAuth?: boolean;
+  /** The repo isn't linked yet — publish it before deploying. */
+  needsPublish?: boolean;
+  /** 402: the plan's app limit is used up. */
+  limitReached?: boolean;
+  upgradeRequired?: boolean;
+  appLimit?: number | null;
+  error?: string;
+};
+
+type OrionCloudAppStateResult = {
+  ok: boolean;
+  app?: OrionCloudApp | null;
+  needsAuth?: boolean;
+  error?: string;
+};
+
+/** Can Orion Cloud build this repo unattended, or does it need the agent? */
+type OrionCloudDeployPrecheck = {
+  ok: boolean;
+  simple?: boolean;
+  reasons?: string[];
   error?: string;
 };
 
@@ -359,7 +400,7 @@ type OrionCloudPushResult = {
   skipped?: Array<{ branch: string; reason: string }>;
   repo?: { id: string; name: string };
   webUrl?: string | null;
-  app?: { slug: string; url: string; status: string; error: string | null } | null;
+  app?: OrionCloudApp | null;
   error?: string;
 };
 
@@ -980,6 +1021,12 @@ type OrionComputerUsePermissions = {
       pushToCloud: (projectPath: string) => Promise<OrionCloudPushResult>;
       pullFromCloud: (projectPath: string) => Promise<OrionCloudPullResult>;
       openCloudRepoInBrowser: (projectPath: string) => Promise<{ ok: boolean; error?: string }>;
+      deployToCloud: (projectPath: string) => Promise<OrionCloudDeployResult>;
+      getCloudAppState: (projectPath: string) => Promise<OrionCloudAppStateResult>;
+      openCloudAppInBrowser: (
+        projectPath: string
+      ) => Promise<{ ok: boolean; app?: OrionCloudApp | null; error?: string }>;
+      precheckCloudDeploy: (projectPath: string) => Promise<OrionCloudDeployPrecheck>;
       listBoardTasks: () => Promise<OrionBoardResult>;
       getBoardTask: (taskId: string) => Promise<OrionTaskActionResult>;
       linkBoardTask: (input: {

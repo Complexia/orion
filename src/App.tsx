@@ -32,6 +32,7 @@ import {
   CloudUpload,
   CloudDownload,
   Globe,
+  Rocket,
   AppWindow,
   SquareArrowOutUpRight,
   ListPlus,
@@ -392,6 +393,29 @@ const UTILITY_MODEL_PREFERENCE = [
   'muse:muse-spark-1.2',
 ];
 
+// Orion Cloud builds on Railway, which takes minutes; poll until the app row
+// settles, then give up so a build that never reports back stops costing
+// requests for the rest of the session.
+const CLOUD_DEPLOY_POLL_INTERVAL_MS = 4000;
+const CLOUD_DEPLOY_POLL_TIMEOUT_MS = 20 * 60 * 1000;
+
+const cloudAppHost = (url: string) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
+
+/** Billing page on whichever Orion Web this desktop talks to. */
+const cloudBillingUrl = (repoWebUrl: string | null | undefined) => {
+  try {
+    return new URL('/repos/billing', repoWebUrl ?? 'https://orioncode.xyz').toString();
+  } catch {
+    return 'https://orioncode.xyz/repos/billing';
+  }
+};
+
 // Threads grouped under an epic that has a rift workspace (experimental Rifts
 // feature) run their agent processes inside the rift instead of the project
 // directory.
@@ -661,6 +685,8 @@ const App: React.FC = () => {
     setWorkspaceSyncSettings,
     remoteControlSettings,
     setRemoteControlSettings,
+    deploymentSettings,
+    setDeploymentSettings,
     addProject,
     removeProject,
     renameProject,
@@ -731,6 +757,8 @@ const App: React.FC = () => {
       setWorkspaceSyncSettings: state.setWorkspaceSyncSettings,
       remoteControlSettings: state.remoteControlSettings,
       setRemoteControlSettings: state.setRemoteControlSettings,
+      deploymentSettings: state.deploymentSettings,
+      setDeploymentSettings: state.setDeploymentSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
@@ -868,6 +896,16 @@ const App: React.FC = () => {
   const [gitBusy, setGitBusy] = useState(false);
   const [cloudState, setCloudState] = useState<OrionCloudState | null>(null);
   const [cloudBusy, setCloudBusy] = useState(false);
+  // Orion Cloud apps we've heard about since launch, keyed by working dir: a
+  // deploy we just queued, a redeploy a push kicked off, and every poll while a
+  // build runs. cloudState carries the server's copy on each refresh, so this
+  // only has to hold what is fresher than the last refresh.
+  const [cloudAppsByDir, setCloudAppsByDir] = useState<Record<string, OrionCloudApp | null>>({});
+  const [cloudDeployingDir, setCloudDeployingDir] = useState<string | null>(null);
+  // Dirs whose in-flight build the user is waiting on, so only a deploy they
+  // started toasts when it settles.
+  const cloudDeployWatchRef = useRef<Set<string>>(new Set());
+  const cloudDeployPollStartRef = useRef<Record<string, number>>({});
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
   const [goalMenuOpen, setGoalMenuOpen] = useState(false);
   const [projectMenuOpenId, setProjectMenuOpenId] = useState<string | null>(null);
@@ -2342,6 +2380,24 @@ const App: React.FC = () => {
   /** `{ modelId, reasoningEffort }` for a hidden text-generation turn. */
   const resolveUtilityTurn = useCallback(() => utilityTurnRef.current, []);
 
+  // The model behind agent deploys: the Deployments pick when it's installed
+  // and its provider is enabled, else whatever the text-generation turns use.
+  const resolvedDeploymentModelId = useMemo(() => {
+    const picked = deploymentSettings?.agentModelId ?? null;
+    const model = picked ? utilityCandidateModels.find((candidate) => candidate.id === picked) : null;
+    if (model && model.available !== false && enabledProviderIdSet.has(model.providerId)) return picked;
+    return resolvedUtilityModelId;
+  }, [
+    deploymentSettings?.agentModelId,
+    enabledProviderIdSet,
+    resolvedUtilityModelId,
+    utilityCandidateModels,
+  ]);
+  const resolvedDeploymentModel = useMemo(
+    () => utilityCandidateModels.find((model) => model.id === resolvedDeploymentModelId) ?? null,
+    [resolvedDeploymentModelId, utilityCandidateModels]
+  );
+
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
     // Runtime disposal can abort a hidden prompt fork during main-process
     // startup without producing a terminal event. Untrack/stop it here and
@@ -3102,6 +3158,82 @@ const App: React.FC = () => {
   useEffect(() => {
     void refreshCloudState();
   }, [refreshCloudState, accountState.authenticated, gitState]);
+
+  // The Orion Cloud app for the active project: whatever we've learned since
+  // the last cloud-state refresh wins, because a deploy queued a second ago is
+  // newer than the state that was read before it.
+  const cloudApp = useMemo<OrionCloudApp | null>(() => {
+    if (!activeWorkingDir) return null;
+    return activeWorkingDir in cloudAppsByDir
+      ? cloudAppsByDir[activeWorkingDir]
+      : (cloudState?.app ?? null);
+  }, [activeWorkingDir, cloudAppsByDir, cloudState?.app]);
+
+  const recordCloudApp = useCallback((projectPath: string, app: OrionCloudApp | null) => {
+    // Every poll returns a fresh object; only re-render when it says something
+    // different, so a slow build doesn't repaint the shell every four seconds.
+    setCloudAppsByDir((current) => {
+      const previous = current[projectPath];
+      if (
+        previous?.status === app?.status &&
+        previous?.url === app?.url &&
+        previous?.error === app?.error
+      ) {
+        return current;
+      }
+      return { ...current, [projectPath]: app };
+    });
+    if (!app || !cloudDeployWatchRef.current.has(projectPath)) return;
+    if (app.status === 'deployed') {
+      cloudDeployWatchRef.current.delete(projectPath);
+      toast.success(`Live at ${cloudAppHost(app.url)}`, {
+        action: {
+          label: 'Open app',
+          onClick: () => void window.orion?.openExternalUrl?.(app.url),
+        },
+      });
+    } else if (app.status === 'failed') {
+      cloudDeployWatchRef.current.delete(projectPath);
+      toast.error(app.error ?? 'Orion Cloud could not build this app.');
+    }
+  }, []);
+
+  // While a build is queued or running, poll for the app row until it settles.
+  // Keyed off the status alone so a fresh poll result doesn't restart the timer.
+  useEffect(() => {
+    const projectPath = activeWorkingDir;
+    if (!projectPath || !window.orion?.getCloudAppState) return undefined;
+    const status = cloudApp?.status;
+    if (status !== 'queued' && status !== 'building') {
+      delete cloudDeployPollStartRef.current[projectPath];
+      return undefined;
+    }
+    const startedAt = cloudDeployPollStartRef.current[projectPath] ?? Date.now();
+    cloudDeployPollStartRef.current[projectPath] = startedAt;
+
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      if (Date.now() - startedAt > CLOUD_DEPLOY_POLL_TIMEOUT_MS) {
+        window.clearInterval(timer);
+        cloudDeployWatchRef.current.delete(projectPath);
+        return;
+      }
+      void window.orion
+        ?.getCloudAppState?.(projectPath)
+        .then((result) => {
+          if (cancelled || !result.ok) return;
+          recordCloudApp(projectPath, result.app ?? null);
+        })
+        .catch(() => {
+          // A single failed poll is not worth surfacing; the next tick retries.
+        });
+    }, CLOUD_DEPLOY_POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeWorkingDir, cloudApp?.status, recordCloudApp]);
 
   const handleUpdateProviders = useCallback(async () => {
     if (!window.orion?.updateProviders || providerUpdatesRunning) return;
@@ -4561,6 +4693,12 @@ const App: React.FC = () => {
       if (result.skipped?.length) {
         toast.info(`Skipped ${result.skipped.map((item) => item.branch).join(', ')}: ${result.skipped[0].reason}`);
       }
+      // A push into a deployed repo triggers a rebuild server-side; follow it
+      // to the live URL the same way a Deploy click would.
+      if (result.ok && result.app) {
+        cloudDeployWatchRef.current.add(activeWorkingDir);
+        recordCloudApp(activeWorkingDir, result.app);
+      }
       await refreshCloudState();
     } finally {
       setCloudBusy(false);
@@ -4595,6 +4733,151 @@ const App: React.FC = () => {
       await refreshCloudState();
     } finally {
       setCloudBusy(false);
+    }
+  };
+
+  const handleOpenCloudApp = useCallback(() => {
+    const projectPath = activeWorkingDir;
+    if (!projectPath || !window.orion?.openCloudAppInBrowser) return;
+    void window.orion.openCloudAppInBrowser(projectPath).then((result) => {
+      if (!result.ok) toast.error(result.error ?? 'Could not open the deployed app.');
+    });
+  }, [activeWorkingDir]);
+
+  // Complex apps don't deploy themselves: hand the job to a visible agent
+  // thread that works out the build with orion-cli while the user watches.
+  const startAgentDeploy = useCallback(
+    (reasons: string[]) => {
+      const projectId = activeThreadProject?.id;
+      if (!projectId) {
+        toast.error('Open a project before deploying.');
+        return;
+      }
+      const reasonText = reasons.length
+        ? reasons.join('; ')
+        : 'you asked for every deploy to go through the deployment agent';
+      const prompt = [
+        'Deploy this app to Orion Cloud. Use the orion-cli tool: run `orion-cli deploy` from the',
+        'appropriate app directory (install with `npm i -g orion-cli`, or use `npx orion-cli` if it',
+        'is not installed; run `orion-cli --help` first to see usage; authenticate with `orion-cli',
+        'login` if prompted — tell me if login is required, since it opens a browser).',
+        `This project was detected as non-trivial to deploy because: ${reasonText}.`,
+        'Figure out the right way to deploy it (correct subdirectory for monorepos, build',
+        'configuration, etc.), run the deploy, verify it succeeds, and report the live URL.',
+      ].join(' ');
+
+      // Deploying pushes commits, installs a CLI, and talks to Orion Cloud over
+      // the network, so anything less than full access stalls on the first step.
+      const threadId = createThread(projectId, 'Deploy to Orion Cloud', {
+        ...(resolvedDeploymentModelId ? { modelId: resolvedDeploymentModelId } : {}),
+        accessMode: 'full-access',
+        // Keep the thread in the same workspace the Deploy button acted on, so
+        // a rift-backed epic deploys its own tree rather than the source repo.
+        ...(activeRift ? { epicId: activeRift.id } : {}),
+      });
+      setActiveTab('agents');
+      const start = startTurnForThreadRef.current?.(threadId, prompt, []);
+      void start?.then(
+        async (result) => {
+          if (result.ok === false) {
+            toast.error(result.error ?? 'Could not start the deployment agent');
+            return;
+          }
+          try {
+            const startup = await result.startup;
+            if (!startup.ok) toast.error(startup.error ?? 'Could not start the deployment agent');
+          } catch (error) {
+            toast.error(error instanceof Error ? error.message : 'Could not start the deployment agent');
+          }
+        },
+        (error) => toast.error(error instanceof Error ? error.message : 'Could not start the deployment agent')
+      );
+      toast.info('Deploying with the deployment agent', {
+        description: `Detected as non-trivial to deploy: ${reasonText}.`,
+      });
+    },
+    [activeRift, activeThreadProject?.id, createThread, resolvedDeploymentModelId, setActiveTab]
+  );
+
+  const handleCloudDeploy = async () => {
+    const projectPath = activeWorkingDir;
+    if (!projectPath || !window.orion?.deployToCloud || cloudDeployingDir) return;
+    if (!accountState.authenticated) {
+      toast.info('Sign in to your Orion account to deploy this project.');
+      setSettingsTab('account');
+      setSettingsOpen(true);
+      return;
+    }
+
+    setCloudDeployingDir(projectPath);
+    // A deploy pushes, so it holds the same lock as push/pull/publish.
+    setCloudBusy(true);
+    try {
+      // A precheck that can't run (no git root, unreadable tree) shouldn't block
+      // a deploy — the direct path reports the server's own error instead.
+      const precheck = await window.orion.precheckCloudDeploy?.(projectPath);
+      const simple = precheck?.ok ? precheck.simple !== false : true;
+      if (!simple || deploymentSettings.preferAgentDeploys) {
+        startAgentDeploy(precheck?.reasons ?? []);
+        return;
+      }
+
+      // Deploying builds whatever the cloud repo holds, so an unpublished
+      // project has to be published (which pushes) before it can deploy.
+      const publishFirst = async () => {
+        const published = await window.orion?.publishToCloud?.({ projectPath });
+        if (published?.ok) {
+          await refreshCloudState();
+          return true;
+        }
+        if (published?.needsAuth) {
+          toast.error(published.error ?? 'Sign in first.');
+          setSettingsTab('account');
+          setSettingsOpen(true);
+        } else {
+          toast.error(published?.error ?? 'Could not publish this project to Orion Cloud');
+        }
+        return false;
+      };
+
+      if (!cloudState?.linked && !(await publishFirst())) return;
+
+      let result = await window.orion.deployToCloud(projectPath);
+      if (!result.ok && result.needsPublish) {
+        if (!(await publishFirst())) return;
+        result = await window.orion.deployToCloud(projectPath);
+      }
+
+      if (!result.ok) {
+        if (result.needsAuth) {
+          toast.error(result.error ?? 'Sign in first.');
+          setSettingsTab('account');
+          setSettingsOpen(true);
+        } else if (result.limitReached || result.upgradeRequired) {
+          toast.error(result.error ?? 'Your plan does not allow another Orion Cloud app.', {
+            action: {
+              label: 'Upgrade',
+              onClick: () => void window.orion?.openExternalUrl?.(cloudBillingUrl(cloudState?.webUrl)),
+            },
+          });
+        } else {
+          toast.error(result.error ?? 'Deploy to Orion Cloud failed');
+        }
+        return;
+      }
+
+      const app = result.app ?? null;
+      cloudDeployWatchRef.current.add(projectPath);
+      recordCloudApp(projectPath, app);
+      if (app && app.status !== 'deployed' && app.status !== 'failed') {
+        toast.info(`Building ${cloudAppHost(app.url)}…`, {
+          description: 'Orion Cloud is building your app. This usually takes a few minutes.',
+        });
+      }
+      await refreshCloudState();
+    } finally {
+      setCloudBusy(false);
+      setCloudDeployingDir(null);
     }
   };
 
@@ -9543,6 +9826,12 @@ const App: React.FC = () => {
     setWorkspaceSyncSettings,
     remoteControlSettings,
     setRemoteControlSettings,
+    deploymentSettings,
+    setDeploymentSettings,
+    resolvedDeploymentModel,
+    resolvedDeploymentModelId,
+    cloudApp,
+    handleOpenCloudApp,
     workspaceSyncStatus,
     handleWorkspaceSyncNow,
     setUtilityModelPickerOpen,
@@ -11367,32 +11656,75 @@ const App: React.FC = () => {
                   </button>
                 )}
 
-                {gitState?.ok && cloudState?.ok && cloudState.linked && (
-                  <div className="shell-cloud-group" title={`Orion Cloud: ${cloudState.repoName ?? ''}`}>
+                {gitState?.ok && cloudState?.ok && (
+                  <div
+                    className="shell-cloud-group"
+                    title={cloudState.linked ? `Orion Cloud: ${cloudState.repoName ?? ''}` : 'Orion Cloud'}
+                  >
+                    {cloudState.linked && (
+                      <button
+                        type="button"
+                        className={`shell-cloud-icon-button ${
+                          cloudState.sync === 'behind' || cloudState.sync === 'diverged' ? 'attention' : ''
+                        }`}
+                        onClick={() => void handleCloudPull()}
+                        disabled={repositoryOperationBusy}
+                        title={
+                          cloudState.sync === 'behind'
+                            ? 'Orion Cloud has new changes — pull them'
+                            : 'Pull from Orion Cloud'
+                        }
+                      >
+                        <CloudDownload size={14} />
+                      </button>
+                    )}
+                    {/* Deploy stands on its own: an unpublished project publishes,
+                        pushes, and deploys from this one click. */}
                     <button
                       type="button"
                       className={`shell-cloud-icon-button ${
-                        cloudState.sync === 'behind' || cloudState.sync === 'diverged' ? 'attention' : ''
+                        cloudDeployingDir === activeWorkingDir ||
+                        cloudApp?.status === 'queued' ||
+                        cloudApp?.status === 'building'
+                          ? 'deploying'
+                          : cloudApp?.status === 'failed'
+                            ? 'attention'
+                            : ''
                       }`}
-                      onClick={() => void handleCloudPull()}
-                      disabled={repositoryOperationBusy}
+                      onClick={() => void handleCloudDeploy()}
+                      disabled={cloudDeployingDir !== null || repositoryOperationBusy}
                       title={
-                        cloudState.sync === 'behind'
-                          ? 'Orion Cloud has new changes — pull them'
-                          : 'Pull from Orion Cloud'
+                        cloudApp?.status === 'queued' || cloudApp?.status === 'building'
+                          ? `Building ${cloudAppHost(cloudApp.url)}…`
+                          : cloudApp?.status === 'failed'
+                            ? `Last deploy failed — deploy ${cloudAppHost(cloudApp.url)} again`
+                            : cloudApp
+                              ? `Redeploy ${cloudAppHost(cloudApp.url)} to Orion Cloud`
+                              : 'Deploy to Orion Cloud'
                       }
                     >
-                      <CloudDownload size={14} />
+                      <Rocket size={14} />
                     </button>
-                    <button
-                      type="button"
-                      className="shell-cloud-icon-button"
-                      onClick={() => activeWorkingDir && void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir)}
-                      disabled={!cloudState.linked}
-                      title="Open on Orion Cloud"
-                    >
-                      <Globe size={14} />
-                    </button>
+                    {cloudState.linked && (
+                      <button
+                        type="button"
+                        className="shell-cloud-icon-button"
+                        onClick={() => {
+                          if (!activeWorkingDir) return;
+                          // Once an app is live the globe is the way to it; until
+                          // then it stays the link to the repo on Orion Cloud.
+                          if (cloudApp?.status === 'deployed') handleOpenCloudApp();
+                          else void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir);
+                        }}
+                        title={
+                          cloudApp?.status === 'deployed'
+                            ? `Open ${cloudAppHost(cloudApp.url)}`
+                            : 'Open on Orion Cloud'
+                        }
+                      >
+                        <Globe size={14} />
+                      </button>
+                    )}
                   </div>
                 )}
               </>
