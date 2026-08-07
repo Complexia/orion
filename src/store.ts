@@ -612,7 +612,7 @@ export type OrchestrationRoleId =
 export type OrchestrationSettings = {
   /** AgentModel id per role, e.g. 'claude:claude-fable-5'. */
   models: Record<OrchestrationRoleId, string>;
-  /** Extra instructions given to every orchestrated run. */
+  /** Standing instructions injected into every agent run started from Orion. */
   generalInstructions: string;
 };
 

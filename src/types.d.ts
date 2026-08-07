@@ -1164,6 +1164,8 @@ type OrionComputerUsePermissions = {
         restart?: boolean;
         /** Resume the inherited session into a new id for a branched thread. */
         forkSession?: boolean;
+        /** Orion's general instructions, appended to the CLI's system prompt at spawn. */
+        generalInstructions?: string;
       }) => Promise<{
         ok: boolean;
         /** True when an already-running PTY was reattached instead of spawned. */

@@ -1398,7 +1398,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="setting-label-title">General instructions</div>
                   <div className="setting-label-desc">
-                    Free-form guidance included in the orchestrator's instructions
+                    Free-form guidance every model follows when run through Orion — like a global
+                    CLAUDE.md that never affects these models outside Orion
                   </div>
                 </div>
                 <textarea
