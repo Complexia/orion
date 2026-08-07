@@ -37,6 +37,14 @@ export const providerUpdaterConfigs = [
     command: 'grok',
     updateCommands: [['update']],
     checkCommand: ['update', '--check', '--json'],
+    // Grok installed via the official script self-updates in place
+    // ("installer":"internal" in `grok update --check --json`), but older
+    // builds and npm-detected installs route through `npm i -g`, which fails
+    // with EEXIST against the script-managed binary. When the self-updater
+    // fails or leaves the version unchanged, reinstall from the official
+    // script instead of npm.
+    fallbackInstallCommand: 'curl -fsSL https://x.ai/cli/install.sh | bash',
+    verifyAfterUpdate: true,
     authCommands: [['login', '--oauth']],
     statusCommand: ['models'],
   },
@@ -647,15 +655,49 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
 
     if (config.verifyAfterUpdate && expectedLatestVersion) {
       onPhase?.('verifying');
-      const installedVersion = await readCliVersion(
+      let installedVersion = await readCliVersion(
         config.command,
         config.versionPattern,
         config.versionEnv
       );
-      if (
-        !installedVersion ||
-        compareVersionStrings(installedVersion, expectedLatestVersion) < 0
-      ) {
+      const isStale = (version) =>
+        !version || compareVersionStrings(version, expectedLatestVersion) < 0;
+
+      // A self-updater can exit 0 without installing anything (e.g. grok
+      // routing through a broken npm path). Reinstall from the configured
+      // source before declaring failure.
+      if (isStale(installedVersion) && config.fallbackInstallCommand) {
+        onPhase?.('installing');
+        try {
+          const fallbackResult = await runUpdateCommand(config.fallbackInstallCommand);
+          const fallbackOutput = `${fallbackResult.stdout}\n${fallbackResult.stderr}`.trim();
+          if (fallbackOutput) outputParts.push(fallbackOutput);
+        } catch (fallbackError) {
+          // Cancellation propagates to the outer handler; any other failure
+          // must not fall through to the catch block, which would run the
+          // same fallback command a second time.
+          if (isProviderUpdateCancelled(fallbackError)) throw fallbackError;
+          const fallbackOutput =
+            `${fallbackError?.stdout || ''}\n${fallbackError?.stderr || ''}`.trim();
+          if (fallbackOutput) outputParts.push(fallbackOutput);
+          return {
+            id: config.id,
+            label: config.label,
+            command: config.command,
+            ok: false,
+            error: getProviderUpdateError(fallbackError),
+            output: outputParts.join('\n\n'),
+          };
+        }
+        onPhase?.('verifying');
+        installedVersion = await readCliVersion(
+          config.command,
+          config.versionPattern,
+          config.versionEnv
+        );
+      }
+
+      if (isStale(installedVersion)) {
         return {
           id: config.id,
           label: config.label,
@@ -689,17 +731,45 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
       };
     }
 
-    if (config.packageName) {
+    const fallbackCommand =
+      config.fallbackInstallCommand ??
+      (config.packageName ? `npm install -g ${shellQuote(`${config.packageName}@latest`)}` : null);
+    if (fallbackCommand) {
       try {
-        const fallbackCommand = `npm install -g ${shellQuote(`${config.packageName}@latest`)}`;
         onPhase?.('installing');
         const { stdout, stderr } = await runUpdateCommand(fallbackCommand);
+        const fallbackOutput = `${stdout}\n${stderr}`.trim();
+
+        if (config.verifyAfterUpdate && expectedLatestVersion) {
+          onPhase?.('verifying');
+          const installedVersion = await readCliVersion(
+            config.command,
+            config.versionPattern,
+            config.versionEnv
+          );
+          if (
+            !installedVersion ||
+            compareVersionStrings(installedVersion, expectedLatestVersion) < 0
+          ) {
+            return {
+              id: config.id,
+              label: config.label,
+              command: config.command,
+              ok: false,
+              error: installedVersion
+                ? `${config.label} is still on ${installedVersion}; expected ${expectedLatestVersion}.`
+                : `Could not verify the installed ${config.label} version after updating.`,
+              output: fallbackOutput,
+            };
+          }
+        }
+
         return {
           id: config.id,
           label: config.label,
           command: config.command,
           ok: true,
-          output: `${stdout}\n${stderr}`.trim(),
+          output: fallbackOutput,
         };
       } catch (fallbackError) {
         if (isProviderUpdateCancelled(fallbackError)) {
