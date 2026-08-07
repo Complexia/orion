@@ -4758,7 +4758,7 @@ const App: React.FC = () => {
         : 'you asked for every deploy to go through the deployment agent';
       const prompt = [
         'Deploy this app to Orion Cloud. Use the orion-cli tool: run `orion-cli deploy` from the',
-        'appropriate app directory (install with `npm i -g orion-cli`, or use `npx orion-cli` if it',
+        'appropriate app directory (install with `npm i -g orioncode`, or use `npx orioncode` if it',
         'is not installed; run `orion-cli --help` first to see usage; authenticate with `orion-cli',
         'login` if prompted — tell me if login is required, since it opens a browser).',
         `This project was detected as non-trivial to deploy because: ${reasonText}.`,
