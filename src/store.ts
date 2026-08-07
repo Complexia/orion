@@ -139,6 +139,27 @@ export const defaultTextGenerationSettings: TextGenerationSettings = {
   reasoningEffort: null,
 };
 
+/**
+ * Orion Cloud deploys. Simple apps deploy straight from the navbar; anything
+ * Railpack can't build unattended (monorepos, compose stacks) is handed to a
+ * visible agent thread that drives `orion-cli` instead.
+ */
+export type DeploymentSettings = {
+  /**
+   * AgentModel id for the deployment agent. `null` means never picked, which
+   * falls back to the text-generation model (see resolvedDeploymentModelId in
+   * App.tsx).
+   */
+  agentModelId: string | null;
+  /** Route every deploy through the agent, even ones Orion judges simple. */
+  preferAgentDeploys: boolean;
+};
+
+export const defaultDeploymentSettings: DeploymentSettings = {
+  agentModelId: null,
+  preferAgentDeploys: false,
+};
+
 /** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */
 export type RiftsSettings = {
   /** Master switch for the experimental Rifts integration. */
@@ -690,6 +711,7 @@ interface OrionState {
   riftsSettings: RiftsSettings;
   workspaceSyncSettings: WorkspaceSyncSettings;
   remoteControlSettings: RemoteControlSettings;
+  deploymentSettings: DeploymentSettings;
 
   // Code tab workspace
   workspacePath: string | null;
@@ -739,6 +761,7 @@ interface OrionState {
   setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
+  setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
 
   createThread: (
     projectId: string,
@@ -1324,6 +1347,7 @@ export const useOrionStore = create<OrionState>()(
       riftsSettings: defaultRiftsSettings,
       workspaceSyncSettings: defaultWorkspaceSyncSettings,
       remoteControlSettings: defaultRemoteControlSettings,
+      deploymentSettings: defaultDeploymentSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -1697,6 +1721,15 @@ export const useOrionStore = create<OrionState>()(
           remoteControlSettings: {
             ...defaultRemoteControlSettings,
             ...state.remoteControlSettings,
+            ...updates,
+          },
+        })),
+
+      setDeploymentSettings: (updates) =>
+        set((state) => ({
+          deploymentSettings: {
+            ...defaultDeploymentSettings,
+            ...state.deploymentSettings,
             ...updates,
           },
         })),
@@ -2314,6 +2347,10 @@ export const useOrionStore = create<OrionState>()(
         remoteControlSettings: {
           ...defaultRemoteControlSettings,
           ...state.remoteControlSettings,
+        },
+        deploymentSettings: {
+          ...defaultDeploymentSettings,
+          ...state.deploymentSettings,
         },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,

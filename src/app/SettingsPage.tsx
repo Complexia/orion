@@ -14,6 +14,7 @@ import {
   Play,
   Plug,
   RefreshCw,
+  Rocket,
   Server,
   Settings,
   Sparkles,
@@ -29,6 +30,7 @@ import {
   defaultRiftsSettings,
   defaultSplitViewSettings,
   MAX_THREAD_PANES,
+  type DeploymentSettings,
   type Epic,
   type EpicsSettings,
   type NotificationSettings,
@@ -55,6 +57,7 @@ import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
 import SkillsSettings from './SkillsSettings';
+import DeploymentsSettings from './DeploymentsSettings';
 import DevServersSettings from './DevServersSettings';
 import RemoteControlSettings from './RemoteControlSettings';
 import { orchestrationRoleMeta } from './promptContext';
@@ -97,6 +100,12 @@ export type SettingsPageProps = {
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   remoteControlSettings: RemoteControlSettingsValue;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettingsValue>) => void;
+  deploymentSettings: DeploymentSettings;
+  setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
+  resolvedDeploymentModel: AgentModel | null;
+  resolvedDeploymentModelId: string | null;
+  cloudApp: OrionCloudApp | null;
+  handleOpenCloudApp: () => void;
   workspaceSyncStatus: WorkspaceSyncStatus | null;
   handleWorkspaceSyncNow: () => void;
   setUtilityModelPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -215,6 +224,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setWorkspaceSyncSettings,
     remoteControlSettings,
     setRemoteControlSettings,
+    deploymentSettings,
+    setDeploymentSettings,
+    resolvedDeploymentModel,
+    resolvedDeploymentModelId,
+    cloudApp,
+    handleOpenCloudApp,
     workspaceSyncStatus,
     handleWorkspaceSyncNow,
     setUtilityModelPickerOpen,
@@ -369,6 +384,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {[
             { id: 'account', label: 'Account', Icon: UserRound },
             { id: 'cloud-sync', label: 'Cloud Sync', Icon: Cloud },
+            { id: 'deployments', label: 'Deployments', Icon: Rocket },
             { id: 'remote-control', label: 'Remote Control', Icon: Cast },
             { id: 'general', label: 'General', Icon: Settings },
             { id: 'providers', label: 'Providers', Icon: Plug },
@@ -407,6 +423,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         <div className="settings-content-header">
           {settingsTab === 'account' && 'ACCOUNT'}
           {settingsTab === 'cloud-sync' && 'CLOUD SYNC'}
+          {settingsTab === 'deployments' && 'DEPLOYMENTS'}
           {settingsTab === 'remote-control' && 'REMOTE CONTROL'}
           {settingsTab === 'general' && 'GENERAL'}
           {settingsTab === 'providers' && 'PROVIDERS'}
@@ -1400,6 +1417,19 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           )}
 
           {settingsTab === 'dev-servers' && <DevServersSettings formatBytes={formatBytes} />}
+
+          {settingsTab === 'deployments' && (
+            <DeploymentsSettings
+              deploymentSettings={deploymentSettings}
+              setDeploymentSettings={setDeploymentSettings}
+              deploymentCandidateModels={utilityCandidateModels}
+              deploymentProviders={utilityProviders}
+              resolvedDeploymentModel={resolvedDeploymentModel}
+              resolvedDeploymentModelId={resolvedDeploymentModelId}
+              cloudApp={cloudApp}
+              onOpenCloudApp={handleOpenCloudApp}
+            />
+          )}
 
           {settingsTab === 'remote-control' && (
             <RemoteControlSettings

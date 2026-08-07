@@ -368,6 +368,24 @@ body {
   border-color: rgb(77 141 255 / 35%);
 }
 
+/* A queued or running Orion Cloud build. Pulsing rather than spinning: the
+   rocket reads as a direction, and a rotating one just looks broken. */
+.shell-cloud-icon-button.deploying {
+  color: var(--accent);
+  animation: shell-cloud-deploying 1.4s ease-in-out infinite;
+}
+
+@keyframes shell-cloud-deploying {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.45;
+  }
+}
+
 .shell-project-picker,
 .shell-branch-picker {
   position: absolute;

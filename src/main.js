@@ -24,6 +24,8 @@ import { spawn } from 'node:child_process';
 import started from 'electron-squirrel-startup';
 import {
   clearCloudRepoLink,
+  deployApp,
+  getAppState,
   getCloudRepoLink,
   getCloudState,
   publishRepo,
@@ -4715,6 +4717,170 @@ ipcMain.handle('cloud:pull', async (_event, projectPath) => {
       baseUrl: getOrionWebUrl(),
       token: session.token,
     });
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+// --- Orion Cloud deploys ------------------------------------------------------
+
+const cloudAppFileExists = async (gitRoot, name) => {
+  try {
+    await fs.access(path.join(gitRoot, name));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Can Railway's Railpack build this repo straight from its root, or does it
+ * need someone to figure it out? "Simple" is the direct-deploy path; anything
+ * else gets handed to the deployment agent with these reasons as context.
+ */
+const cloudDeployPrecheck = async (gitRoot) => {
+  const reasons = [];
+
+  // Explicit build config wins: whoever wrote it already answered the question.
+  for (const name of ['railway.json', 'railway.toml', 'railpack.json']) {
+    if (await cloudAppFileExists(gitRoot, name)) {
+      return { simple: true, reasons: [`${name} pins the build configuration`] };
+    }
+  }
+
+  for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    if (await cloudAppFileExists(gitRoot, name)) reasons.push(`${name} present (multi-service app)`);
+  }
+  if (await cloudAppFileExists(gitRoot, 'pnpm-workspace.yaml')) reasons.push('pnpm workspaces monorepo');
+  if (await cloudAppFileExists(gitRoot, 'lerna.json')) reasons.push('Lerna monorepo');
+
+  let packageJson = null;
+  let packageJsonUnreadable = false;
+  try {
+    packageJson = JSON.parse(await fs.readFile(path.join(gitRoot, 'package.json'), 'utf8'));
+  } catch (error) {
+    if (error?.code !== 'ENOENT') packageJsonUnreadable = true;
+  }
+
+  if (packageJsonUnreadable) {
+    reasons.push('package.json could not be parsed');
+  } else if (packageJson) {
+    if (packageJson.workspaces) reasons.push('npm workspaces monorepo');
+  } else if (!(await cloudAppFileExists(gitRoot, 'Dockerfile'))) {
+    reasons.push('no package.json or Dockerfile at the repository root');
+  }
+
+  return { simple: reasons.length === 0, reasons };
+};
+
+ipcMain.handle('cloud:deployPrecheck', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const gitRoot = await getGitRoot(projectPath);
+    return { ok: true, ...(await cloudDeployPrecheck(gitRoot)) };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('cloud:deploy', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const link = await getCloudRepoLink(gitRoot);
+    if (!link) {
+      return {
+        ok: false,
+        error: 'Publish this project to Orion Cloud first.',
+        needsPublish: true,
+      };
+    }
+
+    // The server builds whatever HEAD it has, so push before deploying —
+    // otherwise a deploy silently ships the previous commit.
+    const pushed = await pushRepo({
+      gitRoot,
+      repoId: link.repoId,
+      baseUrl: getOrionWebUrl(),
+      token: session.token,
+    });
+    if (!pushed.ok) return pushed;
+
+    const app = await deployApp({
+      repoId: link.repoId,
+      baseUrl: getOrionWebUrl(),
+      token: session.token,
+    });
+    return { ok: true, app };
+  } catch (error) {
+    if (error?.status === 402) {
+      // Free plan's one-app limit. The server's message is the user-facing
+      // copy; the flags let the renderer offer the upgrade path.
+      return {
+        ok: false,
+        error: error?.data?.error ?? 'Your plan does not allow another Orion Cloud app.',
+        limitReached: Boolean(error?.data?.limitReached),
+        upgradeRequired: Boolean(error?.data?.upgradeRequired),
+        appLimit: error?.data?.appLimit ?? null,
+      };
+    }
+    return {
+      ok: false,
+      error: cloudErrorMessage(error),
+      ...(error?.status === 401 ? { needsAuth: true } : {}),
+    };
+  }
+});
+
+ipcMain.handle('cloud:getAppState', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const link = await getCloudRepoLink(gitRoot);
+    if (!link) return { ok: true, app: null };
+
+    return {
+      ok: true,
+      app: await getAppState({
+        repoId: link.repoId,
+        baseUrl: getOrionWebUrl(),
+        token: session.token,
+      }),
+    };
+  } catch (error) {
+    return { ok: false, error: cloudErrorMessage(error) };
+  }
+});
+
+ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const link = await getCloudRepoLink(gitRoot);
+    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+
+    const app = await getAppState({
+      repoId: link.repoId,
+      baseUrl: getOrionWebUrl(),
+      token: session.token,
+    });
+    if (!app?.url) return { ok: false, error: 'This project has no deployed app yet.' };
+    const parsed = new URL(app.url);
+    if (parsed.protocol !== 'https:') return { ok: false, error: 'Only https URLs can be opened.' };
+    await shell.openExternal(parsed.toString());
+    return { ok: true, app };
   } catch (error) {
     return { ok: false, error: cloudErrorMessage(error) };
   }

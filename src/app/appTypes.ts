@@ -150,6 +150,7 @@ export type WorkspaceSyncStatus = {
 export type SettingsTab =
   | 'account'
   | 'cloud-sync'
+  | 'deployments'
   | 'remote-control'
   | 'general'
   | 'providers'
