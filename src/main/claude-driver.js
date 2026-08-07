@@ -625,6 +625,14 @@ export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
   } else {
     clearClaudeBackgroundRun(session);
   }
+  // A successful end finishes whatever checklist task was in flight, even if
+  // the agent skipped the closing update. session.tasks persists across
+  // turns, so a stale in_progress entry would re-emit as spinning next turn.
+  if (!resultIsError && pendingBackgroundTasks.length === 0 && session.tasks) {
+    for (const task of session.tasks.values()) {
+      if (task.status === 'in_progress') task.status = 'completed';
+    }
+  }
   emitAgentEvent(session.sender, {
     runId: turn.runId,
     threadId: session.threadId,

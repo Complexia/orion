@@ -22,6 +22,7 @@
     "test:thread-reader": "electron scripts/test-thread-reader.mjs",
     "test:thread-storage": "electron scripts/test-thread-storage.mjs",
     "test:epic-threads": "node --no-warnings --experimental-strip-types scripts/test-epic-threads.mjs",
+    "test:ui-improvements": "node --no-warnings --experimental-strip-types scripts/test-ui-improvements.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",

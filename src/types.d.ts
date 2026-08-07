@@ -614,6 +614,8 @@ type OrionComputerUsePermissions = {
         epicName?: string;
         /** Commit message written by the user; empty means the model writes it. */
         message?: string;
+        /** Commit locally but skip the push (epic "Only commit" tickbox). */
+        skipPush?: boolean;
         /** projectPath is the epic's own rift workspace — claims don't apply. */
         isRift?: boolean;
         expectedGitRoot?: string;
@@ -630,6 +632,10 @@ type OrionComputerUsePermissions = {
         message?: string;
         /** The commit landed locally even though a later step (normally push) failed. */
         committed?: boolean;
+        /** False when skipPush left the commit local. */
+        pushed?: boolean;
+        /** The user aborted the operation mid-flight. */
+        aborted?: boolean;
         error?: string;
       }>;
       epicCreatePr: (input: {
@@ -662,7 +668,16 @@ type OrionComputerUsePermissions = {
         branch?: string;
         baseBranch?: string;
         alreadyExists?: boolean;
+        /** The user aborted the operation mid-flight. */
+        aborted?: boolean;
+        /** A commit landed before the abort and remains local. */
+        committed?: boolean;
         error?: string;
+      }>;
+      /** Abort the epic's in-flight commit-and-push or open-PR operation. */
+      epicAbortGitOperation: (input: { epicId: string }) => Promise<{
+        ok: boolean;
+        kind?: 'commit' | 'pr';
       }>;
       /** Local-git answer for the PR base picker's first paint — no network. */
       epicLocalPrBase: (input: {

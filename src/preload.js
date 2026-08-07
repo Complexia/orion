@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('orion', {
   // Epics (sidebar Epics section)
   epicCommitAndPush: (input) => ipcRenderer.invoke('epic:commitAndPush', input),
   epicCreatePr: (input) => ipcRenderer.invoke('epic:createPr', input),
+  epicAbortGitOperation: (input) => ipcRenderer.invoke('epic:abortGitOperation', input),
   epicLocalPrBase: (input) => ipcRenderer.invoke('epic:localPrBase', input),
   epicListRemoteBranches: (input) => ipcRenderer.invoke('epic:listRemoteBranches', input),
   epicGitStatus: (input) => ipcRenderer.invoke('epic:gitStatus', input),
