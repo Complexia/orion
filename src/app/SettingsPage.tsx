@@ -107,6 +107,8 @@ export type SettingsPageProps = {
   setSuggestedTasksSettings: (updates: Partial<SuggestedTasksSettings>) => void;
   resolvedDeploymentModel: AgentModel | null;
   resolvedDeploymentModelId: string | null;
+  deploymentReasoningOptions: Array<{ value: string; label: string }>;
+  resolvedDeploymentReasoningEffort: string | null;
   cloudApp: OrionCloudApp | null;
   handleOpenCloudApp: () => void;
   workspaceSyncStatus: WorkspaceSyncStatus | null;
@@ -233,6 +235,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setSuggestedTasksSettings,
     resolvedDeploymentModel,
     resolvedDeploymentModelId,
+    deploymentReasoningOptions,
+    resolvedDeploymentReasoningEffort,
     cloudApp,
     handleOpenCloudApp,
     workspaceSyncStatus,
@@ -1432,6 +1436,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               deploymentProviders={utilityProviders}
               resolvedDeploymentModel={resolvedDeploymentModel}
               resolvedDeploymentModelId={resolvedDeploymentModelId}
+              deploymentReasoningOptions={deploymentReasoningOptions}
+              resolvedDeploymentReasoningEffort={resolvedDeploymentReasoningEffort}
               cloudApp={cloudApp}
               onOpenCloudApp={handleOpenCloudApp}
             />

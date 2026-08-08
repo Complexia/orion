@@ -151,12 +151,19 @@ export type DeploymentSettings = {
    * App.tsx).
    */
   agentModelId: string | null;
+  /**
+   * Reasoning effort for the deployment agent. Kept provider-agnostic like
+   * TextGenerationSettings because each model family exposes different tiers;
+   * the renderer clamps it to the selected deployment model's options.
+   */
+  reasoningEffort: string | null;
   /** Route every deploy through the agent, even ones Orion judges simple. */
   preferAgentDeploys: boolean;
 };
 
 export const defaultDeploymentSettings: DeploymentSettings = {
   agentModelId: null,
+  reasoningEffort: null,
   preferAgentDeploys: false,
 };
 
@@ -2420,6 +2427,10 @@ export const useOrionStore = create<OrionState>()(
             allowIncoming: true,
           };
         }
+        merged.deploymentSettings = {
+          ...defaultDeploymentSettings,
+          ...merged.deploymentSettings,
+        };
         // The commit/PR message model used to live on epicsSettings; it now
         // also writes thread titles, so it moved to textGenerationSettings.
         // Carry an explicit pick over — the old "Auto (cheapest available)"

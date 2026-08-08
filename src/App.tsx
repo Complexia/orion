@@ -394,6 +394,47 @@ const UTILITY_MODEL_PREFERENCE = [
   'muse:muse-spark-1.2',
 ];
 
+type ReasoningOption = { value: string; label: string };
+
+const reasoningOptionsForModel = (model: AgentModel | null | undefined): ReasoningOption[] => {
+  const toOptions = (options: Array<{ value: string; label: string }>) =>
+    options.map(({ value, label }) => ({ value, label }));
+  if (!model) return [];
+  if (model.providerId === 'codex') return toOptions(codexReasoningOptionsForModel(model));
+  if (model.providerId === 'claude') return toOptions(claudeReasoningOptions);
+  if (model.providerId === 'grok') return toOptions(grokReasoningOptions);
+  if (model.providerId === 'muse') return toOptions(museReasoningOptions);
+  return [];
+};
+
+const defaultReasoningEffortForModel = (model: AgentModel | null | undefined): string | null => {
+  if (!model) return null;
+  if (model.providerId === 'codex') return getEffectiveCodexReasoningEffort(model, undefined);
+  if (model.providerId === 'claude') return getDefaultClaudeReasoningEffort(model);
+  if (model.providerId === 'grok') return defaultGrokReasoningEffort;
+  if (model.providerId === 'muse') return defaultMuseReasoningEffort;
+  return null;
+};
+
+type ThreadReasoningPatch = Partial<
+  Pick<
+    Thread,
+    'codexReasoningEffort' | 'claudeReasoningEffort' | 'grokReasoningEffort' | 'museReasoningEffort'
+  >
+>;
+
+const threadReasoningPatchForModel = (
+  model: AgentModel | null | undefined,
+  effort: string | null
+): ThreadReasoningPatch => {
+  if (!model || !effort) return {};
+  if (model.providerId === 'codex') return { codexReasoningEffort: effort as CodexReasoningEffort };
+  if (model.providerId === 'claude') return { claudeReasoningEffort: effort as ClaudeReasoningEffort };
+  if (model.providerId === 'grok') return { grokReasoningEffort: effort as GrokReasoningEffort };
+  if (model.providerId === 'muse') return { museReasoningEffort: effort as MuseReasoningEffort };
+  return {};
+};
+
 // Orion Cloud builds on Railway, which takes minutes; poll until the app row
 // settles, then give up so a build that never reports back stops costing
 // requests for the rest of the session.
@@ -2364,17 +2405,10 @@ const App: React.FC = () => {
   const utilityModelProviderId = resolvedUtilityModel?.providerId ?? null;
   // Reasoning tiers the picked model actually accepts, cheapest first. Cursor
   // and Kimi take none, so they get no picker at all.
-  const utilityReasoningOptions = useMemo<Array<{ value: string; label: string }>>(() => {
-    const toOptions = (options: Array<{ value: string; label: string }>) =>
-      options.map(({ value, label }) => ({ value, label }));
-    if (!resolvedUtilityModel) return [];
-    if (resolvedUtilityModel.providerId === 'codex')
-      return toOptions(codexReasoningOptionsForModel(resolvedUtilityModel));
-    if (resolvedUtilityModel.providerId === 'claude') return toOptions(claudeReasoningOptions);
-    if (resolvedUtilityModel.providerId === 'grok') return toOptions(grokReasoningOptions);
-    if (resolvedUtilityModel.providerId === 'muse') return toOptions(museReasoningOptions);
-    return [];
-  }, [resolvedUtilityModel]);
+  const utilityReasoningOptions = useMemo(
+    () => reasoningOptionsForModel(resolvedUtilityModel),
+    [resolvedUtilityModel]
+  );
   // A hidden turn writes a title or a commit message, so an unset effort — and
   // one the current model doesn't offer, e.g. Claude's Ultrathink after a
   // switch to Codex — falls back to the cheapest tier rather than a provider
@@ -2414,6 +2448,23 @@ const App: React.FC = () => {
   const resolvedDeploymentModel = useMemo(
     () => utilityCandidateModels.find((model) => model.id === resolvedDeploymentModelId) ?? null,
     [resolvedDeploymentModelId, utilityCandidateModels]
+  );
+  const deploymentReasoningOptions = useMemo(
+    () => reasoningOptionsForModel(resolvedDeploymentModel),
+    [resolvedDeploymentModel]
+  );
+  // A deploy is a real implementation task, so an unset or stale effort uses
+  // the selected model's normal default rather than Text generation's cheap
+  // one-shot fallback.
+  const resolvedDeploymentReasoningEffort = useMemo(() => {
+    if (deploymentReasoningOptions.length === 0) return null;
+    const stored = deploymentSettings?.reasoningEffort ?? null;
+    if (stored && deploymentReasoningOptions.some((option) => option.value === stored)) return stored;
+    return defaultReasoningEffortForModel(resolvedDeploymentModel);
+  }, [deploymentReasoningOptions, deploymentSettings?.reasoningEffort, resolvedDeploymentModel]);
+  const deploymentThreadReasoningPatch = useMemo(
+    () => threadReasoningPatchForModel(resolvedDeploymentModel, resolvedDeploymentReasoningEffort),
+    [resolvedDeploymentModel, resolvedDeploymentReasoningEffort]
   );
 
   const disposeThreadRuntime = useCallback(async (threadId: string) => {
@@ -4820,6 +4871,7 @@ const App: React.FC = () => {
         // a rift-backed epic deploys its own tree rather than the source repo.
         ...(activeRift ? { epicId: activeRift.id } : {}),
       });
+      updateThread(threadId, deploymentThreadReasoningPatch);
       setActiveTab('agents');
       const start = startTurnForThreadRef.current?.(threadId, prompt, []);
       void start?.then(
@@ -4841,7 +4893,15 @@ const App: React.FC = () => {
         description: `Detected as non-trivial to deploy: ${reasonText}.`,
       });
     },
-    [activeRift, activeThreadProject?.id, createThread, resolvedDeploymentModelId, setActiveTab]
+    [
+      activeRift,
+      activeThreadProject?.id,
+      createThread,
+      deploymentThreadReasoningPatch,
+      resolvedDeploymentModelId,
+      setActiveTab,
+      updateThread,
+    ]
   );
 
   const handleCloudDeploy = async () => {
@@ -9888,6 +9948,8 @@ const App: React.FC = () => {
     setSuggestedTasksSettings,
     resolvedDeploymentModel,
     resolvedDeploymentModelId,
+    deploymentReasoningOptions,
+    resolvedDeploymentReasoningEffort,
     cloudApp,
     handleOpenCloudApp,
     workspaceSyncStatus,

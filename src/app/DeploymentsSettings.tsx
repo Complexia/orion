@@ -3,9 +3,10 @@ import { ChevronDown, Play, RotateCcw, SquareArrowOutUpRight } from 'lucide-reac
 import type { DeploymentSettings } from '../store';
 import { agentProviders, type AgentModel, type AgentProvider, type AgentProviderId } from '../agentCatalog';
 import { ModelPickerPopover } from './ModelPickerPopover';
+import { SelectMenu } from './SelectMenu';
 
 // Deploys themselves live in App (the navbar button owns the flow); this panel
-// only edits the two persisted settings and mirrors the active project's app,
+// only edits the persisted settings and mirrors the active project's app,
 // so it keeps its picker state local like the composer's own mount does.
 export type DeploymentsSettingsProps = {
   deploymentSettings: DeploymentSettings;
@@ -16,6 +17,8 @@ export type DeploymentsSettingsProps = {
   /** The model a deploy would actually run on right now. */
   resolvedDeploymentModel: AgentModel | null;
   resolvedDeploymentModelId: string | null;
+  deploymentReasoningOptions: Array<{ value: string; label: string }>;
+  resolvedDeploymentReasoningEffort: string | null;
   /** Orion Cloud app for the active project, when there is one. */
   cloudApp: OrionCloudApp | null;
   onOpenCloudApp: () => void;
@@ -43,6 +46,8 @@ const DeploymentsSettings = React.memo(function DeploymentsSettings({
   deploymentProviders,
   resolvedDeploymentModel,
   resolvedDeploymentModelId,
+  deploymentReasoningOptions,
+  resolvedDeploymentReasoningEffort,
   cloudApp,
   onOpenCloudApp,
 }: DeploymentsSettingsProps) {
@@ -137,6 +142,14 @@ const DeploymentsSettings = React.memo(function DeploymentsSettings({
               />
             )}
           </div>
+          {deploymentReasoningOptions.length > 0 && (
+            <SelectMenu
+              label="Reasoning effort"
+              value={resolvedDeploymentReasoningEffort}
+              options={deploymentReasoningOptions}
+              onChange={(value) => setDeploymentSettings({ reasoningEffort: value })}
+            />
+          )}
         </div>
       </div>
 
