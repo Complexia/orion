@@ -356,7 +356,7 @@ export type Message = {
   content: string;
   ts: string;
   attachments?: ImageAttachment[];
-  kind?: 'text' | 'agent-run';
+  kind?: 'text' | 'agent-run' | 'claude-background-intervention';
   status?: 'running' | 'done' | 'error' | 'stopped';
   statusText?: string;
   command?: string;
@@ -379,6 +379,13 @@ export type Message = {
    * threads), so per-message attribution needs this frozen copy.
    */
   modelId?: string;
+  /** Orion-authored prompt shown when a completed Claude turn is held open only by local shell tasks. */
+  claudeBackgroundIntervention?: {
+    runId: string;
+    tasks: string[];
+    status: 'pending' | 'stopping' | 'stopped' | 'settled' | 'error';
+    error?: string;
+  };
   /** Board-task chips shown on the user message whose turn sent those tasks to the agent. */
   linkedTasks?: Array<Pick<LinkedBoardTask, 'id' | 'title' | 'description'>>;
 };
@@ -2494,6 +2501,21 @@ export const useOrionStore = create<OrionState>()(
             ...thread,
             status: waitUnresolved ? 'idle' : thread.status,
             messages: thread.messages.map((message) => {
+              if (
+                message.kind === 'claude-background-intervention' &&
+                message.claudeBackgroundIntervention &&
+                (message.claudeBackgroundIntervention.status === 'pending' ||
+                  message.claudeBackgroundIntervention.status === 'stopping')
+              ) {
+                return {
+                  ...message,
+                  claudeBackgroundIntervention: {
+                    ...message.claudeBackgroundIntervention,
+                    status: 'settled' as const,
+                    error: undefined,
+                  },
+                };
+              }
               if (message.status === 'running') {
                 return {
                   ...message,

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, GitBranch, MessageSquare, Plus, Sparkles, SquareKanban, X, Zap } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, GitBranch, MessageSquare, Plus, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type SuggestedTask, type Thread, useOrionStore } from '../store';
 import { agentProviders } from '../agentCatalog';
@@ -619,6 +619,7 @@ export type ChatMessageProps = {
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
+  onDiscardClaudeBackgroundTasks?: (messageId: string, runId: string) => void;
 };
 
 export const ChatMessage = React.memo(function ChatMessage({
@@ -632,11 +633,59 @@ export const ChatMessage = React.memo(function ChatMessage({
   renderBtwAside,
   onAuthenticateProvider,
   authenticatingProviderId,
+  onDiscardClaudeBackgroundTasks,
 }: ChatMessageProps) {
   const attachments = message.attachments ?? [];
   const messageTasks = message.linkedTasks ?? [];
   const isAgentRun = message.role === 'agent' && message.kind === 'agent-run';
   const isRunning = isAgentRun && message.status === 'running';
+  const backgroundIntervention = message.claudeBackgroundIntervention;
+
+  if (message.kind === 'claude-background-intervention' && backgroundIntervention) {
+    const busy = backgroundIntervention.status === 'stopping';
+    const actionable =
+      backgroundIntervention.status === 'pending' ||
+      backgroundIntervention.status === 'stopping' ||
+      backgroundIntervention.status === 'error';
+    const taskCount = backgroundIntervention.tasks.length;
+    return (
+      <div className="message system claude-background-intervention">
+        <div className="claude-background-intervention-heading">
+          <Terminal size={15} />
+          <span>Orion · Background processes still running</span>
+        </div>
+        <div className="claude-background-intervention-copy">{message.content}</div>
+        <div className="claude-background-intervention-tasks">
+          {backgroundIntervention.tasks.slice(0, 3).map((task, index) => (
+            <div key={`${index}:${task}`} title={task}>{task}</div>
+          ))}
+          {taskCount > 3 && <div>+{taskCount - 3} more shell processes</div>}
+        </div>
+        {actionable && onDiscardClaudeBackgroundTasks && (
+          <button
+            type="button"
+            className="claude-background-intervention-action"
+            disabled={busy}
+            onClick={() => onDiscardClaudeBackgroundTasks(message.id, backgroundIntervention.runId)}
+          >
+            {busy ? 'Stopping background processes…' : 'Stop background processes and finish'}
+          </button>
+        )}
+        {backgroundIntervention.status === 'stopping' && (
+          <div className="claude-background-intervention-result">Stopping the remaining Claude shell processes…</div>
+        )}
+        {backgroundIntervention.status === 'stopped' && (
+          <div className="claude-background-intervention-result success">Background processes stopped. The completed response and file changes were preserved.</div>
+        )}
+        {backgroundIntervention.status === 'settled' && (
+          <div className="claude-background-intervention-result success">The background processes finished on their own.</div>
+        )}
+        {backgroundIntervention.status === 'error' && backgroundIntervention.error && (
+          <div className="claude-background-intervention-result error">{backgroundIntervention.error}</div>
+        )}
+      </div>
+    );
+  }
 
   if (isAgentRun) {
     const duration = formatRunDuration(message.startedAt, message.completedAt);
@@ -909,6 +958,7 @@ export type ChatTranscriptProps = {
   onUnlinkTask: (threadId: string, taskId: string) => void;
   onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
   onAuthenticateProvider: (providerId: string) => void;
+  onDiscardClaudeBackgroundTasks: (threadId: string, messageId: string, runId: string) => void;
   onSteerQueuedMessage: (threadId: string, queuedId: string) => void;
   /** Suggested-task card: the rift option creates a rift-backed epic when true. */
   suggestedTaskUsesRift: boolean;
@@ -954,6 +1004,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   onUnlinkTask,
   onDismissBtwExchange,
   onAuthenticateProvider,
+  onDiscardClaudeBackgroundTasks,
   onSteerQueuedMessage,
   suggestedTaskUsesRift,
   suggestedTaskCanStartRift,
@@ -1109,6 +1160,11 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     (taskId: string) => onUnlinkTask(threadId, taskId),
     [onUnlinkTask, threadId]
   );
+  const handleDiscardClaudeBackgroundTasks = useCallback(
+    (messageId: string, runId: string) =>
+      onDiscardClaudeBackgroundTasks(threadId, messageId, runId),
+    [onDiscardClaudeBackgroundTasks, threadId]
+  );
   const handleMoveTasksCard = useCallback(
     (position: { x: number; y: number }) => onMoveTasksCard(threadId, position),
     [onMoveTasksCard, threadId]
@@ -1228,13 +1284,16 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                   renderBtwAside={renderBtwAside}
                   onAuthenticateProvider={onAuthenticateProvider}
                   authenticatingProviderId={authenticatingProviderId}
+                  onDiscardClaudeBackgroundTasks={handleDiscardClaudeBackgroundTasks}
                 />
                 {message.kind !== 'agent-run' &&
                   btwAsidesByAnchor.get(message.id)?.map(renderBtwAside)}
               </React.Fragment>
             ))}
 
-            {isSending && thread.messages.at(-1)?.role !== 'agent' && (
+            {isSending &&
+              thread.messages.at(-1)?.role !== 'agent' &&
+              thread.messages.at(-1)?.kind !== 'claude-background-intervention' && (
               <div className="message agent opacity-70">Starting agent...</div>
             )}
 

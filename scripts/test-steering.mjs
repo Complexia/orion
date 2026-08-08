@@ -5,6 +5,9 @@ import {
   claudeBackgroundRunSessions,
   claudeSdkSessions,
   createClaudeTurnState,
+  discardClaudeBackgroundShellTasks,
+  discardableClaudeBackgroundShellTasks,
+  endClaudeSession,
   finalizeClaudeTurn,
   steerClaudeSdkRun,
 } from '../src/main/claude-driver.js';
@@ -121,6 +124,12 @@ assert.deepEqual(new Set(independentOrder), new Set(['left', 'right']), 'Steerin
 const createSession = ({ threadId, runId, retained = false }) => {
   const events = [];
   const pushed = [];
+  const stoppedTasks = [];
+  let interruptCount = 0;
+  let resolveEnded;
+  const endedPromise = new Promise((resolve) => {
+    resolveEnded = resolve;
+  });
   const session = {
     threadId,
     activeTurns: retained ? [] : [createClaudeTurnState(runId, { baseline: runId })],
@@ -130,11 +139,29 @@ const createSession = ({ threadId, runId, retained = false }) => {
     skipTranscriptTaskIds: new Set(),
     pendingSuggestionRunId: 'older-turn',
     pendingTaskNotifications: [],
+    pendingSteerBoundary: null,
     lastTurnEndSnapshot: { baseline: 'background' },
     resultsOwed: 1,
     ended: false,
     disposed: false,
-    query: {},
+    endedPromise,
+    resolveEnded,
+    stderrTail: '',
+    query: {
+      interrupt: async () => {
+        interruptCount += 1;
+        const interrupted = session.activeTurns[0];
+        queueMicrotask(async () => {
+          session.resultsOwed = Math.max(0, session.resultsOwed - 1);
+          await finalizeClaudeTurn(session, { subtype: 'interrupted', is_error: true });
+        });
+        return interrupted ? { still_queued: [] } : undefined;
+      },
+      stopTask: async (taskId) => {
+        stoppedTasks.push(taskId);
+        session.backgroundTasks.delete(taskId);
+      },
+    },
     sender: {
       isDestroyed: () => false,
       send: (_channel, event) => events.push(event),
@@ -144,7 +171,18 @@ const createSession = ({ threadId, runId, retained = false }) => {
       pushed.push(text);
     },
   };
-  return { session, events, pushed };
+  session.dispose = () => {
+    if (session.disposed) return;
+    session.disposed = true;
+    endClaudeSession(session, null);
+  };
+  return {
+    session,
+    events,
+    pushed,
+    stoppedTasks,
+    get interruptCount() { return interruptCount; },
+  };
 };
 
 claudeSdkSessions.clear();
@@ -152,20 +190,21 @@ claudeBackgroundRunSessions.clear();
 
 const active = createSession({ threadId: 'thread-active', runId: 'run-active' });
 claudeSdkSessions.set(active.session.threadId, active.session);
-assert.equal(steerClaudeSdkRun('run-active', 'change direction'), true);
-assert.equal(active.session.activeTurns.length, 1, 'An active steer must reuse the running result owner');
-assert.equal(active.session.resultsOwed, 1, 'A folded steer must not reserve a second SDK result');
+assert.equal(await steerClaudeSdkRun('run-active', 'change direction'), true);
+assert.equal(active.interruptCount, 1, 'An active steer must interrupt a blocking Claude loop');
+assert.equal(active.session.activeTurns.length, 1, 'An active steer must replace the interrupted owner');
+assert.equal(active.session.resultsOwed, 1, 'The continuation must own exactly one SDK result');
 assert.deepEqual(active.pushed, ['change direction']);
 assert.equal(active.session.backgroundSettleTimer, null, 'A live steer must disarm background settlement');
 assert.equal(active.session.pendingSuggestionRunId, null, 'A steer supersedes the prior suggestion owner');
-assert.equal(active.events.length, 0, 'An already tracked foreground run does not need a synthetic start');
+assert.equal(active.events.length, 0, 'The interrupted transport boundary must not settle the visible run');
 active.session.resultsOwed -= 1;
 await finalizeClaudeTurn(active.session, {
   usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2 },
 });
-assert.equal(active.session.activeTurns.length, 0, 'One folded result must fully settle the visible run');
-assert.equal(active.session.resultsOwed, 0, 'One folded result must clear all result debt');
-assert.equal(active.events.length, 1, 'The folded result must emit a terminal event');
+assert.equal(active.session.activeTurns.length, 0, 'The continuation result must settle the visible run');
+assert.equal(active.session.resultsOwed, 0, 'The continuation result must clear all result debt');
+assert.equal(active.events.length, 1, 'The continuation result must emit a terminal event');
 assert.equal(active.events[0]?.type, 'done');
 assert.deepEqual(active.events[0]?.stats, {
   totalTokens: 16,
@@ -173,6 +212,64 @@ assert.deepEqual(active.events[0]?.stats, {
   outputTokens: 4,
   cachedReadTokens: 2,
 });
+
+const failedInterrupt = createSession({
+  threadId: 'thread-interrupt-failed',
+  runId: 'run-interrupt-failed',
+});
+failedInterrupt.session.query.interrupt = async () => {
+  throw new Error('control channel unavailable');
+};
+claudeSdkSessions.set(failedInterrupt.session.threadId, failedInterrupt.session);
+assert.equal(await steerClaudeSdkRun('run-interrupt-failed', 'preserve me'), false);
+assert.equal(
+  failedInterrupt.session.pendingSteerBoundary,
+  null,
+  'A failed interrupt must restore ordinary terminal handling'
+);
+assert.equal(failedInterrupt.session.activeTurns.length, 1, 'A failed interrupt must retain its owner');
+assert.deepEqual(failedInterrupt.pushed, [], 'A failed interrupt must leave the prompt for renderer fallback');
+
+const releasedBeforeControlFailure = createSession({
+  threadId: 'thread-released-before-control-failure',
+  runId: 'run-released-before-control-failure',
+});
+releasedBeforeControlFailure.session.query.interrupt = async () => {
+  releasedBeforeControlFailure.session.resultsOwed = 0;
+  await finalizeClaudeTurn(releasedBeforeControlFailure.session, {
+    subtype: 'interrupted',
+    is_error: true,
+  });
+  throw new Error('late control failure');
+};
+claudeSdkSessions.set(
+  releasedBeforeControlFailure.session.threadId,
+  releasedBeforeControlFailure.session
+);
+assert.equal(
+  await steerClaudeSdkRun('run-released-before-control-failure', 'continue anyway'),
+  true,
+  'A released hidden boundary must continue even if the control request reports a late failure'
+);
+assert.equal(releasedBeforeControlFailure.session.activeTurns.length, 1);
+assert.equal(releasedBeforeControlFailure.session.resultsOwed, 1);
+assert.deepEqual(releasedBeforeControlFailure.pushed, ['continue anyway']);
+
+const lostHandoff = createSession({
+  threadId: 'thread-lost-handoff',
+  runId: 'run-lost-handoff',
+});
+const lostOwner = lostHandoff.session.activeTurns.shift();
+lostHandoff.session.pendingSteerBoundary = lostOwner;
+lostHandoff.session.stderrTail = '';
+claudeSdkSessions.set(lostHandoff.session.threadId, lostHandoff.session);
+endClaudeSession(lostHandoff.session, new Error('session exited after interrupt'));
+assert.ok(
+  lostHandoff.events.some(
+    (event) => event.runId === 'run-lost-handoff' && event.type === 'error'
+  ),
+  'A session lost after the hidden boundary must still settle the visible run'
+);
 
 const retained = createSession({
   threadId: 'thread-retained',
@@ -182,7 +279,7 @@ const retained = createSession({
 retained.session.resultsOwed = 0;
 claudeSdkSessions.set(retained.session.threadId, retained.session);
 claudeBackgroundRunSessions.set('run-retained', retained.session);
-assert.equal(steerClaudeSdkRun('run-retained', 'follow up'), true);
+assert.equal(await steerClaudeSdkRun('run-retained', 'follow up'), true);
 assert.equal(retained.session.backgroundRunId, null, 'Steering must consume the retained background handle');
 assert.equal(
   claudeBackgroundRunSessions.has('run-retained'),
@@ -195,13 +292,51 @@ assert.equal(retained.session.resultsOwed, 1);
 assert.equal(retained.events[0]?.type, 'started', 'The renderer must receive an owner for retained-run output');
 assert.equal(retained.events[0]?.runId, 'run-retained');
 
+const shellOnly = createSession({
+  threadId: 'thread-shell-only',
+  runId: 'run-shell-only',
+  retained: true,
+});
+shellOnly.session.resultsOwed = 0;
+shellOnly.session.backgroundTasks = new Map([
+  ['bash-1', { taskType: 'local_bash', description: '20 minute idle wait' }],
+  ['bash-2', { taskType: 'local_bash', description: 'monitor controls.mjs' }],
+]);
+claudeSdkSessions.set(shellOnly.session.threadId, shellOnly.session);
+claudeBackgroundRunSessions.set('run-shell-only', shellOnly.session);
+assert.deepEqual(
+  discardableClaudeBackgroundShellTasks(shellOnly.session).map((task) => task.taskId),
+  ['bash-1', 'bash-2'],
+  'A completed Claude turn may offer an intervention when every live task is local_bash'
+);
+assert.equal((await discardClaudeBackgroundShellTasks('run-shell-only')).ok, true);
+assert.deepEqual(shellOnly.stoppedTasks, ['bash-1', 'bash-2']);
+assert.equal(shellOnly.session.ended, true, 'Discarding shell-only work must settle the Claude runtime');
+
+const mixedBackground = createSession({
+  threadId: 'thread-mixed-background',
+  runId: 'run-mixed-background',
+  retained: true,
+});
+mixedBackground.session.resultsOwed = 0;
+mixedBackground.session.backgroundTasks = new Map([
+  ['bash-3', { taskType: 'local_bash', description: 'idle wait' }],
+  ['agent-1', { taskType: 'agent', description: 'useful implementation subagent' }],
+]);
+claudeSdkSessions.set(mixedBackground.session.threadId, mixedBackground.session);
+claudeBackgroundRunSessions.set('run-mixed-background', mixedBackground.session);
+assert.deepEqual(discardableClaudeBackgroundShellTasks(mixedBackground.session), []);
+const mixedDiscard = await discardClaudeBackgroundShellTasks('run-mixed-background');
+assert.equal(mixedDiscard.ok, false, 'The shell discard must refuse mixed useful background work');
+assert.deepEqual(mixedBackground.stoppedTasks, []);
+
 assert.match(
   claudeDriverSource,
-  /if \(activeOwner\) \{[\s\S]*pushUserMessage\(text, \{ expectResult: false \}\)[\s\S]*return true;/,
-  'An active steer must push into the current result boundary without adding a continuation owner'
+  /if \(activeOwner\) \{[\s\S]*session\.query\.interrupt\(\)[\s\S]*createClaudeTurnState\(runId[\s\S]*session\.pushUserMessage\(text\)[\s\S]*return true;/,
+  'An active steer must interrupt the blocked loop before pushing its continuation'
 );
 
-for (const { session } of [active, retained]) {
+for (const { session } of [active, retained, mixedBackground]) {
   if (session.backgroundSettleTimer) clearTimeout(session.backgroundSettleTimer);
 }
 claudeSdkSessions.clear();

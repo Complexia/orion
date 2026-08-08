@@ -528,10 +528,31 @@ export const flushPendingClaudeTaskNotifications = (session, turn) => {
 // housekeeping) never hold the thread open. A task that never exits (a dev
 // server left running) keeps the thread waiting indefinitely; the caption in
 // the renderer names the task so the user can tell, and Stop settles it.
+const liveClaudeBackgroundTasks = (session) =>
+  [...session.backgroundTasks.entries()].filter(
+    ([taskId]) => !session.skipTranscriptTaskIds.has(taskId)
+  );
+
 export const pendingClaudeBackgroundTasks = (session) =>
-  [...session.backgroundTasks.entries()]
-    .filter(([taskId]) => !session.skipTranscriptTaskIds.has(taskId))
-    .map(([, task]) => task.description);
+  liveClaudeBackgroundTasks(session).map(([, task]) => task.description);
+
+// Claude Code reports backgrounded Bash commands as local_bash. Keep this
+// deliberately narrow: the interactive discard action must never terminate a
+// subagent or workflow just because a shell command happens to be live too.
+const CLAUDE_BACKGROUND_SHELL_TASK_TYPES = new Set(['local_bash', 'bash', 'shell']);
+export const discardableClaudeBackgroundShellTasks = (session) => {
+  const liveTasks = liveClaudeBackgroundTasks(session);
+  if (
+    liveTasks.length === 0 ||
+    liveTasks.some(([, task]) => !CLAUDE_BACKGROUND_SHELL_TASK_TYPES.has(task.taskType))
+  ) {
+    return [];
+  }
+  return liveTasks.map(([taskId, task]) => ({
+    taskId,
+    description: task.description,
+  }));
+};
 
 // A thread left "working" by a done event that carried pending background
 // tasks normally settles when a finished task's notification re-invokes the
@@ -568,6 +589,18 @@ export const updateClaudeBackgroundSettle = (session) => {
 export const finalizeClaudeTurn = async (session, resultMessage) => {
   const turn = session.activeTurns.shift();
   if (!turn) return;
+  // Steering interrupts the current Claude loop so a user instruction can
+  // take effect immediately, even while the model is blocked in a long tool
+  // call. That interrupted result is only a transport boundary: the visible
+  // Orion run continues with the same run id, so do not emit a terminal event
+  // that would clear the renderer's owner before the continuation is pushed.
+  if (session.pendingSteerBoundary === turn) {
+    session.pendingSuggestionRunId = null;
+    finishClaudeTurnReasoning(session, turn);
+    turn.resolveSteerBoundary?.(true);
+    turn.resolveSteerBoundary = null;
+    return;
+  }
   const continuesSameRun = session.activeTurns.some((activeTurn) => activeTurn.runId === turn.runId);
   // prompt_suggestion is emitted after this result, when the turn is no
   // longer in activeTurns. Retain the exact owner so the renderer can reject
@@ -619,6 +652,9 @@ export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
   // names what it's waiting on instead of flipping to Finished between turns.
   // The harness re-invokes the model (a synthetic turn) when each settles.
   const pendingBackgroundTasks = resultIsError ? [] : pendingClaudeBackgroundTasks(session);
+  const pendingBackgroundShellTasks = resultIsError
+    ? []
+    : discardableClaudeBackgroundShellTasks(session).map((task) => task.description);
   if (pendingBackgroundTasks.length > 0) {
     retainClaudeBackgroundRun(session, turn.runId);
   } else {
@@ -641,6 +677,8 @@ export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
     ...(stats ? { stats } : {}),
     ...(errorText ? { error: errorText } : {}),
     ...(pendingBackgroundTasks.length > 0 ? { pendingBackgroundTasks } : {}),
+    ...(pendingBackgroundShellTasks.length > 0 ? { pendingBackgroundShellTasks } : {}),
+    providerId: 'claude',
   });
 };
 
@@ -1080,6 +1118,10 @@ export const endClaudeSession = (session, error) => {
     claudeSdkSessions.delete(session.threadId);
   }
 
+  const interruptedSteer = session.pendingSteerBoundary;
+  session.pendingSteerBoundary = null;
+  interruptedSteer?.resolveSteerBoundary?.(false);
+  if (interruptedSteer) interruptedSteer.resolveSteerBoundary = null;
   const pendingTurns = session.activeTurns.splice(0);
 
   // The stored session may be gone (harness cache cleared, expired, or a CLI
@@ -1134,6 +1176,28 @@ export const endClaudeSession = (session, error) => {
       // Lets the renderer offer the Authenticate button when the failure text
       // reads as a logged-out CLI (e.g. "OAuth session expired").
       ...(session.disposed ? {} : { providerId: 'claude' }),
+    });
+  }
+
+  // The interrupted boundary may already have been shifted and deliberately
+  // hidden while steerClaudeSdkRun was preparing its continuation. If the
+  // harness dies in that narrow gap, give the renderer a terminal event so
+  // it can dispatch the steer's queued fallback instead of retaining a run
+  // that can no longer produce output.
+  if (interruptedSteer && !pendingTurns.includes(interruptedSteer)) {
+    const errorText =
+      !session.disposed && error
+        ? [error.message ?? 'Claude session ended unexpectedly.', session.stderrTail.trim()]
+            .filter(Boolean)
+            .join('\n')
+        : null;
+    emitAgentEvent(session.sender, {
+      runId: interruptedSteer.runId,
+      threadId: session.threadId,
+      type: errorText ? 'error' : 'done',
+      exitCode: errorText ? 1 : 0,
+      changedFiles: [],
+      ...(errorText ? { error: errorText, providerId: 'claude' } : {}),
     });
   }
 
@@ -1197,9 +1261,14 @@ export const createClaudeSdkSession = ({
     // Task notifications that arrived while no turn was active; flushed as
     // activities into the next turn that opens.
     pendingTaskNotifications: [],
-    // How many `result` messages the CLI still owes (one per pushed user turn,
-    // except a steer folded into an already active turn, and per harness-
-    // initiated synthetic turn). When this hits zero, any turn still queued
+    // Exact foreground owner whose interrupted result is a hidden steering
+    // boundary. Cleared as soon as its continuation is reserved, or by
+    // session teardown so a lost handoff still settles the renderer.
+    pendingSteerBoundary: null,
+    // How many `result` messages the CLI still owes (one per pushed user turn
+    // and per harness-initiated synthetic turn). A steer first consumes the
+    // interrupted turn's result, then reserves one for its continuation. When
+    // this hits zero, any turn still queued
     // can never finalize on its own — see
     // interruptClaudeSdkRun, which uses it to recover instead of interrupting.
     resultsOwed: 0,
@@ -1438,15 +1507,19 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
   return { ok: true, runId };
 };
 
-// Proper steering (Claude Code semantics): push the instruction into the
-// live session's input stream WITHOUT interrupting anything. During an active
-// turn Claude folds the queued instruction into that turn and emits one result
-// for the combined work, so the existing owner and result debt must be reused.
-// With only a retained background handle, there is no active owner to fold
-// into: open one and use normal result accounting. Returns false when no live
-// session holds the run — the caller falls back to queueing the message for
-// end-of-turn dispatch.
-export const steerClaudeSdkRun = (runId, text) => {
+// Steering must redirect a live run immediately. Streaming a second user
+// message alone is insufficient: Claude does not consume that input while a
+// blocking tool call (notably a delegated Orion subagent) is in flight, which
+// leaves the renderer's split continuation bubble waiting indefinitely. End
+// the current loop through the SDK control channel, suppress that intermediate
+// result boundary, then push the instruction as a continuation owned by the
+// same Orion run id.
+//
+// With only a retained background handle there is no foreground loop to
+// interrupt, so open one and use normal result accounting. Returns false when
+// the run/session disappears or an interrupt cannot be completed promptly;
+// the renderer then preserves the message as an ordinary queued follow-up.
+export const steerClaudeSdkRun = async (runId, text) => {
   for (const session of claudeSdkSessions.values()) {
     const activeOwner = session.activeTurns.find((turn) => turn.runId === runId);
     const retainedOwner = session.backgroundRunId === runId;
@@ -1455,11 +1528,70 @@ export const steerClaudeSdkRun = (runId, text) => {
     if (session.ended || session.disposed || !session.query) return false;
     session.pendingSuggestionRunId = null;
     if (activeOwner) {
-      // This push is part of the result already owed by activeOwner. If the
-      // CLI has crossed the result boundary before it consumes the input, its
-      // next assistant event opens a synthetic turn and accounts for that
-      // observed result in handleClaudeSessionMessage.
-      session.pushUserMessage(text, { expectResult: false });
+      let resolveSteerBoundary;
+      const steerBoundary = new Promise((resolve) => {
+        resolveSteerBoundary = resolve;
+      });
+      activeOwner.resolveSteerBoundary = resolveSteerBoundary;
+      session.pendingSteerBoundary = activeOwner;
+      try {
+        await Promise.race([
+          session.query.interrupt(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Claude steer interrupt timed out.')), 3000)
+          ),
+        ]);
+      } catch {
+        // A natural result can release the owner while the control request is
+        // failing or timing out. In that case the hidden boundary already
+        // committed and must continue; only fall back while the exact owner
+        // is still live, which is a synchronous/atomic check here.
+        if (session.activeTurns.includes(activeOwner)) {
+          if (session.pendingSteerBoundary === activeOwner) {
+            session.pendingSteerBoundary = null;
+          }
+          activeOwner.resolveSteerBoundary = null;
+          return false;
+        }
+      }
+
+      // The control response can arrive before the interrupted `result` that
+      // releases the FIFO owner. The explicit settlement signal makes the
+      // timeout atomic with finalize/teardown; polling the array left a race
+      // where finalize could suppress the boundary just after a timeout had
+      // decided to fall back.
+      const boundaryReleased = await Promise.race([
+        steerBoundary,
+        new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
+      ]);
+      if (
+        boundaryReleased !== true ||
+        session.ended ||
+        session.disposed ||
+        claudeSdkSessions.get(session.threadId) !== session
+      ) {
+        // Let a late result settle normally if the interrupt acknowledgement
+        // did not produce a boundary. The renderer will queue the steer, so
+        // no instruction is lost and no empty continuation bubble is opened.
+        if (session.pendingSteerBoundary === activeOwner) {
+          session.pendingSteerBoundary = null;
+        }
+        activeOwner.resolveSteerBoundary = null;
+        return false;
+      }
+
+      const continuation = createClaudeTurnState(runId, activeOwner.snapshot);
+      // Changed-file attribution spans both halves of the visible run. Carry
+      // explicit tool writes forward because the intermediate boundary was
+      // intentionally hidden from the renderer.
+      for (const filePath of activeOwner.toolWrittenPaths) {
+        continuation.toolWrittenPaths.add(filePath);
+      }
+      session.pendingSteerBoundary = null;
+      session.activeTurns.push(continuation);
+      updateClaudeBackgroundSettle(session);
+      flushPendingClaudeTaskNotifications(session, continuation);
+      session.pushUserMessage(text);
       return true;
     }
     clearClaudeBackgroundRun(session);
@@ -1481,6 +1613,60 @@ export const steerClaudeSdkRun = (runId, text) => {
     return true;
   }
   return false;
+};
+
+// The renderer offers this only after a Claude turn has produced its final
+// response while every remaining task is a background shell. Recheck that
+// invariant here at click time: task membership may have changed while the
+// intervention card was visible, and useful subagents/workflows must never be
+// discarded by this narrow action.
+export const discardClaudeBackgroundShellTasks = async (runId) => {
+  const session = claudeBackgroundRunSessions.get(runId);
+  if (!session || session.ended || session.disposed) {
+    return { ok: true, alreadySettled: true, tasks: [] };
+  }
+  if (session.activeTurns.length > 0) {
+    return {
+      ok: false,
+      error: 'Claude has resumed foreground work, so Orion left its background tasks alone.',
+    };
+  }
+  const shellTasks = discardableClaudeBackgroundShellTasks(session);
+  if (shellTasks.length === 0) {
+    if (pendingClaudeBackgroundTasks(session).length === 0) {
+      return { ok: true, alreadySettled: true, tasks: [] };
+    }
+    return {
+      ok: false,
+      error: 'Claude is now waiting on non-shell work, so Orion did not discard it.',
+    };
+  }
+
+  // Ask Claude Code to stop each exact task first so it can tear down the
+  // child process cleanly. Then dispose the now-shell-only persistent runtime
+  // to prevent task notifications from starting a synthetic follow-up turn;
+  // the next user prompt can still resume from the stored Claude session id.
+  if (typeof session.query?.stopTask === 'function') {
+    await Promise.allSettled(
+      shellTasks.map(({ taskId }) =>
+        Promise.race([
+          session.query.stopTask(taskId),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ])
+      )
+    );
+  }
+  try {
+    await disposeClaudeSdkSessionAndWait(session.threadId);
+  } catch {
+    // The bounded teardown force-closes and finalizes a wedged query before it
+    // throws, so the requested shell discard has still completed locally.
+  }
+  return {
+    ok: true,
+    alreadySettled: false,
+    tasks: shellTasks.map((task) => task.description),
+  };
 };
 
 export const interruptClaudeSdkRun = async (runId, { terminateBackground = false } = {}) => {

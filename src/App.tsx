@@ -4098,6 +4098,23 @@ const App: React.FC = () => {
         if (retainedRunId) clearActiveRun(retainedRunId);
         const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
         if (!thread || thread.status !== 'running') return;
+        for (const message of thread.messages) {
+          const intervention = message.claudeBackgroundIntervention;
+          if (
+            message.kind !== 'claude-background-intervention' ||
+            !intervention ||
+            (intervention.status !== 'pending' && intervention.status !== 'stopping')
+          ) {
+            continue;
+          }
+          updateThreadMessage(thread.id, message.id, {
+            claudeBackgroundIntervention: {
+              ...intervention,
+              status: intervention.status === 'stopping' ? 'stopped' : 'settled',
+              error: undefined,
+            },
+          });
+        }
         const lastRun = [...thread.messages].reverse().find((m) => m.kind === 'agent-run');
         updateThread(event.threadId, { status: 'done' });
         notifyThreadFinished(event.threadId, 'done');
@@ -4280,6 +4297,21 @@ const App: React.FC = () => {
         if (event.type === 'started' && event.background) {
           const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
           if (!thread) return;
+          for (const message of thread.messages) {
+            const intervention = message.claudeBackgroundIntervention;
+            if (
+              message.kind === 'claude-background-intervention' &&
+              intervention?.status === 'pending'
+            ) {
+              updateThreadMessage(thread.id, message.id, {
+                claudeBackgroundIntervention: {
+                  ...intervention,
+                  status: 'settled',
+                  error: undefined,
+                },
+              });
+            }
+          }
           const backgroundModelId =
             dispatchedModelIdForProvider(thread, 'claude') ??
             agentModelsRef.current.find(
@@ -4369,6 +4401,7 @@ const App: React.FC = () => {
         // re-invoking.
         const waitingOn = event.pendingBackgroundTasks ?? [];
         const waiting = waitingOn.length > 0;
+        const discardableShellTasks = event.pendingBackgroundShellTasks ?? [];
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'done',
           completedAt: new Date().toISOString(),
@@ -4378,6 +4411,19 @@ const App: React.FC = () => {
         });
         if (waiting) {
           updateThread(tracked.threadId, { status: 'running' });
+          if (discardableShellTasks.length > 0) {
+            const count = discardableShellTasks.length;
+            addMessageToThread(tracked.threadId, {
+              role: 'system',
+              kind: 'claude-background-intervention',
+              content: `Claude finished its response, but ${count === 1 ? 'a background shell process is' : `${count} background shell processes are`} still running. Orion will keep waiting so useful work is not discarded automatically. If ${count === 1 ? 'this is' : 'these are'} only a leftover wait, monitor, or dev server, you can stop ${count === 1 ? 'it' : 'them'} and finish the thread.`,
+              claudeBackgroundIntervention: {
+                runId: event.runId,
+                tasks: discardableShellTasks,
+                status: 'pending',
+              },
+            });
+          }
           // The thread stays 'running', so the count-based tree refresh
           // can't see this turn's completion — tick it explicitly so the
           // files the foreground turn wrote surface in the Code tree.
@@ -9041,12 +9087,10 @@ const App: React.FC = () => {
     setAccessModeOpen(false);
   };
 
-  // Steering = deliver a follow-up into the run in flight WITHOUT
-  // interrupting it — the same behavior as typing while Claude Code works.
-  // The claude session folds a mid-turn user message into the running turn
-  // at its next loop boundary, so nothing in flight is lost; providers
-  // without a live mid-turn channel don't support steer (their follow-ups
-  // queue and dispatch when the current turn ends).
+  // Steering = redirect the run in flight immediately. Main interrupts the
+  // current Claude loop, hides that transport-only result boundary, and
+  // continues under the same visible run id. If the interrupt cannot land,
+  // the message falls back to the ordinary end-of-turn queue.
   // Optional chain: 'orion' has no follow-up-support entry (steering an
   // orchestrated thread would bypass the driver resolution), so treat it as
   // unsupported instead of crashing mid-run.
@@ -9448,6 +9492,86 @@ const App: React.FC = () => {
       restoreRootQueueToComposer: true,
     });
   };
+
+  const discardClaudeBackgroundTasks = useCallback(
+    async (threadId: string, messageId: string, runId: string) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const message = thread?.messages.find((candidate) => candidate.id === messageId);
+      const intervention = message?.claudeBackgroundIntervention;
+      if (!thread || !message || !intervention || intervention.runId !== runId) return;
+
+      updateThreadMessage(threadId, messageId, {
+        claudeBackgroundIntervention: {
+          ...intervention,
+          status: 'stopping',
+          error: undefined,
+        },
+      });
+
+      let result:
+        | { ok: boolean; alreadySettled?: boolean; tasks?: string[]; error?: string }
+        | undefined;
+      try {
+        result = await window.orion?.discardClaudeBackgroundShellTasks?.(runId);
+      } catch (error) {
+        result = {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Orion could not stop the background processes.',
+        };
+      }
+
+      const currentThread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const currentMessage = currentThread?.messages.find((candidate) => candidate.id === messageId);
+      const currentIntervention = currentMessage?.claudeBackgroundIntervention;
+      if (!currentIntervention || currentIntervention.runId !== runId) return;
+
+      if (!result?.ok) {
+        updateThreadMessage(threadId, messageId, {
+          claudeBackgroundIntervention: {
+            ...currentIntervention,
+            status: 'error',
+            error: result?.error ?? 'Orion could not stop the background processes.',
+          },
+        });
+        return;
+      }
+
+      updateThreadMessage(threadId, messageId, {
+        claudeBackgroundIntervention: {
+          ...currentIntervention,
+          status: result.alreadySettled ? 'settled' : 'stopped',
+          error: undefined,
+        },
+      });
+      const currentRunId = activeRunsByThreadRef.current[threadId];
+      // A newer foreground turn may have taken ownership while this click was
+      // in flight. Resolve the historical card, but never finish that newer
+      // work or clear its run mapping.
+      if (currentRunId && currentRunId !== runId) return;
+      if (currentRunId === runId) clearActiveRun(runId);
+      const freshThread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      if (freshThread?.status === 'running') {
+        const lastRun = [...freshThread.messages].reverse().find((candidate) => candidate.kind === 'agent-run');
+        updateThread(threadId, { status: 'done' });
+        notifyThreadFinished(threadId, 'done');
+        pushLinkedTaskStatus(threadId, 'finished', lastRun?.content.trim() || undefined);
+        if (lastRun?.status === 'done') {
+          updateThreadMessage(threadId, lastRun.id, {
+            statusText: result.alreadySettled
+              ? 'Finished.'
+              : 'Finished — background shell processes stopped by user.',
+          });
+        }
+      }
+    },
+    [
+      clearActiveRun,
+      notifyThreadFinished,
+      pushLinkedTaskStatus,
+      updateThread,
+      updateThreadMessage,
+    ]
+  );
 
   // Remote runTurn/stopTurn commands from paired controllers (host side of
   // remote control). Executed exactly like local user actions so this
@@ -12550,6 +12674,7 @@ const App: React.FC = () => {
                               onUnlinkTask={unlinkTaskFromThread}
                               onDismissBtwExchange={dismissBtwExchange}
                               onAuthenticateProvider={handleAuthenticateProvider}
+                              onDiscardClaudeBackgroundTasks={discardClaudeBackgroundTasks}
                               onSteerQueuedMessage={steerQueuedMessage}
                               suggestedTaskUsesRift={riftsActive && riftsSettings.autoCreateForEpics}
                               suggestedTaskCanStartRift={epicsEnabled}

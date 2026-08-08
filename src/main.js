@@ -33,7 +33,7 @@ import {
   pushRepo,
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
-import { claudeSdkSessions, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
+import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
@@ -6601,13 +6601,20 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
   }
 });
 
-// Steer = deliver a follow-up into the run in flight without interrupting
-// it. Only providers with a live mid-turn input channel support this (claude's
-// persistent SDK session); false tells the renderer to queue the message for
-// end-of-turn dispatch instead. Never kills a process.
+// Steer = interrupt Claude's current loop and immediately continue the same
+// visible run with a new instruction. A plain streamed user message cannot be
+// consumed while Claude is blocked in a long tool call. False tells the
+// renderer to preserve the message as an ordinary end-of-turn follow-up.
 ipcMain.handle('agent:steerTurn', (_event, runId, text) => {
   if (typeof runId !== 'string' || typeof text !== 'string' || !text) return false;
   return steerClaudeSdkRun(runId, text);
+});
+
+ipcMain.handle('agent:discardClaudeBackgroundShellTasks', (_event, runId) => {
+  if (typeof runId !== 'string' || !runId) {
+    return { ok: false, error: 'A Claude run id is required.' };
+  }
+  return discardClaudeBackgroundShellTasks(runId);
 });
 
 ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {

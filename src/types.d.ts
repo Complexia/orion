@@ -1129,6 +1129,13 @@ type OrionComputerUsePermissions = {
        * this run — queue the message for end-of-turn dispatch instead.
        */
       steerAgentTurn?: (runId: string, text: string) => Promise<boolean>;
+      /** Stop only a completed Claude turn's remaining local shell tasks and settle its runtime. */
+      discardClaudeBackgroundShellTasks?: (runId: string) => Promise<{
+        ok: boolean;
+        alreadySettled?: boolean;
+        tasks?: string[];
+        error?: string;
+      }>;
       stopAgentTurn: (
         runId: string,
         /** terminateBackground: also dispose the thread's persistent claude session (kills background subagents). */
@@ -1237,6 +1244,8 @@ type OrionComputerUsePermissions = {
         subagentId?: string;
         /** done events only: descriptions of background tasks (subagents, workflows, backgrounded shell commands) still running when the turn ended — the thread stays in the working state until they settle. */
         pendingBackgroundTasks?: string[];
+        /** Claude done events only: present when every pending task is a local shell process that the user may safely discard. */
+        pendingBackgroundShellTasks?: string[];
         chunk?: string;
         exitCode?: number | null;
         error?: string;

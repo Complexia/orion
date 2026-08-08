@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { epicHasActionableCommitWork } from '../src/app/epicGit.ts';
 
-const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const [appSource, chatSource, mainSource, preloadSource] = await Promise.all([
+  readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
+  readFile(new URL('../src/app/chat.tsx', import.meta.url), 'utf8'),
+  readFile(new URL('../src/main.js', import.meta.url), 'utf8'),
+  readFile(new URL('../src/preload.js', import.meta.url), 'utf8'),
+]);
 
 const section = (source, start, end) => {
   const startIndex = source.indexOf(start);
@@ -59,6 +64,27 @@ assert.doesNotMatch(
   backgroundSettled,
   /completeInProgressPlanEntries/,
   'failed or killed background work must leave its in-progress plan entry halted'
+);
+
+assert.match(
+  appSource,
+  /pendingBackgroundShellTasks[\s\S]*kind: 'claude-background-intervention'[\s\S]*status: 'pending'/,
+  'A completed Claude response with only shell work left must append an Orion intervention message'
+);
+assert.match(
+  chatSource,
+  /Stop background processes and finish[\s\S]*onDiscardClaudeBackgroundTasks/,
+  'The intervention must expose an explicit user action in the transcript'
+);
+assert.match(
+  mainSource,
+  /agent:discardClaudeBackgroundShellTasks/,
+  'The renderer action must have a dedicated Claude-only IPC route'
+);
+assert.match(
+  preloadSource,
+  /discardClaudeBackgroundShellTasks/,
+  'The Claude shell-discard action must be exposed through the preload boundary'
 );
 
 const epicActions = section(
