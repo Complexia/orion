@@ -1235,7 +1235,7 @@ type OrionComputerUsePermissions = {
         };
         /** subagent-chunk / subagent-activity events: which subagent the payload belongs to. */
         subagentId?: string;
-        /** done events only: background subagents/workflows still running when the turn ended — the thread stays in the working state until they settle. */
+        /** done events only: descriptions of background tasks (subagents, workflows, backgrounded shell commands) still running when the turn ended — the thread stays in the working state until they settle. */
         pendingBackgroundTasks?: string[];
         chunk?: string;
         exitCode?: number | null;

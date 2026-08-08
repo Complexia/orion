@@ -644,6 +644,19 @@ const CHAT_MENTION_THREAD_PAGE = 20;
 // last activity (i.e. when they finished) — or by when they were unpinned, so
 // a just-unpinned thread surfaces at the top instead of sinking back to its
 // old chronological spot.
+// Caption for a turn that ended while the harness still owns live background
+// tasks (subagents, workflows, backgrounded shell commands). Task descriptions
+// come from the driver's done event; naming them lets the user tell a genuine
+// wait from e.g. a dev server that will never exit. The store's restart
+// migration matches this caption by pattern — keep the two in sync.
+const waitingOnBackgroundStatusText = (tasks: string[]): string => {
+  const clip = (text: string) => (text.length > 80 ? `${text.slice(0, 79)}…` : text);
+  if (tasks.length === 1) return `Waiting on background task: ${clip(tasks[0])}…`;
+  const shown = tasks.slice(0, 2).map(clip).join(', ');
+  const more = tasks.length - 2;
+  return `Waiting on ${tasks.length} background tasks: ${shown}${more > 0 ? ` (+${more} more)` : ''}…`;
+};
+
 const compareRecentThreadOrder = (a: Thread, b: Thread) => {
   const aRunning = a.status === 'running';
   const bRunning = b.status === 'running';
@@ -688,6 +701,8 @@ const App: React.FC = () => {
     setRemoteControlSettings,
     deploymentSettings,
     setDeploymentSettings,
+    suggestedTasksSettings,
+    setSuggestedTasksSettings,
     addProject,
     removeProject,
     renameProject,
@@ -760,6 +775,8 @@ const App: React.FC = () => {
       setRemoteControlSettings: state.setRemoteControlSettings,
       deploymentSettings: state.deploymentSettings,
       setDeploymentSettings: state.setDeploymentSettings,
+      suggestedTasksSettings: state.suggestedTasksSettings,
+      setSuggestedTasksSettings: state.setSuggestedTasksSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
@@ -3993,6 +4010,7 @@ const App: React.FC = () => {
       if (event.type === 'suggestion') {
         if (
           !event.suggestion ||
+          !useOrionStore.getState().suggestedTasksSettings.enabled ||
           latestTurnRunIdsRef.current.get(event.threadId) !== event.runId
         ) {
           return;
@@ -4291,19 +4309,19 @@ const App: React.FC = () => {
 
       if (event.type === 'done') {
         flushChunkBuffers();
-        // Background subagents/workflows the model is still waiting on: the
-        // turn is over, but the task isn't. Keep the thread in the working
-        // state — the harness re-invokes the model (a `started {background}`
-        // turn) when each task settles, and a `background-settled` event
-        // covers tasks that die without re-invoking.
+        // Background tasks the model is still waiting on (subagents,
+        // workflows, backgrounded shell commands): the turn is over, but the
+        // task isn't. Keep the thread in the working state and name what it's
+        // waiting on — the harness re-invokes the model (a `started
+        // {background}` turn) when each task settles, and a
+        // `background-settled` event covers tasks that die without
+        // re-invoking.
         const waitingOn = event.pendingBackgroundTasks ?? [];
         const waiting = waitingOn.length > 0;
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'done',
           completedAt: new Date().toISOString(),
-          statusText: waiting
-            ? `Waiting on ${waitingOn.length} background ${waitingOn.length === 1 ? 'agent' : 'agents'}…`
-            : 'Finished.',
+          statusText: waiting ? waitingOnBackgroundStatusText(waitingOn) : 'Finished.',
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
         });
@@ -9866,6 +9884,8 @@ const App: React.FC = () => {
     setRemoteControlSettings,
     deploymentSettings,
     setDeploymentSettings,
+    suggestedTasksSettings,
+    setSuggestedTasksSettings,
     resolvedDeploymentModel,
     resolvedDeploymentModelId,
     cloudApp,

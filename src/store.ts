@@ -160,6 +160,23 @@ export const defaultDeploymentSettings: DeploymentSettings = {
   preferAgentDeploys: false,
 };
 
+/**
+ * The suggested-task card: the Claude harness's predicted next prompt for a
+ * thread, surfaced after each turn (promptSuggestions in claude-driver.js).
+ */
+export type SuggestedTasksSettings = {
+  /**
+   * Master switch. Off drops incoming suggestions before they reach a thread
+   * — no card, and no detailed-prompt fork run — and hides any card already
+   * showing.
+   */
+  enabled: boolean;
+};
+
+export const defaultSuggestedTasksSettings: SuggestedTasksSettings = {
+  enabled: true,
+};
+
 /** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */
 export type RiftsSettings = {
   /** Master switch for the experimental Rifts integration. */
@@ -712,6 +729,7 @@ interface OrionState {
   workspaceSyncSettings: WorkspaceSyncSettings;
   remoteControlSettings: RemoteControlSettings;
   deploymentSettings: DeploymentSettings;
+  suggestedTasksSettings: SuggestedTasksSettings;
 
   // Code tab workspace
   workspacePath: string | null;
@@ -762,6 +780,7 @@ interface OrionState {
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
+  setSuggestedTasksSettings: (updates: Partial<SuggestedTasksSettings>) => void;
 
   createThread: (
     projectId: string,
@@ -1348,6 +1367,7 @@ export const useOrionStore = create<OrionState>()(
       workspaceSyncSettings: defaultWorkspaceSyncSettings,
       remoteControlSettings: defaultRemoteControlSettings,
       deploymentSettings: defaultDeploymentSettings,
+      suggestedTasksSettings: defaultSuggestedTasksSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -1703,6 +1723,15 @@ export const useOrionStore = create<OrionState>()(
           riftsSettings: {
             ...defaultRiftsSettings,
             ...state.riftsSettings,
+            ...updates,
+          },
+        })),
+
+      setSuggestedTasksSettings: (updates) =>
+        set((state) => ({
+          suggestedTasksSettings: {
+            ...defaultSuggestedTasksSettings,
+            ...state.suggestedTasksSettings,
             ...updates,
           },
         })),
@@ -2352,6 +2381,10 @@ export const useOrionStore = create<OrionState>()(
           ...defaultDeploymentSettings,
           ...state.deploymentSettings,
         },
+        suggestedTasksSettings: {
+          ...defaultSuggestedTasksSettings,
+          ...state.suggestedTasksSettings,
+        },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
         providerSettings: {
@@ -2407,16 +2440,19 @@ export const useOrionStore = create<OrionState>()(
         // status bar forever, because the run-event handler only flips
         // messages tracked by runs started in this session.
         const restartedAt = new Date().toISOString();
-        // A Claude turn can finish while its background agents keep working:
-        // the message persists as 'done' captioned "Waiting on N background
-        // agents…" (the done handler in App.tsx) with the thread 'running'.
-        // Those agents died with the app, so the wait can never settle —
-        // rewrite the caption alongside the status flip. Only while the
-        // thread is still 'running', though: every resolution path (a
-        // background-settled event or the synthetic follow-up turn finishing)
-        // flips the thread off 'running' but leaves the old caption behind as
-        // history, and history must not be rebranded as a restart casualty.
-        const waitingOnBackground = /^Waiting on \d+ background agents?…$/;
+        // A Claude turn can finish while its background tasks keep working:
+        // the message persists as 'done' captioned "Waiting on … background
+        // task(s) …" (waitingOnBackgroundStatusText in App.tsx — keep this
+        // pattern in sync) with the thread 'running'. Those tasks died with
+        // the app, so the wait can never settle — rewrite the caption
+        // alongside the status flip. Only while the thread is still
+        // 'running', though: every resolution path (a background-settled
+        // event or the synthetic follow-up turn finishing) flips the thread
+        // off 'running' but leaves the old caption behind as history, and
+        // history must not be rebranded as a restart casualty. The first
+        // alternation matches captions persisted by older builds ("Waiting on
+        // N background agents…").
+        const waitingOnBackground = /^Waiting on (\d+ background (?:agents?|tasks?)|background task)\b.*…$/;
         merged.threads = merged.threads.map((thread) => {
           // Threads used to carry a single board task; they now carry a list.
           thread = migrateLegacyLinkedTask(thread);
@@ -2458,7 +2494,7 @@ export const useOrionStore = create<OrionState>()(
               if (message.id === liveWaitId) {
                 return {
                   ...message,
-                  statusText: 'Background agents interrupted by app restart.',
+                  statusText: 'Background tasks interrupted by app restart.',
                 };
               }
               return message;

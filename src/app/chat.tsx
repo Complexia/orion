@@ -964,10 +964,11 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   onStartSuggestedTask,
   onDismissSuggestedTask,
 }: ChatTranscriptProps) {
-  const { thread, removeQueuedThreadMessage } = useOrionStore(
+  const { thread, removeQueuedThreadMessage, suggestedTasksEnabled } = useOrionStore(
     useShallow((state) => ({
       thread: state.threads.find((candidate) => candidate.id === threadId),
       removeQueuedThreadMessage: state.removeQueuedThreadMessage,
+      suggestedTasksEnabled: state.suggestedTasksSettings.enabled,
     }))
   );
   const latestAgentRun = useMemo(() => {
@@ -1307,7 +1308,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
         />
       )}
 
-      {thread.suggestedTask && thread.status !== 'running' && !isSending && (
+      {suggestedTasksEnabled && thread.suggestedTask && thread.status !== 'running' && !isSending && (
         <FloatingSuggestedTaskCard
           suggestion={thread.suggestedTask}
           usesRift={suggestedTaskUsesRift}
