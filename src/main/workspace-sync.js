@@ -1,6 +1,10 @@
 import crypto from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { clearCloudRepoLink, getCloudRepoLink, publishRepo, pushRepo } from '../cloud-sync.js';
 
@@ -47,9 +51,10 @@ let scheduledSyncOptions = null;
 let syncGeneration = 0;
 let activeSyncController = null;
 let lastSyncStartedAt = 0;
-// Per-thread sha256 of the serialized thread confirmed uploaded (seeded from
-// the server on the first pass so restarts don't re-upload every transcript).
-let knownTranscriptHashes = new Map();
+// Per-thread server state, seeded on the first pass so unchanged transcripts
+// stay skipped. A server-side zero-token row is deliberately left unchecked
+// once so older Codex threads can be backfilled from their provider rollout.
+let knownThreadStates = new Map();
 let serverStateSeeded = false;
 // gitRoot -> complete refs/heads state successfully pushed.
 const pushedBranchStates = new Map();
@@ -144,7 +149,7 @@ const syncOwnerIdentity = (session) => {
 const resetAccountScopedState = (ownerId) => {
   syncOwnerId = ownerId;
   serverStateSeeded = false;
-  knownTranscriptHashes = new Map();
+  knownThreadStates = new Map();
   pushedBranchStates.clear();
   publishFailures.clear();
   totals = { projects: 0, epics: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
@@ -280,14 +285,202 @@ export const computeThreadUsage = (thread) => {
   return { usage, models };
 };
 
+const codexStatsAreMissing = (message, thread) =>
+  message?.kind === 'agent-run' &&
+  providerOfModel(normalizedTurnModelId(message, thread)) === 'codex' &&
+  statsTotals(message.stats).totalTokens <= 0;
+
+const codexSessionDayDirs = (thread, codexHome) => {
+  const dirs = new Set();
+  const timestamps = [
+    thread?.createdAt,
+    ...(Array.isArray(thread?.messages)
+      ? thread.messages.flatMap((message) => [message?.ts, message?.completedAt])
+      : []),
+  ];
+  for (const value of timestamps) {
+    const time = new Date(value).getTime();
+    if (!Number.isFinite(time)) continue;
+    for (const offset of [-1, 0, 1]) {
+      const date = new Date(time + offset * 86400000);
+      const parts = [
+        [date.getFullYear(), date.getMonth() + 1, date.getDate()],
+        [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()],
+      ];
+      for (const [year, month, day] of parts) {
+        dirs.add(
+          path.join(
+            codexHome,
+            'sessions',
+            String(year),
+            String(month).padStart(2, '0'),
+            String(day).padStart(2, '0')
+          )
+        );
+      }
+    }
+  }
+  return [...dirs];
+};
+
+const findCodexRollout = async (thread, codexHome) => {
+  const sessionId = thread?.agentSessionIds?.codex;
+  if (typeof sessionId !== 'string' || !sessionId) return null;
+  const suffix = `-${sessionId}.jsonl`;
+  for (const dir of codexSessionDayDirs(thread, codexHome)) {
+    let names;
+    try {
+      names = await fs.readdir(dir);
+    } catch {
+      continue;
+    }
+    const name = names.find((entry) => entry.endsWith(suffix));
+    if (name) return path.join(dir, name);
+  }
+  return null;
+};
+
+const totalsFromCodexRollout = (value) => {
+  const raw = value?.payload?.info?.total_token_usage;
+  if (!raw || typeof raw !== 'object') return null;
+  const totalTokens = Number(raw.total_tokens);
+  if (!Number.isFinite(totalTokens) || totalTokens <= 0) return null;
+  return {
+    totalTokens,
+    inputTokens: Number(raw.input_tokens) || 0,
+    outputTokens: Number(raw.output_tokens) || 0,
+    cachedReadTokens: Number(raw.cached_input_tokens) || 0,
+    reasoningTokens: Number(raw.reasoning_output_tokens) || 0,
+    cumulative: true,
+  };
+};
+
+export const readCodexUsageCompletions = async (filePath, options = {}) => {
+  const completions = [];
+  let activeTurn = null;
+  let latestTotals = null;
+  let input;
+  const abort = () => input?.destroy(new Error('Workspace sync was cancelled.'));
+  try {
+    if (options.signal?.aborted) return [];
+    input = createReadStream(filePath, { encoding: 'utf8' });
+    options.signal?.addEventListener('abort', abort, { once: true });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      let value;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const payload = value?.payload;
+      if (value?.type !== 'event_msg' || !payload || typeof payload !== 'object') continue;
+      if (payload.type === 'task_started') {
+        activeTurn = {
+          turnId: typeof payload.turn_id === 'string' ? payload.turn_id : null,
+          startedAt: value.timestamp ?? null,
+        };
+        latestTotals = null;
+        continue;
+      }
+      if (payload.type === 'token_count' && activeTurn) {
+        latestTotals = totalsFromCodexRollout(value) ?? latestTotals;
+        continue;
+      }
+      if (
+        payload.type === 'task_complete' &&
+        activeTurn &&
+        (!activeTurn.turnId || !payload.turn_id || payload.turn_id === activeTurn.turnId)
+      ) {
+        if (latestTotals) {
+          completions.push({
+            startedAt: activeTurn.startedAt,
+            completedAt: value.timestamp ?? null,
+            stats: latestTotals,
+          });
+        }
+        activeTurn = null;
+        latestTotals = null;
+      }
+    }
+  } catch {
+    input?.destroy();
+    return [];
+  } finally {
+    options.signal?.removeEventListener('abort', abort);
+  }
+  return completions;
+};
+
+export const backfillCodexThreadUsage = async (thread, options = {}) => {
+  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  const missingIndexes = messages
+    .map((message, index) => (codexStatsAreMissing(message, thread) ? index : -1))
+    .filter((index) => index >= 0);
+  if (missingIndexes.length === 0) return thread;
+
+  const configuredHome =
+    typeof options.codexHome === 'string' && options.codexHome
+      ? options.codexHome
+      : typeof process.env.CODEX_HOME === 'string' && process.env.CODEX_HOME
+        ? process.env.CODEX_HOME
+        : path.join(os.homedir(), '.codex');
+  const rollout = await findCodexRollout(thread, configuredHome);
+  if (!rollout) return thread;
+  const completions = await readCodexUsageCompletions(rollout, options);
+  if (completions.length === 0) return thread;
+
+  const used = new Set();
+  const nextMessages = [...messages];
+  let changed = false;
+  for (const messageIndex of missingIndexes) {
+    const message = messages[messageIndex];
+    const completedAt = new Date(message?.completedAt).getTime();
+    let bestIndex = -1;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    if (Number.isFinite(completedAt)) {
+      for (let index = 0; index < completions.length; index += 1) {
+        if (used.has(index)) continue;
+        const candidateTime = new Date(completions[index].completedAt).getTime();
+        if (!Number.isFinite(candidateTime)) continue;
+        const distance = Math.abs(candidateTime - completedAt);
+        if (distance < bestDistance) {
+          bestIndex = index;
+          bestDistance = distance;
+        }
+      }
+    }
+    // Provider completion and renderer persistence normally differ by less
+    // than a second. Keep a generous bound for busy machines, then fall back
+    // to chronological matching only when the rollout and agent-run counts
+    // are identical.
+    if (bestDistance > 15 * 60_000) bestIndex = -1;
+    if (bestIndex < 0 && completions.length === missingIndexes.length) {
+      bestIndex = missingIndexes.indexOf(messageIndex);
+    }
+    if (bestIndex < 0 || used.has(bestIndex)) continue;
+    used.add(bestIndex);
+    nextMessages[messageIndex] = {
+      ...message,
+      stats: {
+        ...completions[bestIndex].stats,
+        modelId: message?.modelId ?? thread?.modelId,
+      },
+    };
+    changed = true;
+  }
+  return changed ? { ...thread, messages: nextMessages } : thread;
+};
+
 const threadLastActivity = (thread) => {
   const messages = Array.isArray(thread?.messages) ? thread.messages : [];
   const last = messages[messages.length - 1];
   return last?.completedAt || last?.ts || thread?.createdAt || null;
 };
 
-const threadPayload = (thread, transcriptHash) => {
-  const { usage, models } = computeThreadUsage(thread);
+const threadPayload = async (thread, transcriptHash, options = {}) => {
+  const usageThread = await backfillCodexThreadUsage(thread, options);
+  const { usage, models } = computeThreadUsage(usageThread);
   return {
     id: thread.id,
     projectId: thread.projectId ?? null,
@@ -366,7 +559,11 @@ const syncThreads = async (token, threadIndex, { generation, signal }) => {
   // each transcript. Load and serialize only threads that differ from the
   // server instead of rebuilding every historical transcript every minute.
   const changedIds = threadIndex.entries
-    .filter((entry) => typeof entry?.id === 'string' && knownTranscriptHashes.get(entry.id) !== entry.hash)
+    .filter((entry) => {
+      if (typeof entry?.id !== 'string') return false;
+      const known = knownThreadStates.get(entry.id);
+      return !known || known.transcriptHash !== entry.hash || known.usageChecked !== true;
+    })
     .map((entry) => entry.id);
   totals.threads = threadIndex.entries.length;
   if (changedIds.length === 0) return;
@@ -384,11 +581,22 @@ const syncThreads = async (token, threadIndex, { generation, signal }) => {
   for (let index = 0; index < entries.length; index += THREAD_SYNC_BATCH) {
     ensureCurrentSync(generation, signal);
     const batch = entries.slice(index, index + THREAD_SYNC_BATCH);
+    const payloads = [];
+    // Historical rollouts can be large. Stream them one at a time so a
+    // zero-usage backfill cannot open an entire 50-thread batch concurrently.
+    for (const entry of batch) {
+      ensureCurrentSync(generation, signal);
+      payloads.push({
+        entry,
+        payload: await threadPayload(entry.thread, entry.hash, { signal }),
+      });
+    }
+    ensureCurrentSync(generation, signal);
     const response = await api(token, '/api/sync/threads', {
       method: 'POST',
       signal,
       body: JSON.stringify({
-        threads: batch.map((entry) => threadPayload(entry.thread, entry.hash)),
+        threads: payloads.map(({ payload }) => payload),
       }),
     });
 
@@ -420,7 +628,13 @@ const syncThreads = async (token, threadIndex, { generation, signal }) => {
     }
     // Threads whose transcript the server already had (hash match) are synced
     // too — remember every hash in the batch, not just fresh uploads.
-    for (const entry of batch) knownTranscriptHashes.set(entry.thread.id, entry.hash);
+    for (const { entry, payload } of payloads) {
+      knownThreadStates.set(entry.thread.id, {
+        transcriptHash: entry.hash,
+        totalTokens: payload.usage.totalTokens,
+        usageChecked: true,
+      });
+    }
     totals.transcriptsUploaded += confirmed.length;
   }
 };
@@ -570,10 +784,20 @@ const syncCode = async (
 const seedServerState = async (token, signal) => {
   if (serverStateSeeded) return;
   const state = await api(token, '/api/sync/state', { signal });
-  knownTranscriptHashes = new Map(
+  knownThreadStates = new Map(
     (state?.threads ?? [])
-      .filter((thread) => thread?.transcriptHash)
-      .map((thread) => [thread.id, thread.transcriptHash])
+      .filter((thread) => typeof thread?.id === 'string')
+      .map((thread) => {
+        const totalTokens = Number(thread.totalTokens) || 0;
+        return [
+          thread.id,
+          {
+            transcriptHash: thread.transcriptHash ?? null,
+            totalTokens,
+            usageChecked: totalTokens > 0,
+          },
+        ];
+      })
   );
   serverStateSeeded = true;
 };
@@ -746,7 +970,7 @@ export const getWorkspaceSyncStatus = () => ({ ...status });
 export const notifyAccountChanged = () => {
   invalidateActiveSync();
   serverStateSeeded = false;
-  knownTranscriptHashes = new Map();
+  knownThreadStates = new Map();
   if (!settings.enabled) return;
   setStatus({ syncing: false });
   scheduleSync(1_000);
