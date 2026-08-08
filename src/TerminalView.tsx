@@ -26,6 +26,12 @@ type TerminalViewProps = {
   resumeSessionId?: string;
   /** Fork the inherited resume session instead of appending to it in place. */
   forkSession?: boolean;
+  /**
+   * Orion's general instructions, appended to the CLI's system prompt at
+   * spawn so they bind this session without touching on-disk CLAUDE.md files
+   * (which would leak into claude runs outside Orion).
+   */
+  generalInstructions?: string;
 };
 
 const terminalTheme = {
@@ -44,6 +50,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   focused,
   resumeSessionId,
   forkSession = false,
+  generalInstructions,
 }) => {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -54,6 +61,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   focusedRef.current = focused;
   const resumeSessionIdRef = useRef(resumeSessionId);
   resumeSessionIdRef.current = resumeSessionId;
+  // Ref, not an effect dep: edits to the settings field apply to the next
+  // spawn instead of killing a live session to restart it.
+  const generalInstructionsRef = useRef(generalInstructions);
+  generalInstructionsRef.current = generalInstructions;
   const ensureRef = useRef<
     ((options: {
       fresh?: boolean;
@@ -132,6 +143,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         ...(options.resumeSessionId ? { resumeSessionId: options.resumeSessionId } : {}),
         ...(!options.fresh && (options.forkSession ?? forkSession)
           ? { forkSession: true }
+          : {}),
+        ...(generalInstructionsRef.current?.trim()
+          ? { generalInstructions: generalInstructionsRef.current.trim() }
           : {}),
       });
       if (disposed || attempt !== ensureAttempt) return;

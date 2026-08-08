@@ -43,6 +43,7 @@ import {
   type RiftsSettings,
   type SavedView,
   type SplitViewSettings,
+  type SuggestedTasksSettings,
   type TextGenerationSettings,
   type WorkspaceSyncSettings,
 } from '../store';
@@ -102,6 +103,8 @@ export type SettingsPageProps = {
   setRemoteControlSettings: (updates: Partial<RemoteControlSettingsValue>) => void;
   deploymentSettings: DeploymentSettings;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
+  suggestedTasksSettings: SuggestedTasksSettings;
+  setSuggestedTasksSettings: (updates: Partial<SuggestedTasksSettings>) => void;
   resolvedDeploymentModel: AgentModel | null;
   resolvedDeploymentModelId: string | null;
   cloudApp: OrionCloudApp | null;
@@ -226,6 +229,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setRemoteControlSettings,
     deploymentSettings,
     setDeploymentSettings,
+    suggestedTasksSettings,
+    setSuggestedTasksSettings,
     resolvedDeploymentModel,
     resolvedDeploymentModelId,
     cloudApp,
@@ -1398,7 +1403,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="setting-label-title">General instructions</div>
                   <div className="setting-label-desc">
-                    Free-form guidance included in the orchestrator's instructions
+                    Free-form guidance every model follows when run through Orion — like a global
+                    CLAUDE.md that never affects these models outside Orion
                   </div>
                 </div>
                 <textarea
@@ -1990,6 +1996,28 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   </div>
                 </>
               )}
+
+              <div className="settings-group-label">Suggested tasks</div>
+              <div className="settings-group">
+                <div className="setting-row">
+                  <div className="setting-label">
+                    <div className="setting-label-title">Suggest a next task after each turn</div>
+                    <div className="setting-label-desc">
+                      Show Claude's predicted next prompt as a card when a turn finishes. Turn off to stop new
+                      suggestion cards and skip the background run that expands each suggestion into a full start
+                      prompt.
+                    </div>
+                  </div>
+                  <label className="provider-toggle" title="Suggest a next task after each turn">
+                    <input
+                      type="checkbox"
+                      checked={suggestedTasksSettings.enabled}
+                      onChange={(e) => setSuggestedTasksSettings({ enabled: e.target.checked })}
+                    />
+                    <span />
+                  </label>
+                </div>
+              </div>
 
               <div className="settings-group-label">Rifts</div>
               <div className="settings-group">

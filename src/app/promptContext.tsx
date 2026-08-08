@@ -242,6 +242,23 @@ export const buildOrchestrationContext = (
   return lines.join('\n');
 };
 
+// Context block prepended to every agent turn started from Orion, whatever
+// model the thread runs on — the user's general instructions act like a
+// global CLAUDE.md/AGENTS.md scoped to Orion, without touching on-disk files
+// that the same CLIs would read when launched outside Orion. Orchestrated
+// turns skip this block: the [Orion orchestration] block already carries the
+// same instructions.
+export const buildGeneralInstructionsContext = (generalInstructions: string) => {
+  const trimmed = generalInstructions.trim();
+  if (!trimmed) return '';
+  return [
+    '[Orion general instructions]',
+    'The user configured these standing instructions in Orion. They apply to every agent session run through Orion, alongside any project instructions:',
+    trimmed,
+    '[/Orion general instructions]',
+  ].join('\n');
+};
+
 export type ModelMention = {
   modelId: string;
   providerId: string;

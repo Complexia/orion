@@ -7158,6 +7158,12 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
         ? ['--dangerously-skip-permissions']
         : ['--permission-mode', accessMode === 'read-only' ? 'plan' : 'acceptEdits'];
     const args = ['claude', ...accessArgs];
+    // Orion's general instructions bind this session like a global CLAUDE.md,
+    // but only when claude is launched from Orion — appending to the system
+    // prompt leaves the project's real CLAUDE.md untouched for outside runs.
+    const generalInstructions =
+      typeof input?.generalInstructions === 'string' ? input.generalInstructions.trim() : '';
+    if (generalInstructions) args.push('--append-system-prompt', generalInstructions);
     let claudeSessionId = null;
     if (!input?.fresh && isUuid(input?.resumeSessionId)) {
       // Only resume when claude actually persisted that conversation: it

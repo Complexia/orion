@@ -161,6 +161,7 @@ import {
 import { resolveOrionMainDriverModel } from './app/orionDriver';
 import {
   accessModeOptions,
+  buildGeneralInstructionsContext,
   buildLinkedTaskContext,
   buildModelMentionsContext,
   buildOrchestrationContext,
@@ -643,6 +644,19 @@ const CHAT_MENTION_THREAD_PAGE = 20;
 // last activity (i.e. when they finished) — or by when they were unpinned, so
 // a just-unpinned thread surfaces at the top instead of sinking back to its
 // old chronological spot.
+// Caption for a turn that ended while the harness still owns live background
+// tasks (subagents, workflows, backgrounded shell commands). Task descriptions
+// come from the driver's done event; naming them lets the user tell a genuine
+// wait from e.g. a dev server that will never exit. The store's restart
+// migration matches this caption by pattern — keep the two in sync.
+const waitingOnBackgroundStatusText = (tasks: string[]): string => {
+  const clip = (text: string) => (text.length > 80 ? `${text.slice(0, 79)}…` : text);
+  if (tasks.length === 1) return `Waiting on background task: ${clip(tasks[0])}…`;
+  const shown = tasks.slice(0, 2).map(clip).join(', ');
+  const more = tasks.length - 2;
+  return `Waiting on ${tasks.length} background tasks: ${shown}${more > 0 ? ` (+${more} more)` : ''}…`;
+};
+
 const compareRecentThreadOrder = (a: Thread, b: Thread) => {
   const aRunning = a.status === 'running';
   const bRunning = b.status === 'running';
@@ -687,6 +701,8 @@ const App: React.FC = () => {
     setRemoteControlSettings,
     deploymentSettings,
     setDeploymentSettings,
+    suggestedTasksSettings,
+    setSuggestedTasksSettings,
     addProject,
     removeProject,
     renameProject,
@@ -759,6 +775,8 @@ const App: React.FC = () => {
       setRemoteControlSettings: state.setRemoteControlSettings,
       deploymentSettings: state.deploymentSettings,
       setDeploymentSettings: state.setDeploymentSettings,
+      suggestedTasksSettings: state.suggestedTasksSettings,
+      setSuggestedTasksSettings: state.setSuggestedTasksSettings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
@@ -3110,17 +3128,27 @@ const App: React.FC = () => {
     }
   }, []);
 
+  // Reads race: a status scan of the previously active project (large repos
+  // take seconds) can resolve after the fast read for the project the user
+  // just switched to, and would overwrite the pill and picker with the wrong
+  // repository's branches. Only the latest request may write state.
+  const gitRefreshSeqRef = useRef(0);
   const refreshGitState = useCallback(async () => {
     const projectPath = activeWorkingDir;
+    const seq = ++gitRefreshSeqRef.current;
     if (!projectPath || !window.orion?.getGitState) {
       setGitState(null);
+      setGitLoading(false);
       return;
     }
 
     setGitLoading(true);
     try {
-      setGitState(await window.orion.getGitState(projectPath));
+      const state = await window.orion.getGitState(projectPath);
+      if (seq !== gitRefreshSeqRef.current) return;
+      setGitState(state);
     } catch (error) {
+      if (seq !== gitRefreshSeqRef.current) return;
       setGitState({
         ok: false,
         branches: [],
@@ -3128,7 +3156,7 @@ const App: React.FC = () => {
         error: error instanceof Error ? error.message : 'Unable to read git state',
       });
     } finally {
-      setGitLoading(false);
+      if (seq === gitRefreshSeqRef.current) setGitLoading(false);
     }
   }, [activeWorkingDir]);
 
@@ -3136,16 +3164,32 @@ const App: React.FC = () => {
     void refreshGitState();
   }, [refreshGitState]);
 
+  // A checkout in an outside terminal doesn't notify the app; re-read when
+  // the window regains focus so the pill matches the repository's real HEAD.
+  useEffect(() => {
+    const onFocus = () => void refreshGitState();
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [refreshGitState]);
+
+  // Same stale-response race as refreshGitState: only the latest request may
+  // write, so a slow read for the previous project can't repaint the cloud
+  // pill after a project switch.
+  const cloudRefreshSeqRef = useRef(0);
   const refreshCloudState = useCallback(async () => {
     const projectPath = activeWorkingDir;
+    const seq = ++cloudRefreshSeqRef.current;
     if (!projectPath || !window.orion?.getCloudState) {
       setCloudState(null);
       return;
     }
 
     try {
-      setCloudState(await window.orion.getCloudState(projectPath));
+      const state = await window.orion.getCloudState(projectPath);
+      if (seq !== cloudRefreshSeqRef.current) return;
+      setCloudState(state);
     } catch (error) {
+      if (seq !== cloudRefreshSeqRef.current) return;
       setCloudState({
         ok: false,
         error: error instanceof Error ? error.message : 'Unable to read Orion Cloud state',
@@ -3966,6 +4010,7 @@ const App: React.FC = () => {
       if (event.type === 'suggestion') {
         if (
           !event.suggestion ||
+          !useOrionStore.getState().suggestedTasksSettings.enabled ||
           latestTurnRunIdsRef.current.get(event.threadId) !== event.runId
         ) {
           return;
@@ -4264,19 +4309,19 @@ const App: React.FC = () => {
 
       if (event.type === 'done') {
         flushChunkBuffers();
-        // Background subagents/workflows the model is still waiting on: the
-        // turn is over, but the task isn't. Keep the thread in the working
-        // state — the harness re-invokes the model (a `started {background}`
-        // turn) when each task settles, and a `background-settled` event
-        // covers tasks that die without re-invoking.
+        // Background tasks the model is still waiting on (subagents,
+        // workflows, backgrounded shell commands): the turn is over, but the
+        // task isn't. Keep the thread in the working state and name what it's
+        // waiting on — the harness re-invokes the model (a `started
+        // {background}` turn) when each task settles, and a
+        // `background-settled` event covers tasks that die without
+        // re-invoking.
         const waitingOn = event.pendingBackgroundTasks ?? [];
         const waiting = waitingOn.length > 0;
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'done',
           completedAt: new Date().toISOString(),
-          statusText: waiting
-            ? `Waiting on ${waitingOn.length} background ${waitingOn.length === 1 ? 'agent' : 'agents'}…`
-            : 'Finished.',
+          statusText: waiting ? waitingOnBackgroundStatusText(waitingOn) : 'Finished.',
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
         });
@@ -7211,6 +7256,17 @@ const App: React.FC = () => {
           thread.accessMode ?? 'full-access'
         );
         addAgentContext(orchestrationContext);
+      } else {
+        // The user's general instructions bind every model run through Orion,
+        // not just the orchestrator — a global CLAUDE.md scoped to the app.
+        // Orchestrated turns already carry them in the block above. Added last
+        // so the block sits topmost on ordinary prompts.
+        addAgentContext(
+          buildGeneralInstructionsContext(
+            state.orchestrationSettings?.generalInstructions ??
+              defaultOrchestrationSettings.generalInstructions
+          )
+        );
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
@@ -9828,6 +9884,8 @@ const App: React.FC = () => {
     setRemoteControlSettings,
     deploymentSettings,
     setDeploymentSettings,
+    suggestedTasksSettings,
+    setSuggestedTasksSettings,
     resolvedDeploymentModel,
     resolvedDeploymentModelId,
     cloudApp,
@@ -11531,7 +11589,12 @@ const App: React.FC = () => {
                     type="button"
                     className="shell-branch-trigger"
                     onClick={() => {
-                      if (!activeRiftUnavailable) setBranchPickerOpen((open) => !open);
+                      if (activeRiftUnavailable) return;
+                      const opening = !branchPickerOpen;
+                      setBranchPickerOpen(opening);
+                      // The list can be stale (branch switched or created in a
+                      // terminal since the last read) — re-read on open.
+                      if (opening) void refreshGitState();
                     }}
                     disabled={activeRiftUnavailable || gitLoading || repositoryOperationBusy || !gitState?.ok}
                     title={gitState?.error ?? gitState?.root ?? 'Git state'}
@@ -12396,6 +12459,7 @@ const App: React.FC = () => {
                                   focused={pane.focused}
                                   resumeSessionId={pane.thread.agentSessionIds?.claude}
                                   forkSession={pane.thread.pendingForkProviders?.includes('claude')}
+                                  generalInstructions={normalizedOrchestrationSettings.generalInstructions}
                                 />
                               </React.Suspense>
                             )

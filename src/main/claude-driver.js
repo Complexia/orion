@@ -520,19 +520,17 @@ export const flushPendingClaudeTaskNotifications = (session, turn) => {
   }
 };
 
-// Background tasks the model is genuinely waiting on: subagents and workflows
-// (local or remote) settle and re-invoke the model via a task notification.
-// local_bash is deliberately excluded — a dev server left running in the
-// background never "finishes" and must not pin the thread in a working state.
-export const claudeAwaitedBackgroundTaskTypes = /agent|workflow/i;
-
+// Background tasks the model is genuinely waiting on. Every live task in the
+// harness's set re-invokes the model when it settles — subagents and workflows
+// via a task notification, backgrounded shell commands when they exit — so a
+// turn that ends while any of them run is a pause, not a finish, and the
+// thread must keep reading as working. Only skip_transcript tasks (ambient
+// housekeeping) never hold the thread open. A task that never exits (a dev
+// server left running) keeps the thread waiting indefinitely; the caption in
+// the renderer names the task so the user can tell, and Stop settles it.
 export const pendingClaudeBackgroundTasks = (session) =>
   [...session.backgroundTasks.entries()]
-    .filter(
-      ([taskId, task]) =>
-        claudeAwaitedBackgroundTaskTypes.test(task.taskType) &&
-        !session.skipTranscriptTaskIds.has(taskId)
-    )
+    .filter(([taskId]) => !session.skipTranscriptTaskIds.has(taskId))
     .map(([, task]) => task.description);
 
 // A thread left "working" by a done event that carried pending background
@@ -615,10 +613,11 @@ export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
         ? `Claude ended the turn with an error (${resultMessage.subtype}).`
         : 'Claude reported an error for this turn.');
   }
-  // Background subagents/workflows still running when the turn ended: the
-  // done event carries them so the renderer keeps the thread in the working
-  // state instead of flipping it to Finished between turns. The harness will
-  // re-invoke the model (a synthetic turn) when each task settles.
+  // Background tasks (subagents, workflows, backgrounded shell commands)
+  // still running when the turn ended: the done event carries their
+  // descriptions so the renderer keeps the thread in the working state and
+  // names what it's waiting on instead of flipping to Finished between turns.
+  // The harness re-invokes the model (a synthetic turn) when each settles.
   const pendingBackgroundTasks = resultIsError ? [] : pendingClaudeBackgroundTasks(session);
   if (pendingBackgroundTasks.length > 0) {
     retainClaudeBackgroundRun(session, turn.runId);
