@@ -98,4 +98,25 @@ assert.match(
   'commit-only mode must be frozen while the selected epic operation is busy'
 );
 
+const cloudDeployPrecheck = section(
+  mainSource,
+  'const cloudDeployPrecheck = async (gitRoot) => {',
+  "ipcMain.handle('cloud:deployPrecheck'"
+);
+assert.match(
+  cloudDeployPrecheck,
+  /readGitStatusEntries\(gitRoot\)[\s\S]*uncommitted working tree changes/,
+  'a dirty worktree must route through the deployment agent instead of rebuilding stale HEAD'
+);
+assert.match(
+  cloudDeployPrecheck,
+  /reasons\.length === 0 && \(await cloudAppFileExists\(gitRoot, name\)\)/,
+  'explicit build config must not bypass the dirty-worktree deploy guard'
+);
+assert.match(
+  appSource,
+  /working tree has uncommitted changes[\s\S]*commit the intended deployable work[\s\S]*preserving unrelated user changes/,
+  'the deployment agent must commit intended dirty-tree work without swallowing unrelated changes'
+);
+
 console.log('UI improvements tests passed');

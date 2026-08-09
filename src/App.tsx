@@ -4904,6 +4904,8 @@ const App: React.FC = () => {
         'is not installed; run `orion-cli --help` first to see usage; authenticate with `orion-cli',
         'login` if prompted — tell me if login is required, since it opens a browser).',
         `This project was detected as non-trivial to deploy because: ${reasonText}.`,
+        'If the working tree has uncommitted changes, review and commit the intended deployable work',
+        'before deploying, while preserving unrelated user changes.',
         'Figure out the right way to deploy it (correct subdirectory for monorepos, build',
         'configuration, etc.), run the deploy, verify it succeeds, and report the live URL.',
       ].join(' ');

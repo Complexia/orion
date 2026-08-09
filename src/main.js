@@ -4741,9 +4741,17 @@ const cloudAppFileExists = async (gitRoot, name) => {
 const cloudDeployPrecheck = async (gitRoot) => {
   const reasons = [];
 
+  // A direct deploy can only push commits. If the working tree is dirty,
+  // handing the deploy to the agent prevents a successful rebuild of stale
+  // HEAD while the user's latest files remain local and uncommitted.
+  const statusEntries = await readGitStatusEntries(gitRoot);
+  if (statusEntries.length > 0) {
+    reasons.push('uncommitted working tree changes');
+  }
+
   // Explicit build config wins: whoever wrote it already answered the question.
   for (const name of ['railway.json', 'railway.toml', 'railpack.json']) {
-    if (await cloudAppFileExists(gitRoot, name)) {
+    if (reasons.length === 0 && (await cloudAppFileExists(gitRoot, name))) {
       return { simple: true, reasons: [`${name} pins the build configuration`] };
     }
   }
