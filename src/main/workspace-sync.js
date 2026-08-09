@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { clearCloudRepoLink, getCloudRepoLink, publishRepo, pushRepo } from '../cloud-sync.js';
+import { isOrionRepoRemoteUrl } from './source-control.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -665,6 +666,19 @@ const gitBranchState = async (gitRoot) => {
   }
 };
 
+const usesOrionOrigin = async (gitRoot) => {
+  try {
+    const [{ stdout: configured }, { stdout: repoId }, { stdout: originUrl }] = await Promise.all([
+      execFileAsync('git', ['config', '--local', '--get', 'orion.sourcecontrol'], { cwd: gitRoot }),
+      execFileAsync('git', ['config', '--local', '--get', 'orion.cloudrepoid'], { cwd: gitRoot }),
+      execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd: gitRoot }),
+    ]);
+    return configured.trim() === 'orion' && isOrionRepoRemoteUrl(originUrl.trim(), repoId.trim());
+  } catch {
+    return false;
+  }
+};
+
 const getCloudRepoLinkForOwner = async (
   gitRoot,
   ownerId,
@@ -720,6 +734,18 @@ const syncCode = async (
 
     let link = null;
     try {
+      if (await usesOrionOrigin(gitRoot)) {
+        if (pushedBranchStates.get(gitRoot) === branchState) continue;
+        if (typeof deps.pushOrionSourceControl !== 'function') {
+          throw new Error('This Orion build cannot authenticate the repository origin.');
+        }
+        await deps.pushOrionSourceControl({ gitRoot, token, signal });
+        ensureCurrentSync(generation, signal);
+        publishFailures.delete(gitRoot);
+        pushedBranchStates.set(gitRoot, branchState);
+        totals.codePushes += 1;
+        continue;
+      }
       link = await getCloudRepoLinkForOwner(gitRoot, ownerId, { generation, signal });
       if (!link) {
         const name = path

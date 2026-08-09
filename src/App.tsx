@@ -28,7 +28,6 @@ import {
   Image as ImageIcon,
   RefreshCw,
   Archive,
-  Cloud,
   CloudUpload,
   CloudDownload,
   Globe,
@@ -4767,6 +4766,7 @@ const App: React.FC = () => {
         toast.success(`Committed and pushed ${result.branch ?? gitState?.currentBranch ?? 'branch'}`, {
           description: result.message?.split('\n')[0],
         });
+        if (result.mirrorWarning) toast.warning(result.mirrorWarning);
         await refreshGitState();
       } else {
         toast.error(result.error ?? 'Commit and push failed');
@@ -4776,71 +4776,86 @@ const App: React.FC = () => {
     }
   };
 
-  const handleCloudPublish = async () => {
-    if (!activeWorkingDir || !window.orion?.publishToCloud || repositoryOperationBusy) return;
+  const handleChangeSourceControlToOrion = async () => {
+    if (!activeWorkingDir || !window.orion?.changeSourceControlToOrion || repositoryOperationBusy) return;
+
+    if (!accountState.authenticated) {
+      toast.info('Sign in to your Orion account to use Orion source control.');
+      setSettingsTab('account');
+      setSettingsOpen(true);
+      return;
+    }
 
     setCloudBusy(true);
     try {
-      const result = await window.orion.publishToCloud({
-        projectPath: activeWorkingDir,
-      });
-      if (result.ok && result.alreadyLinked) {
-        toast.success(result.upToDate ? 'Orion Cloud is already up to date' : 'Pushed to Orion Cloud');
-        await refreshCloudState();
-      } else if (result.ok) {
-        toast.success(`Published to Orion Cloud as ${result.repo?.name ?? 'repository'}`, {
-          description: 'Press Deploy on Orion Cloud to host it as an app.',
-          action: {
-            label: 'Open',
-            onClick: () => void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir),
-          },
-        });
+      const result = await window.orion.changeSourceControlToOrion({ projectPath: activeWorkingDir });
+      if (result.ok) {
+        const mirror = result.mirror;
+        const authorizationUrl = mirror?.authorizationUrl;
+        const mirrorDescription =
+          mirror?.status === 'active' && mirror.delivery === 'cloud'
+            ? 'GitHub is mirrored continuously by Orion Cloud.'
+            : mirror?.status === 'authorization_required'
+              ? [
+                  'Authorize GitHub to keep this mirror in sync when Orion Desktop is closed.',
+                  result.mirrorWarning,
+                ]
+                  .filter(Boolean)
+                  .join(' ')
+              : result.mirrorWarning ??
+                (result.githubMirrorUrl ? 'GitHub is preserved as a read-only mirror.' : undefined);
+        toast.success(
+          gitState?.sourceProvider === 'github'
+            ? 'Source control changed to Orion'
+            : `Pushed ${activeThreadProject?.name ?? 'project'} to Orion`,
+          result.githubMirrorUrl
+            ? {
+                description: mirrorDescription,
+                ...(mirror?.status === 'authorization_required' && authorizationUrl
+                  ? {
+                      action: {
+                        label: 'Authorize GitHub',
+                        onClick: () => void window.orion?.openExternalUrl?.(authorizationUrl),
+                      },
+                    }
+                  : {}),
+              }
+            : undefined
+        );
+        await refreshGitState();
         await refreshCloudState();
       } else if (result.needsAuth) {
         toast.error(result.error ?? 'Sign in first.');
         setSettingsTab('account');
         setSettingsOpen(true);
       } else {
-        toast.error(result.error ?? 'Publish failed');
+        toast.error(result.error ?? 'Could not change source control to Orion');
       }
     } finally {
       setCloudBusy(false);
     }
   };
 
-  const handleCloudPush = async () => {
-    if (!activeWorkingDir || !window.orion?.pushToCloud || repositoryOperationBusy) return;
-
+  const handleAuthorizeGithubMirror = async () => {
+    if (!activeWorkingDir || !window.orion?.authorizeGithubMirror || repositoryOperationBusy) return;
     setCloudBusy(true);
     try {
-      const result = await window.orion.pushToCloud(activeWorkingDir);
-      if (result.ok && result.upToDate) {
-        toast.info('Orion Cloud is already up to date');
-      } else if (result.ok) {
-        toast.success(
-          `Pushed ${result.pushed?.length === 1 ? result.pushed[0] : `${result.pushed?.length ?? 0} branches`} to Orion Cloud`,
-          result.app?.url
-            ? {
-                description: `Redeploying ${new URL(result.app.url).host}`,
-                action: {
-                  label: 'Open app',
-                  onClick: () => void window.orion?.openExternalUrl?.(result.app!.url),
-                },
-              }
-            : undefined
-        );
-      } else {
-        toast.error(result.error ?? 'Push to Orion Cloud failed');
+      const result = await window.orion.authorizeGithubMirror(activeWorkingDir);
+      if (!result.ok) {
+        if (result.needsAuth) {
+          setSettingsTab('account');
+          setSettingsOpen(true);
+        }
+        toast.error(result.error ?? 'Could not start GitHub authorization');
+        return;
       }
-      if (result.skipped?.length) {
-        toast.info(`Skipped ${result.skipped.map((item) => item.branch).join(', ')}: ${result.skipped[0].reason}`);
+      const authorizationUrl = result.mirror?.authorizationUrl;
+      if (!authorizationUrl) {
+        toast.error('Orion Cloud did not return a GitHub authorization link.');
+        return;
       }
-      // A push into a deployed repo triggers a rebuild server-side; follow it
-      // to the live URL the same way a Deploy click would.
-      if (result.ok && result.app) {
-        cloudDeployWatchRef.current.add(activeWorkingDir);
-        recordCloudApp(activeWorkingDir, result.app);
-      }
+      await window.orion.openExternalUrl?.(authorizationUrl);
+      toast.info('Finish authorizing the Orion GitHub App in your browser.');
       await refreshCloudState();
     } finally {
       setCloudBusy(false);
@@ -4870,6 +4885,7 @@ const App: React.FC = () => {
         } else {
           toast.success('Fetched from Orion Cloud');
         }
+        if (result.mirrorWarning) toast.warning(result.mirrorWarning);
       }
       await refreshGitState();
       await refreshCloudState();
@@ -5735,7 +5751,7 @@ const App: React.FC = () => {
   // Keeps the selected epic's git-button status fresh: fetched on selection
   // and after every epic git action (the epic's busy kind clearing re-runs the
   // effect), plus a light local-only poll while the view stays open so agent
-  // work re-enables "Commit & push". The PR state lookup hits GitHub, so it
+  // work re-enables "Commit & push". The PR state lookup hits the provider, so it
   // runs only on the initial fetch, not on every poll tick.
   const refreshEpicGitStatus = async (epic: Epic, options?: { includePr?: boolean }) => {
     if (!window.orion?.epicGitStatus) return;
@@ -5759,7 +5775,7 @@ const App: React.FC = () => {
   const epicPrLookupOrderRef = useRef(0);
   const latestEpicPrLookupOrderRef = useRef<Map<string, number>>(new Map());
 
-  // Opening a PR on GitHub is the one moment Orion knows the user is looking at
+  // Opening a PR is the one moment Orion knows the user is looking at
   // it, so the next focus refreshes without waiting on any throttle. Only a
   // hint: a teammate can merge, or the user can merge from elsewhere entirely,
   // which is why the background interval remains what actually catches merges.
@@ -6068,6 +6084,7 @@ const App: React.FC = () => {
             description: result.message?.split('\n')[0],
           }
         );
+        if (result.mirrorWarning) toast.warning(result.mirrorWarning);
         // Refresh only when the shell is showing the directory just committed
         // (the epic's rift, or its repository when it has none).
         if (projectPath === activeWorkingDir || (project && activeThreadProject?.id === project.id)) {
@@ -6342,6 +6359,7 @@ const App: React.FC = () => {
               }
             : undefined
         );
+        if (result.mirrorWarning) toast.warning(result.mirrorWarning);
       } else if (result.aborted) {
         toast.info('Opening the pull request was aborted');
       } else {
@@ -11794,7 +11812,7 @@ const App: React.FC = () => {
                       {gitLoading
                         ? 'Git...'
                         : (gitState?.currentBranch ??
-                          (gitState?.detachedHead ? `Detached @ ${gitState.detachedHead}` : 'No Git'))}
+                          (gitState?.detachedHead ? `Detached @ ${gitState.detachedHead}` : 'Local'))}
                     </span>
                     <ChevronDown size={13} className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`} />
                   </button>
@@ -11864,45 +11882,27 @@ const App: React.FC = () => {
                   )}
                 </div>
 
-                {gitState?.ok && cloudState?.ok && (
+                {(gitState?.sourceProvider === 'github' || gitState?.sourceProvider === 'none') && (
                   <button
                     type="button"
-                    className={`shell-cloud-button ${
-                      cloudState.linked && (cloudState.sync === 'ahead' || cloudState.sync === 'diverged')
-                        ? 'attention'
-                        : ''
-                    }`}
-                    onClick={() => {
-                      if (!cloudState.authenticated) {
-                        toast.info('Sign in to your Orion account to publish this repository.');
-                        setSettingsTab('account');
-                        setSettingsOpen(true);
-                        return;
-                      }
-                      if (cloudState.linked) {
-                        void handleCloudPush();
-                      } else {
-                        void handleCloudPublish();
-                      }
-                    }}
+                    className="shell-cloud-button attention"
+                    onClick={() => void handleChangeSourceControlToOrion()}
                     disabled={repositoryOperationBusy}
                     title={
-                      !cloudState.linked
-                        ? 'Publish this repository to Orion Cloud'
-                        : cloudState.sync === 'diverged'
-                          ? 'Local and cloud history diverged'
-                          : 'Push local commits to Orion Cloud'
+                      gitState.sourceProvider === 'github'
+                        ? 'Make Orion the source of truth and keep GitHub as a mirror'
+                        : 'Initialize source control if needed and push this project to Orion'
                     }
                   >
-                    {cloudState.linked ? <CloudUpload size={14} /> : <Cloud size={14} />}
+                    <CloudUpload size={14} />
                     <span>
                       {cloudBusy
-                        ? cloudState.linked
-                          ? 'Pushing…'
-                          : 'Publishing…'
-                        : cloudState.linked
-                          ? 'Push'
-                          : 'Publish'}
+                        ? gitState.sourceProvider === 'github'
+                          ? 'Changing…'
+                          : 'Pushing…'
+                        : gitState.sourceProvider === 'github'
+                          ? 'Change source control to Orion'
+                          : 'Push to Orion'}
                     </span>
                   </button>
                 )}
@@ -11912,6 +11912,25 @@ const App: React.FC = () => {
                     className="shell-cloud-group"
                     title={cloudState.linked ? `Orion Cloud: ${cloudState.repoName ?? ''}` : 'Orion Cloud'}
                   >
+                    {cloudState.linked &&
+                      gitState.githubMirrorUrl &&
+                      ['authorization_required', 'reconnect_required', 'disabled', 'unconfigured'].includes(
+                        cloudState.mirror?.status ?? 'disabled'
+                      ) && (
+                        <button
+                          type="button"
+                          className="shell-cloud-icon-button attention"
+                          onClick={() => void handleAuthorizeGithubMirror()}
+                          disabled={repositoryOperationBusy}
+                          title={
+                            cloudState.mirror?.status === 'reconnect_required'
+                              ? 'Reconnect the Orion GitHub App'
+                              : 'Authorize continuous GitHub mirroring'
+                          }
+                        >
+                          <RefreshCw size={14} />
+                        </button>
+                      )}
                     {cloudState.linked && (
                       <button
                         type="button"
@@ -12408,7 +12427,7 @@ const App: React.FC = () => {
                           title={
                             selectedEpicPrBadge.modifier === 'merged'
                               ? 'The pull request is merged — settle the epic to archive it'
-                              : 'This epic already has a pull request — click to view it on GitHub'
+                              : 'This epic already has a pull request — click to view it'
                           }
                         >
                           {selectedEpicPrBadge.modifier === 'merged' ? (

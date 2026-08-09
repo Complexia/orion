@@ -35,6 +35,7 @@
     "test:slash-commands": "node --no-warnings --experimental-strip-types scripts/test-slash-commands.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "test:provider-updates": "node --no-warnings scripts/test-provider-updates.mjs",
+    "test:source-control": "node --no-warnings scripts/test-source-control.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",
     "postinstall": "node -e \"const fs=require('fs');try{for(const d of fs.readdirSync('node_modules/node-pty/prebuilds')){try{fs.chmodSync('node_modules/node-pty/prebuilds/'+d+'/spawn-helper',0o755)}catch{}}}catch{};try{for(const d of fs.readdirSync('node_modules/rift-snapshot/prebuilds')){for(const b of ['rift','rift.exe']){try{fs.chmodSync('node_modules/rift-snapshot/prebuilds/'+d+'/'+b,0o755)}catch{}}}}catch{}\""

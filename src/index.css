@@ -7182,7 +7182,7 @@ body {
   cursor: default;
 }
 
-/* Shows an existing PR's lifecycle state and opens it on GitHub. A closed PR
+/* Shows an existing PR's lifecycle state and opens it at its provider. A closed PR
    keeps a separate replacement action alongside this history badge. */
 .epic-view-actions .epic-view-pr-state {
   background: transparent;

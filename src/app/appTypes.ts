@@ -52,7 +52,11 @@ export type GitBranchInfo = {
 
 export type GitRepoState = {
   ok: boolean;
+  isGitRepository?: boolean;
   root?: string;
+  originUrl?: string | null;
+  sourceProvider?: 'github' | 'orion' | 'other' | 'none';
+  githubMirrorUrl?: string | null;
   currentBranch?: string | null;
   detachedHead?: string | null;
   branches: GitBranchInfo[];

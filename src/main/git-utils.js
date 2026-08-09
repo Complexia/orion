@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 import { execFileAsync } from './shell-env.js';
+import { classifyRemoteUrl, isOrionRepoRemoteUrl } from './source-control.js';
 
 export const getGitStatusKind = (rawStatus) => {
   if (rawStatus === '??') return 'untracked';
@@ -390,19 +391,61 @@ export const readGitAheadBehind = async (gitRoot) => {
   }
 };
 
+export const sourceProviderForRemoteUrl = (remoteUrl) => classifyRemoteUrl(remoteUrl).kind;
+
+export const readOriginRemote = async (gitRoot) => {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', 'origin']);
+    const url = stdout.trim();
+    let provider = sourceProviderForRemoteUrl(url);
+    try {
+      const [{ stdout: configured }, { stdout: repoId }] = await Promise.all([
+        execFileAsync('git', ['-C', gitRoot, 'config', '--local', 'orion.sourcecontrol']),
+        execFileAsync('git', ['-C', gitRoot, 'config', '--local', 'orion.cloudrepoid']),
+      ]);
+      if (configured.trim() === 'orion' && isOrionRepoRemoteUrl(url, repoId.trim())) {
+        provider = 'orion';
+      }
+    } catch {}
+    return { url: url || null, provider };
+  } catch {
+    return { url: null, provider: 'none' };
+  }
+};
+
+export const readGithubMirrorRemote = async (gitRoot) => {
+  for (const args of [
+    ['config', '--local', '--get', 'orion.githubMirrorUrl'],
+    ['remote', 'get-url', 'github'],
+  ]) {
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', gitRoot, ...args]);
+      const url = stdout.trim();
+      if (url && sourceProviderForRemoteUrl(url) === 'github') return url;
+    } catch {}
+  }
+  return null;
+};
+
 export const getGitStateForPath = async (projectPath) => {
   const gitRoot = await getGitRoot(projectPath);
-  const [currentBranch, entries, aheadBehind] = await Promise.all([
+  const [currentBranch, entries, aheadBehind, origin, githubMirrorUrl] = await Promise.all([
     getCurrentGitBranch(gitRoot),
     readGitStatusEntries(gitRoot),
     readGitAheadBehind(gitRoot),
+    readOriginRemote(gitRoot),
+    readGithubMirrorRemote(gitRoot),
   ]);
   const branches = await readGitBranches(gitRoot, currentBranch);
   const detachedHead = currentBranch === null ? await getDetachedGitHead(gitRoot) : null;
 
   return {
     ok: true,
+    isGitRepository: true,
     root: gitRoot,
+    originUrl: origin.url,
+    sourceProvider: origin.provider,
+    githubMirrorUrl,
     currentBranch,
     detachedHead,
     branches,
