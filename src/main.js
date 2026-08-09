@@ -24,13 +24,17 @@ import { spawn } from 'node:child_process';
 import started from 'electron-squirrel-startup';
 import {
   clearCloudRepoLink,
+  createCloudRepo,
   deployApp,
+  findOwnedCloudRepo,
   getAppState,
+  getCloudGitConnection,
   getCloudRepoLink,
   getCloudState,
   publishRepo,
   pullRepo,
   pushRepo,
+  setCloudRepoLink,
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
@@ -92,6 +96,18 @@ import {
 import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
 import { listRiftTrashPaths, riftBinaryPath, riftCreate, riftGc, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
+import {
+  configureOrionSourceControl,
+  ensureBaselineGitignore,
+  inspectSourceControl,
+  isOrionRepoRemoteUrl,
+  planGithubRefImport,
+  pushSourceControl,
+  runAuthenticatedGit,
+  sanitizeRepositoryName,
+  shouldMirrorGithubLocally,
+  switchSourceControlToOrion,
+} from './main/source-control.js';
 import {
   collectCurrentManualRiftReleaseEntries,
   collectPendingRiftOwnersByPath,
@@ -1044,6 +1060,11 @@ app.whenReady().then(async () => {
     readStoreState: () => readPersistedStoreState(),
     readThreadsIndex,
     readThreadsByIds,
+    pushOrionSourceControl: async ({ gitRoot, token, signal }) => {
+      const branch = await getCurrentGitBranch(gitRoot);
+      if (!branch) throw new Error('Cannot push from a detached HEAD.');
+      return await pushOrionSourceControl({ gitRoot, branch, token, signal });
+    },
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
   });
   void readPersistedStoreState().then((state) => {
@@ -1941,11 +1962,16 @@ ipcMain.handle('git:getState', async (_event, projectPath) => {
 
     return await getGitStateForPath(projectPath);
   } catch (error) {
+    const detail = error?.stderr?.toString().trim() || error?.message || String(error);
+    const isPlainProject = /not a git repository/i.test(detail);
     return {
       ok: false,
+      isGitRepository: false,
+      sourceProvider: isPlainProject ? 'none' : 'other',
+      originUrl: null,
       branches: [],
       hasUncommittedChanges: false,
-      error: error?.message ?? String(error),
+      error: isPlainProject ? 'This project is ready to publish to Orion.' : detail,
     };
   }
 });
@@ -1982,6 +2008,38 @@ ipcMain.handle('git:checkoutBranch', async (_event, input) => {
     return { ok: false, error: error?.stderr?.toString().trim() || error?.message || String(error) };
   }
 });
+
+const pushBranchToSourceControl = async (gitRoot, branch, { signal } = {}) => {
+  const state = await getGitStateForPath(gitRoot);
+  if (state.sourceProvider === 'orion') {
+    const session = await readAccountSession();
+    if (!session?.token) {
+      const error = new Error('Sign in to your Orion account before pushing.');
+      error.needsAuth = true;
+      throw error;
+    }
+    return await pushOrionSourceControl({ gitRoot, branch, token: session.token, signal });
+  }
+  await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
+  return { ok: true, branch, pushedToOrion: false, mirrorWarning: null };
+};
+
+const runOriginNetworkGit = async (gitRoot, args, options = {}) => {
+  const state = await getGitStateForPath(gitRoot);
+  if (state.sourceProvider === 'orion') {
+    const session = await readAccountSession();
+    if (!session?.token) throw new Error('Sign in to your Orion account first.');
+    return await runVerifiedOrionGit({
+      gitRoot,
+      args,
+      token: session.token,
+      signal: options.signal,
+      timeout: options.timeout,
+      maxBuffer: options.maxBuffer,
+    });
+  }
+  return await execFileAsync('git', ['-C', gitRoot, ...args], options);
+};
 
 // The navbar action passes `{ projectPath, modelId, reasoningEffort }`; older
 // callers passed the path alone and keep the diffstat-style fallback message.
@@ -2035,12 +2093,13 @@ ipcMain.handle('git:commitAndPush', async (_event, input) => {
     }
 
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
-    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', state.currentBranch]);
+    const pushed = await pushBranchToSourceControl(gitRoot, state.currentBranch);
 
     return {
       ok: true,
       branch: state.currentBranch,
       message,
+      ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
       state: await getGitStateForPath(projectPath),
     };
   } catch (error) {
@@ -2180,9 +2239,9 @@ const resolveRemoteDefaultBranch = async (gitRoot) => {
     // unreachable or auth-gated remote would otherwise never settle and pin
     // the epic action in its disabled-UI busy state. The fallbacks below are
     // local, so failing fast here degrades gracefully.
-    const { stdout } = await execFileAsync(
-      'git',
-      ['-C', gitRoot, 'ls-remote', '--symref', 'origin', 'HEAD'],
+    const { stdout } = await runOriginNetworkGit(
+      gitRoot,
+      ['ls-remote', '--symref', 'origin', 'HEAD'],
       { timeout: 15_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
     );
     const branch = stdout.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD$/m)?.[1]?.trim();
@@ -2194,6 +2253,19 @@ const resolveRemoteDefaultBranch = async (gitRoot) => {
   // No usable answer from the remote; local metadata may still be right.
   const localDefaultBranch = await readLocalDefaultBranch(gitRoot);
   if (localDefaultBranch) return localDefaultBranch;
+
+  const sourceProvider = (await getGitStateForPath(gitRoot)).sourceProvider;
+  if (sourceProvider === 'orion') {
+    try {
+      const link = await getCloudRepoLink(gitRoot);
+      if (!link?.repoId) return '';
+      const state = await cloudGitApiRequest(`/api/git/repos/${encodeURIComponent(link.repoId)}`);
+      return typeof state?.repo?.defaultBranch === 'string' ? state.repo.defaultBranch.trim() : '';
+    } catch {
+      return '';
+    }
+  }
+  if (sourceProvider !== 'github') return '';
 
   try {
     const { stdout } = await execFileAsync(
@@ -2256,7 +2328,7 @@ const validateEpicGitTarget = async (gitRoot, branch, input) => {
     return {
       ok: false,
       error:
-        'Could not determine the remote default branch. Check the origin remote and GitHub authentication.',
+        'Could not determine the remote default branch. Check the origin remote and source-control authentication.',
     };
   }
   if (baseBranch === branch) {
@@ -2406,8 +2478,15 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
         if (setupErrorBeforePush) {
           return { ok: false, gitRoot, branch, error: setupErrorBeforePush };
         }
-        await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
-        return { ok: true, gitRoot, branch, message: 'Pushed existing local commits', pushed: true };
+        const pushed = await pushBranchToSourceControl(gitRoot, branch, { signal });
+        return {
+          ok: true,
+          gitRoot,
+          branch,
+          message: 'Pushed existing local commits',
+          pushed: true,
+          ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
+        };
       }
       return { ok: false, error: 'No local changes to commit.' };
     }
@@ -2468,9 +2547,16 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
     if (skipPush) {
       return { ok: true, gitRoot, branch, message, committed: true, pushed: false };
     }
-    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
+    const pushed = await pushBranchToSourceControl(gitRoot, branch, { signal });
 
-    return { ok: true, gitRoot, branch, message, pushed: true };
+    return {
+      ok: true,
+      gitRoot,
+      branch,
+      message,
+      pushed: true,
+      ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
+    };
   } catch (error) {
     if (isAbortError(error) || operation?.controller.signal.aborted) {
       return {
@@ -2558,9 +2644,9 @@ ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
         // The source checkout may be gone; the picker just loses its default.
       }
     }
-    const { stdout } = await execFileAsync(
-      'git',
-      ['-C', gitRoot, 'ls-remote', '--heads', 'origin'],
+    const { stdout } = await runOriginNetworkGit(
+      gitRoot,
+      ['ls-remote', '--heads', 'origin'],
       {
         timeout: 15_000,
         env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
@@ -2602,17 +2688,20 @@ ipcMain.handle('epic:createPr', async (event, input) => {
     if (!projectPath) {
       return { ok: false, error: 'Missing project path.' };
     }
-    if (!(await checkCommandAvailable('gh'))) {
-      return {
-        ok: false,
-        error: 'The GitHub CLI (gh) is required to open PRs. Install it and run `gh auth login`.',
-      };
-    }
-
     gitRoot = await getGitRoot(projectPath);
     branch = (await getCurrentGitBranch(gitRoot)) ?? '';
     if (!branch) {
       return { ok: false, error: 'Cannot open a PR from a detached HEAD.' };
+    }
+    const sourceProvider = (await getGitStateForPath(gitRoot)).sourceProvider;
+    if (sourceProvider === 'github' && !(await checkCommandAvailable('gh'))) {
+      return {
+        ok: false,
+        error: 'The GitHub CLI (gh) is required to open GitHub PRs. Install it and run `gh auth login`.',
+      };
+    }
+    if (sourceProvider !== 'github' && sourceProvider !== 'orion') {
+      return { ok: false, error: 'Pull requests are supported for Orion and GitHub repositories.' };
     }
 
     const target = await validateEpicGitTarget(gitRoot, branch, input);
@@ -2658,7 +2747,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
     // valid open PR even though its non-fast-forward push would fail. With no
     // selector, gh resolves the checked-out branch and its head repository;
     // filtering only by branch name could select a same-named fork PR.
-    try {
+    if (sourceProvider === 'github') try {
       // `gh pr view` below intentionally relies on the checkout so it can
       // distinguish the current repository's head from a same-named fork.
       // Revalidate at the last possible moment so a concurrent agent or
@@ -2697,6 +2786,30 @@ ipcMain.handle('epic:createPr', async (event, input) => {
       // No PR yet.
     }
 
+    if (sourceProvider === 'orion') {
+      const link = await getCloudRepoLink(gitRoot);
+      if (!link?.repoId) {
+        return { ok: false, gitRoot, branch, error: 'This Orion remote is missing its repository link.' };
+      }
+      const existing = await cloudGitApiRequest(
+        `/api/git/repos/${encodeURIComponent(link.repoId)}/pulls?state=open`,
+        { signal }
+      );
+      const pull = (existing.pulls ?? []).find(
+        (candidate) => candidate.headBranch === branch && candidate.baseBranch === baseBranch
+      );
+      if (pull) {
+        return {
+          ok: true,
+          url: orionPullRequestWebUrl(link.repoId, pull.number),
+          alreadyExists: true,
+          gitRoot,
+          branch,
+          baseBranch,
+        };
+      }
+    }
+
     // The branch must exist on the remote before gh can target a new PR.
     const worktreeFailureBeforePush = await riftWorktreeChangesFailure(gitRoot, branch, input);
     if (worktreeFailureBeforePush) return worktreeFailureBeforePush;
@@ -2707,7 +2820,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
     if (signal.aborted) {
       return { ok: false, aborted: true, gitRoot, branch };
     }
-    await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
+    const pushedBranch = await pushBranchToSourceControl(gitRoot, branch, { signal });
 
     let title = '';
     let body = '';
@@ -2727,11 +2840,9 @@ ipcMain.handle('epic:createPr', async (event, input) => {
       // the PR: fall through to the static title/body.
       let fetchedCurrentBase = false;
       try {
-        await execFileAsync(
-          'git',
+        await runOriginNetworkGit(
+          gitRoot,
           [
-            '-C',
-            gitRoot,
             'fetch',
             '--no-tags',
             'origin',
@@ -2766,7 +2877,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
           ]));
         } catch {}
         const prompt =
-          'Write a GitHub pull request title and description for the branch changes below' +
+          'Write a pull request title and description for the branch changes below' +
           (input?.epicName ? `, which deliver the epic "${input.epicName}"` : '') +
           '. First line: the PR title (specific, under 72 characters). Then a blank line, then the ' +
           'PR description in markdown: a short summary paragraph followed by a "## Changes" bullet ' +
@@ -2801,13 +2912,35 @@ ipcMain.handle('epic:createPr', async (event, input) => {
     if (signal.aborted) {
       return { ok: false, aborted: true, gitRoot, branch };
     }
-    const { stdout } = await execFileAsync(
-      'gh',
-      ['pr', 'create', '--head', branch, '--base', baseBranch, '--title', title, '--body', body],
-      { cwd: gitRoot, signal }
-    );
-    const url = stdout.match(/https?:\/\/\S+/)?.[0] ?? '';
-    return { ok: true, url, title, gitRoot, branch, baseBranch };
+    let url = '';
+    if (sourceProvider === 'orion') {
+      const link = await getCloudRepoLink(gitRoot);
+      const created = await cloudGitApiRequest(
+        `/api/git/repos/${encodeURIComponent(link.repoId)}/pulls`,
+        {
+          method: 'POST',
+          body: { title, body, baseBranch, headBranch: branch },
+          signal,
+        }
+      );
+      url = orionPullRequestWebUrl(link.repoId, created.pull.number);
+    } else {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['pr', 'create', '--head', branch, '--base', baseBranch, '--title', title, '--body', body],
+        { cwd: gitRoot, signal }
+      );
+      url = stdout.match(/https?:\/\/\S+/)?.[0] ?? '';
+    }
+    return {
+      ok: true,
+      url,
+      title,
+      gitRoot,
+      branch,
+      baseBranch,
+      ...(pushedBranch.mirrorWarning ? { mirrorWarning: pushedBranch.mirrorWarning } : {}),
+    };
   } catch (error) {
     if (isAbortError(error) || operation?.controller.signal.aborted) {
       return { ok: false, aborted: true, ...(gitRoot ? { gitRoot, branch } : {}) };
@@ -2826,7 +2959,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
 // anything to do, and — when the epic already has a PR — that PR's lifecycle
 // state. The renderer polls this while an epic view is open, so the git
 // checks stay local-only (no ls-remote/fetch); only the optional PR lookup
-// talks to GitHub, and only when prUrl is passed.
+// talks to its source-control provider, and only when prUrl is passed.
 ipcMain.handle('epic:gitStatus', async (_event, input) => {
   try {
     const projectPath = input?.projectPath;
@@ -2866,7 +2999,22 @@ ipcMain.handle('epic:gitStatus', async (_event, input) => {
     }
 
     let pr;
-    if (input?.prUrl && (await checkCommandAvailable('gh'))) {
+    const orionPr = input?.prUrl ? parseOrionPrUrl(input.prUrl) : null;
+    if (orionPr) {
+      try {
+        const result = await cloudGitApiRequest(
+          `/api/git/repos/${encodeURIComponent(orionPr.repoId)}/pulls/${orionPr.number}`
+        );
+        if (result.pull?.status) {
+          pr = {
+            state: String(result.pull.status).toUpperCase(),
+            url: String(input.prUrl),
+          };
+        }
+      } catch {
+        // Offline, expired session, or the PR is gone — keep the last state.
+      }
+    } else if (input?.prUrl && (await checkCommandAvailable('gh'))) {
       try {
         const { stdout } = await execFileAsync(
           'gh',
@@ -2902,6 +3050,18 @@ ipcMain.handle('epic:gitStatus', async (_event, input) => {
 // https://<host>/<owner>/<repo>/pull/<number>, allowing the trailing path or
 // query GitHub adds for files/commits views on a copied URL.
 const PR_URL_PATTERN = /^https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#]|$)/;
+const ORION_PR_URL_PATTERN = /^https?:\/\/[^/]+\/repos\/([^/]+)\/pulls\/(\d+)(?:[/?#]|$)/;
+
+const orionPullRequestWebUrl = (repoId, number) =>
+  new URL(`/repos/${encodeURIComponent(repoId)}/pulls/${number}`, getOrionWebUrl()).toString();
+
+const parseOrionPrUrl = (prUrl) => {
+  const match = ORION_PR_URL_PATTERN.exec(String(prUrl));
+  if (!match) return null;
+  const number = Number(match[2]);
+  if (!Number.isSafeInteger(number) || number <= 0) return null;
+  return { repoId: decodeURIComponent(match[1]), number };
+};
 
 const parsePrUrl = (prUrl) => {
   const match = PR_URL_PATTERN.exec(String(prUrl));
@@ -2943,17 +3103,41 @@ ipcMain.handle('epic:prStates', async (_event, input) => {
   const requested = Array.isArray(input?.epics) ? input.epics : [];
   const targets = requested.filter((entry) => entry?.epicId && entry?.prUrl);
   if (targets.length === 0) return { ok: true, states: [] };
-  if (!(await checkCommandAvailable('gh'))) {
-    return { ok: false, error: 'The GitHub CLI (gh) is not available.' };
-  }
 
   const states = [];
+  const githubTargets = [];
+  const orionTargets = [];
+  for (const target of targets) {
+    const parsed = parseOrionPrUrl(target.prUrl);
+    if (parsed) orionTargets.push({ ...target, ...parsed });
+    else githubTargets.push(target);
+  }
+
+  await Promise.all(
+    orionTargets.map(async (target) => {
+      try {
+        const result = await cloudGitApiRequest(
+          `/api/git/repos/${encodeURIComponent(target.repoId)}/pulls/${target.number}`
+        );
+        if (result.pull?.status) {
+          states.push({ epicId: target.epicId, state: String(result.pull.status).toUpperCase() });
+        }
+      } catch {
+        // Keep the epic's persisted state when the cloud lookup is unavailable.
+      }
+    })
+  );
+
+  if (githubTargets.length === 0) return { ok: true, states };
+  if (!(await checkCommandAvailable('gh'))) {
+    return { ok: states.length > 0, states, error: 'The GitHub CLI (gh) is not available.' };
+  }
 
   // Several epics can point at one PR, so every pull carries the list of epics
   // waiting on it rather than a single id.
   const byHost = new Map();
   const unparsed = [];
-  for (const target of targets) {
+  for (const target of githubTargets) {
     const parsed = parsePrUrl(target.prUrl);
     if (!parsed) {
       unparsed.push(target);
@@ -3029,7 +3213,7 @@ ipcMain.handle('epic:prStates', async (_event, input) => {
 
   if (fallbackTargets.length > 0) {
     const queue = [...fallbackTargets];
-    const byEpicId = new Map(targets.map((target) => [target.epicId, target]));
+    const byEpicId = new Map(githubTargets.map((target) => [target.epicId, target]));
     const lookup = async () => {
       for (;;) {
         const target = queue.shift();
@@ -4601,6 +4785,122 @@ const cloudErrorMessage = (error) => {
   return error?.stderr?.toString().trim() || error?.message || String(error);
 };
 
+const cloudGitApiRequest = async (apiPath, { method = 'GET', body, signal } = {}) => {
+  const session = await readAccountSession();
+  if (!session?.token) {
+    const error = new Error('Sign in to your Orion account first.');
+    error.needsAuth = true;
+    throw error;
+  }
+  const response = await fetch(new URL(apiPath, getOrionWebUrl()), {
+    method,
+    signal,
+    headers: {
+      authorization: `Bearer ${session.token}`,
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  let data = {};
+  try {
+    data = await response.json();
+  } catch {}
+  if (!response.ok) {
+    const error = new Error(data?.error || `Orion Cloud request failed (${response.status}).`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
+  return data;
+};
+
+const expectedOrionGitRemote = (gitHttpUrl, repoId) =>
+  `${String(gitHttpUrl ?? '').replace(/\/+$/, '')}/r/${encodeURIComponent(repoId)}.git`;
+
+// Local git config is mutable and can arrive with an untrusted repository.
+// Resolve the authoritative endpoint through Orion Cloud and compare the
+// complete remote before placing the session token in Git's environment.
+const verifyOrionGitRemote = async ({ gitRoot, token, signal }) => {
+  const link = await getCloudRepoLink(gitRoot);
+  if (!link?.repoId) throw new Error('This repository is not linked to Orion Cloud.');
+  const [{ stdout }, connection] = await Promise.all([
+    execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', 'origin']),
+    getCloudGitConnection({ baseUrl: getOrionWebUrl(), token, signal }),
+  ]);
+  const actual = stdout.trim().replace(/\/+$/, '');
+  const expected = expectedOrionGitRemote(connection?.gitHttpUrl, link.repoId);
+  if (!connection?.gitHttpUrl || actual !== expected || !isOrionRepoRemoteUrl(actual, link.repoId)) {
+    throw new Error(
+      'The origin remote does not match this repository’s authenticated Orion Cloud endpoint.'
+    );
+  }
+  return expected;
+};
+
+const runVerifiedOrionGit = async ({ gitRoot, token, args, signal, timeout, maxBuffer }) => {
+  await verifyOrionGitRemote({ gitRoot, token, signal });
+  return await runAuthenticatedGit({ gitRoot, token, args, signal, timeout, maxBuffer });
+};
+
+const readPersistedGithubMirrorDelivery = async (gitRoot) => {
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '-C', gitRoot, 'config', '--local', '--get', 'orion.githubMirrorDelivery',
+    ]);
+    return ['cloud', 'desktop'].includes(stdout.trim()) ? stdout.trim() : null;
+  } catch {
+    return null;
+  }
+};
+
+const persistGithubMirrorDelivery = async (gitRoot, mirror) => {
+  const delivery = shouldMirrorGithubLocally(mirror) ? 'desktop' : 'cloud';
+  await execFileAsync('git', [
+    '-C', gitRoot, 'config', '--local', 'orion.githubMirrorDelivery', delivery,
+  ]);
+  return delivery;
+};
+
+const mirrorFromCloudResponse = (data) =>
+  data?.mirror ?? data?.githubMirror ?? (data?.delivery && data?.status ? data : null);
+
+// Orion Cloud owns the downstream GitHub push once its mirror is active. A
+// missing/legacy endpoint and an installation that still needs authorization
+// deliberately preserve Desktop's existing best-effort mirror.
+const resolveGithubMirrorDelivery = async (gitRoot, { signal } = {}) => {
+  const link = await getCloudRepoLink(gitRoot);
+  if (!link?.repoId) return { mirrorGithub: true, mirror: null };
+  const persistedDelivery = await readPersistedGithubMirrorDelivery(gitRoot);
+  try {
+    const data = await cloudGitApiRequest(
+      `/api/git/repos/${encodeURIComponent(link.repoId)}/github-mirror`,
+      { signal }
+    );
+    const mirror = mirrorFromCloudResponse(data);
+    const delivery = await persistGithubMirrorDelivery(gitRoot, mirror);
+    return { mirrorGithub: delivery === 'desktop', mirror };
+  } catch (error) {
+    const legacyFallback = error?.status === 404 && persistedDelivery !== 'cloud';
+    if (!legacyFallback) {
+      console.warn('Could not resolve Orion Cloud GitHub mirror delivery; skipping Desktop mirror:', error);
+    }
+    return { mirrorGithub: legacyFallback, mirror: null };
+  }
+};
+
+const pushOrionSourceControl = async ({ gitRoot, branch, token, signal }) => {
+  await verifyOrionGitRemote({ gitRoot, token, signal });
+  const delivery = await resolveGithubMirrorDelivery(gitRoot, { signal });
+  const pushed = await pushSourceControl({
+    gitRoot,
+    branch,
+    token,
+    signal,
+    mirrorGithub: delivery.mirrorGithub,
+  });
+  return { ...pushed, mirror: delivery.mirror };
+};
+
 const sanitizeCloudRepoName = (value) =>
   String(value ?? '')
     .trim()
@@ -4610,6 +4910,459 @@ const sanitizeCloudRepoName = (value) =>
     .slice(0, 100);
 
 const cloudRepoWebUrl = (repoId) => new URL(`/repos/${repoId}`, getOrionWebUrl()).toString();
+
+const ensureInitialSourceControlCommit = async (gitRoot, session) => {
+  const hasHead = await commandSucceeds('git', ['-C', gitRoot, 'rev-parse', '--verify', 'HEAD']);
+  if (hasHead) return false;
+
+  await ensureBaselineGitignore(gitRoot);
+  const readConfig = async (key) => {
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', gitRoot, 'config', '--get', key]);
+      return stdout.trim();
+    } catch {
+      return '';
+    }
+  };
+  if (!(await readConfig('user.name'))) {
+    await execFileAsync('git', [
+      '-C',
+      gitRoot,
+      'config',
+      '--local',
+      'user.name',
+      String(session?.user?.name || 'Orion User'),
+    ]);
+  }
+  if (!(await readConfig('user.email'))) {
+    await execFileAsync('git', [
+      '-C',
+      gitRoot,
+      'config',
+      '--local',
+      'user.email',
+      String(session?.user?.email || 'orion@users.noreply.orioncode.xyz'),
+    ]);
+  }
+  await execFileAsync('git', ['-C', gitRoot, 'add', '-A']);
+  await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', 'Initial commit']);
+  return true;
+};
+
+const parseImportedGitRefs = (stdout, name) => stdout
+  .split('\n')
+  .map((line) => line.trim().split('\t'))
+  .filter(([refName, oid]) => refName && /^[0-9a-f]{40,64}$/i.test(oid))
+  .map(([refName, oid]) => ({ [name]: refName, oid }));
+
+const clearGithubImportTagRefs = async (gitRoot) => {
+  let refs = [];
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '-C',
+      gitRoot,
+      'for-each-ref',
+      '--format=%(refname)',
+      'refs/orion-import/github-tags',
+    ]);
+    refs = stdout.split('\n').map((ref) => ref.trim()).filter(Boolean);
+  } catch {
+    return;
+  }
+  await Promise.allSettled(
+    refs.map((ref) => execFileAsync('git', ['-C', gitRoot, 'update-ref', '-d', ref]))
+  );
+};
+
+const readLocalNamedRefs = async (gitRoot, namespace, name) => {
+  const { stdout } = await execFileAsync('git', [
+    '-C', gitRoot, 'for-each-ref', '--format=%(refname:strip=2)\t%(objectname)', namespace,
+  ]);
+  return parseImportedGitRefs(stdout, name);
+};
+
+const createAvailableEmptyCloudRepo = async ({ gitRoot, name, defaultBranch, token }) => {
+  const previousLink = await getCloudRepoLink(gitRoot);
+  if (previousLink?.repoId) {
+    const existing = await cloudGitApiRequest(
+      `/api/git/repos/${encodeURIComponent(previousLink.repoId)}`
+    );
+    if ((existing?.refs ?? []).length === 0) {
+      return { repo: existing.repo, previousLink, created: false };
+    }
+  }
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const candidate = attempt === 0 ? name : `${name}-orion${attempt === 1 ? '' : `-${attempt}`}`;
+    try {
+      const repo = await createCloudRepo({
+        gitRoot,
+        name: candidate,
+        defaultBranch,
+        baseUrl: getOrionWebUrl(),
+        token,
+      });
+      return { repo, previousLink, created: true };
+    } catch (error) {
+      if (error?.status !== 409) throw error;
+    }
+  }
+  throw new Error('Could not choose an available Orion repository name.');
+};
+
+const restoreCloudRepoLink = async (gitRoot, previousLink) => {
+  if (previousLink?.repoId) await setCloudRepoLink(gitRoot, previousLink);
+  else await clearCloudRepoLink(gitRoot);
+};
+
+const convertGithubSourceControl = async ({ projectPath, state, session }) => {
+  const gitRoot = state.gitRoot;
+  const current = await getCurrentGitBranch(gitRoot);
+  if (!current) {
+    throw new Error('Cannot switch source control from a detached HEAD. Check out a branch first.');
+  }
+  await ensureInitialSourceControlCommit(gitRoot, session);
+
+  const [localBranches, localTags] = await Promise.all([
+    readLocalNamedRefs(gitRoot, 'refs/heads', 'branch'),
+    readLocalNamedRefs(gitRoot, 'refs/tags', 'tag'),
+  ]);
+  let githubDefaultBranch = current;
+  try {
+    await execFileAsync(
+      'git',
+      [
+        '-C', gitRoot, 'fetch', '--prune', 'origin',
+        '+refs/heads/*:refs/remotes/origin/*',
+        '+refs/tags/*:refs/orion-import/github-tags/*',
+      ],
+      { timeout: 60_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
+    );
+    const { stdout: remoteHead } = await execFileAsync(
+      'git',
+      ['-C', gitRoot, 'ls-remote', '--symref', 'origin', 'HEAD'],
+      { timeout: 15_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
+    );
+    githubDefaultBranch =
+      remoteHead.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD$/m)?.[1]?.trim() || current;
+  } catch {
+    throw new Error(
+      'The GitHub remote could not be refreshed completely. Orion left the repository on GitHub.'
+    );
+  }
+
+  const [githubBranches, githubTags] = await Promise.all([
+    readLocalNamedRefs(gitRoot, 'refs/remotes/origin', 'branch'),
+    readLocalNamedRefs(gitRoot, 'refs/orion-import/github-tags', 'tag'),
+  ]);
+  const filteredGithubBranches = githubBranches.filter(({ branch }) => branch !== 'HEAD');
+  const { targetBranches, targetTags, branchPreservations, tagPreservations } =
+    planGithubRefImport({
+      localBranches,
+      githubBranches: filteredGithubBranches,
+      localTags,
+      githubTags,
+    });
+
+  const repoName = sanitizeRepositoryName(state.origin.repo || path.basename(gitRoot));
+  const provisioned = await createAvailableEmptyCloudRepo({
+    gitRoot,
+    name: repoName,
+    defaultBranch: githubDefaultBranch,
+    token: session.token,
+  });
+  const connection = await getCloudGitConnection({
+    baseUrl: getOrionWebUrl(), token: session.token,
+  });
+  const cloneUrl = expectedOrionGitRemote(connection?.gitHttpUrl, provisioned.repo.id);
+  if (!connection?.gitHttpUrl || !isOrionRepoRemoteUrl(cloneUrl, provisioned.repo.id)) {
+    await restoreCloudRepoLink(gitRoot, provisioned.previousLink);
+    await clearGithubImportTagRefs(gitRoot);
+    throw new Error('Orion Cloud did not return a valid Git repository endpoint.');
+  }
+
+  const refspecs = [
+    ...[...targetBranches].map(([branch, oid]) => `${oid}:refs/heads/${branch}`),
+    ...[...targetTags].map(([tag, oid]) => `${oid}:refs/tags/${tag}`),
+  ];
+  try {
+    if (refspecs.length > 0) {
+      await runAuthenticatedGit({
+        gitRoot,
+        token: session.token,
+        args: ['push', '--atomic', cloneUrl, ...refspecs],
+      });
+    }
+  } catch (error) {
+    await restoreCloudRepoLink(gitRoot, provisioned.previousLink);
+    await clearGithubImportTagRefs(gitRoot);
+    throw error;
+  }
+
+  const currentPreservation = branchPreservations.find((entry) => entry.original === current);
+  const previousGithubUrl = state.remotes.find((remote) => remote.name === 'github')?.url ?? null;
+  let localRefsChanged = false;
+  let remotesMayHaveChanged = false;
+  try {
+    if (currentPreservation) {
+      await execFileAsync('git', ['-C', gitRoot, 'branch', '-m', currentPreservation.preserved]);
+      localRefsChanged = true;
+      await execFileAsync('git', [
+        '-C', gitRoot, 'update-ref', `refs/heads/${currentPreservation.original}`,
+        currentPreservation.githubOid,
+      ]);
+    }
+    for (const entry of branchPreservations) {
+      if (entry === currentPreservation) continue;
+      await execFileAsync('git', [
+        '-C', gitRoot, 'update-ref', `refs/heads/${entry.preserved}`, entry.localOid,
+      ]);
+      localRefsChanged = true;
+      await execFileAsync('git', [
+        '-C', gitRoot, 'update-ref', `refs/heads/${entry.original}`, entry.githubOid,
+      ]);
+    }
+    for (const entry of tagPreservations) {
+      await execFileAsync('git', [
+        '-C', gitRoot, 'update-ref', `refs/tags/${entry.preserved}`, entry.localOid,
+      ]);
+      localRefsChanged = true;
+      await execFileAsync('git', [
+        '-C', gitRoot, 'update-ref', `refs/tags/${entry.original}`, entry.githubOid,
+      ]);
+    }
+
+    remotesMayHaveChanged = true;
+    await configureOrionSourceControl({
+      gitRoot,
+      orionUrl: cloneUrl,
+      repoId: provisioned.repo.id,
+      repoName: provisioned.repo.name,
+      orionHosts: [new URL(connection.gitHttpUrl).hostname],
+    });
+    for (const [branch, oid] of targetBranches) {
+      await execFileAsync('git', ['-C', gitRoot, 'update-ref', `refs/remotes/origin/${branch}`, oid]);
+    }
+    for (const { branch, oid } of filteredGithubBranches) {
+      await execFileAsync('git', ['-C', gitRoot, 'update-ref', `refs/remotes/github/${branch}`, oid]);
+    }
+    const activeBranch = currentPreservation?.preserved ?? current;
+    await execFileAsync('git', ['-C', gitRoot, 'config', '--local', `branch.${activeBranch}.remote`, 'origin']);
+    await execFileAsync('git', [
+      '-C', gitRoot, 'config', '--local', `branch.${activeBranch}.merge`, `refs/heads/${activeBranch}`,
+    ]);
+  } catch (error) {
+    if (remotesMayHaveChanged) {
+      await execFileAsync('git', ['-C', gitRoot, 'remote', 'set-url', 'origin', state.originUrl]).catch(() => {});
+      if (previousGithubUrl) {
+        const hasGithubRemote = await execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', 'github'])
+          .then(() => true, () => false);
+        await execFileAsync('git', [
+          '-C', gitRoot, 'remote', hasGithubRemote ? 'set-url' : 'add', 'github', previousGithubUrl,
+        ]).catch(() => {});
+      } else {
+        await execFileAsync('git', ['-C', gitRoot, 'remote', 'remove', 'github']).catch(() => {});
+      }
+      for (const key of ['orion.sourcecontrol', 'orion.githubMirrorUrl', 'orion.githubMirrorDelivery']) {
+        await execFileAsync('git', ['-C', gitRoot, 'config', '--local', '--unset-all', key]).catch(() => {});
+      }
+    }
+    if (localRefsChanged) {
+      if (currentPreservation && (await getCurrentGitBranch(gitRoot)) === currentPreservation.preserved) {
+        await execFileAsync('git', ['-C', gitRoot, 'branch', '-m', current]).catch(() => {});
+      }
+      for (const entry of branchPreservations) {
+        await execFileAsync('git', ['-C', gitRoot, 'update-ref', `refs/heads/${entry.original}`, entry.localOid]).catch(() => {});
+        await execFileAsync('git', ['-C', gitRoot, 'update-ref', '-d', `refs/heads/${entry.preserved}`]).catch(() => {});
+      }
+      for (const entry of tagPreservations) {
+        await execFileAsync('git', ['-C', gitRoot, 'update-ref', `refs/tags/${entry.original}`, entry.localOid]).catch(() => {});
+        await execFileAsync('git', ['-C', gitRoot, 'update-ref', '-d', `refs/tags/${entry.preserved}`]).catch(() => {});
+      }
+    }
+    await restoreCloudRepoLink(gitRoot, provisioned.previousLink);
+    throw error;
+  } finally {
+    await clearGithubImportTagRefs(gitRoot);
+  }
+
+  let mirror = null;
+  let mirrorConfigurationWarning = null;
+  try {
+    const configured = await cloudGitApiRequest(
+      `/api/git/repos/${encodeURIComponent(provisioned.repo.id)}/github-mirror`,
+      {
+        method: 'PUT',
+        body: {
+          githubOwner: state.origin.owner,
+          githubName: state.origin.repo,
+          githubUrl: state.originUrl,
+        },
+      }
+    );
+    mirror = mirrorFromCloudResponse(configured);
+    await persistGithubMirrorDelivery(gitRoot, mirror);
+  } catch (error) {
+    if (error?.status === 404) {
+      await persistGithubMirrorDelivery(gitRoot, null);
+    } else {
+      mirrorConfigurationWarning =
+        'Continuous GitHub mirroring could not be confirmed; Desktop will not mirror until Cloud status recovers.';
+    }
+  }
+
+  const preservedNames = [
+    ...branchPreservations.map((entry) => entry.preserved),
+    ...tagPreservations.map((entry) => `tag ${entry.preserved}`),
+  ];
+  const preservationMessage = preservedNames.length > 0
+    ? `Differing local refs were preserved in Orion as ${preservedNames.join(', ')}.`
+    : null;
+  return {
+    ok: true,
+    createdRepository: provisioned.created,
+    repo: provisioned.repo,
+    originUrl: cloneUrl,
+    githubMirrorUrl: state.originUrl,
+    mirror,
+    ...(
+      preservationMessage || mirrorConfigurationWarning
+        ? { mirrorWarning: [preservationMessage, mirrorConfigurationWarning].filter(Boolean).join(' ') }
+        : {}
+    ),
+  };
+};
+
+ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
+  try {
+    const projectPath = input?.projectPath;
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, needsAuth: true, error: 'Sign in to your Orion account first.' };
+    }
+
+    const initialSource = await inspectSourceControl(projectPath);
+    if (initialSource.origin.kind === 'github') {
+      return await convertGithubSourceControl({ projectPath, state: initialSource, session });
+    }
+
+    const trustedOrionHosts = [];
+    let createdRepository = false;
+    const switched = await switchSourceControlToOrion({
+      projectPath,
+      orionHosts: trustedOrionHosts,
+      provisionRepo: async ({ name, defaultBranch, gitRoot }) => {
+        await ensureInitialSourceControlCommit(gitRoot, session);
+        let link = await getCloudRepoLink(gitRoot);
+        let repo = null;
+
+        if (link?.repoId) {
+          const pushed = await pushRepo({
+            gitRoot,
+            repoId: link.repoId,
+            baseUrl: getOrionWebUrl(),
+            token: session.token,
+          });
+          if (!pushed.ok) throw new Error(pushed.error || 'Could not seed the Orion repository.');
+          repo = pushed.repo ?? { id: link.repoId, name: link.repoName ?? name, defaultBranch };
+        } else {
+          try {
+            const published = await publishRepo({
+              gitRoot,
+              name,
+              baseUrl: getOrionWebUrl(),
+              token: session.token,
+            });
+            if (!published.ok) throw new Error(published.error || 'Could not seed the Orion repository.');
+            repo = published.repo;
+            createdRepository = true;
+          } catch (error) {
+            if (error?.status !== 409) throw error;
+            repo = await findOwnedCloudRepo({
+              baseUrl: getOrionWebUrl(),
+              token: session.token,
+              name,
+            });
+            if (!repo) throw error;
+            await setCloudRepoLink(gitRoot, { repoId: repo.id, repoName: repo.name });
+            const pushed = await pushRepo({
+              gitRoot,
+              repoId: repo.id,
+              baseUrl: getOrionWebUrl(),
+              token: session.token,
+            });
+            if (!pushed.ok) throw new Error(pushed.error || 'Could not update the Orion repository.');
+          }
+        }
+
+        const connection = await getCloudGitConnection({
+          baseUrl: getOrionWebUrl(),
+          token: session.token,
+        });
+        const gitHttpUrl = String(connection?.gitHttpUrl ?? '').replace(/\/+$/, '');
+        const parsed = new URL(gitHttpUrl);
+        trustedOrionHosts.push(parsed.hostname);
+        return { repo, cloneUrl: `${gitHttpUrl}/r/${encodeURIComponent(repo.id)}.git` };
+      },
+    });
+
+    await runVerifiedOrionGit({
+      gitRoot: switched.gitRoot,
+      token: session.token,
+      args: ['push', 'origin', '--tags'],
+    });
+    const pushed = await pushOrionSourceControl({
+      gitRoot: switched.gitRoot,
+      token: session.token,
+    });
+    return {
+      ok: true,
+      createdRepository,
+      repo: switched.repo,
+      originUrl: switched.originUrl,
+      githubMirrorUrl: switched.githubUrl,
+      mirror: pushed.mirror ?? null,
+      ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      ...(error?.needsAuth || error?.status === 401 ? { needsAuth: true } : {}),
+      error: cloudErrorMessage(error),
+    };
+  }
+});
+
+ipcMain.handle('git:authorizeGithubMirror', async (_event, projectPath) => {
+  try {
+    if (!projectPath) return { ok: false, error: 'Missing project path.' };
+    const session = await readAccountSession();
+    if (!session?.token) {
+      return { ok: false, needsAuth: true, error: 'Sign in to your Orion account first.' };
+    }
+    const gitRoot = await getGitRoot(projectPath);
+    const [link, state] = await Promise.all([
+      getCloudRepoLink(gitRoot),
+      getGitStateForPath(gitRoot),
+    ]);
+    if (!link?.repoId || !state.githubMirrorUrl) {
+      return { ok: false, error: 'This repository does not have a preserved GitHub mirror.' };
+    }
+    await verifyOrionGitRemote({ gitRoot, token: session.token });
+    const configured = await cloudGitApiRequest(
+      `/api/git/repos/${encodeURIComponent(link.repoId)}/github-mirror`,
+      { method: 'PUT', body: { githubUrl: state.githubMirrorUrl } }
+    );
+    return { ok: true, mirror: mirrorFromCloudResponse(configured) };
+  } catch (error) {
+    return {
+      ok: false,
+      ...(error?.needsAuth || error?.status === 401 ? { needsAuth: true } : {}),
+      error: cloudErrorMessage(error),
+    };
+  }
+});
 
 ipcMain.handle('cloud:getState', async (_event, projectPath) => {
   try {
@@ -4711,12 +5464,27 @@ ipcMain.handle('cloud:pull', async (_event, projectPath) => {
     const link = await getCloudRepoLink(gitRoot);
     if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
 
-    return await pullRepo({
+    const pulled = await pullRepo({
       gitRoot,
       repoId: link.repoId,
       baseUrl: getOrionWebUrl(),
       token: session.token,
     });
+    const sourceState = await getGitStateForPath(gitRoot);
+    if (
+      pulled.ok &&
+      sourceState.sourceProvider === 'orion' &&
+      sourceState.currentBranch &&
+      ['fast-forwarded', 'checked-out', 'up-to-date'].includes(pulled.merge?.status)
+    ) {
+      const mirrored = await pushOrionSourceControl({
+        gitRoot,
+        branch: sourceState.currentBranch,
+        token: session.token,
+      });
+      if (mirrored.mirrorWarning) pulled.mirrorWarning = mirrored.mirrorWarning;
+    }
+    return pulled;
   } catch (error) {
     return { ok: false, error: cloudErrorMessage(error) };
   }
@@ -4808,14 +5576,21 @@ ipcMain.handle('cloud:deploy', async (_event, projectPath) => {
       };
     }
 
-    // The server builds whatever HEAD it has, so push before deploying —
-    // otherwise a deploy silently ships the previous commit.
-    const pushed = await pushRepo({
-      gitRoot,
-      repoId: link.repoId,
-      baseUrl: getOrionWebUrl(),
-      token: session.token,
-    });
+    // The server builds whatever HEAD it has, so push before deploying. A
+    // converted repository uses its real Orion origin (and downstream GitHub
+    // mirror); legacy Cloud-linked repos retain the JSON pack-upload path.
+    const sourceState = await getGitStateForPath(gitRoot);
+    if (sourceState.sourceProvider === 'orion' && !sourceState.currentBranch) {
+      return { ok: false, error: 'Cannot deploy from a detached HEAD.' };
+    }
+    const pushed = sourceState.sourceProvider === 'orion'
+      ? await pushBranchToSourceControl(gitRoot, sourceState.currentBranch)
+      : await pushRepo({
+          gitRoot,
+          repoId: link.repoId,
+          baseUrl: getOrionWebUrl(),
+          token: session.token,
+        });
     if (!pushed.ok) return pushed;
 
     const app = await deployApp({

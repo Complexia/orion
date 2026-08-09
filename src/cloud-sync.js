@@ -78,6 +78,16 @@ async function currentBranch(gitRoot, signal) {
   }
 }
 
+async function cloudTrackingRemote(gitRoot, signal) {
+  try {
+    const configured = await git(gitRoot, ['config', '--local', 'orion.sourcecontrol'], { signal });
+    if (configured === 'orion') return 'origin';
+  } catch {
+    // Legacy cloud-linked repositories keep their separate `orion/*` refs.
+  }
+  return 'orion';
+}
+
 async function fileExists(filePath) {
   try {
     await fs.access(filePath);
@@ -110,6 +120,27 @@ async function api(baseUrl, token, apiPath, options = {}) {
     throw error;
   }
   return data;
+}
+
+// Smart-HTTP discovery lives behind the same bearer-authenticated CLI surface
+// as repository provisioning. Keeping this server-provided avoids a packaged
+// desktop accidentally targeting production while ORION_WEB_URL points at a
+// local Orion Web instance (or vice versa).
+export async function getCloudGitConnection({ baseUrl, token, signal }) {
+  return await api(baseUrl, token, '/api/cli/whoami', { signal });
+}
+
+// POST /api/git/repos is intentionally strict about duplicate names. During a
+// source-control conversion, a repo may already have been created from another
+// machine, so adopt only an exact-name repo owned by this account. Never adopt
+// a collaborator repo merely because its display name happens to match.
+export async function findOwnedCloudRepo({ baseUrl, token, name, signal }) {
+  const result = await api(baseUrl, token, '/api/cli/repos', { signal });
+  return (
+    (Array.isArray(result?.repos) ? result.repos : []).find(
+      (repo) => repo?.role === 'owner' && repo?.name === name
+    ) ?? null
+  );
 }
 
 async function uploadTo(url, body, contentType = 'application/octet-stream', signal) {
@@ -514,6 +545,18 @@ export async function publishRepo({
   return { ...result, repo: created.repo };
 }
 
+/** Create and link an empty repository so callers can seed an exact ref set. */
+export async function createCloudRepo({ gitRoot, name, defaultBranch, baseUrl, token, signal }) {
+  signal?.throwIfAborted();
+  const created = await api(baseUrl, token, '/api/git/repos', {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({ name, defaultBranch }),
+  });
+  await setCloudRepoLink(gitRoot, { repoId: created.repo.id, repoName: created.repo.name });
+  return created.repo;
+}
+
 // --- Pull ---------------------------------------------------------------------
 
 export async function pullRepo({ gitRoot, repoId, baseUrl, token, onProgress = () => {} }) {
@@ -546,6 +589,7 @@ export async function pullRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
   }
 
   const branches = [];
+  const trackingRemote = await cloudTrackingRemote(gitRoot);
   for (const ref of info.refs) {
     if (!ref.name.startsWith('refs/heads/')) continue;
     const branch = ref.name.slice('refs/heads/'.length);
@@ -553,7 +597,7 @@ export async function pullRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
       branches.push({ branch, oid: ref.oid, status: 'missing-objects' });
       continue;
     }
-    await git(gitRoot, ['update-ref', `refs/remotes/orion/${branch}`, ref.oid]);
+    await git(gitRoot, ['update-ref', `refs/remotes/${trackingRemote}/${branch}`, ref.oid]);
     branches.push({ branch, oid: ref.oid, status: 'fetched' });
   }
 
@@ -576,7 +620,7 @@ export async function pullRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
         } else {
           merge = {
             status: 'unborn-dirty',
-            hint: `Check out refs/remotes/orion/${branch} manually.`,
+            hint: `Check out refs/remotes/${trackingRemote}/${branch} manually.`,
           };
         }
       } else if (serverRef.oid === localOid) {
@@ -596,7 +640,7 @@ export async function pullRepo({ gitRoot, repoId, baseUrl, token, onProgress = (
       } else {
         merge = {
           status: 'diverged',
-          hint: `Local and cloud history diverged — merge refs/remotes/orion/${branch} manually.`,
+          hint: `Local and cloud history diverged — merge refs/remotes/${trackingRemote}/${branch} manually.`,
         };
       }
     }
@@ -674,6 +718,9 @@ export async function getCloudState({ gitRoot, baseUrl, token }) {
       // Deployed app for this repo, if any. Older Orion Web deployments omit
       // the field entirely, so absent and "never deployed" both read as null.
       app: state.app ?? null,
+      // Continuous downstream source-control mirror. Older Orion Web
+      // deployments omit this field and Desktop retains its local fallback.
+      mirror: state.mirror ?? state.githubMirror ?? null,
     };
   } catch (error) {
     if (error.status === 404) {
