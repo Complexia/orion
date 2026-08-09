@@ -6,9 +6,12 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import mcpBridgeShimSource from '../mcp-bridge-shim.cjs?raw';
-import { runShellCommand } from './shell-env.js';
+import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
-import { isMcpBridgeProvider } from './thread-reader-routing.js';
+import {
+  isMcpBridgeProvider,
+  probeProviderRunPluginSupport,
+} from './thread-reader-routing.js';
 
 export let legacyMcpCleanupPromise = Promise.resolve();
 
@@ -258,12 +261,12 @@ export const runPluginSupportPromises = new Map();
 export const providerSupportsRunPlugin = (providerId) => {
   if (providerId !== 'cursor' && providerId !== 'grok') return Promise.resolve(true);
   if (!runPluginSupportPromises.has(providerId)) {
-    const helpCommand = providerId === 'cursor' ? 'cursor-agent --help' : 'grok agent --help';
     runPluginSupportPromises.set(
       providerId,
-      runShellCommand(helpCommand, 10000)
-        .then(({ stdout, stderr }) => `${stdout}\n${stderr}`.includes('--plugin-dir'))
-        .catch(() => false)
+      probeProviderRunPluginSupport(providerId, {
+        shellPathReady: shellPathSyncPromise,
+        runShellCommand,
+      })
     );
   }
   return runPluginSupportPromises.get(providerId);

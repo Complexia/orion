@@ -10,6 +10,7 @@ import {
   isEffectiveThreadReaderBridgeReady,
   isMcpBridgeProvider,
   isRequiredThreadReaderBridgeMissing,
+  probeProviderRunPluginSupport,
   requiresRegisteredThreadReaderBridge,
 } from '../src/main/thread-reader-routing.js';
 import { withThreadStartReservation } from '../src/app/turnStart.ts';
@@ -96,6 +97,36 @@ assert.equal(
   hasThreadReaderSupport('grok', { providerId: 'grok', supported: true }),
   true,
   'thread mentions should be offered after the effective provider is confirmed capable'
+);
+
+let releaseShellPath;
+const shellPathReady = new Promise((resolve) => {
+  releaseShellPath = resolve;
+});
+let pluginProbeStarted = false;
+const pluginSupport = probeProviderRunPluginSupport('grok', {
+  shellPathReady,
+  runShellCommand: async () => {
+    pluginProbeStarted = true;
+    return { stdout: '  --plugin-dir <DIR>', stderr: '' };
+  },
+});
+await Promise.resolve();
+assert.equal(
+  pluginProbeStarted,
+  false,
+  'Grok and Cursor capability probes must wait for the Finder-safe shell PATH'
+);
+releaseShellPath();
+assert.equal(await pluginSupport, true, 'the post-PATH plugin probe should expose thread mentions');
+assert.equal(pluginProbeStarted, true);
+assert.equal(
+  await probeProviderRunPluginSupport('cursor', {
+    shellPathReady: Promise.resolve(),
+    runShellCommand: async () => ({ stdout: '', stderr: '  --plugin-dir <path>' }),
+  }),
+  true,
+  'Cursor should accept the plugin flag whether its CLI writes help to stdout or stderr'
 );
 
 assert.equal(
