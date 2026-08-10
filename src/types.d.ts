@@ -345,6 +345,25 @@ type OrionCloudApp = {
   commitOid?: string | null;
 };
 
+type OrionGithubMirror = {
+  provider: 'github';
+  delivery: 'cloud' | 'desktop';
+  status:
+    | 'active'
+    | 'queued'
+    | 'syncing'
+    | 'authorization_required'
+    | 'reconnect_required'
+    | 'error'
+    | 'disabling'
+    | 'unconfigured'
+    | 'disabled';
+  authorizationUrl?: string | null;
+  repositoryUrl?: string | null;
+  lastMirroredGeneration?: number | null;
+  lastError?: string | null;
+};
+
 type OrionCloudState = {
   ok: boolean;
   authenticated?: boolean;
@@ -359,6 +378,8 @@ type OrionCloudState = {
   webUrl?: string | null;
   /** Absent on Orion Web deployments that predate app hosting. */
   app?: OrionCloudApp | null;
+  /** Absent on Orion Web deployments that predate continuous GitHub mirroring. */
+  mirror?: OrionGithubMirror | null;
   error?: string;
 };
 
@@ -424,6 +445,7 @@ type OrionCloudPullResult = {
   };
   downloadedPacks?: number;
   downloadedLoose?: number;
+  mirrorWarning?: string;
   error?: string;
 };
 }
@@ -585,7 +607,11 @@ type OrionComputerUsePermissions = {
       confirmDeletePath: (input: { path: string; isDirectory: boolean }) => Promise<boolean>;
       getGitState: (projectPath: string) => Promise<{
         ok: boolean;
+        isGitRepository?: boolean;
         root?: string;
+        originUrl?: string | null;
+        sourceProvider?: 'github' | 'orion' | 'other' | 'none';
+        githubMirrorUrl?: string | null;
         currentBranch?: string | null;
         detachedHead?: string | null;
         branches: Array<{
@@ -596,6 +622,23 @@ type OrionComputerUsePermissions = {
         hasUncommittedChanges: boolean;
         ahead?: number;
         behind?: number;
+        error?: string;
+      }>;
+      changeSourceControlToOrion: (input: { projectPath: string }) => Promise<{
+        ok: boolean;
+        needsAuth?: boolean;
+        createdRepository?: boolean;
+        repo?: { id: string; name: string; defaultBranch?: string; generation?: number };
+        originUrl?: string;
+        githubMirrorUrl?: string | null;
+        mirror?: OrionGithubMirror | null;
+        mirrorWarning?: string;
+        error?: string;
+      }>;
+      authorizeGithubMirror: (projectPath: string) => Promise<{
+        ok: boolean;
+        needsAuth?: boolean;
+        mirror?: OrionGithubMirror | null;
         error?: string;
       }>;
       checkoutGitBranch: (input: {
@@ -630,6 +673,7 @@ type OrionComputerUsePermissions = {
         ok: boolean;
         branch?: string;
         message?: string;
+        mirrorWarning?: string;
         error?: string;
         state?: {
           ok: boolean;
@@ -677,6 +721,7 @@ type OrionComputerUsePermissions = {
         pushed?: boolean;
         /** The user aborted the operation mid-flight. */
         aborted?: boolean;
+        mirrorWarning?: string;
         error?: string;
       }>;
       epicCreatePr: (input: {
@@ -713,6 +758,7 @@ type OrionComputerUsePermissions = {
         aborted?: boolean;
         /** A commit landed before the abort and remains local. */
         committed?: boolean;
+        mirrorWarning?: string;
         error?: string;
       }>;
       /** Abort the epic's in-flight commit-and-push or open-PR operation. */

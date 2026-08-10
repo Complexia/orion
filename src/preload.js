@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('orion', {
 
   // Git
   getGitState: (projectPath) => ipcRenderer.invoke('git:getState', projectPath),
+  changeSourceControlToOrion: (input) => ipcRenderer.invoke('git:changeSourceControlToOrion', input),
+  authorizeGithubMirror: (projectPath) => ipcRenderer.invoke('git:authorizeGithubMirror', projectPath),
   checkoutGitBranch: (input) => ipcRenderer.invoke('git:checkoutBranch', input),
   commitAndPush: (input) => ipcRenderer.invoke('git:commitAndPush', input),
 
