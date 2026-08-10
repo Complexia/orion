@@ -221,7 +221,10 @@ export const defaultRiftsSettings: RiftsSettings = {
 export type WorkspaceSyncSettings = {
   /** Master switch; requires a signed-in Orion account to take effect. */
   enabled: boolean;
-  /** Auto-publish git projects as cloud repos and auto-push new commits. */
+  /**
+   * Auto-publish git projects and auto-push branch save points (commits).
+   * Dirty working-tree files are never uploaded by workspace sync.
+   */
   syncCode: boolean;
 };
 

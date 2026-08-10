@@ -9,10 +9,12 @@ import {
   BASELINE_GITIGNORE,
   classifyRemoteUrl,
   configureOrionSourceControl,
+  canReuseLinkedCloudRepo,
   ensureBaselineGitignore,
   ensureGitRepository,
   inspectSourceControl,
   isOrionRepoRemoteUrl,
+  parseNamedGitRefs,
   planGithubRefImport,
   pushSourceControl,
   runAuthenticatedGit,
@@ -70,6 +72,38 @@ try {
   git(markerOnlyRepo, 'config', '--local', 'orion.cloudrepoid', 'repo_123');
   assert.equal((await readOriginRemote(markerOnlyRepo)).provider, 'other');
   console.log('ok  an Orion marker alone never routes authenticated Git');
+
+  assert.deepEqual(
+    parseNamedGitRefs({
+      stdout: [
+        `refs/remotes/origin/HEAD\t${'a'.repeat(40)}`,
+        `refs/remotes/origin/main\t${'b'.repeat(40)}`,
+        `refs/remotes/origin/feature/x\t${'c'.repeat(40)}`,
+      ].join('\n'),
+      namespace: 'refs/remotes/origin',
+      field: 'branch',
+    }),
+    [
+      { branch: 'HEAD', oid: 'a'.repeat(40) },
+      { branch: 'main', oid: 'b'.repeat(40) },
+      { branch: 'feature/x', oid: 'c'.repeat(40) },
+    ]
+  );
+  assert.equal(
+    canReuseLinkedCloudRepo({
+      repo: { id: 'canonical', name: 'orion-web' },
+      expectedName: 'orion-web',
+    }),
+    true
+  );
+  assert.equal(
+    canReuseLinkedCloudRepo({
+      repo: { id: 'duplicate', name: 'orion-web-orion' },
+      expectedName: 'orion-web',
+    }),
+    false
+  );
+  console.log('ok  conversion reuses the canonical link without importing remote namespaces');
 
   const plain = path.join(root, 'plain');
   await fs.mkdir(plain);

@@ -575,8 +575,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="setting-label-title">Sync code</div>
                   <div className="setting-label-desc">
-                    Publish each git project as a private Orion Cloud repo and push new commits
-                    automatically, keeping the full history and diffs.
+                    Publish each git project as a private Orion Cloud repo. New commits sync as
+                    immutable save points with full history and diffs; uncommitted file changes are
+                    never uploaded or deployed.
                   </div>
                 </div>
                 <label className="provider-toggle" title="Auto-publish and push git projects">

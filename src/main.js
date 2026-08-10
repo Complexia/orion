@@ -101,6 +101,8 @@ import {
   ensureBaselineGitignore,
   inspectSourceControl,
   isOrionRepoRemoteUrl,
+  canReuseLinkedCloudRepo,
+  parseNamedGitRefs,
   planGithubRefImport,
   pushSourceControl,
   runAuthenticatedGit,
@@ -4949,12 +4951,6 @@ const ensureInitialSourceControlCommit = async (gitRoot, session) => {
   return true;
 };
 
-const parseImportedGitRefs = (stdout, name) => stdout
-  .split('\n')
-  .map((line) => line.trim().split('\t'))
-  .filter(([refName, oid]) => refName && /^[0-9a-f]{40,64}$/i.test(oid))
-  .map(([refName, oid]) => ({ [name]: refName, oid }));
-
 const clearGithubImportTagRefs = async (gitRoot) => {
   let refs = [];
   try {
@@ -4976,9 +4972,9 @@ const clearGithubImportTagRefs = async (gitRoot) => {
 
 const readLocalNamedRefs = async (gitRoot, namespace, name) => {
   const { stdout } = await execFileAsync('git', [
-    '-C', gitRoot, 'for-each-ref', '--format=%(refname:strip=2)\t%(objectname)', namespace,
+    '-C', gitRoot, 'for-each-ref', '--format=%(refname)\t%(objectname)', namespace,
   ]);
-  return parseImportedGitRefs(stdout, name);
+  return parseNamedGitRefs({ stdout, namespace, field: name });
 };
 
 const createAvailableEmptyCloudRepo = async ({ gitRoot, name, defaultBranch, token }) => {
@@ -4987,7 +4983,7 @@ const createAvailableEmptyCloudRepo = async ({ gitRoot, name, defaultBranch, tok
     const existing = await cloudGitApiRequest(
       `/api/git/repos/${encodeURIComponent(previousLink.repoId)}`
     );
-    if ((existing?.refs ?? []).length === 0) {
+    if (canReuseLinkedCloudRepo({ repo: existing?.repo, expectedName: name })) {
       return { repo: existing.repo, previousLink, created: false };
     }
   }

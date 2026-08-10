@@ -706,8 +706,11 @@ const getCloudRepoLinkForOwner = async (
 };
 
 // Auto-publish unlinked git projects and push linked ones whose branch refs
-// moved. Serialized on purpose: pushes are I/O-heavy and this must never
-// compete with the agent-run path for resources.
+// moved. A branch ref only moves when Git creates a commit: dirty working-tree
+// edits are deliberately invisible here, so repository sync exposes immutable
+// save points rather than a stream of file saves. Serialized on purpose:
+// pushes are I/O-heavy and this must never compete with the agent-run path for
+// resources.
 const syncCode = async (
   token,
   storeState,

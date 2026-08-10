@@ -197,8 +197,13 @@ const status2 = getWorkspaceSyncStatus();
 assert(status2.counts?.transcriptsUploaded === 2, 'unchanged threads skipped on second pass');
 assert(status2.lastError === null, 'second pass clean');
 
-// New commit → code push on next pass.
+// Dirty working-tree changes are not repository save points and must not push.
 fs.writeFileSync(path.join(repoDir, 'file2.txt'), 'more\n');
+await workspaceSyncNow();
+const dirtyStatus = getWorkspaceSyncStatus();
+assert(dirtyStatus.counts?.codePushes === 1, 'uncommitted change did not auto-push');
+
+// New commit → one code push on the next pass.
 git('add', '.');
 git('commit', '-m', 'second');
 await workspaceSyncNow();

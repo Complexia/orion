@@ -135,6 +135,21 @@ export const orionRepoIdFromRemoteUrl = (remoteUrl) => {
 export const isOrionRepoRemoteUrl = (remoteUrl, repoId) =>
   Boolean(repoId) && orionRepoIdFromRemoteUrl(remoteUrl) === String(repoId);
 
+export const parseNamedGitRefs = ({ stdout, namespace, field }) => {
+  const prefix = `${String(namespace).replace(/\/+$/, '')}/`;
+  return String(stdout ?? '')
+    .split('\n')
+    .map((line) => line.trim().split('\t'))
+    .filter(
+      ([refName, oid]) =>
+        refName?.startsWith(prefix) && /^[0-9a-f]{40,64}$/i.test(String(oid ?? ''))
+    )
+    .map(([refName, oid]) => ({ [field]: refName.slice(prefix.length), oid }));
+};
+
+export const canReuseLinkedCloudRepo = ({ repo, expectedName }) =>
+  Boolean(repo?.id && repo?.name === expectedName);
+
 const uniquePreservedRefName = (original, used) => {
   const base = `orion-local/${original}`;
   let candidate = base;
