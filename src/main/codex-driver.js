@@ -2,7 +2,7 @@ import { app, protocol } from 'electron';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
-import { codexBrowserEnvironmentNote, codexPersonalizationConfig } from './codex-config.js';
+import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
@@ -28,13 +28,7 @@ export const codexAppServerConfig = (model, input) => {
   };
   if (options.networkAccess) config['sandbox_workspace_write.network_access'] = true;
   if (options.webSearch) config['tools.web_search'] = true;
-  if (options.browserControl && input.accessMode !== 'read-only') {
-    config['mcp_servers.chrome_devtools.command'] = 'npx';
-    config['mcp_servers.chrome_devtools.args'] = options.browserAutoConnect
-      ? ['-y', chromeDevtoolsMcpPackage, '--autoConnect']
-      : ['-y', chromeDevtoolsMcpPackage];
-    config['mcp_servers.chrome_devtools.startup_timeout_sec'] = 90;
-  }
+  Object.assign(config, codexBrowserMcpConfig(options, input.accessMode, chromeDevtoolsMcpPackage));
   // Orion's spawn_subagent bridge — same overrides as the exec path builds.
   if (input.orionMcp) {
     config['mcp_servers.orion.command'] = input.orionMcp.command;

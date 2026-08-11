@@ -546,18 +546,33 @@ type OrionComputerUsePermissionStatus =
   | 'unknown'
   | 'unsupported';
 
-type OrionChromeDebugStatus = {
-  /** enabled: debugging server reachable; stale: toggle flipped but Chrome not running; disabled: never enabled */
-  status: 'enabled' | 'stale' | 'disabled' | 'unsupported';
-  browser?: string;
-};
-
 type OrionComputerUsePermissions = {
   supported: boolean;
   accessibility: OrionComputerUsePermissionStatus;
   screenRecording: OrionComputerUsePermissionStatus;
   automation: OrionComputerUsePermissionStatus;
-  chromeDebug?: OrionChromeDebugStatus;
+  browserUse: {
+    codex: OrionCodexBrowserIntegrationStatus;
+  };
+  chromeDebug: OrionChromeDebugStatus;
+};
+
+type OrionChromeDebugStatus = {
+  /** enabled: server reachable; stale: configured but Chrome needs restart; disabled: not configured */
+  status: 'enabled' | 'stale' | 'disabled' | 'unsupported';
+  browser?: string;
+};
+
+type OrionCodexBrowserIntegrationStatus = {
+  status: 'ready' | 'setup-required' | 'unavailable';
+  ready: boolean;
+  pluginInstalled: boolean;
+  pluginEnabled: boolean;
+  nodeReplEnabled: boolean;
+  extensionInstalled: boolean | null;
+  extensionEnabled: boolean | null;
+  nativeHostReady: boolean | null;
+  detail: string;
 };
 
   interface Window {
@@ -1155,6 +1170,7 @@ type OrionComputerUsePermissions = {
           chrome?: boolean;
           browserControl?: boolean;
           browserAutoConnect?: boolean;
+          browserUseMode?: 'disabled' | 'extension' | 'mcp';
           extraArgs?: string;
         };
         /** Set when the thread runs the Orion pseudo-model: the roles it may delegate to. */

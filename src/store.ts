@@ -588,6 +588,7 @@ export type OpenFile = {
 export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'muse' | 'opencode';
 
 export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
+export type BrowserUseMode = 'disabled' | 'extension' | 'mcp';
 
 // Per-provider harness capabilities, passed through to the CLI invocation.
 export type ProviderRuntimeOptions = {
@@ -611,10 +612,12 @@ export type ProviderRuntimeOptions = {
   experimentalMemory?: boolean;
   /** claude: browser control via the Claude Chrome extension (--chrome) */
   chrome?: boolean;
-  /** codex: browser control via chrome-devtools-mcp (the ChatGPT-extension backend is desktop-app-only) */
+  /** legacy codex browser toggle, retained for migration */
   browserControl?: boolean;
-  /** codex: attach browser control to the user's real signed-in Chrome (--autoConnect) instead of a dedicated profile */
+  /** legacy codex opt-in to attach MCP browser control to signed-in Chrome */
   browserAutoConnect?: boolean;
+  /** codex: disabled, signed-in Chrome extension, or signed-in Chrome through chrome-devtools MCP */
+  browserUseMode?: BrowserUseMode;
   /** any provider: extra CLI flags appended to every run */
   extraArgs?: string;
 };
