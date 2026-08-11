@@ -364,17 +364,16 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
 // dispatches automatically the moment the current turn ends.
 // steer: deliver the message INTO the running turn without interrupting it —
 // the same behavior as typing while Claude Code works. This needs a live
-// mid-turn input channel: only claude has one (its persistent SDK session
-// folds a mid-turn user message into the running turn). The other harnesses
-// run one-shot per turn (codex exec, cursor-agent --print, opencode run) or
-// hold a single-prompt ACP dialog (grok, kimi), so a follow-up cannot reach
-// the running turn — it queues and sends when that turn finishes. Steer must
-// never kill the running process; that is Stop's job.
+// mid-turn input channel: Claude folds the message into its persistent SDK
+// session, while Codex uses app-server's native turn/steer. The other
+// harnesses run one-shot per turn or hold a single-prompt ACP dialog, so a
+// follow-up cannot reach the running turn — it queues and sends when that
+// turn finishes. Steer must never kill the running process; that is Stop's job.
 export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; steer: boolean }> = {
   // Steering an orchestrated thread would bypass the driver resolution.
   orion: { queue: true, steer: false },
   grok: { queue: true, steer: false },
-  codex: { queue: true, steer: false },
+  codex: { queue: true, steer: true },
   claude: { queue: true, steer: true },
   cursor: { queue: true, steer: false },
   kimi: { queue: true, steer: false },

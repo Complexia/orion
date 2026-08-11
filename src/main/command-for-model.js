@@ -1,6 +1,6 @@
 import { app } from 'electron';
 import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, defaultMuseReasoningEffort, parseExtraArgs } from './models.js';
-import { codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
+import { codexBrowserEnvironmentNote, codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
 
 export const commandForModel = (model, input) => {
   const prompt =
@@ -16,18 +16,13 @@ export const commandForModel = (model, input) => {
     typeof input.resumeSessionId === 'string' && input.resumeSessionId ? input.resumeSessionId : null;
 
   if (model.providerId === 'codex') {
-    // Goal runs (/goal) speak JSON-RPC over `codex app-server` — model,
-    // sandbox, and config overrides travel in the dialog, not argv.
-    if (input.codexGoal) return ['codex', 'app-server'];
-    const reasoningEffort = codexReasoningEffortForModel(model, input.codexReasoningEffort);
-    // Inline code reviews (/review) need the current Codex thread so the
-    // reviewer can see the conversation that led to the changes. The
-    // app-server's review/start method resumes that thread and runs the
-    // dedicated reviewer in place; `codex exec review` always starts a
-    // context-free session.
-    if (input.codexReview && typeof input.codexReview === 'object') {
-      return ['codex', 'app-server'];
+    // Codex turns speak JSON-RPC over `codex app-server` so Orion can deliver
+    // native turn/steer input while a turn is still running. Model, sandbox,
+    // and config overrides travel in the dialog, not argv.
+    if (input.codexAppServer || input.codexGoal || input.codexReview) {
+      return ['codex', 'app-server', ...extraArgs];
     }
+    const reasoningEffort = codexReasoningEffortForModel(model, input.codexReasoningEffort);
     const serviceTier = input.codexServiceTier || defaultCodexServiceTier;
     const configArgs = [
       '--config',
@@ -98,11 +93,7 @@ export const commandForModel = (model, input) => {
     // tasks, hits the dead extension backend, and gives up without ever trying
     // the chrome_devtools tools (verified empirically). The skill defers to a
     // user-named alternative, which this note provides.
-    const browserNote = !browserControlEnabled
-      ? ''
-      : options.browserAutoConnect
-        ? `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For any browser task, use the chrome_devtools MCP tools (discover them via tools_search); they attach to the user's real signed-in Chrome, so treat open tabs and logins with care and do not close tabs you did not open. If those tools report "Could not connect to Chrome", tell the user to open chrome://inspect/#remote-debugging in Chrome, turn the remote debugging toggle on, quit and reopen Chrome (the server only starts on launch), and retry — do not attempt workarounds.]\n\n`
-        : `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For any browser task, use the chrome_devtools MCP tools (discover them via tools_search).]\n\n`;
+    const browserNote = codexBrowserEnvironmentNote(options, accessMode);
     const codexPrompt = `${browserNote}${prompt}`;
 
     if (resumeSessionId) {

@@ -67,3 +67,15 @@ export const codexConfigArgs = (config) =>
     '--config',
     `${key}=${JSON.stringify(value)}`,
   ]);
+
+// Codex's bundled Chrome integration can only connect from ChatGPT.app.
+// Keep this provider steer in one place so exec asides and app-server turns
+// both direct browser work to the MCP server Orion actually configured.
+export const codexBrowserEnvironmentNote = (providerOptions, accessMode) => {
+  const options =
+    providerOptions && typeof providerOptions === 'object' ? providerOptions : {};
+  if (options.browserControl !== true || accessMode === 'read-only') return '';
+  return options.browserAutoConnect
+    ? `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For any browser task, use the chrome_devtools MCP tools (discover them via tools_search); they attach to the user's real signed-in Chrome, so treat open tabs and logins with care and do not close tabs you did not open. If those tools report "Could not connect to Chrome", tell the user to open chrome://inspect/#remote-debugging in Chrome, turn the remote debugging toggle on, quit and reopen Chrome (the server only starts on launch), and retry — do not attempt workarounds.]\n\n`
+    : `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For any browser task, use the chrome_devtools MCP tools (discover them via tools_search).]\n\n`;
+};

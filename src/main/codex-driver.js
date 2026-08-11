@@ -2,7 +2,7 @@ import { app, protocol } from 'electron';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
-import { codexPersonalizationConfig } from './codex-config.js';
+import { codexBrowserEnvironmentNote, codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
@@ -278,7 +278,9 @@ export const createCodexAppServerDriver = ({
       // thread/resume emits the authoritative goal snapshot before an inline
       // review starts. Keep Orion's mirror synchronized without letting that
       // snapshot terminate the review run.
-      if (!review && !turnActive) endRun(CODEX_GOAL_END_NOTES[wireGoal.status] ?? '');
+      if (goal && !review && !turnActive) {
+        endRun(CODEX_GOAL_END_NOTES[wireGoal.status] ?? '');
+      }
     }
   };
 
@@ -318,6 +320,10 @@ export const createCodexAppServerDriver = ({
     }
     if (ended) return;
     if (review) {
+      endRun();
+      return;
+    }
+    if (!goal) {
       endRun();
       return;
     }
@@ -452,6 +458,20 @@ export const createCodexAppServerDriver = ({
       return;
     }
 
+    if (!goal) {
+      const startedTurn = await request('turn/start', {
+        threadId,
+        input: [
+          {
+            type: 'text',
+            text: `${codexBrowserEnvironmentNote(input.providerOptions, accessMode)}${input.prompt}`,
+          },
+        ],
+      });
+      if (startedTurn.error) return fail(startedTurn.error);
+      return;
+    }
+
     // Goals require a persistent thread; setting one active immediately
     // starts the pursuit turn — no turn/start call needed.
     const setParams =
@@ -496,6 +516,38 @@ export const createCodexAppServerDriver = ({
         1000
       );
     } catch {}
+  };
+
+  const dispose = () => {
+    ended = true;
+    clearContinuationTimer();
+    for (const resolve of pendingRequests.values()) {
+      resolve({ error: { message: 'Codex app-server run ended.' } });
+    }
+    pendingRequests.clear();
+  };
+
+  // Codex app-server accepts same-turn steering natively. The active turn id
+  // is an ownership precondition, so a racing completion cannot redirect a
+  // newer turn or silently turn this into an ordinary follow-up.
+  const steer = async (text) => {
+    if (ended || !threadId || !activeTurnId || typeof text !== 'string' || !text) return false;
+    const expectedTurnId = activeTurnId;
+    try {
+      const response = await request('turn/steer', {
+        threadId,
+        expectedTurnId,
+        input: [{ type: 'text', text }],
+      });
+      return (
+        !response?.error &&
+        activeTurnId === expectedTurnId &&
+        typeof response?.result?.turnId === 'string' &&
+        response.result.turnId === expectedTurnId
+      );
+    } catch {
+      return false;
+    }
   };
 
   const handleMessage = (message) => {
@@ -563,7 +615,7 @@ export const createCodexAppServerDriver = ({
         goalStatus = 'cleared';
         callbacks.onGoal(null);
         clearContinuationTimer();
-        if (!review && !turnActive) endRun('\n\n_Goal cleared._');
+        if (goal && !review && !turnActive) endRun('\n\n_Goal cleared._');
         return;
       }
       case 'error': {
@@ -583,7 +635,17 @@ export const createCodexAppServerDriver = ({
     }
   };
 
-  return { start, handleMessage, stopGoalRun };
+  return { start, handleMessage, steer, stopGoalRun, dispose };
+};
+
+// Ordinary Codex app-server turns addressable by Orion's renderer run id.
+// Review and goal turns deliberately stay out: the protocol rejects steering
+// while those specialized loops own the thread.
+export const codexSteerableRunDrivers = new Map();
+
+export const steerCodexAppServerRun = (runId, text) => {
+  const driver = codexSteerableRunDrivers.get(runId);
+  return driver ? driver.steer(text) : false;
 };
 
 // Goal runs whose driver must be asked to pause before the process is killed

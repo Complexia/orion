@@ -40,7 +40,7 @@ import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIc
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexUtilityPrivacyOptions } from './main/codex-config.js';
-import { codexGoalRunDrivers, createCodexAppServerDriver, runCodexGoalOp } from './main/codex-driver.js';
+import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
@@ -6610,6 +6610,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       model.providerId === 'codex' &&
       Boolean(input.codexReview) &&
       typeof input.codexReview === 'object';
+    const useCodexAppServer = model.providerId === 'codex' && !input.aside;
     // spawn_subagent for non-Claude drivers: hand the CLI the bridge shim as
     // an `orion` MCP server. One token per runTurn call — a resume-fallback
     // reattempt reuses it; the last attempt's finalizeRun releases it.
@@ -6664,6 +6665,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const args = commandForModel(model, {
       ...input,
       acp: useAcp,
+      codexAppServer: useCodexAppServer,
       resumeSessionId,
       forkSession: forkWithNativeFlag && Boolean(resumeSessionId),
       orionMcp,
@@ -6680,7 +6682,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       },
       // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
       // take no input.
-      stdio: [useAcp || useCodexGoal || useCodexReview ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      stdio: [useAcp || useCodexAppServer ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
 
     let stderr = '';
@@ -6888,6 +6890,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       activeAgentRuns.delete(runId);
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
+      codexSteerableRunDrivers.delete(runId);
+      acpDriver?.dispose?.();
       orionMcp?.release();
       codexSpawnWatcher?.stop();
       kimiSpawnWatcher?.stop();
@@ -7206,7 +7210,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             },
           },
         })
-      : useCodexGoal || useCodexReview
+      : useCodexAppServer
         ? createCodexAppServerDriver({
             child,
             cwd: input.projectPath,
@@ -7234,6 +7238,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           })
         : null;
     if (useCodexGoal && acpDriver) codexGoalRunDrivers.set(runId, acpDriver);
+    if (useCodexAppServer && !useCodexGoal && !useCodexReview && acpDriver) {
+      codexSteerableRunDrivers.set(runId, acpDriver);
+    }
 
     emitAgentEvent(event.sender, {
       runId,
@@ -7241,7 +7248,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       type: 'started',
       // App-server runs have no trailing prompt to strip.
       command: `${model.command} ${(
-        useCodexGoal || useCodexReview ? args.slice(1) : args.slice(1, -1)
+        useCodexAppServer ? args.slice(1) : args.slice(1, -1)
       ).join(' ')}`,
     });
 
@@ -7328,6 +7335,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       if (exitCode !== 0 && resumeSessionId && !stdoutSeen && !wasStopped && !turnCompleted) {
         finalized = true;
         clearFinalizeTimers();
+        codexSteerableRunDrivers.delete(runId);
+        acpDriver?.dispose?.();
         codexSpawnWatcher?.stop();
         kimiSpawnWatcher?.stop();
         subagentTracker.dispose('error');
@@ -7380,13 +7389,13 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
   }
 });
 
-// Steer = interrupt Claude's current loop and immediately continue the same
-// visible run with a new instruction. A plain streamed user message cannot be
-// consumed while Claude is blocked in a long tool call. False tells the
-// renderer to preserve the message as an ordinary end-of-turn follow-up.
-ipcMain.handle('agent:steerTurn', (_event, runId, text) => {
+// Deliver a message into the provider's active turn. Codex has a native
+// turn/steer RPC; Claude interrupts its blocking SDK loop and immediately
+// continues it. False preserves the message as an ordinary queued follow-up.
+ipcMain.handle('agent:steerTurn', async (_event, runId, text) => {
   if (typeof runId !== 'string' || typeof text !== 'string' || !text) return false;
-  return steerClaudeSdkRun(runId, text);
+  if (await steerCodexAppServerRun(runId, text)) return true;
+  return await steerClaudeSdkRun(runId, text);
 });
 
 ipcMain.handle('agent:discardClaudeBackgroundShellTasks', (_event, runId) => {
@@ -7412,6 +7421,8 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
     return false;
   }
   stoppedAgentRuns.add(runId);
+  codexSteerableRunDrivers.get(runId)?.dispose?.();
+  codexSteerableRunDrivers.delete(runId);
   // Stopping a goal run = pausing the goal: ask the app-server to record the
   // pause (so the stored goal matches reality and /goal resume works) before
   // the process goes down.
