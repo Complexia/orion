@@ -11,6 +11,12 @@ import {
   finalizeClaudeTurn,
   steerClaudeSdkRun,
 } from '../src/main/claude-driver.js';
+import {
+  codexSteerableRunDrivers,
+  createCodexAppServerDriver,
+  steerCodexAppServerRun,
+} from '../src/main/codex-driver.js';
+import { commandForModel } from '../src/main/command-for-model.js';
 import { createThreadSteeringCoordinator } from '../src/app/thread-steering.js';
 
 const [appSource, claudeDriverSource] = await Promise.all([
@@ -120,6 +126,145 @@ const left = independent.enqueue('left', async () => independentOrder.push('left
 const right = independent.enqueue('right', async () => independentOrder.push('right'));
 await Promise.all([left, right]);
 assert.deepEqual(new Set(independentOrder), new Set(['left', 'right']), 'Steering reservations must be per thread');
+
+const codexModel = {
+  id: 'codex:gpt-test',
+  providerId: 'codex',
+  slug: 'gpt-test',
+  label: 'Codex Test',
+};
+assert.deepEqual(
+  commandForModel(codexModel, {
+    codexAppServer: true,
+    projectPath: '/tmp/project',
+    prompt: 'initial direction',
+  }),
+  ['codex', 'app-server'],
+  'Ordinary Codex turns must use app-server so live steering has an input channel'
+);
+assert.equal(
+  commandForModel(codexModel, {
+    projectPath: '/tmp/project',
+    prompt: 'utility prompt',
+  })[1],
+  'exec',
+  'Hidden Codex utility prompts must remain one-shot exec turns'
+);
+
+const codexRequests = [];
+const pendingCodexResponses = new Map();
+let codexDriver;
+const codexChild = {
+  stdin: {
+    write: (line) => {
+      const message = JSON.parse(line);
+      if (message.id === undefined) return;
+      codexRequests.push(message);
+      if (message.method === 'turn/steer') {
+        pendingCodexResponses.set(message.id, message);
+        return;
+      }
+      const result =
+        message.method === 'thread/start'
+          ? { thread: { id: 'codex-thread' } }
+          : message.method === 'turn/start'
+            ? { turn: { id: 'codex-turn' } }
+            : {};
+      queueMicrotask(() => {
+        if (message.method === 'thread/start') {
+          codexDriver.handleMessage({
+            jsonrpc: '2.0',
+            method: 'thread/goal/cleared',
+            params: { threadId: 'codex-thread' },
+          });
+          codexDriver.handleMessage({
+            jsonrpc: '2.0',
+            method: 'thread/goal/updated',
+            params: {
+              threadId: 'codex-thread',
+              goal: { objective: 'old goal', status: 'paused' },
+            },
+          });
+        }
+        codexDriver.handleMessage({ jsonrpc: '2.0', id: message.id, result });
+        if (message.method === 'turn/start') {
+          codexDriver.handleMessage({
+            jsonrpc: '2.0',
+            method: 'turn/started',
+            params: { threadId: 'codex-thread', turn: { id: 'codex-turn' } },
+          });
+        }
+      });
+    },
+  },
+};
+let codexRunEnded = 0;
+codexDriver = createCodexAppServerDriver({
+  child: codexChild,
+  cwd: '/tmp/project',
+  model: codexModel,
+  input: { prompt: 'initial direction' },
+  goal: undefined,
+  review: undefined,
+  resumeSessionId: null,
+  accessMode: 'full-access',
+  callbacks: {
+    onActivity: () => {},
+    onFatal: (error) => assert.fail(error),
+    onGoal: () => {},
+    onReasoning: () => {},
+    onRunEnd: () => {
+      codexRunEnded += 1;
+    },
+    onSessionId: () => {},
+    onStats: () => {},
+    onText: () => {},
+  },
+});
+await codexDriver.start();
+assert.equal(
+  codexRunEnded,
+  0,
+  'Stored goal snapshots must not terminate an ordinary Codex turn during resume/start'
+);
+const codexTurnStart = codexRequests.find((request) => request.method === 'turn/start');
+assert.deepEqual(codexTurnStart?.params, {
+  threadId: 'codex-thread',
+  input: [{ type: 'text', text: 'initial direction' }],
+});
+
+codexSteerableRunDrivers.set('codex-run', codexDriver);
+const codexSteer = steerCodexAppServerRun('codex-run', 'change direction');
+await Promise.resolve();
+const codexSteerRequest = [...pendingCodexResponses.values()][0];
+assert.deepEqual(codexSteerRequest?.params, {
+  threadId: 'codex-thread',
+  expectedTurnId: 'codex-turn',
+  input: [{ type: 'text', text: 'change direction' }],
+});
+codexDriver.handleMessage({
+  jsonrpc: '2.0',
+  id: codexSteerRequest.id,
+  result: { turnId: 'codex-turn' },
+});
+assert.equal(await codexSteer, true, 'Codex must acknowledge a steer accepted by the active turn');
+
+const racingSteer = codexDriver.steer('too late');
+await Promise.resolve();
+const racingRequest = [...pendingCodexResponses.values()].at(-1);
+codexDriver.handleMessage({
+  jsonrpc: '2.0',
+  method: 'turn/completed',
+  params: { threadId: 'codex-thread', turn: { id: 'codex-turn', status: 'completed' } },
+});
+codexDriver.handleMessage({
+  jsonrpc: '2.0',
+  id: racingRequest.id,
+  result: { turnId: 'codex-turn' },
+});
+assert.equal(await racingSteer, false, 'A completed turn must reject a racing stale steer');
+assert.equal(codexRunEnded, 1, 'An ordinary Codex turn must end after turn/completed');
+codexSteerableRunDrivers.clear();
 
 const createSession = ({ threadId, runId, retained = false }) => {
   const events = [];
