@@ -30,6 +30,7 @@ import {
   defaultRiftsSettings,
   defaultSplitViewSettings,
   MAX_THREAD_PANES,
+  type BrowserUseMode,
   type DeploymentSettings,
   type Epic,
   type EpicsSettings,
@@ -76,6 +77,8 @@ import type {
 } from './appTypes';
 
 const ARCHIVED_EPICS_COLLAPSED_LIMIT = 5;
+const CODEX_BROWSER_EXTENSION_URL =
+  'https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg';
 
 // Settings remains controlled by App because its asynchronous account, update,
 // and Rift operations are shared with the shell. Keeping that integration in a
@@ -314,10 +317,23 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     epicPrStatus,
   } = props;
   const [archivedEpicsExpanded, setArchivedEpicsExpanded] = React.useState(false);
+  const [computerUseSubtab, setComputerUseSubtab] = React.useState<'permissions' | 'browser-use'>('permissions');
   const visibleArchivedEpics = archivedEpicsExpanded
     ? archivedEpics
     : archivedEpics.slice(0, ARCHIVED_EPICS_COLLAPSED_LIMIT);
   const hiddenArchivedEpicCount = Math.max(0, archivedEpics.length - ARCHIVED_EPICS_COLLAPSED_LIMIT);
+  const configuredCodexBrowserMode = providerSettings.codex?.options?.browserUseMode;
+  const codexBrowserMode: BrowserUseMode =
+    configuredCodexBrowserMode === 'disabled' ||
+    configuredCodexBrowserMode === 'extension' ||
+    configuredCodexBrowserMode === 'mcp'
+      ? configuredCodexBrowserMode
+      : providerSettings.codex?.options?.browserControl === true &&
+          providerSettings.codex?.options?.browserAutoConnect === true
+        ? 'mcp'
+        : 'disabled';
+  const codexBrowserIntegration = computerUsePerms?.browserUse.codex ?? null;
+  const chromeDebugStatus = computerUsePerms?.chromeDebug.status ?? 'disabled';
   const appUpdatePercent = Math.max(0, Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0)));
   const appUpdateStatus =
     appUpdateState?.status === 'checking'
@@ -1515,16 +1531,39 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             </>
           )}
 
-          {settingsTab === 'computer-use' &&
-            (computerUsePerms && !computerUsePerms.supported ? (
-              <div className="settings-empty-panel">
-                <div className="settings-panel-title">Computer use</div>
-                <div className="settings-muted">
-                  Computer use permissions only apply on macOS. Nothing to configure on this platform.
-                </div>
+          {settingsTab === 'computer-use' && (
+            <>
+              <div className="computer-use-subtabs" role="tablist" aria-label="Computer Use settings">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={computerUseSubtab === 'permissions'}
+                  className={`computer-use-subtab ${computerUseSubtab === 'permissions' ? 'active' : ''}`}
+                  onClick={() => setComputerUseSubtab('permissions')}
+                >
+                  Permissions
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={computerUseSubtab === 'browser-use'}
+                  className={`computer-use-subtab ${computerUseSubtab === 'browser-use' ? 'active' : ''}`}
+                  onClick={() => setComputerUseSubtab('browser-use')}
+                >
+                  Browser use
+                </button>
               </div>
-            ) : (
-              <>
+
+              {computerUseSubtab === 'permissions' &&
+                (computerUsePerms && !computerUsePerms.supported ? (
+                  <div className="settings-empty-panel">
+                    <div className="settings-panel-title">Computer use</div>
+                    <div className="settings-muted">
+                      Computer use permissions only apply on macOS. Nothing to configure on this platform.
+                    </div>
+                  </div>
+                ) : (
+                  <>
                 <div className="setting-row">
                   <div className="setting-label">
                     <div className="setting-label-title">macOS permissions</div>
@@ -1621,110 +1660,143 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     Relaunch Orion
                   </button>
                 </div>
+                  </>
+                ))}
 
-                <div className="setting-row">
-                  <div className="setting-label">
-                    <div className="setting-label-title">Browser control</div>
-                    <div className="setting-label-desc">
-                      Codex’s built-in ChatGPT-extension browser only works inside the ChatGPT desktop app, so Orion
-                      gives each provider its own browser tooling instead. These mirror the same options under Settings
-                      → Providers.
+              {computerUseSubtab === 'browser-use' && (
+                <>
+                  <div className="setting-row">
+                    <div className="setting-label">
+                      <div className="setting-label-title">Browser use by provider</div>
+                      <div className="setting-label-desc">
+                        Choose browser access separately for each provider. Browser tools remain unavailable in Read
+                        only mode.
+                      </div>
                     </div>
                   </div>
-                </div>
 
-                <div className="setting-row">
-                  <div className="setting-label">
-                    <div className="setting-label-title">Codex · Browser control</div>
-                    <div className="setting-label-desc">
-                      Full browser control through chrome-devtools-mcp: navigate, click, read pages, screenshot.
-                      Launches a dedicated Chrome with a persistent profile — sign in to sites once there and logins
-                      stick across runs.
+                  <div className="setting-row setting-row-stacked">
+                    <div className="setting-label">
+                      <div className="setting-label-title">Codex</div>
+                      <div className="setting-label-desc">
+                        Use your signed-in Chrome through the extension, or attach through Chrome’s public debugging
+                        server with chrome-devtools-mcp. If Orion cannot verify the extension integration, Codex
+                        automatically falls back to the MCP connection.
+                      </div>
+                    </div>
+                    <div className="browser-use-mode-options" role="group" aria-label="Codex browser use mode">
+                      {(
+                        [
+                          { value: 'disabled', label: 'Off' },
+                          { value: 'extension', label: 'Chrome extension' },
+                          { value: 'mcp', label: 'Your Chrome (MCP)' },
+                        ] as Array<{ value: BrowserUseMode; label: string }>
+                      ).map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={`browser-use-mode-button ${codexBrowserMode === option.value ? 'active' : ''}`}
+                          aria-pressed={codexBrowserMode === option.value}
+                          onClick={() =>
+                            setProviderOptions('codex', {
+                              browserUseMode: option.value,
+                              browserControl: option.value !== 'disabled',
+                              browserAutoConnect: option.value === 'mcp',
+                            })
+                          }
+                        >
+                          {option.label}
+                        </button>
+                      ))}
                     </div>
                   </div>
-                  <div className="setting-row-actions">
-                    <label className="provider-toggle">
-                      <input
-                        type="checkbox"
-                        checked={providerSettings.codex?.options?.browserControl === true}
-                        onChange={(event) => {
-                          setProviderOptions('codex', {
-                            browserControl: event.target.checked,
-                          });
-                        }}
-                      />
-                      <span />
-                    </label>
-                  </div>
-                </div>
 
-                {(() => {
-                  const browserControlOn = providerSettings.codex?.options?.browserControl === true;
-                  const autoConnectOn = providerSettings.codex?.options?.browserAutoConnect === true;
-                  const debugStatus = computerUsePerms?.chromeDebug?.status ?? 'disabled';
-                  const chip =
-                    debugStatus === 'enabled'
-                      ? { className: 'authenticated', label: 'Ready' }
-                      : debugStatus === 'stale'
-                        ? { className: '', label: 'Restart Chrome' }
-                        : autoConnectOn
-                          ? {
-                              className: 'unauthenticated',
-                              label: 'Setup needed',
-                            }
-                          : { className: '', label: 'Not set up' };
-                  return (
+                  {codexBrowserMode === 'extension' && (
                     <div className="setting-row">
                       <div className="setting-label">
-                        <div className="setting-label-title">Codex · Use your signed-in Chrome</div>
+                        <div className="setting-label-title">Codex extension setup</div>
                         <div className="setting-label-desc">
-                          Attach browser control to your real Chrome profile — existing tabs, logins, and cookies —
-                          instead of the dedicated one. Requires Browser control above.
-                          {autoConnectOn && debugStatus !== 'enabled' && (
+                          {codexBrowserIntegration?.detail ?? 'Checking the Codex plugin, node_repl, native host, and Chrome extension…'}
+                        </div>
+                      </div>
+                      <div className="setting-row-actions">
+                        <span
+                          className={`provider-status-chip ${
+                            codexBrowserIntegration?.ready
+                              ? 'authenticated'
+                              : codexBrowserIntegration
+                                ? 'unauthenticated'
+                                : ''
+                          }`}
+                        >
+                          {codexBrowserIntegration?.ready
+                            ? 'Ready'
+                            : codexBrowserIntegration
+                              ? 'Setup needed'
+                              : 'Checking…'}
+                        </span>
+                        <button
+                          type="button"
+                          className="provider-auth-button"
+                          onClick={() => {
+                            void window.orion.openExternalUrl(CODEX_BROWSER_EXTENSION_URL);
+                          }}
+                        >
+                          <SquareArrowOutUpRight size={13} />
+                          {codexBrowserIntegration?.ready ? 'View extension' : 'Install extension'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {codexBrowserMode === 'mcp' && (
+                    <div className="setting-row">
+                      <div className="setting-label">
+                        <div className="setting-label-title">Codex signed-in Chrome via MCP</div>
+                        <div className="setting-label-desc">
+                          Orion starts chrome-devtools-mcp with <code>--autoConnect</code> so it controls your existing
+                          Chrome tabs, logins, and cookies through Chrome’s public debugging server.
+                          {chromeDebugStatus !== 'enabled' && (
                             <>
                               <br />
-                              One-time setup: 1. Click “Set up in Chrome” (the link is also copied to your clipboard —
-                              paste it in Chrome’s address bar if no tab opens). 2. On that page, turn on “Enable remote
-                              debugging” (Chrome 144+). 3. Quit Chrome fully (⌘Q) and reopen it — the server only starts
-                              on launch. The status here flips to Ready automatically.
-                            </>
-                          )}
-                          {autoConnectOn && !browserControlOn && (
-                            <>
-                              <br />
-                              Turn on Browser control above for this to take effect.
+                              One-time setup: click “Set up in Chrome”, turn on “Enable remote debugging”, then quit
+                              Chrome fully and reopen it. The server only starts when Chrome launches.
                             </>
                           )}
                         </div>
                       </div>
                       <div className="setting-row-actions">
-                        <span className={`provider-status-chip ${chip.className}`}>{chip.label}</span>
+                        <span
+                          className={`provider-status-chip ${
+                            chromeDebugStatus === 'enabled'
+                              ? 'authenticated'
+                              : chromeDebugStatus === 'disabled'
+                                ? 'unauthenticated'
+                                : ''
+                          }`}
+                        >
+                          {chromeDebugStatus === 'enabled'
+                            ? 'Ready'
+                            : chromeDebugStatus === 'stale'
+                              ? 'Restart Chrome'
+                              : chromeDebugStatus === 'unsupported'
+                                ? 'Unsupported'
+                                : 'Setup needed'}
+                        </span>
                         <button
                           type="button"
                           className="provider-auth-button"
                           onClick={() => {
                             void handleOpenChromeDebugSetup();
                           }}
+                          disabled={chromeDebugStatus === 'unsupported'}
                         >
                           <SquareArrowOutUpRight size={13} />
                           Set up in Chrome
                         </button>
-                        <label className="provider-toggle">
-                          <input
-                            type="checkbox"
-                            checked={autoConnectOn}
-                            onChange={(event) => {
-                              setProviderOptions('codex', {
-                                browserAutoConnect: event.target.checked,
-                              });
-                            }}
-                          />
-                          <span />
-                        </label>
                       </div>
                     </div>
-                  );
-                })()}
+                  )}
 
                 <div className="setting-row">
                   <div className="setting-label">
@@ -1749,8 +1821,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     </label>
                   </div>
                 </div>
-              </>
-            ))}
+                </>
+              )}
+            </>
+          )}
 
           {settingsTab === 'storage' && (
             <>

@@ -39,7 +39,8 @@ import {
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
-import { codexUtilityPrivacyOptions } from './main/codex-config.js';
+import { codexBrowserUseMode, codexUtilityPrivacyOptions } from './main/codex-config.js';
+import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
@@ -5928,10 +5929,8 @@ const probeAutomationStatus = async (timeout = 5000) => {
 
 // Chrome's remote-debugging server (the chrome://inspect/#remote-debugging
 // toggle, Chrome 144+) writes DevToolsActivePort into the profile root while
-// it runs. That server is what "Use your signed-in Chrome" (codex browser
-// control via chrome-devtools-mcp --autoConnect) attaches to. File present +
-// port answering = ready; file present but dead port = Chrome not running (or
-// a stale file); no file = the toggle was never enabled.
+// it runs. chrome-devtools-mcp --autoConnect attaches to that server so Codex
+// controls the user's existing signed-in Chrome rather than another profile.
 const chromeDebugPortFile = () =>
   path.join(app.getPath('home'), 'Library', 'Application Support', 'Google', 'Chrome', 'DevToolsActivePort');
 const chromeDebugSetupUrl = 'chrome://inspect/#remote-debugging';
@@ -5939,7 +5938,9 @@ let chromeDebugProbe = { checkedAt: 0, result: null };
 
 const getChromeDebugStatus = async () => {
   if (process.platform !== 'darwin') return { status: 'unsupported' };
-  if (Date.now() - chromeDebugProbe.checkedAt < 2500 && chromeDebugProbe.result) return chromeDebugProbe.result;
+  if (Date.now() - chromeDebugProbe.checkedAt < 2500 && chromeDebugProbe.result) {
+    return chromeDebugProbe.result;
+  }
   let result;
   try {
     const port = Number.parseInt((await fs.readFile(chromeDebugPortFile(), 'utf8')).split('\n')[0], 10);
@@ -5947,7 +5948,9 @@ const getChromeDebugStatus = async () => {
     result = await new Promise((resolve) => {
       const request = http.get({ host: '127.0.0.1', port, path: '/json/version', timeout: 1500 }, (response) => {
         let body = '';
-        response.on('data', (chunk) => { body += chunk; });
+        response.on('data', (chunk) => {
+          body += chunk;
+        });
         response.on('end', () => {
           try {
             resolve({ status: 'enabled', browser: JSON.parse(body)?.Browser });
@@ -5966,14 +5969,51 @@ const getChromeDebugStatus = async () => {
   return result;
 };
 
+let codexBrowserIntegrationProbe = { checkedAt: 0, result: null, promise: null };
+const getCodexBrowserIntegrationStatus = async () => {
+  if (
+    codexBrowserIntegrationProbe.result &&
+    Date.now() - codexBrowserIntegrationProbe.checkedAt < 15000
+  ) {
+    return codexBrowserIntegrationProbe.result;
+  }
+  if (codexBrowserIntegrationProbe.promise) return codexBrowserIntegrationProbe.promise;
+  const promise = probeCodexBrowserIntegration(runShellCommand)
+    .then((result) => {
+      codexBrowserIntegrationProbe = { checkedAt: Date.now(), result, promise: null };
+      return result;
+    })
+    .catch(() => {
+      const result = {
+        status: 'unavailable',
+        ready: false,
+        pluginInstalled: false,
+        pluginEnabled: false,
+        nodeReplEnabled: false,
+        extensionInstalled: null,
+        extensionEnabled: null,
+        nativeHostReady: null,
+        detail:
+          'Could not inspect this Codex installation. Use the dedicated MCP browser until Codex browser support is available.',
+      };
+      codexBrowserIntegrationProbe = { checkedAt: Date.now(), result, promise: null };
+      return result;
+    });
+  codexBrowserIntegrationProbe.promise = promise;
+  return promise;
+};
+
 const getComputerUsePermissions = async () => {
+  const browserUse = { codex: await getCodexBrowserIntegrationStatus() };
+  const chromeDebug = await getChromeDebugStatus();
   if (process.platform !== 'darwin') {
     return {
       supported: false,
       accessibility: 'unsupported',
       screenRecording: 'unsupported',
       automation: 'unsupported',
-      chromeDebug: { status: 'unsupported' },
+      browserUse,
+      chromeDebug,
     };
   }
   return {
@@ -5981,7 +6021,8 @@ const getComputerUsePermissions = async () => {
     accessibility: systemPreferences.isTrustedAccessibilityClient(false) ? 'granted' : 'denied',
     screenRecording: systemPreferences.getMediaAccessStatus('screen'),
     automation: (await readAutomationRequested()) ? await probeAutomationStatus() : 'not-determined',
-    chromeDebug: await getChromeDebugStatus(),
+    browserUse,
+    chromeDebug,
   };
 };
 
@@ -6019,9 +6060,8 @@ ipcMain.handle('computerUse:requestPermission', async (_event, kind) => {
   }
 });
 
-// Chrome refuses chrome:// URLs from outside contexts inconsistently, so this
-// does both: copies the setup URL to the clipboard (paste works everywhere)
-// and asks Chrome to open it, which at minimum brings Chrome to the front.
+// Chrome refuses chrome:// URLs from outside contexts inconsistently, so copy
+// the setup URL as a reliable fallback and also ask Chrome to open it.
 ipcMain.handle('computerUse:openChromeDebugSetup', async () => {
   if (process.platform !== 'darwin') {
     return { ok: false, error: 'Chrome remote-debugging setup is only wired up on macOS.' };
@@ -6661,9 +6701,28 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           'Orion could not make read_thread available for this run. Try the referenced-thread turn again.',
       };
     }
+    let runtimeInput = input;
+    if (
+      model.providerId === 'codex' &&
+      (input.accessMode || 'full-access') !== 'read-only' &&
+      codexBrowserUseMode(input.providerOptions) === 'extension'
+    ) {
+      const browserIntegration = await getCodexBrowserIntegrationStatus();
+      if (!browserIntegration.ready) {
+        // Never tell Codex to use extension tools that Orion cannot verify.
+        // The dedicated MCP browser is the supported, self-contained fallback.
+        runtimeInput = {
+          ...input,
+          providerOptions: codexBrowserOptionsForIntegration(
+            input.providerOptions,
+            browserIntegration
+          ),
+        };
+      }
+    }
     const startAttempt = (resumeSessionId) => {
     const args = commandForModel(model, {
-      ...input,
+      ...runtimeInput,
       acp: useAcp,
       codexAppServer: useCodexAppServer,
       resumeSessionId,
@@ -7215,7 +7274,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             child,
             cwd: input.projectPath,
             model,
-            input: { ...input, orionMcp },
+            input: { ...runtimeInput, orionMcp },
             goal: input.codexGoal,
             review: input.codexReview,
             resumeSessionId,

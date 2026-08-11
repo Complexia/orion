@@ -1,6 +1,6 @@
 import { app } from 'electron';
 import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, defaultMuseReasoningEffort, parseExtraArgs } from './models.js';
-import { codexBrowserEnvironmentNote, codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
+import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
 
 export const commandForModel = (model, input) => {
   const prompt =
@@ -37,35 +37,9 @@ export const commandForModel = (model, input) => {
     ];
     if (options.networkAccess) configArgs.push('--config', 'sandbox_workspace_write.network_access=true');
     if (options.webSearch) configArgs.push('--config', 'tools.web_search=true');
-    // Browser control: the ChatGPT-extension browser backend is hard-gated to
-    // the ChatGPT.app process tree (code-sign ancestry check on its
-    // /tmp/codex-browser-use sockets), so codex spawned by Orion can never use
-    // it. Instead expose Google's chrome-devtools-mcp as a purpose-built
-    // browser connector — the codex chrome plugin docs explicitly prefer
-    // purpose-built connectors over the Chrome plugin. Uses a persistent
-    // profile (~/.cache/chrome-devtools-mcp/chrome-profile), so logins stick
-    // across runs.
-    const browserControlEnabled =
-      options.browserControl === true && accessMode !== 'read-only';
-    if (browserControlEnabled) {
-      // autoConnect attaches to the user's real signed-in Chrome profile
-      // (Chrome 144+, after the one-time chrome://inspect/#remote-debugging
-      // toggle); otherwise chrome-devtools-mcp launches a dedicated Chrome
-      // with its own persistent profile.
-      const mcpArgs = JSON.stringify([
-        '-y',
-        chromeDevtoolsMcpPackage,
-        ...(options.browserAutoConnect ? ['--autoConnect'] : []),
-      ]);
-      configArgs.push(
-        '--config',
-        'mcp_servers.chrome_devtools.command="npx"',
-        '--config',
-        `mcp_servers.chrome_devtools.args=${mcpArgs}`,
-        '--config',
-        'mcp_servers.chrome_devtools.startup_timeout_sec=90',
-      );
-    }
+    configArgs.push(
+      ...codexConfigArgs(codexBrowserMcpConfig(options, accessMode, chromeDevtoolsMcpPackage))
+    );
     // Orion's spawn_subagent bridge (@-mention delegation / orchestration).
     // A spawned subagent can run for a long time, so lift codex's 60s default
     // MCP tool timeout well clear of real runs.
@@ -89,10 +63,8 @@ export const commandForModel = (model, input) => {
         'mcp_servers.orion.default_tools_approval_mode="approve"',
       );
     }
-    // Without this steer, codex's bundled control-chrome skill grabs browser
-    // tasks, hits the dead extension backend, and gives up without ever trying
-    // the chrome_devtools tools (verified empirically). The skill defers to a
-    // user-named alternative, which this note provides.
+    // The selected and runtime-verified browser backend gets an explicit steer
+    // so Codex does not try the unavailable alternative first and stop there.
     const browserNote = codexBrowserEnvironmentNote(options, accessMode);
     const codexPrompt = `${browserNote}${prompt}`;
 

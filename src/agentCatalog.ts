@@ -190,7 +190,6 @@ export type ProviderOptionDef = {
     | 'experimentalMemory'
     | 'chrome'
     | 'browserControl'
-    | 'browserAutoConnect'
     | 'extraArgs';
   label: string;
   description: string;
@@ -213,13 +212,6 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
   // The Orion orchestrator is a pseudo-model, not a CLI harness — no options.
   orion: [],
   claude: [
-    {
-      key: 'chrome',
-      label: 'Claude in Chrome',
-      description:
-        'Browser control through the Claude Chrome extension (--chrome): navigate, click, read pages, and screenshot your real signed-in Chrome. Requires the extension. Available in Workspace write and Full access; disabled in Read only.',
-      type: 'boolean',
-    },
     {
       key: 'allowedTools',
       label: 'Auto-allowed tools',
@@ -299,20 +291,6 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       key: 'webSearch',
       label: 'Web search',
       description: 'Enable the Codex web search tool for all runs.',
-      type: 'boolean',
-    },
-    {
-      key: 'browserControl',
-      label: 'Browser control',
-      description:
-        'First-class browser control through chrome-devtools-mcp (navigate, click, read pages, screenshot). Codex’s own ChatGPT-extension browser only works inside the ChatGPT app, so this exposes a dedicated Chrome instead. Uses a persistent profile — sign in to sites once there and logins stick across runs.',
-      type: 'boolean',
-    },
-    {
-      key: 'browserAutoConnect',
-      label: 'Use your signed-in Chrome',
-      description:
-        'Attach browser control to your real Chrome profile — existing logins, tabs, and cookies — instead of a dedicated one. One-time setup: in Chrome, open chrome://inspect/#remote-debugging and turn the remote debugging toggle on (Chrome 144+), then keep Chrome running. Requires Browser control to be on.',
       type: 'boolean',
     },
     extraArgsOption('codex'),

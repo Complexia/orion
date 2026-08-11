@@ -1495,6 +1495,73 @@ body {
   overflow: hidden;
 }
 
+.computer-use-subtabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.computer-use-subtab {
+  position: relative;
+  padding: 8px 10px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.computer-use-subtab:hover {
+  color: var(--text-primary);
+}
+
+.computer-use-subtab.active {
+  color: var(--text-primary);
+}
+
+.computer-use-subtab.active::after {
+  content: '';
+  position: absolute;
+  right: 8px;
+  bottom: -1px;
+  left: 8px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--accent);
+}
+
+.browser-use-mode-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.browser-use-mode-button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: rgb(255 255 255 / 3%);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.browser-use-mode-button:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.browser-use-mode-button.active {
+  border-color: rgb(77 141 255 / 55%);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
 /* Variant for tabs whose rows are split into labeled group cards. */
 .settings-panel-grouped {
   background: transparent;
