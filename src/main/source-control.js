@@ -434,6 +434,50 @@ export const runAuthenticatedGit = async ({
 
 const pushRef = (branch) => `refs/heads/${branch}:refs/heads/${branch}`;
 
+export const gitPushWasAlreadyUpToDate = (result) =>
+  /(?:everything|already) up[- ]to[- ]date/i.test(
+    `${String(result?.stdout ?? '')}\n${String(result?.stderr ?? '')}`
+  );
+
+const gitFailureText = (error) =>
+  String(error?.stderr?.toString().trim() || error?.message || error || '').trim();
+
+const conciseGitFailureDetail = (error) => {
+  const lines = gitFailureText(error)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && !/^hint:/i.test(line) && !/^to\s+/i.test(line));
+  const useful = lines.find((line) => /^(?:fatal|error):/i.test(line)) ?? lines[0];
+  if (!useful) return 'Git did not provide any more information.';
+  return useful.length > 280 ? `${useful.slice(0, 277)}…` : useful;
+};
+
+/** Keep raw multi-line Git stderr out of compact renderer toasts. */
+export const describeGitPushFailure = (error, { committed = false } = {}) => {
+  const text = gitFailureText(error);
+  const title = committed ? 'Committed locally, but the push failed' : 'Push failed';
+
+  if (/(?:fetch first|non-fast-forward|rejected.*(?:stale info|remote contains work))/is.test(text)) {
+    return {
+      error: committed ? 'Committed locally, but the push was rejected' : 'Push rejected',
+      errorDetail: 'The remote has newer changes. Pull them, resolve any divergence, then try again.',
+    };
+  }
+  if (/(?:authentication failed|could not read username|access denied|unauthorized|403\b)/i.test(text)) {
+    return {
+      error: title,
+      errorDetail: 'Git authentication failed. Check your source-control account and try again.',
+    };
+  }
+  if (/(?:could not resolve host|enotfound|network is unreachable|connection timed out)/i.test(text)) {
+    return {
+      error: title,
+      errorDetail: 'The remote could not be reached. Check your connection and try again.',
+    };
+  }
+  return { error: title, errorDetail: conciseGitFailureDetail(error) };
+};
+
 /**
  * Cloud mirroring becomes authoritative only after GitHub has authorized it.
  * Older/unconfigured Orion Web deployments keep the existing Desktop mirror.
@@ -461,7 +505,7 @@ export const pushSourceControl = async ({
 }) => {
   const resolvedBranch = branch || await currentBranch(gitRoot);
   const refspec = pushRef(resolvedBranch);
-  await runAuthenticatedGit({
+  const originPush = await runAuthenticatedGit({
     gitRoot,
     args: ['push', '--set-upstream', 'origin', refspec],
     token,
@@ -498,5 +542,6 @@ export const pushSourceControl = async ({
     pushedToOrion: true,
     mirroredToGithub,
     mirrorWarning,
+    alreadyUpToDate: gitPushWasAlreadyUpToDate(originPush),
   };
 };

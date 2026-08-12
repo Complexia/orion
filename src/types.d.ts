@@ -688,8 +688,15 @@ type OrionCodexBrowserIntegrationStatus = {
         ok: boolean;
         branch?: string;
         message?: string;
+        /** Whether this click created a new local commit. */
+        committed?: boolean;
+        pushed?: boolean;
+        /** The push succeeded without changing the remote branch. */
+        alreadyUpToDate?: boolean;
         mirrorWarning?: string;
         error?: string;
+        /** Concise remediation or technical context rendered below the error title. */
+        errorDetail?: string;
         state?: {
           ok: boolean;
           root?: string;

@@ -12,6 +12,8 @@ import {
   canReuseLinkedCloudRepo,
   ensureBaselineGitignore,
   ensureGitRepository,
+  describeGitPushFailure,
+  gitPushWasAlreadyUpToDate,
   inspectSourceControl,
   isOrionRepoRemoteUrl,
   parseNamedGitRefs,
@@ -280,11 +282,29 @@ try {
   git(pushRepo, 'remote', 'add', 'github', githubBare);
   const pushed = await pushSourceControl({ gitRoot: pushRepo, token: 'local-test-token' });
   assert.equal(pushed.ok, true);
+  assert.equal(pushed.alreadyUpToDate, false);
   assert.equal(pushed.mirroredToGithub, true);
   assert.equal(pushed.mirrorWarning, null);
   assert.equal(git(orionBare, 'rev-parse', 'refs/heads/main'), git(pushRepo, 'rev-parse', 'HEAD'));
   assert.equal(git(githubBare, 'rev-parse', 'refs/heads/main'), git(pushRepo, 'rev-parse', 'HEAD'));
   console.log('ok  pushes update Orion first and then the GitHub mirror');
+
+  const noOpPush = await pushSourceControl({ gitRoot: pushRepo, token: 'local-test-token' });
+  assert.equal(noOpPush.ok, true);
+  assert.equal(noOpPush.alreadyUpToDate, true);
+  assert.equal(gitPushWasAlreadyUpToDate({ stderr: 'Everything up-to-date' }), true);
+  assert.equal(gitPushWasAlreadyUpToDate({ stderr: 'main -> main' }), false);
+  assert.deepEqual(
+    describeGitPushFailure(
+      { stderr: '! [rejected] main -> main (fetch first)\nerror: failed to push some refs\nhint: pull first' },
+      { committed: true }
+    ),
+    {
+      error: 'Committed locally, but the push was rejected',
+      errorDetail: 'The remote has newer changes. Pull them, resolve any divergence, then try again.',
+    }
+  );
+  console.log('ok  push outcomes distinguish successful no-ops and concise rejection guidance');
 
   assert.equal(shouldMirrorGithubLocally(null), true);
   assert.equal(shouldMirrorGithubLocally({ delivery: 'desktop', status: 'active' }), true);

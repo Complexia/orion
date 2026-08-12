@@ -99,7 +99,9 @@ import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, 
 import { listRiftTrashPaths, riftBinaryPath, riftCreate, riftGc, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
 import {
   configureOrionSourceControl,
+  describeGitPushFailure,
   ensureBaselineGitignore,
+  gitPushWasAlreadyUpToDate,
   inspectSourceControl,
   isOrionRepoRemoteUrl,
   canReuseLinkedCloudRepo,
@@ -2023,8 +2025,14 @@ const pushBranchToSourceControl = async (gitRoot, branch, { signal } = {}) => {
     }
     return await pushOrionSourceControl({ gitRoot, branch, token: session.token, signal });
   }
-  await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
-  return { ok: true, branch, pushedToOrion: false, mirrorWarning: null };
+  const pushed = await execFileAsync('git', ['-C', gitRoot, 'push', '-u', 'origin', branch], { signal });
+  return {
+    ok: true,
+    branch,
+    pushedToOrion: false,
+    mirrorWarning: null,
+    alreadyUpToDate: gitPushWasAlreadyUpToDate(pushed),
+  };
 };
 
 const runOriginNetworkGit = async (gitRoot, args, options = {}) => {
@@ -2047,6 +2055,8 @@ const runOriginNetworkGit = async (gitRoot, args, options = {}) => {
 // The navbar action passes `{ projectPath, modelId, reasoningEffort }`; older
 // callers passed the path alone and keep the diffstat-style fallback message.
 ipcMain.handle('git:commitAndPush', async (_event, input) => {
+  let committed = false;
+  let pushAttempted = false;
   try {
     const request = typeof input === 'string' ? { projectPath: input } : (input ?? {});
     const { projectPath } = request;
@@ -2062,7 +2072,20 @@ ipcMain.handle('git:commitAndPush', async (_event, input) => {
 
     const entries = await readGitStatusEntries(gitRoot);
     if (entries.length === 0) {
-      return { ok: false, error: 'No local changes to commit.' };
+      // A previous click may have committed successfully before its push was
+      // rejected. A clean worktree must still retry that push; a true no-op is
+      // reported as already up to date instead of as a commit failure.
+      pushAttempted = true;
+      const pushed = await pushBranchToSourceControl(gitRoot, state.currentBranch);
+      return {
+        ok: true,
+        branch: state.currentBranch,
+        committed: false,
+        pushed: true,
+        alreadyUpToDate: Boolean(pushed.alreadyUpToDate),
+        ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
+        state: await getGitStateForPath(projectPath),
+      };
     }
 
     await execFileAsync('git', ['-C', gitRoot, 'add', '-A']);
@@ -2096,16 +2119,24 @@ ipcMain.handle('git:commitAndPush', async (_event, input) => {
     }
 
     await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
+    committed = true;
+    pushAttempted = true;
     const pushed = await pushBranchToSourceControl(gitRoot, state.currentBranch);
 
     return {
       ok: true,
       branch: state.currentBranch,
       message,
+      committed: true,
+      pushed: true,
+      alreadyUpToDate: Boolean(pushed.alreadyUpToDate),
       ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
       state: await getGitStateForPath(projectPath),
     };
   } catch (error) {
+    if (pushAttempted) {
+      return { ok: false, committed, ...describeGitPushFailure(error, { committed }) };
+    }
     return { ok: false, error: error?.stderr?.toString().trim() || error?.message || String(error) };
   }
 });

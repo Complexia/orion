@@ -4763,13 +4763,25 @@ const App: React.FC = () => {
         ...resolveUtilityTurn(),
       });
       if (result.ok) {
-        toast.success(`Committed and pushed ${result.branch ?? gitState?.currentBranch ?? 'branch'}`, {
-          description: result.message?.split('\n')[0],
-        });
+        const branch = result.branch ?? gitState?.currentBranch ?? 'branch';
+        if (result.alreadyUpToDate) {
+          toast.info(`Already up to date on ${branch}`);
+        } else if (result.committed === false) {
+          toast.success(`Pushed ${branch}`, {
+            description: 'Existing local commits are now on the remote.',
+          });
+        } else {
+          toast.success(`Committed and pushed ${branch}`, {
+            description: result.message?.split('\n')[0],
+          });
+        }
         if (result.mirrorWarning) toast.warning(result.mirrorWarning);
         await refreshGitState();
       } else {
-        toast.error(result.error ?? 'Commit and push failed');
+        toast.error(result.error ?? 'Commit and push failed', {
+          ...(result.errorDetail ? { description: result.errorDetail } : {}),
+          duration: 8000,
+        });
       }
     } finally {
       setGitBusy(false);
