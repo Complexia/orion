@@ -27,6 +27,32 @@ export const claudeOneMillionContextModels = new Set([
 
 export const cursorFallbackModels = [
   {
+    id: 'cursor:auto',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Auto',
+    slug: 'auto',
+    command: 'cursor-agent',
+    favorite: true,
+  },
+  {
+    id: 'cursor:cursor-grok-4.6-high-fast',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Cursor Grok 4.6 Fast',
+    slug: 'cursor-grok-4.6-high-fast',
+    command: 'cursor-agent',
+    favorite: true,
+  },
+  {
+    id: 'cursor:cursor-grok-4.5-high-fast',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Cursor Grok 4.5 Fast',
+    slug: 'cursor-grok-4.5-high-fast',
+    command: 'cursor-agent',
+  },
+  {
     id: 'cursor:composer-2.5',
     providerId: 'cursor',
     providerLabel: 'Cursor',
@@ -36,67 +62,67 @@ export const cursorFallbackModels = [
     favorite: true,
   },
   {
-    id: 'cursor:composer-2.5-fast',
+    id: 'cursor:claude-opus-5-thinking-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'Composer 2.5 Fast',
-    slug: 'composer-2.5-fast',
+    label: 'Opus 5 1M Thinking',
+    slug: 'claude-opus-5-thinking-high',
     command: 'cursor-agent',
   },
   {
-    id: 'cursor:gpt-5.5-high-fast',
+    id: 'cursor:claude-opus-4-8-thinking-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'GPT-5.5 High Fast',
-    slug: 'gpt-5.5-high-fast',
+    label: 'Opus 4.8 1M Thinking',
+    slug: 'claude-opus-4-8-thinking-high',
     command: 'cursor-agent',
   },
   {
-    id: 'cursor:gpt-5',
+    id: 'cursor:gpt-5.6-sol-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'GPT-5',
-    slug: 'gpt-5',
+    label: 'GPT-5.6 Sol 1M High',
+    slug: 'gpt-5.6-sol-high',
     command: 'cursor-agent',
   },
   {
-    id: 'cursor:sonnet-4-thinking',
+    id: 'cursor:gpt-5.5-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'Sonnet 4 Thinking',
-    slug: 'sonnet-4-thinking',
+    label: 'GPT-5.5 1M High',
+    slug: 'gpt-5.5-high',
     command: 'cursor-agent',
   },
   {
-    id: 'cursor:sonnet-4',
+    id: 'cursor:claude-fable-5-thinking-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'Sonnet 4',
-    slug: 'sonnet-4',
+    label: 'Fable 5 1M Thinking (NO ZDR)',
+    slug: 'claude-fable-5-thinking-high',
     command: 'cursor-agent',
   },
   {
-    id: 'cursor:claude-opus-4-8',
+    id: 'cursor:claude-sonnet-5-thinking-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'Opus 4.8',
-    slug: 'claude-opus-4-8',
+    label: 'Sonnet 5 1M Thinking',
+    slug: 'claude-sonnet-5-thinking-high',
     command: 'cursor-agent',
   },
   {
-    id: 'cursor:gemini-3.1-pro',
+    id: 'cursor:gpt-5.6-luna-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'Gemini 3.1 Pro',
-    slug: 'gemini-3.1-pro',
+    label: 'GPT-5.6 Luna 1M High',
+    slug: 'gpt-5.6-luna-high',
     command: 'cursor-agent',
   },
   {
-    id: 'cursor:grok-4.3',
+    id: 'cursor:kimi-k3-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
-    label: 'Grok 4.3',
-    slug: 'grok-4.3',
+    label: 'Kimi K3 High',
+    slug: 'kimi-k3-high',
     command: 'cursor-agent',
   },
 ];
@@ -352,11 +378,22 @@ export const humanizeModelSlug = (slug) =>
 
 export const cleanCursorModelLabel = (label) =>
   String(label || '')
-    .replace(/\s+\((?:current|default|selected)\)/gi, '')
+    .replace(
+      /\s+\((?:current|default|selected)(?:\s*,\s*(?:current|default|selected))*\)/gi,
+      ''
+    )
     .replace(/\s+/g, ' ')
     .trim();
 
-export const cursorModelFromCliRow = (slug, label, index = 0) => {
+// Keep favorites stable as Cursor changes the ordering of `--list-models`.
+// These are primary selector entries, not every effort/fast variant.
+export const cursorFavoriteModelSlugs = new Set([
+  'auto',
+  'cursor-grok-4.6-high-fast',
+  'composer-2.5',
+]);
+
+export const cursorModelFromCliRow = (slug, label) => {
   const cleanSlug = String(slug || '').trim();
   if (!cleanSlug) return null;
   const cleanLabel = cleanCursorModelLabel(label) || humanizeModelSlug(cleanSlug);
@@ -367,11 +404,11 @@ export const cursorModelFromCliRow = (slug, label, index = 0) => {
     label: cleanLabel,
     slug: cleanSlug,
     command: 'cursor-agent',
-    favorite: index < 2,
+    favorite: cursorFavoriteModelSlugs.has(cleanSlug),
   };
 };
 
-export const parseCursorModelObject = (value, index) => {
+export const parseCursorModelObject = (value) => {
   if (!value || typeof value !== 'object') return null;
   const slug =
     value.id ||
@@ -389,7 +426,7 @@ export const parseCursorModelObject = (value, index) => {
     value.name ||
     value.model ||
     slug;
-  return cursorModelFromCliRow(slug, label, index);
+  return cursorModelFromCliRow(slug, label);
 };
 
 export const parseCursorModelsOutput = (output) => {
@@ -411,20 +448,20 @@ export const parseCursorModelsOutput = (output) => {
 
     const dashMatch = trimmed.match(/^(\S+)\s+-\s+(.+)$/);
     if (dashMatch) {
-      const model = cursorModelFromCliRow(dashMatch[1], dashMatch[2], models.length);
+      const model = cursorModelFromCliRow(dashMatch[1], dashMatch[2]);
       if (model) models.push(model);
       continue;
     }
 
     const columns = trimmed.split(/\s{2,}/).filter(Boolean);
     if (columns.length >= 2) {
-      const model = cursorModelFromCliRow(columns[0], columns.slice(1).join(' '), models.length);
+      const model = cursorModelFromCliRow(columns[0], columns.slice(1).join(' '));
       if (model) models.push(model);
       continue;
     }
 
     if (/^[a-z0-9][a-z0-9._:/[\]=,-]*$/i.test(trimmed)) {
-      const model = cursorModelFromCliRow(trimmed, trimmed, models.length);
+      const model = cursorModelFromCliRow(trimmed, trimmed);
       if (model) models.push(model);
     }
   }
