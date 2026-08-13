@@ -524,7 +524,7 @@ export type Thread = {
   codexServiceTier?: 'default' | 'priority';
   claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
   claudeContextWindow?: '200k' | '1m';
-  grokReasoningEffort?: 'low' | 'medium' | 'high';
+  grokReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
   createdAt: string;
   /** Removed from the sidebar Recent agents list (still listed under its project). */
@@ -659,7 +659,7 @@ export const defaultOrchestrationSettings: OrchestrationSettings = {
     computerUse: 'codex:gpt-5.6-sol',
     exploring: 'claude:claude-haiku-4-5',
     implementation: 'codex:gpt-5.6-sol',
-    imageVideoGen: 'grok:grok-4.5',
+    imageVideoGen: 'grok:grok-4.6',
   },
   generalInstructions: '',
 };
@@ -1813,7 +1813,7 @@ export const useOrionStore = create<OrionState>()(
           projectId,
           title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
           status: 'idle',
-          modelId: options?.modelId ?? inheritedModelId ?? 'grok:grok-4.5',
+          modelId: options?.modelId ?? inheritedModelId ?? 'grok:grok-4.6',
           accessMode: options?.accessMode ?? lastProjectThread?.accessMode ?? 'full-access',
           codexReasoningEffort: lastProjectThread?.codexReasoningEffort,
           codexServiceTier: lastProjectThread?.codexServiceTier,

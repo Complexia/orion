@@ -93,10 +93,10 @@ import {
   defaultAgentModelId,
   defaultClaudeContextWindow,
   defaultCodexServiceTier,
-  defaultGrokReasoningEffort,
   defaultMuseReasoningEffort,
   getEffectiveCodexReasoningEffort,
-  grokReasoningOptions,
+  getEffectiveGrokReasoningEffort,
+  grokReasoningOptionsForModel,
   museReasoningOptions,
   fallbackAgentModels,
   findAgentModel,
@@ -401,7 +401,7 @@ const reasoningOptionsForModel = (model: AgentModel | null | undefined): Reasoni
   if (!model) return [];
   if (model.providerId === 'codex') return toOptions(codexReasoningOptionsForModel(model));
   if (model.providerId === 'claude') return toOptions(claudeReasoningOptions);
-  if (model.providerId === 'grok') return toOptions(grokReasoningOptions);
+  if (model.providerId === 'grok') return toOptions(grokReasoningOptionsForModel(model));
   if (model.providerId === 'muse') return toOptions(museReasoningOptions);
   return [];
 };
@@ -410,7 +410,7 @@ const defaultReasoningEffortForModel = (model: AgentModel | null | undefined): s
   if (!model) return null;
   if (model.providerId === 'codex') return getEffectiveCodexReasoningEffort(model, undefined);
   if (model.providerId === 'claude') return getDefaultClaudeReasoningEffort(model);
-  if (model.providerId === 'grok') return defaultGrokReasoningEffort;
+  if (model.providerId === 'grok') return getEffectiveGrokReasoningEffort(model, undefined);
   if (model.providerId === 'muse') return defaultMuseReasoningEffort;
   return null;
 };
@@ -1670,9 +1670,13 @@ const App: React.FC = () => {
     claudeReasoningOptions.find((option) => option.value === selectedClaudeReasoning)?.label ?? 'High';
   const selectedClaudeContextWindowLabel =
     claudeContextWindowOptions.find((option) => option.value === effectiveClaudeContextWindow)?.label ?? '200k';
-  const selectedGrokReasoning = selectedThread?.grokReasoningEffort ?? defaultGrokReasoningEffort;
+  const selectedGrokReasoningOptions = grokReasoningOptionsForModel(selectedAgentModel);
+  const selectedGrokReasoning = getEffectiveGrokReasoningEffort(
+    selectedAgentModel,
+    selectedThread?.grokReasoningEffort
+  );
   const selectedGrokReasoningLabel =
-    grokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
+    selectedGrokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
   const selectedMuseReasoning = selectedThread?.museReasoningEffort ?? defaultMuseReasoningEffort;
   const selectedMuseReasoningLabel =
     museReasoningOptions.find((option) => option.value === selectedMuseReasoning)?.label ?? 'High';
@@ -7503,7 +7507,7 @@ const App: React.FC = () => {
           : {}),
         ...(model.providerId === 'grok'
           ? {
-              grokReasoningEffort: thread.grokReasoningEffort ?? defaultGrokReasoningEffort,
+              grokReasoningEffort: getEffectiveGrokReasoningEffort(model, thread.grokReasoningEffort),
             }
           : {}),
         ...(model.providerId === 'muse'
@@ -10666,7 +10670,7 @@ const App: React.FC = () => {
       <div className="codex-settings-section">
         <div className="codex-settings-heading">Reasoning</div>
         <div className="codex-settings-options">
-          {grokReasoningOptions.map((option) => {
+          {selectedGrokReasoningOptions.map((option) => {
             const selected = selectedGrokReasoning === option.value;
             return (
               <button

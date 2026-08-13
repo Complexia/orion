@@ -25,6 +25,43 @@ export const claudeOneMillionContextModels = new Set([
   'claude-sonnet-4-6',
 ]);
 
+// Cursor's CLI catalog is account-backed, but its raw order currently starts
+// with legacy Codex 5.3 variants. Pin one representative from each current
+// frontier family ahead of that raw order while retaining every discovered
+// model below them.
+export const cursorFrontierModelSlugs = [
+  'auto',
+  'cursor-grok-4.6-high-fast',
+  'claude-opus-5-thinking-high',
+  'claude-fable-5-thinking-high',
+  'claude-sonnet-5-thinking-high',
+  'gpt-5.6-sol-high',
+  'gpt-5.6-terra-high',
+  'gpt-5.6-luna-high',
+  'kimi-k3-high',
+  'gemini-3.6-flash-high',
+  'composer-2.5',
+];
+
+const cursorFrontierModelRank = new Map(
+  cursorFrontierModelSlugs.map((slug, index) => [slug, index])
+);
+
+export const sortCursorModels = (models) =>
+  models
+    .map((model, index) => ({ model, index }))
+    .sort((a, b) => {
+      const aRank = cursorFrontierModelRank.get(a.model.slug);
+      const bRank = cursorFrontierModelRank.get(b.model.slug);
+      if (aRank !== undefined || bRank !== undefined) {
+        if (aRank === undefined) return 1;
+        if (bRank === undefined) return -1;
+        return aRank - bRank;
+      }
+      return a.index - b.index;
+    })
+    .map(({ model }) => model);
+
 export const cursorFallbackModels = [
   {
     id: 'cursor:auto',
@@ -45,52 +82,11 @@ export const cursorFallbackModels = [
     favorite: true,
   },
   {
-    id: 'cursor:cursor-grok-4.5-high-fast',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'Cursor Grok 4.5 Fast',
-    slug: 'cursor-grok-4.5-high-fast',
-    command: 'cursor-agent',
-  },
-  {
-    id: 'cursor:composer-2.5',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'Composer 2.5',
-    slug: 'composer-2.5',
-    command: 'cursor-agent',
-    favorite: true,
-  },
-  {
     id: 'cursor:claude-opus-5-thinking-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
     label: 'Opus 5 1M Thinking',
     slug: 'claude-opus-5-thinking-high',
-    command: 'cursor-agent',
-  },
-  {
-    id: 'cursor:claude-opus-4-8-thinking-high',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'Opus 4.8 1M Thinking',
-    slug: 'claude-opus-4-8-thinking-high',
-    command: 'cursor-agent',
-  },
-  {
-    id: 'cursor:gpt-5.6-sol-high',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'GPT-5.6 Sol 1M High',
-    slug: 'gpt-5.6-sol-high',
-    command: 'cursor-agent',
-  },
-  {
-    id: 'cursor:gpt-5.5-high',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'GPT-5.5 1M High',
-    slug: 'gpt-5.5-high',
     command: 'cursor-agent',
   },
   {
@@ -110,6 +106,22 @@ export const cursorFallbackModels = [
     command: 'cursor-agent',
   },
   {
+    id: 'cursor:gpt-5.6-sol-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'GPT-5.6 Sol 1M High',
+    slug: 'gpt-5.6-sol-high',
+    command: 'cursor-agent',
+  },
+  {
+    id: 'cursor:gpt-5.6-terra-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'GPT-5.6 Terra 1M High',
+    slug: 'gpt-5.6-terra-high',
+    command: 'cursor-agent',
+  },
+  {
     id: 'cursor:gpt-5.6-luna-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
@@ -123,6 +135,47 @@ export const cursorFallbackModels = [
     providerLabel: 'Cursor',
     label: 'Kimi K3 High',
     slug: 'kimi-k3-high',
+    command: 'cursor-agent',
+  },
+  {
+    id: 'cursor:gemini-3.6-flash-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Gemini 3.6 Flash',
+    slug: 'gemini-3.6-flash-high',
+    command: 'cursor-agent',
+  },
+  {
+    id: 'cursor:composer-2.5',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Composer 2.5',
+    slug: 'composer-2.5',
+    command: 'cursor-agent',
+    favorite: true,
+  },
+  {
+    id: 'cursor:cursor-grok-4.5-high-fast',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Cursor Grok 4.5 Fast',
+    slug: 'cursor-grok-4.5-high-fast',
+    command: 'cursor-agent',
+  },
+  {
+    id: 'cursor:claude-opus-4-8-thinking-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Opus 4.8 1M Thinking',
+    slug: 'claude-opus-4-8-thinking-high',
+    command: 'cursor-agent',
+  },
+  {
+    id: 'cursor:gpt-5.5-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'GPT-5.5 1M High',
+    slug: 'gpt-5.5-high',
     command: 'cursor-agent',
   },
 ];
@@ -189,14 +242,23 @@ export const agentModels = [
     slug: 'orion',
   },
   {
+    id: 'grok:grok-4.6',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.6',
+    slug: 'grok-4.6',
+    command: 'grok',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
     id: 'grok:grok-4.5',
     providerId: 'grok',
     providerLabel: 'Grok',
     label: 'Grok 4.5',
     slug: 'grok-4.5',
     command: 'grok',
-    shortcut: '⌘1',
-    favorite: true,
+    shortcut: '⌘2',
   },
   {
     id: 'grok:grok-composer-2.5-fast',
@@ -205,7 +267,7 @@ export const agentModels = [
     label: 'Composer 2.5 Fast',
     slug: 'grok-composer-2.5-fast',
     command: 'grok',
-    shortcut: '⌘2',
+    shortcut: '⌘3',
     favorite: true,
   },
   {
@@ -437,7 +499,7 @@ export const parseCursorModelsOutput = (output) => {
     const parsed = JSON.parse(text);
     const values = Array.isArray(parsed) ? parsed : parsed.models || parsed.data || parsed.items;
     if (Array.isArray(values)) {
-      return values.map(parseCursorModelObject).filter(Boolean);
+      return sortCursorModels(values.map(parseCursorModelObject).filter(Boolean));
     }
   } catch {}
 
@@ -467,11 +529,11 @@ export const parseCursorModelsOutput = (output) => {
   }
 
   const seen = new Set();
-  return models.filter((model) => {
+  return sortCursorModels(models.filter((model) => {
     if (seen.has(model.slug)) return false;
     seen.add(model.slug);
     return true;
-  });
+  }));
 };
 
 export const listCursorAgentModels = async () => {

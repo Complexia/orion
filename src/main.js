@@ -43,6 +43,7 @@ import { codexBrowserUseMode, codexUtilityPrivacyOptions } from './main/codex-co
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
+import { validateAgentWorkspace } from './main/agent-run-preflight.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
@@ -6584,6 +6585,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const riftSetupError = pendingRiftSetupError(input);
     if (riftSetupError) {
       return { ok: false, error: riftSetupError };
+    }
+    const workspaceError = await validateAgentWorkspace(input.projectPath);
+    if (workspaceError) {
+      return { ok: false, error: workspaceError };
     }
 
     // A newly opened window can submit a turn while startup cleanup is still
