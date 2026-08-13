@@ -49,7 +49,7 @@ export type ClaudeReasoningEffort =
   | 'ultracode'
   | 'ultrathink';
 export type ClaudeContextWindow = '200k' | '1m';
-export type GrokReasoningEffort = 'low' | 'medium' | 'high';
+export type GrokReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
 export type MuseReasoningEffort =
   | 'none'
   | 'minimal'
@@ -144,20 +144,40 @@ export const claudeContextWindowOptions: Array<{
   { value: '1m', label: '1M' },
 ];
 
-// Grok 4.5 exposes reasoning effort over ACP; labels/descriptions mirror the
-// tiers the agent itself advertises in session/new model metadata.
+// Grok exposes reasoning effort over ACP; labels/descriptions mirror the
+// tiers the agent itself advertises in session/new model metadata. Extra High
+// is currently specific to Grok 4.6.
 export const defaultGrokReasoningEffort: GrokReasoningEffort = 'high';
 
-export const grokReasoningOptions: Array<{
+export type GrokReasoningOption = {
   value: GrokReasoningEffort;
   label: string;
   default?: boolean;
   description?: string;
-}> = [
+};
+
+export const grokReasoningOptions: GrokReasoningOption[] = [
   { value: 'low', label: 'Low', description: 'Quick, fast implementations' },
   { value: 'medium', label: 'Medium', description: 'Balanced effort with standard implementation and testing' },
-  { value: 'high', label: 'High', default: true, description: 'Highest implementation quality with extensive reasoning' },
+  { value: 'high', label: 'High', default: true, description: 'Higher implementation quality with extensive reasoning' },
+  { value: 'xhigh', label: 'Extra High', description: 'Highest effort and reasoning level' },
 ];
+
+export const grokReasoningOptionsForModel = (
+  model: AgentModel | undefined
+): GrokReasoningOption[] =>
+  model?.slug === 'grok-4.6'
+    ? grokReasoningOptions
+    : grokReasoningOptions.filter((option) => option.value !== 'xhigh');
+
+export const getEffectiveGrokReasoningEffort = (
+  model: AgentModel | undefined,
+  effort: GrokReasoningEffort | undefined
+): GrokReasoningEffort => {
+  const options = grokReasoningOptionsForModel(model);
+  if (effort && options.some((option) => option.value === effort)) return effort;
+  return options.find((option) => option.default)?.value ?? defaultGrokReasoningEffort;
+};
 
 // Muse Code's reasoning-effort tiers, the wire values `muse exec
 // --reasoning-effort` accepts. The CLI defaults to high.
@@ -380,13 +400,21 @@ export const fallbackAgentModels: AgentModel[] = [
     favorite: true,
   },
   {
+    id: 'grok:grok-4.6',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.6',
+    slug: 'grok-4.6',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
     id: 'grok:grok-4.5',
     providerId: 'grok',
     providerLabel: 'Grok',
     label: 'Grok 4.5',
     slug: 'grok-4.5',
-    shortcut: '⌘1',
-    favorite: true,
+    shortcut: '⌘2',
   },
   {
     id: 'grok:grok-composer-2.5-fast',
@@ -394,7 +422,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Grok',
     label: 'Composer 2.5 Fast',
     slug: 'grok-composer-2.5-fast',
-    shortcut: '⌘2',
+    shortcut: '⌘3',
     favorite: true,
   },
   {
@@ -576,47 +604,11 @@ export const fallbackAgentModels: AgentModel[] = [
     favorite: true,
   },
   {
-    id: 'cursor:cursor-grok-4.5-high-fast',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'Cursor Grok 4.5 Fast',
-    slug: 'cursor-grok-4.5-high-fast',
-  },
-  {
-    id: 'cursor:composer-2.5',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'Composer 2.5',
-    slug: 'composer-2.5',
-    favorite: true,
-  },
-  {
     id: 'cursor:claude-opus-5-thinking-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
     label: 'Opus 5 1M Thinking',
     slug: 'claude-opus-5-thinking-high',
-  },
-  {
-    id: 'cursor:claude-opus-4-8-thinking-high',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'Opus 4.8 1M Thinking',
-    slug: 'claude-opus-4-8-thinking-high',
-  },
-  {
-    id: 'cursor:gpt-5.6-sol-high',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'GPT-5.6 Sol 1M High',
-    slug: 'gpt-5.6-sol-high',
-  },
-  {
-    id: 'cursor:gpt-5.5-high',
-    providerId: 'cursor',
-    providerLabel: 'Cursor',
-    label: 'GPT-5.5 1M High',
-    slug: 'gpt-5.5-high',
   },
   {
     id: 'cursor:claude-fable-5-thinking-high',
@@ -633,6 +625,20 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'claude-sonnet-5-thinking-high',
   },
   {
+    id: 'cursor:gpt-5.6-sol-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'GPT-5.6 Sol 1M High',
+    slug: 'gpt-5.6-sol-high',
+  },
+  {
+    id: 'cursor:gpt-5.6-terra-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'GPT-5.6 Terra 1M High',
+    slug: 'gpt-5.6-terra-high',
+  },
+  {
     id: 'cursor:gpt-5.6-luna-high',
     providerId: 'cursor',
     providerLabel: 'Cursor',
@@ -647,6 +653,42 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'kimi-k3-high',
   },
   {
+    id: 'cursor:gemini-3.6-flash-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Gemini 3.6 Flash',
+    slug: 'gemini-3.6-flash-high',
+  },
+  {
+    id: 'cursor:composer-2.5',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Composer 2.5',
+    slug: 'composer-2.5',
+    favorite: true,
+  },
+  {
+    id: 'cursor:cursor-grok-4.5-high-fast',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Cursor Grok 4.5 Fast',
+    slug: 'cursor-grok-4.5-high-fast',
+  },
+  {
+    id: 'cursor:claude-opus-4-8-thinking-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'Opus 4.8 1M Thinking',
+    slug: 'claude-opus-4-8-thinking-high',
+  },
+  {
+    id: 'cursor:gpt-5.5-high',
+    providerId: 'cursor',
+    providerLabel: 'Cursor',
+    label: 'GPT-5.5 1M High',
+    slug: 'gpt-5.5-high',
+  },
+  {
     id: 'opencode:anthropic/claude-sonnet-4-6',
     providerId: 'opencode',
     providerLabel: 'OpenCode',
@@ -655,7 +697,7 @@ export const fallbackAgentModels: AgentModel[] = [
   },
 ];
 
-export const defaultAgentModelId = 'grok:grok-4.5';
+export const defaultAgentModelId = 'grok:grok-4.6';
 
 // The Orion pseudo-model: not a CLI harness, resolved by the renderer into
 // the per-role models configured in Settings → Orchestration.

@@ -118,8 +118,10 @@ export const extractClaudeReasoningFromJsonEvent = (value, context = {}) => {
   return '';
 };
 
-// cursor-agent stream-json mirrors Claude Code's: assistant events carry the
-// streamed text and a final 'result' event repeats the whole response.
+// With --stream-partial-output, current cursor-agent versions emit timestamped
+// assistant records as true text deltas, then one untimestamped assistant
+// record containing the complete response, followed by a result that repeats
+// it again. Render the deltas; use either aggregate only when no delta arrived.
 export const extractCursorTextFromJsonEvent = (value, context = {}) => {
   if (!value || typeof value !== 'object') return '';
 
@@ -130,23 +132,8 @@ export const extractCursorTextFromJsonEvent = (value, context = {}) => {
       .join('');
     if (!text) return '';
 
-    // A new assistant message (id changed) after earlier text is a separate
-    // paragraph — insert a blank line and stop prefix-matching against the
-    // previous message's text.
-    const messageId = typeof value.message?.id === 'string' ? value.message.id : null;
-    const isNewMessage =
-      messageId && context.lastAssistantMessageId && messageId !== context.lastAssistantMessageId;
-    if (messageId) context.lastAssistantMessageId = messageId;
-    if (isNewMessage) context.lastAssistantText = '';
-    const prefix = isNewMessage && context.textSeen ? '\n\n' : '';
-
-    // --stream-partial-output may resend a message's text cumulatively;
-    // append only the new suffix. Genuine deltas fail the prefix test and
-    // are appended whole.
-    const previous = context.lastAssistantText ?? '';
-    context.lastAssistantText = text;
-    if (previous && text.startsWith(previous)) return `${prefix}${text.slice(previous.length)}`;
-    return `${prefix}${text}`;
+    if (typeof value.timestamp_ms === 'number') return text;
+    return context.textSeen ? '' : text;
   }
 
   // Only use the final aggregate when nothing streamed, so the response

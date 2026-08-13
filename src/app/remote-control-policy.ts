@@ -11,6 +11,7 @@ export const remoteThreadRunError = (modelId: string) =>
     : null;
 
 const GROK_REASONING = new Set(['low', 'medium', 'high']);
+const GROK_46_REASONING = new Set([...GROK_REASONING, 'xhigh']);
 const MUSE_REASONING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']);
 const CLAUDE_REASONING = new Set([
   'low',
@@ -59,7 +60,8 @@ export const remoteAgentSettingsPatch = (
 
   if (input.reasoningEffort) {
     if (model.providerId === 'grok') {
-      if (GROK_REASONING.has(input.reasoningEffort) && thread.grokReasoningEffort !== input.reasoningEffort) {
+      const allowed = model.slug === 'grok-4.6' ? GROK_46_REASONING : GROK_REASONING;
+      if (allowed.has(input.reasoningEffort) && thread.grokReasoningEffort !== input.reasoningEffort) {
         patch.grokReasoningEffort = input.reasoningEffort;
       }
     } else if (model.providerId === 'muse') {

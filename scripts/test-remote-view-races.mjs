@@ -36,6 +36,13 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     label: 'Grok 4.5',
     slug: 'grok-4.5',
   };
+  const grok46Model = {
+    id: 'grok:grok-4.6',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.6',
+    slug: 'grok-4.6',
+  };
   const claudeModel = {
     id: 'claude:claude-opus-5',
     providerId: 'claude',
@@ -63,6 +70,16 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     remoteAgentSettingsPatch(emptyThread, grokModel, { reasoningEffort: 'ultra' }),
     {},
     'grok must not accept codex-only ultra'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, grok46Model, { reasoningEffort: 'xhigh' }),
+    { grokReasoningEffort: 'xhigh' },
+    'Grok 4.6 accepts its Extra High effort tier'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, grokModel, { reasoningEffort: 'xhigh' }),
+    {},
+    'older Grok models must not inherit the Grok 4.6-only effort tier'
   );
   assert.deepEqual(
     remoteAgentSettingsPatch(emptyThread, claudeModel, {
