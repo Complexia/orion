@@ -35,6 +35,7 @@
     "test:slash-commands": "node --no-warnings --experimental-strip-types scripts/test-slash-commands.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "test:provider-updates": "node --no-warnings scripts/test-provider-updates.mjs",
+    "test:agent-models": "node --no-warnings scripts/test-agent-models.mjs",
     "test:source-control": "node --no-warnings scripts/test-source-control.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",
