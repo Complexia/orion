@@ -1,4 +1,4 @@
-import { dialog, shell } from 'electron';
+import { app, dialog, shell } from 'electron';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -13,6 +13,7 @@ import { execFileAsync } from './shell-env.js';
 const claudeHomeDirectory = () => path.join(os.homedir(), '.claude');
 export const skillsDirectory = () => path.join(claudeHomeDirectory(), 'skills');
 export const disabledSkillsDirectory = () => path.join(claudeHomeDirectory(), 'skills-disabled');
+const bundledSkillsReceiptPath = () => path.join(claudeHomeDirectory(), '.orion-bundled-skills.json');
 
 const skillFileName = 'SKILL.md';
 const archiveExtensions = new Set(['.zip']);
@@ -38,6 +39,23 @@ const isDirectory = async (target) => {
   }
 };
 
+const readBundledSkillReceipts = async () => {
+  try {
+    const parsed = JSON.parse(await fs.readFile(bundledSkillsReceiptPath(), 'utf-8'));
+    return new Set(Array.isArray(parsed?.installed) ? parsed.installed.filter(isSafeSkillId) : []);
+  } catch {
+    return new Set();
+  }
+};
+
+const writeBundledSkillReceipts = async (installed) => {
+  const receipt = bundledSkillsReceiptPath();
+  const temporary = `${receipt}.${process.pid}.tmp`;
+  await fs.mkdir(path.dirname(receipt), { recursive: true });
+  await fs.writeFile(temporary, JSON.stringify({ installed: [...installed].sort() }, null, 2));
+  await fs.rename(temporary, receipt);
+};
+
 /** Directory names only — never a path segment that could escape the roots. */
 const isSafeSkillId = (id) =>
   typeof id === 'string' && id.length > 0 && id !== '.' && id !== '..' && /^[A-Za-z0-9._-]+$/.test(id);
@@ -50,6 +68,53 @@ const sanitizeSkillId = (value) => {
     .replace(/^[-.]+|[-.]+$/g, '')
     .slice(0, 64);
   return isSafeSkillId(slug) ? slug : '';
+};
+
+/**
+ * Install first-party skills exactly once. Existing active or inactive skills
+ * win, so the Settings toggle is authoritative and deleting a bundled skill
+ * does not make it reappear on every launch.
+ */
+export const installBundledSkillsFrom = async (sourceRoot) => {
+  if (!(await isDirectory(sourceRoot))) return { installed: [], skipped: [] };
+  const receipts = await readBundledSkillReceipts();
+  const installed = [];
+  const skipped = [];
+  const entries = await fs.readdir(sourceRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !isSafeSkillId(entry.name)) continue;
+    const source = path.join(sourceRoot, entry.name);
+    if (!(await hasSkillFile(source))) continue;
+
+    const active = path.join(skillsDirectory(), entry.name);
+    const inactive = path.join(disabledSkillsDirectory(), entry.name);
+    if (receipts.has(entry.name) || (await pathExists(active)) || (await pathExists(inactive))) {
+      receipts.add(entry.name);
+      skipped.push(entry.name);
+      continue;
+    }
+
+    await fs.mkdir(skillsDirectory(), { recursive: true });
+    const staging = await fs.mkdtemp(path.join(skillsDirectory(), '.orion-bundled-skill-'));
+    try {
+      const staged = path.join(staging, entry.name);
+      await fs.cp(source, staged, { recursive: true, dereference: true });
+      await fs.rename(staged, active);
+      receipts.add(entry.name);
+      installed.push(entry.name);
+    } finally {
+      await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  await writeBundledSkillReceipts(receipts);
+  return { installed, skipped };
+};
+
+export const ensureBundledSkills = async () => {
+  const sourceRoot = app.isPackaged
+    ? path.join(process.resourcesPath, 'bundled-skills')
+    : path.join(app.getAppPath(), 'assets', 'bundled-skills');
+  return installBundledSkillsFrom(sourceRoot);
 };
 
 const unquote = (value) => {

@@ -56,7 +56,7 @@ import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
 import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents, stringifySummary } from './main/stream-adapters.js';
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
-import { deleteSkill, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
+import { deleteSkill, ensureBundledSkills, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
@@ -1035,6 +1035,11 @@ const createWindow = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  try {
+    await ensureBundledSkills();
+  } catch (error) {
+    console.error('Could not install bundled agent skills', error);
+  }
   // Hydrate the release guard before a renderer can launch work against a
   // stale path. The journal stays authoritative until renderer persistence is
   // acknowledged, including across full app restarts.

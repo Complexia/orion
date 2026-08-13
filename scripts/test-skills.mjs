@@ -8,8 +8,10 @@ process.env.HOME = testHome;
 
 const {
   disabledSkillsDirectory,
+  installBundledSkillsFrom,
   installSkillFrom,
   locateSkillDirectory,
+  setSkillEnabled,
   skillPickerOptions,
   skillsDirectory,
 } = await import('../src/main/skills.js');
@@ -21,6 +23,22 @@ const writeSkill = async (directory, name, marker) => {
 };
 
 try {
+  const bundledRoot = path.join(testHome, 'bundled');
+  await writeSkill(path.join(bundledRoot, 'use-orion-cli'), 'use-orion-cli', 'bundled');
+  const bundled = await installBundledSkillsFrom(bundledRoot);
+  assert.deepEqual(bundled.installed, ['use-orion-cli']);
+  assert.match(
+    await fs.readFile(path.join(skillsDirectory(), 'use-orion-cli', 'SKILL.md'), 'utf-8'),
+    /bundled/
+  );
+  assert.deepEqual(await setSkillEnabled({ id: 'use-orion-cli', enabled: false }), { ok: true });
+  assert.match(
+    await fs.readFile(path.join(disabledSkillsDirectory(), 'use-orion-cli', 'SKILL.md'), 'utf-8'),
+    /bundled/
+  );
+  const bundledAgain = await installBundledSkillsFrom(bundledRoot);
+  assert.deepEqual(bundledAgain, { installed: [], skipped: ['use-orion-cli'] });
+
   const originalSource = path.join(testHome, 'sources', 'original');
   await writeSkill(originalSource, 'replace-me', 'original');
   const firstInstall = await installSkillFrom(originalSource, { overwriteAll: true });

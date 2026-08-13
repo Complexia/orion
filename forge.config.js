@@ -15,7 +15,10 @@ module.exports = {
     // its own '**/*.node' pattern into this.
     asar: { unpack: '**/node_modules/{node-pty,rift-snapshot}/**' },
     icon: path.join(__dirname, 'assets', 'icon'),
-    extraResource: [path.join(__dirname, 'assets', 'icon.png')],
+    extraResource: [
+      path.join(__dirname, 'assets', 'icon.png'),
+      path.join(__dirname, 'assets', 'bundled-skills'),
+    ],
     name: 'Orion',
     appBundleId: 'com.complexia.orion',
     appCategoryType: 'public.app-category.developer-tools',
