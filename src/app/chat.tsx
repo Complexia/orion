@@ -652,7 +652,7 @@ export const ChatMessage = React.memo(function ChatMessage({
       <div className="message system claude-background-intervention">
         <div className="claude-background-intervention-heading">
           <Terminal size={15} />
-          <span>Orion · Background processes still running</span>
+          <span>Orion · Background monitors still running</span>
         </div>
         <div className="claude-background-intervention-copy">{message.content}</div>
         <div className="claude-background-intervention-tasks">
@@ -668,11 +668,11 @@ export const ChatMessage = React.memo(function ChatMessage({
             disabled={busy}
             onClick={() => onDiscardClaudeBackgroundTasks(message.id, backgroundIntervention.runId)}
           >
-            {busy ? 'Stopping background processes…' : 'Stop background processes and finish'}
+            {busy ? 'Stopping background monitors…' : 'Stop background monitors'}
           </button>
         )}
         {backgroundIntervention.status === 'stopping' && (
-          <div className="claude-background-intervention-result">Stopping the remaining Claude shell processes…</div>
+          <div className="claude-background-intervention-result">Stopping the remaining Claude shell monitors…</div>
         )}
         {backgroundIntervention.status === 'stopped' && (
           <div className="claude-background-intervention-result success">Background processes stopped. The completed response and file changes were preserved.</div>

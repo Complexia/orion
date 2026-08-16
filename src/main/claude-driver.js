@@ -520,31 +520,33 @@ export const flushPendingClaudeTaskNotifications = (session, turn) => {
   }
 };
 
-// Background tasks the model is genuinely waiting on. Every live task in the
-// harness's set re-invokes the model when it settles — subagents and workflows
-// via a task notification, backgrounded shell commands when they exit — so a
-// turn that ends while any of them run is a pause, not a finish, and the
-// thread must keep reading as working. Only skip_transcript tasks (ambient
-// housekeeping) never hold the thread open. A task that never exits (a dev
-// server left running) keeps the thread waiting indefinitely; the caption in
-// the renderer names the task so the user can tell, and Stop settles it.
+// Claude Code keeps background shells distinct from work the model is waiting
+// to rejoin. Agent/workflow completion re-invokes the model, so those tasks
+// keep Orion working between turns. A local_bash dev server, log tail, or
+// monitor can intentionally run forever: keep it visible and stoppable, but
+// never let it pin the completed turn or the persistent SDK session forever.
 const liveClaudeBackgroundTasks = (session) =>
   [...session.backgroundTasks.entries()].filter(
     ([taskId]) => !session.skipTranscriptTaskIds.has(taskId)
   );
 
-export const pendingClaudeBackgroundTasks = (session) =>
-  liveClaudeBackgroundTasks(session).map(([, task]) => task.description);
-
-// Claude Code reports backgrounded Bash commands as local_bash. Keep this
-// deliberately narrow: the interactive discard action must never terminate a
-// subagent or workflow just because a shell command happens to be live too.
+// Claude Code reports backgrounded Bash commands as local_bash. Keep the set
+// deliberately narrow so an unknown provider task remains awaited rather than
+// being mistaken for a disposable monitor.
 const CLAUDE_BACKGROUND_SHELL_TASK_TYPES = new Set(['local_bash', 'bash', 'shell']);
+const isClaudeBackgroundShellTask = (task) =>
+  CLAUDE_BACKGROUND_SHELL_TASK_TYPES.has(task.taskType);
+
+export const pendingClaudeBackgroundTasks = (session) =>
+  liveClaudeBackgroundTasks(session)
+    .filter(([, task]) => !isClaudeBackgroundShellTask(task))
+    .map(([, task]) => task.description);
+
 export const discardableClaudeBackgroundShellTasks = (session) => {
   const liveTasks = liveClaudeBackgroundTasks(session);
   if (
     liveTasks.length === 0 ||
-    liveTasks.some(([, task]) => !CLAUDE_BACKGROUND_SHELL_TASK_TYPES.has(task.taskType))
+    liveTasks.some(([, task]) => !isClaudeBackgroundShellTask(task))
   ) {
     return [];
   }
@@ -552,6 +554,28 @@ export const discardableClaudeBackgroundShellTasks = (session) => {
     taskId,
     description: task.description,
   }));
+};
+
+// SDK stopTask is the Claude Code-native way to end background work. Bound
+// each acknowledgement independently: Stop must still reach the parent turn
+// and runtime teardown when one child task's control channel is wedged.
+export const stopClaudeBackgroundTasks = async (session, tasks, timeoutMs = 1500) => {
+  if (typeof session.query?.stopTask !== 'function' || tasks.length === 0) return;
+  await Promise.allSettled(
+    tasks.map(async ({ taskId }) => {
+      let timeoutId;
+      try {
+        await Promise.race([
+          session.query.stopTask(taskId),
+          new Promise((resolve) => {
+            timeoutId = setTimeout(resolve, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    })
+  );
 };
 
 // A thread left "working" by a done event that carried pending background
@@ -565,7 +589,7 @@ export const updateClaudeBackgroundSettle = (session) => {
   const shouldSettle =
     !session.ended &&
     session.activeTurns.length === 0 &&
-    pendingClaudeBackgroundTasks(session).length === 0;
+    liveClaudeBackgroundTasks(session).length === 0;
   if (!shouldSettle) {
     if (session.backgroundSettleTimer) {
       clearTimeout(session.backgroundSettleTimer);
@@ -646,16 +670,14 @@ export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
         ? `Claude ended the turn with an error (${resultMessage.subtype}).`
         : 'Claude reported an error for this turn.');
   }
-  // Background tasks (subagents, workflows, backgrounded shell commands)
-  // still running when the turn ended: the done event carries their
-  // descriptions so the renderer keeps the thread in the working state and
-  // names what it's waiting on instead of flipping to Finished between turns.
-  // The harness re-invokes the model (a synthetic turn) when each settles.
+  // Agent/workflow tasks keep the thread working because their completion
+  // re-invokes the model. Shell-only work is reported separately: the turn is
+  // finished, while Orion retains a bounded, stoppable monitor handle.
   const pendingBackgroundTasks = resultIsError ? [] : pendingClaudeBackgroundTasks(session);
   const pendingBackgroundShellTasks = resultIsError
     ? []
     : discardableClaudeBackgroundShellTasks(session).map((task) => task.description);
-  if (pendingBackgroundTasks.length > 0) {
+  if (!resultIsError && liveClaudeBackgroundTasks(session).length > 0) {
     retainClaudeBackgroundRun(session, turn.runId);
   } else {
     clearClaudeBackgroundRun(session);
@@ -1646,16 +1668,7 @@ export const discardClaudeBackgroundShellTasks = async (runId) => {
   // child process cleanly. Then dispose the now-shell-only persistent runtime
   // to prevent task notifications from starting a synthetic follow-up turn;
   // the next user prompt can still resume from the stored Claude session id.
-  if (typeof session.query?.stopTask === 'function') {
-    await Promise.allSettled(
-      shellTasks.map(({ taskId }) =>
-        Promise.race([
-          session.query.stopTask(taskId),
-          new Promise((resolve) => setTimeout(resolve, 1500)),
-        ])
-      )
-    );
-  }
+  await stopClaudeBackgroundTasks(session, shellTasks);
   try {
     await disposeClaudeSdkSessionAndWait(session.threadId);
   } catch {
@@ -1688,10 +1701,17 @@ export const interruptClaudeSdkRun = async (runId, { terminateBackground = false
       }
       if (terminateBackground) {
         // Explicit Stop: the user wants ALL work halted, including background
-        // subagents still mutating the working tree. Interrupt is best-effort
-        // (flushes an interrupted result into the transcript), then the whole
-        // harness process is torn down; the next turn resumes the
-        // conversation in a fresh process via the stored session id.
+        // subagents still mutating the working tree. Ask Claude Code to stop
+        // every exact task first, then interrupt the parent and tear down the
+        // harness. This mirrors Claude Code/T3 stop-everything semantics while
+        // keeping every control acknowledgement bounded.
+        await stopClaudeBackgroundTasks(
+          session,
+          liveClaudeBackgroundTasks(session).map(([taskId, task]) => ({
+            taskId,
+            description: task.description,
+          }))
+        );
         try {
           await Promise.race([
             session.query?.interrupt?.(),
@@ -1744,6 +1764,13 @@ export const interruptClaudeSdkRun = async (runId, { terminateBackground = false
   if (backgroundSession) {
     clearClaudeBackgroundRun(backgroundSession);
     if (terminateBackground) {
+      await stopClaudeBackgroundTasks(
+        backgroundSession,
+        liveClaudeBackgroundTasks(backgroundSession).map(([taskId, task]) => ({
+          taskId,
+          description: task.description,
+        }))
+      );
       await disposeClaudeSdkSessionAndWait(backgroundSession.threadId);
     }
     // With no foreground turn there is nothing to interrupt. Returning true
@@ -1825,24 +1852,21 @@ export const disposeAllClaudeSdkSessions = () => {
 // Each persistent session pins a ~200-450MB CLI process, and threads are
 // rarely deleted — without eviction every thread touched since launch keeps
 // its process forever. Evict sessions idle past the threshold; the next turn
-// cold-starts via --resume with the same conversation. Sessions with a live
-// turn, an owed result, or background agents are never evicted — background
-// work is the reason sessions persist at all.
+// cold-starts via --resume with the same conversation. Live agent/workflow
+// tasks block eviction. Shell-only monitors do not: after the idle window the
+// SDK runtime is torn down, which also prevents forgotten dev servers from
+// surviving for hours.
 export const CLAUDE_SESSION_IDLE_EVICT_MS = 15 * 60 * 1000;
-setInterval(() => {
-  const now = Date.now();
+export const evictIdleClaudeSdkSessions = (now = Date.now()) => {
   for (const session of claudeSdkSessions.values()) {
     if (session.ended || session.disposed) continue;
     if (session.activeTurns.length > 0 || session.resultsOwed > 0) continue;
-    // Only awaited tasks (agent/workflow — the kinds whose completion
-    // re-invokes the model) block eviction. Raw backgroundTasks also holds
-    // non-awaited long-runners like a local_bash dev server, which would pin
-    // the session forever — the exact leak eviction exists to stop.
-    if (session.backgroundRunId || pendingClaudeBackgroundTasks(session).length > 0) continue;
+    if (pendingClaudeBackgroundTasks(session).length > 0) continue;
     if (now - session.lastActivityAt < CLAUDE_SESSION_IDLE_EVICT_MS) continue;
     // dispose() aborts the SDK query; the pump loop then runs
     // endClaudeSession, which removes the session from the map and settles
     // the thread without surfacing an error (disposed sessions end cleanly).
     session.dispose();
   }
-}, 60 * 1000);
+};
+setInterval(evictIdleClaudeSdkSessions, 60 * 1000);

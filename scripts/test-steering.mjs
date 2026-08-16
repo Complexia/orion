@@ -2,13 +2,17 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 import {
+  CLAUDE_SESSION_IDLE_EVICT_MS,
   claudeBackgroundRunSessions,
   claudeSdkSessions,
   createClaudeTurnState,
   discardClaudeBackgroundShellTasks,
   discardableClaudeBackgroundShellTasks,
   endClaudeSession,
+  evictIdleClaudeSdkSessions,
   finalizeClaudeTurn,
+  pendingClaudeBackgroundTasks,
+  stopClaudeBackgroundTasks,
   steerClaudeSdkRun,
 } from '../src/main/claude-driver.js';
 import {
@@ -450,6 +454,11 @@ shellOnly.session.backgroundTasks = new Map([
 claudeSdkSessions.set(shellOnly.session.threadId, shellOnly.session);
 claudeBackgroundRunSessions.set('run-shell-only', shellOnly.session);
 assert.deepEqual(
+  pendingClaudeBackgroundTasks(shellOnly.session),
+  [],
+  'Claude Code background shells are monitors and must not pin the completed turn'
+);
+assert.deepEqual(
   discardableClaudeBackgroundShellTasks(shellOnly.session).map((task) => task.taskId),
   ['bash-1', 'bash-2'],
   'A completed Claude turn may offer an intervention when every live task is local_bash'
@@ -457,6 +466,44 @@ assert.deepEqual(
 assert.equal((await discardClaudeBackgroundShellTasks('run-shell-only')).ok, true);
 assert.deepEqual(shellOnly.stoppedTasks, ['bash-1', 'bash-2']);
 assert.equal(shellOnly.session.ended, true, 'Discarding shell-only work must settle the Claude runtime');
+
+const monitoredTurn = createSession({
+  threadId: 'thread-monitored-turn',
+  runId: 'run-monitored-turn',
+});
+monitoredTurn.session.resultsOwed = 0;
+monitoredTurn.session.backgroundTasks = new Map([
+  ['bash-monitor', { taskType: 'local_bash', description: 'watch the dev server' }],
+]);
+claudeSdkSessions.set(monitoredTurn.session.threadId, monitoredTurn.session);
+await finalizeClaudeTurn(monitoredTurn.session, { usage: { input_tokens: 2, output_tokens: 1 } });
+assert.equal(monitoredTurn.events[0]?.type, 'done');
+assert.deepEqual(monitoredTurn.events[0]?.pendingBackgroundTasks, undefined);
+assert.deepEqual(monitoredTurn.events[0]?.pendingBackgroundShellTasks, ['watch the dev server']);
+assert.equal(
+  claudeBackgroundRunSessions.get('run-monitored-turn'),
+  monitoredTurn.session,
+  'A completed monitored turn must retain a handle for the explicit stop action'
+);
+
+const nativeStops = [];
+await stopClaudeBackgroundTasks(
+  {
+    query: {
+      stopTask: async (taskId) => nativeStops.push(taskId),
+    },
+  },
+  [
+    { taskId: 'agent-live', description: 'Agent' },
+    { taskId: 'shell-live', description: 'Monitor' },
+  ],
+  10
+);
+assert.deepEqual(
+  nativeStops,
+  ['agent-live', 'shell-live'],
+  'Stop-everything must use the SDK stopTask control for every exact live task'
+);
 
 const mixedBackground = createSession({
   threadId: 'thread-mixed-background',
@@ -475,13 +522,34 @@ const mixedDiscard = await discardClaudeBackgroundShellTasks('run-mixed-backgrou
 assert.equal(mixedDiscard.ok, false, 'The shell discard must refuse mixed useful background work');
 assert.deepEqual(mixedBackground.stoppedTasks, []);
 
+claudeSdkSessions.clear();
+claudeBackgroundRunSessions.clear();
+const expiredMonitor = createSession({
+  threadId: 'thread-expired-monitor',
+  runId: 'run-expired-monitor',
+  retained: true,
+});
+expiredMonitor.session.resultsOwed = 0;
+expiredMonitor.session.lastActivityAt = 0;
+expiredMonitor.session.backgroundTasks = new Map([
+  ['bash-expired', { taskType: 'local_bash', description: 'forgotten dev server' }],
+]);
+claudeSdkSessions.set(expiredMonitor.session.threadId, expiredMonitor.session);
+claudeBackgroundRunSessions.set('run-expired-monitor', expiredMonitor.session);
+evictIdleClaudeSdkSessions(CLAUDE_SESSION_IDLE_EVICT_MS + 1);
+assert.equal(
+  expiredMonitor.session.ended,
+  true,
+  'An idle shell-only Claude runtime must be reaped instead of surviving indefinitely'
+);
+
 assert.match(
   claudeDriverSource,
   /if \(activeOwner\) \{[\s\S]*session\.query\.interrupt\(\)[\s\S]*createClaudeTurnState\(runId[\s\S]*session\.pushUserMessage\(text\)[\s\S]*return true;/,
   'An active steer must interrupt the blocked loop before pushing its continuation'
 );
 
-for (const { session } of [active, retained, mixedBackground]) {
+for (const { session } of [active, retained, monitoredTurn, mixedBackground, expiredMonitor]) {
   if (session.backgroundSettleTimer) clearTimeout(session.backgroundSettleTimer);
 }
 claudeSdkSessions.clear();

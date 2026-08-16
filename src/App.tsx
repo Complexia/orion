@@ -4083,10 +4083,10 @@ const App: React.FC = () => {
         return;
       }
 
-      // A claude session's background work settled with no re-invocation
+      // A Claude session's background work settled with no re-invocation
       // coming (task killed/failed, notification suppressed, or the session
-      // itself was disposed): flip a thread left "working — waiting on
-      // background agents" to done. No-op unless the thread is idle-running.
+      // itself was disposed). Resolve any monitor card even when its turn was
+      // already done; only the awaited-agent path needs a thread transition.
       if (event.type === 'background-settled') {
         const retainedRunId = activeRunsByThreadRef.current[event.threadId];
         // A mapping without a tracked output message is the retained
@@ -4100,7 +4100,7 @@ const App: React.FC = () => {
         }
         if (retainedRunId) clearActiveRun(retainedRunId);
         const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
-        if (!thread || thread.status !== 'running') return;
+        if (!thread) return;
         for (const message of thread.messages) {
           const intervention = message.claudeBackgroundIntervention;
           if (
@@ -4118,6 +4118,7 @@ const App: React.FC = () => {
             },
           });
         }
+        if (thread.status !== 'running') return;
         const lastRun = [...thread.messages].reverse().find((m) => m.kind === 'agent-run');
         updateThread(event.threadId, { status: 'done' });
         notifyThreadFinished(event.threadId, 'done');
@@ -4395,13 +4396,9 @@ const App: React.FC = () => {
 
       if (event.type === 'done') {
         flushChunkBuffers();
-        // Background tasks the model is still waiting on (subagents,
-        // workflows, backgrounded shell commands): the turn is over, but the
-        // task isn't. Keep the thread in the working state and name what it's
-        // waiting on — the harness re-invokes the model (a `started
-        // {background}` turn) when each task settles, and a
-        // `background-settled` event covers tasks that die without
-        // re-invoking.
+        // Agents/workflows can re-invoke Claude and keep the thread working.
+        // Shell-only work follows Claude Code's monitor semantics: the turn is
+        // finished, but the process remains visible and explicitly stoppable.
         const waitingOn = event.pendingBackgroundTasks ?? [];
         const waiting = waitingOn.length > 0;
         const discardableShellTasks = event.pendingBackgroundShellTasks ?? [];
@@ -4412,14 +4409,34 @@ const App: React.FC = () => {
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
         });
-        if (waiting) {
-          updateThread(tracked.threadId, { status: 'running' });
-          if (discardableShellTasks.length > 0) {
-            const count = discardableShellTasks.length;
+        if (discardableShellTasks.length > 0) {
+          const count = discardableShellTasks.length;
+          const content = `Claude finished its response. ${count === 1 ? 'A background shell process is' : `${count} background shell processes are`} still running as ${count === 1 ? 'a monitor' : 'monitors'}, but ${count === 1 ? 'it does' : 'they do'} not keep the turn open. Stop ${count === 1 ? 'it' : 'them'} here when ${count === 1 ? 'it is' : 'they are'} no longer needed.`;
+          const existingMonitor = [...(useOrionStore.getState().threads.find(
+            (thread) => thread.id === tracked.threadId
+          )?.messages ?? [])]
+            .reverse()
+            .find(
+              (message) =>
+                message.kind === 'claude-background-intervention' &&
+                message.claudeBackgroundIntervention?.status === 'pending'
+            );
+          if (existingMonitor?.claudeBackgroundIntervention) {
+            updateThreadMessage(tracked.threadId, existingMonitor.id, {
+              content,
+              claudeBackgroundIntervention: {
+                ...existingMonitor.claudeBackgroundIntervention,
+                runId: event.runId,
+                tasks: discardableShellTasks,
+                status: 'pending',
+                error: undefined,
+              },
+            });
+          } else {
             addMessageToThread(tracked.threadId, {
               role: 'system',
               kind: 'claude-background-intervention',
-              content: `Claude finished its response, but ${count === 1 ? 'a background shell process is' : `${count} background shell processes are`} still running. Orion will keep waiting so useful work is not discarded automatically. If ${count === 1 ? 'this is' : 'these are'} only a leftover wait, monitor, or dev server, you can stop ${count === 1 ? 'it' : 'them'} and finish the thread.`,
+              content,
               claudeBackgroundIntervention: {
                 runId: event.runId,
                 tasks: discardableShellTasks,
@@ -4427,6 +4444,9 @@ const App: React.FC = () => {
               },
             });
           }
+        }
+        if (waiting) {
+          updateThread(tracked.threadId, { status: 'running' });
           // The thread stays 'running', so the count-based tree refresh
           // can't see this turn's completion — tick it explicitly so the
           // files the foreground turn wrote surface in the Code tree.
@@ -4450,9 +4470,9 @@ const App: React.FC = () => {
           pushLinkedTaskStatus(tracked.threadId, 'finished', finalResponse || undefined);
         }
         runOutputMessages.current.delete(event.runId);
-        // Keep the completed run id as a cancellable handle while Claude's
-        // background agents are still live. Main recognizes it until the
-        // session settles; the mapping also keeps Stop/queue UI active.
+        // Awaited agents keep the run mapping so Stop/queue UI remains active.
+        // Shell monitors use the intervention card's run id directly and do
+        // not make the completed turn look active.
         if (!waiting) clearActiveRun(event.runId);
       }
 

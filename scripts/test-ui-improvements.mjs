@@ -69,12 +69,17 @@ assert.doesNotMatch(
 assert.match(
   appSource,
   /pendingBackgroundShellTasks[\s\S]*kind: 'claude-background-intervention'[\s\S]*status: 'pending'/,
-  'A completed Claude response with only shell work left must append an Orion intervention message'
+  'A completed Claude response with only shell work left must append an Orion monitor message'
+);
+assert.match(
+  appSource,
+  /Shell-only work follows Claude Code's monitor semantics[\s\S]*if \(waiting\)[\s\S]*else \{[\s\S]*status: 'done'/,
+  'Shell-only monitors must not keep the completed Claude turn in the working state'
 );
 assert.match(
   chatSource,
-  /Stop background processes and finish[\s\S]*onDiscardClaudeBackgroundTasks/,
-  'The intervention must expose an explicit user action in the transcript'
+  /Stop background monitors[\s\S]*onDiscardClaudeBackgroundTasks/,
+  'The monitor card must expose an explicit stop action in the transcript'
 );
 assert.match(
   mainSource,
