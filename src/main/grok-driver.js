@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
+import { grokSessionModeForAccessMode } from './grok-access-mode.js';
 
 // --- grok: <session dir>/updates.jsonl holds raw session/update lines -------
 
@@ -587,15 +588,16 @@ export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, a
     }
     callbacks.onSessionId(sessionId);
 
-    // grok agent's default permission mode auto-approves "safe" operations,
-    // which is too permissive for Orion's gated modes — pin the session to
-    // the mode matching the thread's access level (verified live: set_mode
-    // 'plan' blocks writes even though session/new advertises no modes).
+    // Grok's plan mode is an interactive implementation-planning workflow:
+    // it writes plan.md and waits for an exit-plan approval. Gated modes use
+    // normal answer behavior; their CLI permission mode and answerPermission
+    // above enforce the tool policy instead.
     // Full access is covered by --always-approve at spawn.
-    if (accessMode !== 'full-access') {
+    const sessionModeId = grokSessionModeForAccessMode(accessMode);
+    if (sessionModeId) {
       await request('session/set_mode', {
         sessionId,
-        modeId: accessMode === 'read-only' ? 'plan' : 'acceptEdits',
+        modeId: sessionModeId,
       });
     }
 

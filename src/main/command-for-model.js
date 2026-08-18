@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, defaultMuseReasoningEffort, parseExtraArgs } from './models.js';
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
+import { grokPermissionModeForAccessMode } from './grok-access-mode.js';
 
 export const commandForModel = (model, input) => {
   const prompt =
@@ -203,14 +204,17 @@ export const commandForModel = (model, input) => {
       const pluginArgs = input.orionMcp?.pluginDir
         ? ['--plugin-dir', input.orionMcp.pluginDir]
         : [];
+      const permissionMode = grokPermissionModeForAccessMode(accessMode);
       return [
         'grok',
+        ...(permissionMode
+          ? ['--permission-mode', permissionMode]
+          : ['--always-approve']),
         'agent',
         '-m',
         modelArg,
         ...effortArgs,
         ...pluginArgs,
-        ...(accessMode === 'full-access' ? ['--always-approve'] : []),
         ...extraArgs,
         'stdio',
       ];
@@ -224,7 +228,7 @@ export const commandForModel = (model, input) => {
     const accessArgs =
       accessMode === 'full-access'
         ? ['--permission-mode', 'bypassPermissions', '--always-approve']
-        : ['--permission-mode', accessMode === 'read-only' ? 'plan' : 'acceptEdits'];
+        : ['--permission-mode', grokPermissionModeForAccessMode(accessMode)];
     const resumeArgs = resumeSessionId
       ? ['--resume', resumeSessionId, ...(input.forkSession ? ['--fork-session'] : [])]
       : [];
