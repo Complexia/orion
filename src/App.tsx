@@ -70,6 +70,7 @@ import {
   type ThreadGoal,
   type TurnTokenStats,
   type Epic,
+  type EpicRepository,
 } from './store';
 import type {
   RemoteCommandRequest,
@@ -327,6 +328,8 @@ type EpicGitBusyEntry = {
   kind: EpicGitBusyKind;
   workspaceKey?: string;
 };
+
+type EpicRepositoryActionResult = 'completed' | 'failed' | 'aborted';
 
 // Which group of the composer's overflow menu is expanded, when the controls
 // row is too narrow to show them as separate chips. One at a time.
@@ -989,19 +992,19 @@ const App: React.FC = () => {
   const [newEpicDescription, setNewEpicDescription] = useState('');
   // Project the new epic binds to; preset on open to the project the user
   // last sent a message in.
-  const [newEpicProjectId, setNewEpicProjectId] = useState<string | null>(null);
+  const [newEpicProjectIds, setNewEpicProjectIds] = useState<string[]>([]);
   // Tailwind dropdown open state for the create-epic project / base-branch pickers.
-  const [createEpicProjectPickerOpen, setCreateEpicProjectPickerOpen] = useState(false);
-  const [createEpicRiftBranchPickerOpen, setCreateEpicRiftBranchPickerOpen] = useState(false);
+  const [createEpicProjectPickerIndex, setCreateEpicProjectPickerIndex] = useState<number | null>(null);
+  const [createEpicRiftBranchPickerOpen, setCreateEpicRiftBranchPickerOpen] = useState<number | null>(null);
   // Per-epic opt-out for the modal's "Create a rift" checkbox; the default
   // comes from the experimental Rifts settings when the modal opens.
   const [newEpicCreateRift, setNewEpicCreateRift] = useState(false);
   // Local branch the rift's feature branch starts from; null = the source
   // checkout's current branch (which needs no checkout anywhere).
-  const [newEpicRiftBaseBranch, setNewEpicRiftBaseBranch] = useState<string | null>(null);
-  // Local branches of the modal's selected project, for the base picker.
-  // Tagged with the project id so a stale list can't feed another project.
-  const [newEpicRiftBranches, setNewEpicRiftBranches] = useState<NewEpicRiftBranches | null>(null);
+  const [newEpicRiftBaseBranches, setNewEpicRiftBaseBranches] = useState<Record<string, string | null>>({});
+  // Local branches for every selected project, keyed by project id so a stale
+  // response can never feed another project's base picker.
+  const [newEpicRiftBranches, setNewEpicRiftBranches] = useState<NewEpicRiftBranches>({});
   // Rift binary availability, fetched once (null while unknown).
   const [riftStatus, setRiftStatus] = useState<{
     available: boolean;
@@ -1016,6 +1019,8 @@ const App: React.FC = () => {
       riftWorkingDir: string;
       gitRoot?: string;
       branch?: string;
+      sourceBranch?: string;
+      repositories?: EpicRepository[];
     }>;
   } | null>(null);
   // Epics whose rift workspace is still being created (branch naming runs a
@@ -1069,7 +1074,6 @@ const App: React.FC = () => {
   }, []);
   const createEpicTitleRef = useRef<HTMLInputElement>(null);
   const createEpicProjectPickerRef = useRef<HTMLDivElement>(null);
-  const createEpicRiftBranchPickerRef = useRef<HTMLDivElement>(null);
   const [epicMenuOpenId, setEpicMenuOpenId] = useState<string | null>(null);
   const [epicRenameId, setEpicRenameId] = useState<string | null>(null);
   const [epicRepoPickerOpen, setEpicRepoPickerOpen] = useState(false);
@@ -2294,14 +2298,21 @@ const App: React.FC = () => {
   // leftover id cannot hide the controls once Epics is turned off.
   const activeThreadProject = selectedThreadProject ?? (selectedEpic ? selectedProject : defaultNewThreadProject);
 
-  // The directory the repository controls act on. A thread grouped under an
-  // epic with a rift has its agents working inside that rift, so the git
-  // state, branch actions, commit/push, cloud sync, Code tab and Open With
-  // have to follow it there — reading or committing the source repository
-  // instead would show and act on a tree nobody is editing.
+  // The directory the repository controls act on. Multi-project agents use
+  // the shared parent as their cwd so they can see every project, but Git and
+  // Cloud controls must target one of the actual child repositories.
   const activeRift = selectedThread ? selectedThreadEpic : selectedEpic;
+  const activeRiftRepository =
+    activeRift?.repositories?.find(
+      (repository) => repository.projectId === activeThreadProject?.id
+    ) ?? activeRift?.repositories?.[0];
   const activeRiftPath =
-    activeRift?.riftPath && !activeRift.riftCleanupPending ? (activeRift.riftWorkingDir ?? activeRift.riftPath) : null;
+    activeRift?.riftPath && !activeRift.riftCleanupPending
+      ? (activeRiftRepository?.riftWorkingDir ??
+        activeRiftRepository?.riftPath ??
+        activeRift.riftWorkingDir ??
+        activeRift.riftPath)
+      : null;
   const activeRiftUnavailable = Boolean(
     selectedThreadRiftUnavailable ||
     (activeRift &&
@@ -2336,6 +2347,14 @@ const App: React.FC = () => {
   const selectedEpicClaimedProject = selectedEpic
     ? projectForGitRoot(selectedEpic.gitRoot, selectedEpic.repositoryProjectId)
     : null;
+  const selectedEpicRepositories = useMemo(
+    () =>
+      (selectedEpic?.repositories ?? []).map((repository) => ({
+        repository,
+        project: projects.find((project) => project.id === repository.projectId) ?? null,
+      })),
+    [projects, selectedEpic]
+  );
   const selectedEpicGitStatus = selectedEpic ? epicGitStatuses[selectedEpic.id] : undefined;
   // Fail open until the first status arrives. In commit-only mode, an
   // unpushed commit is not actionable because this button deliberately cannot
@@ -5122,6 +5141,8 @@ const App: React.FC = () => {
       riftWorkingDir: string;
       gitRoot?: string;
       branch?: string;
+      sourceBranch?: string;
+      repositories?: EpicRepository[];
     }) => {
       const state = useOrionStore.getState();
       const epic = state.epics.find((candidate) => candidate.id === ownership.epicId);
@@ -5143,6 +5164,20 @@ const App: React.FC = () => {
           error: 'The project that requested this Rift is no longer available in Orion.',
         };
       }
+      const repositories = ownership.repositories?.length
+        ? ownership.repositories
+        : epic.repositories?.map((repository, index) =>
+            index === 0
+              ? {
+                  ...repository,
+                  riftPath: ownership.riftPath,
+                  riftWorkingDir: ownership.riftWorkingDir,
+                  ...(ownership.gitRoot ? { gitRoot: ownership.gitRoot } : {}),
+                  ...(ownership.branch ? { gitBranch: ownership.branch } : {}),
+                  ...(ownership.sourceBranch ? { sourceBranch: ownership.sourceBranch } : {}),
+                }
+              : repository
+          );
       updateEpic(ownership.epicId, {
         riftPath: ownership.riftPath,
         riftWorkingDir: ownership.riftWorkingDir,
@@ -5152,6 +5187,7 @@ const App: React.FC = () => {
         ...(ownership.gitRoot ? { gitRoot: ownership.gitRoot } : {}),
         ...(ownership.branch ? { gitBranch: ownership.branch } : {}),
         repositoryProjectId: project.id,
+        ...(repositories ? { repositories } : {}),
       });
       for (const thread of useOrionStore.getState().threads) {
         if (thread.epicId === ownership.epicId && thread.projectId !== project.id) {
@@ -5297,9 +5333,9 @@ const App: React.FC = () => {
   const openCreateEpicModal = useCallback(() => {
     setNewEpicName('');
     setNewEpicDescription('');
-    setNewEpicProjectId(
-      (projects.find((project) => project.id === lastMessagedProjectId) ?? defaultNewThreadProject)?.id ?? null
-    );
+    const initialProject =
+      projects.find((project) => project.id === lastMessagedProjectId) ?? defaultNewThreadProject;
+    setNewEpicProjectIds(initialProject ? [initialProject.id] : []);
     setNewEpicCreateRift(riftsActive && riftsSettings.autoCreateForEpics);
     setEpicsSectionOpen(true);
     setCreateEpicOpen(true);
@@ -5309,39 +5345,50 @@ const App: React.FC = () => {
     setCreateEpicOpen(false);
     setNewEpicName('');
     setNewEpicDescription('');
-    setNewEpicProjectId(null);
-    setNewEpicRiftBaseBranch(null);
-    setNewEpicRiftBranches(null);
-    setCreateEpicProjectPickerOpen(false);
-    setCreateEpicRiftBranchPickerOpen(false);
+    setNewEpicProjectIds([]);
+    setNewEpicRiftBaseBranches({});
+    setNewEpicRiftBranches({});
+    setCreateEpicProjectPickerIndex(null);
+    setCreateEpicRiftBranchPickerOpen(null);
   }, []);
 
-  // Local branches for the create-epic modal's rift base picker. Refetched
-  // when the selected project changes; the selection resets to the current
-  // branch (null) so a choice made for one project can't apply to another.
+  // Local branches for every create-epic project. Each repository gets its own
+  // base picker, and keyed state prevents selections or late responses from
+  // crossing project rows.
   useEffect(() => {
-    setNewEpicRiftBaseBranch(null);
-    setNewEpicRiftBranches(null);
-    setCreateEpicRiftBranchPickerOpen(false);
+    const selectedIds = new Set(newEpicProjectIds);
+    setNewEpicRiftBaseBranches((current) =>
+      Object.fromEntries(Object.entries(current).filter(([projectId]) => selectedIds.has(projectId)))
+    );
+    setNewEpicRiftBranches((current) =>
+      Object.fromEntries(Object.entries(current).filter(([projectId]) => selectedIds.has(projectId)))
+    );
+    setCreateEpicRiftBranchPickerOpen(null);
     if (!createEpicOpen || !newEpicCreateRift || !riftsActive) return;
-    const project = projects.find((candidate) => candidate.id === newEpicProjectId);
-    if (!project || !window.orion?.getGitState) return;
+    if (!window.orion?.getGitState) return;
+    const requestedProjects = newEpicProjectIds
+      .map((projectId) => projects.find((candidate) => candidate.id === projectId))
+      .filter((project): project is Project => Boolean(project));
     let cancelled = false;
-    void window.orion
-      .getGitState(project.path)
-      .then((state) => {
-        if (cancelled || !state.ok) return;
-        setNewEpicRiftBranches({
-          projectId: project.id,
-          currentBranch: state.currentBranch ?? null,
-          branches: state.branches.map((candidate) => candidate.name),
-        });
-      })
-      .catch(() => {});
+    for (const project of requestedProjects) {
+      void window.orion
+        .getGitState(project.path)
+        .then((state) => {
+          if (cancelled || !state.ok) return;
+          setNewEpicRiftBranches((current) => ({
+            ...current,
+            [project.id]: {
+              currentBranch: state.currentBranch ?? null,
+              branches: state.branches.map((candidate) => candidate.name),
+            },
+          }));
+        })
+        .catch(() => {});
+    }
     return () => {
       cancelled = true;
     };
-  }, [createEpicOpen, newEpicCreateRift, newEpicProjectId, riftsActive, projects]);
+  }, [createEpicOpen, newEpicCreateRift, newEpicProjectIds, riftsActive, projects]);
 
   // Creates the epic's copy-on-write rift workspace and its feature branch
   // (named by the epic message model), then binds them to the epic. Runs in
@@ -5361,6 +5408,40 @@ const App: React.FC = () => {
         riftRequest: {
           ...request,
           error: 'The project selected for this Rift is no longer available in Orion.',
+        },
+      });
+      return;
+    }
+    const requestedProjects = (request.projects?.length ? request.projects : [request])
+      .map((requested) => {
+        const requestedProject =
+          state.projects.find(
+            (candidate) => candidate.id === requested.projectId && candidate.path === requested.projectPath
+          ) ?? state.projects.find((candidate) => candidate.path === requested.projectPath);
+        return requestedProject
+          ? {
+              projectId: requestedProject.id,
+              projectPath: requestedProject.path,
+              ...(requested.baseBranch ? { baseBranch: requested.baseBranch } : {}),
+              ...(requested.sourceBranch ? { sourceBranch: requested.sourceBranch } : {}),
+              ...(requested.existingBranch ? { existingBranch: requested.existingBranch } : {}),
+            }
+          : null;
+      })
+      .filter((requested): requested is {
+        projectId: string;
+        projectPath: string;
+        baseBranch?: string;
+        sourceBranch?: string;
+        existingBranch?: string;
+      } =>
+        Boolean(requested)
+      );
+    if (requestedProjects.length !== (request.projects?.length ?? 1)) {
+      updateEpic(epicId, {
+        riftRequest: {
+          ...request,
+          error: 'One or more projects selected for this Rift are no longer available in Orion.',
         },
       });
       return;
@@ -5403,7 +5484,9 @@ const App: React.FC = () => {
         projectPath: project.path,
         epicName: epic.name,
         epicDescription: epic.description,
+        ...(requestedProjects.length > 1 ? { projects: requestedProjects } : {}),
         ...resolveUtilityTurn(),
+        ...(request.sourceBranch ? { sourceBranch: request.sourceBranch } : {}),
         ...(restoringBranch
           ? { existingBranch: restoringBranch }
           : request.baseBranch
@@ -5423,6 +5506,8 @@ const App: React.FC = () => {
           riftWorkingDir: result.riftWorkingDir ?? result.riftPath,
           gitRoot: result.gitRoot,
           branch: result.branch,
+          sourceBranch: result.sourceBranch,
+          repositories: result.repositories,
         });
         if (!acknowledgement.ok) {
           // The status effect may have gone idle before this local creation
@@ -5494,29 +5579,40 @@ const App: React.FC = () => {
     const trimmed = newEpicName.trim();
     if (!trimmed) return;
     const description = newEpicDescription.trim();
-    const epicProject = projects.find((project) => project.id === newEpicProjectId) ?? null;
+    const epicProjects = newEpicProjectIds
+      .map((projectId) => projects.find((project) => project.id === projectId))
+      .filter((project): project is Project => Boolean(project));
+    const epicProject = epicProjects[0] ?? null;
     const riftProject = epicProject;
-    // Only a base differing from the current branch is recorded: the current
-    // branch needs no checkout, and a list fetched for another project is
-    // ignored rather than trusted.
-    const riftBaseBranch =
-      newEpicRiftBaseBranch &&
-      riftProject &&
-      newEpicRiftBranches?.projectId === riftProject.id &&
-      newEpicRiftBaseBranch !== newEpicRiftBranches.currentBranch
-        ? newEpicRiftBaseBranch
-        : undefined;
+    const riftProjects = epicProjects.map((project) => {
+      const branchState = newEpicRiftBranches[project.id];
+      const selectedBranch = Object.prototype.hasOwnProperty.call(newEpicRiftBaseBranches, project.id)
+        ? newEpicRiftBaseBranches[project.id]
+        : branchState?.currentBranch ?? null;
+      return {
+        projectId: project.id,
+        projectPath: project.path,
+        ...(selectedBranch ? { sourceBranch: selectedBranch } : {}),
+        ...(selectedBranch && selectedBranch !== branchState?.currentBranch
+          ? { baseBranch: selectedBranch }
+          : {}),
+      };
+    });
+    const primaryRiftProject = riftProjects[0];
     const riftRequest =
       newEpicCreateRift && riftsActive && riftProject
         ? {
             projectId: riftProject.id,
             projectPath: riftProject.path,
-            ...(riftBaseBranch ? { baseBranch: riftBaseBranch } : {}),
+            projects: riftProjects,
+            ...(primaryRiftProject?.baseBranch ? { baseBranch: primaryRiftProject.baseBranch } : {}),
+            ...(primaryRiftProject?.sourceBranch ? { sourceBranch: primaryRiftProject.sourceBranch } : {}),
           }
         : undefined;
     const epicId = addEpic(trimmed, {
       ...(description ? { description } : {}),
       ...(epicProject ? { repositoryProjectId: epicProject.id } : {}),
+      ...(epicProjects.length > 0 ? { repositoryProjectIds: epicProjects.map((project) => project.id) } : {}),
       ...(riftRequest ? { riftRequest } : {}),
     });
     closeCreateEpicModal();
@@ -5537,12 +5633,12 @@ const App: React.FC = () => {
       if (e.key !== 'Escape') return;
       e.preventDefault();
       // Close an open dropdown first; only dismiss the modal when none are open.
-      if (createEpicProjectPickerOpen) {
-        setCreateEpicProjectPickerOpen(false);
+      if (createEpicProjectPickerIndex !== null) {
+        setCreateEpicProjectPickerIndex(null);
         return;
       }
-      if (createEpicRiftBranchPickerOpen) {
-        setCreateEpicRiftBranchPickerOpen(false);
+      if (createEpicRiftBranchPickerOpen !== null) {
+        setCreateEpicRiftBranchPickerOpen(null);
         return;
       }
       closeCreateEpicModal();
@@ -5552,23 +5648,23 @@ const App: React.FC = () => {
       window.clearTimeout(id);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [closeCreateEpicModal, createEpicOpen, createEpicProjectPickerOpen, createEpicRiftBranchPickerOpen]);
+  }, [closeCreateEpicModal, createEpicOpen, createEpicProjectPickerIndex, createEpicRiftBranchPickerOpen]);
 
   // Click-outside for create-epic Tailwind dropdowns.
   useEffect(() => {
-    if (!createEpicProjectPickerOpen && !createEpicRiftBranchPickerOpen) return undefined;
+    if (createEpicProjectPickerIndex === null && createEpicRiftBranchPickerOpen === null) return undefined;
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node;
-      if (createEpicProjectPickerOpen && !createEpicProjectPickerRef.current?.contains(target)) {
-        setCreateEpicProjectPickerOpen(false);
+      if (createEpicProjectPickerIndex !== null && !createEpicProjectPickerRef.current?.contains(target)) {
+        setCreateEpicProjectPickerIndex(null);
       }
-      if (createEpicRiftBranchPickerOpen && !createEpicRiftBranchPickerRef.current?.contains(target)) {
-        setCreateEpicRiftBranchPickerOpen(false);
+      if (createEpicRiftBranchPickerOpen !== null && !createEpicProjectPickerRef.current?.contains(target)) {
+        setCreateEpicRiftBranchPickerOpen(null);
       }
     };
     document.addEventListener('mousedown', handlePointerDown);
     return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [createEpicProjectPickerOpen, createEpicRiftBranchPickerOpen]);
+  }, [createEpicProjectPickerIndex, createEpicRiftBranchPickerOpen]);
 
   const handleCreateThreadForEpic = async (epic: Epic) => {
     const project = projectForEpic(epic);
@@ -5718,34 +5814,43 @@ const App: React.FC = () => {
   // main must still refuse a drifted checkout or a branch another epic
   // claimed. A rift is exclusively this epic's workspace, so those claims
   // don't apply there.
+  const claimedBranchesForEpic = (epicId: string) =>
+    epics
+      .filter((candidate) => candidate.id !== epicId && !candidate.riftPath)
+      .flatMap((candidate) => {
+        const repositoryClaims = candidate.repositories?.flatMap((repository) =>
+          repository.gitRoot && repository.gitBranch
+            ? [{ gitRoot: repository.gitRoot, branch: repository.gitBranch, epicName: candidate.name }]
+            : []
+        );
+        if (repositoryClaims?.length) return repositoryClaims;
+        return candidate.gitRoot && candidate.gitBranch
+          ? [{ gitRoot: candidate.gitRoot, branch: candidate.gitBranch, epicName: candidate.name }]
+          : [];
+      });
+
   const resolveEpicGitTarget = (epic: Epic) => {
-    const project = epic.repositoryProjectId
-      ? (projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null)
+    const primaryRepository = epic.repositories?.[0];
+    const projectId = primaryRepository?.projectId ?? epic.repositoryProjectId;
+    const project = projectId
+      ? (projects.find((candidate) => candidate.id === projectId) ?? null)
       : null;
     const isRift = Boolean(epic.riftPath && !epic.riftCleanupPending);
+    const riftGitPath = primaryRepository?.riftPath ?? epic.riftPath;
     return {
       project,
-      projectPath: epic.riftCleanupPending ? undefined : (epic.riftPath ?? epic.gitRoot ?? project?.path),
+      projectPath: epic.riftCleanupPending ? undefined : (riftGitPath ?? epic.gitRoot ?? project?.path),
       claim: isRift
         ? {
             isRift: true as const,
-            expectedGitRoot: epic.riftPath,
-            expectedBranch: epic.gitBranch,
+            expectedGitRoot: riftGitPath,
+            expectedBranch: primaryRepository?.gitBranch ?? epic.gitBranch,
           }
         : {
             isRift: false as const,
             expectedGitRoot: epic.gitRoot,
             expectedBranch: epic.gitBranch,
-            claimedBranches: epics
-              .filter(
-                (candidate) =>
-                  candidate.id !== epic.id && !candidate.riftPath && candidate.gitRoot && candidate.gitBranch
-              )
-              .map((candidate) => ({
-                gitRoot: candidate.gitRoot!,
-                branch: candidate.gitBranch!,
-                epicName: candidate.name,
-              })),
+            claimedBranches: claimedBranchesForEpic(epic.id),
           },
     };
   };
@@ -5760,6 +5865,9 @@ const App: React.FC = () => {
   const epicGitWorkspaceKey = (epic: Epic) => {
     if (epic.riftPath && !epic.riftCleanupPending) {
       return `rift:${normalizeRepositoryPath(epic.riftPath)}`;
+    }
+    if ((epic.repositories?.length ?? 0) > 1) {
+      return UNCLAIMED_EPIC_GIT_WORKSPACE_KEY;
     }
     if (epic.gitRoot) {
       return `git:${normalizeRepositoryPath(epic.gitRoot)}`;
@@ -5791,6 +5899,23 @@ const App: React.FC = () => {
   // runs only on the initial fetch, not on every poll tick.
   const refreshEpicGitStatus = async (epic: Epic, options?: { includePr?: boolean }) => {
     if (!window.orion?.epicGitStatus) return;
+    if ((epic.repositories?.length ?? 0) > 1) {
+      const results = await Promise.all(
+        epic.repositories!.map((repository) =>
+          window.orion!.epicGitStatus!({
+            projectPath: repository.riftPath ?? repository.projectPath,
+            ...(options?.includePr && repository.prUrl ? { prUrl: repository.prUrl } : {}),
+          }).catch(() => null)
+        )
+      );
+      const successful = results.filter((result) => result?.ok);
+      if (successful.length === 0) return;
+      return {
+        ok: true,
+        hasChangesToCommit: successful.some((result) => result?.hasChangesToCommit),
+        hasUnpushedCommits: successful.some((result) => result?.hasUnpushedCommits),
+      };
+    }
     const { projectPath } = resolveEpicGitTarget(epic);
     if (!projectPath) return;
     try {
@@ -6180,6 +6305,9 @@ const App: React.FC = () => {
     return epic.gitRoot ?? project?.path;
   };
 
+  const resolveEpicRecordedSourceBranch = (epic: Epic) =>
+    epic.repositories?.[0]?.sourceBranch ?? '';
+
   // Step one of Create PR: fetch the branches on origin and work out which one
   // to merge into by default — the branch checked out in the epic's real
   // repository, whenever origin has a branch by that name — falling back to
@@ -6204,7 +6332,12 @@ const App: React.FC = () => {
       return { error: 'No branches found on origin to use as the PR base' };
     }
     const defaultBranch = result.defaultBranch && branches.includes(result.defaultBranch) ? result.defaultBranch : '';
-    const sourceBranch = result.sourceBranch && branches.includes(result.sourceBranch) ? result.sourceBranch : '';
+    const recordedSourceBranch = resolveEpicRecordedSourceBranch(epic);
+    if (recordedSourceBranch && !branches.includes(recordedSourceBranch)) {
+      return { error: `The selected source branch ${recordedSourceBranch} is not available on origin.` };
+    }
+    const sourceBranch = recordedSourceBranch ||
+      (result.sourceBranch && branches.includes(result.sourceBranch) ? result.sourceBranch : '');
     return {
       branches,
       defaultBranch,
@@ -6239,7 +6372,7 @@ const App: React.FC = () => {
       if (!result.ok) return;
       // The PR's head branch cannot be its own base.
       const usable = (name?: string | null) => (name && name !== result.currentBranch ? name : '');
-      const sourceBranch = usable(result.sourceBranch);
+      const sourceBranch = usable(resolveEpicRecordedSourceBranch(epic) || result.sourceBranch);
       const defaultBranch = usable(result.defaultBranch);
       patchEpicPrBaseDialog(instanceId, (current) =>
         // Origin already answered — its list is the authoritative one.
@@ -6338,7 +6471,11 @@ const App: React.FC = () => {
     markEpicGitBusy(epic.id, 'pr-branches', epicGitWorkspaceKey(epic));
     try {
       const options = await resolveEpicPrBaseOptions(epic);
-      if (options && !('error' in options)) baseBranch = options.baseBranch;
+      if (options && 'error' in options) {
+        toast.error(options.error);
+        return;
+      }
+      if (options) baseBranch = options.baseBranch;
     } catch {
       // Fall through to the remote default branch.
     } finally {
@@ -6403,6 +6540,200 @@ const App: React.FC = () => {
       }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Could not open a pull request');
+    } finally {
+      markEpicGitBusy(epic.id, null);
+    }
+  };
+
+  const updateEpicRepository = (
+    epicId: string,
+    projectId: string,
+    updates: Partial<EpicRepository>
+  ) => {
+    const latest = useOrionStore.getState().epics.find((candidate) => candidate.id === epicId);
+    if (!latest?.repositories) return;
+    const repositories = latest.repositories.map((repository) =>
+      repository.projectId === projectId ? { ...repository, ...updates } : repository
+    );
+    const primary = repositories[0];
+    updateEpic(epicId, {
+      repositories,
+      ...(primary
+        ? {
+            repositoryProjectId: primary.projectId,
+            gitRoot: primary.gitRoot,
+            gitBranch: primary.gitBranch,
+            prUrl: primary.prUrl,
+            prState: primary.prState,
+            prStateCheckedAt: primary.prStateCheckedAt,
+          }
+        : {}),
+    });
+  };
+
+  const commitEpicRepository = async (
+    epic: Epic,
+    repository: EpicRepository
+  ): Promise<EpicRepositoryActionResult> => {
+    if (!window.orion?.epicCommitAndPush) return 'failed';
+    const project = projects.find((candidate) => candidate.id === repository.projectId);
+    const projectPath = repository.riftPath ?? repository.projectPath ?? project?.path;
+    if (!projectPath) return 'failed';
+    const skipPush = Boolean(
+      useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id)?.commitWithoutPush
+    );
+    const result = await window.orion.epicCommitAndPush({
+      epicId: epic.id,
+      projectPath,
+      ...resolveUtilityTurn(),
+      epicName: `${epic.name} (${project?.name ?? repository.projectId})`,
+      ...(skipPush ? { skipPush: true } : {}),
+      ...(repository.riftPath
+        ? {
+            isRift: true,
+            expectedGitRoot: repository.riftPath,
+            expectedBranch: repository.gitBranch,
+          }
+        : {
+            expectedGitRoot: repository.gitRoot,
+            expectedBranch: repository.gitBranch,
+            claimedBranches: claimedBranchesForEpic(epic.id),
+          }),
+    });
+    if (result.ok || result.committed) {
+      updateEpicRepository(epic.id, repository.projectId, {
+        ...(result.branch ? { gitBranch: result.branch } : {}),
+      });
+    }
+    if (!result.ok) {
+      if (result.aborted) {
+        toast.info(
+          `${project?.name ?? 'Project'}: ${result.committed ? 'push aborted; commit remains local' : 'commit aborted'}`
+        );
+        return 'aborted';
+      }
+      toast.error(`${project?.name ?? 'Project'}: ${result.error ?? 'Commit and push failed'}`);
+      return 'failed';
+    }
+    toast.success(
+      `${project?.name ?? 'Project'}: ${skipPush ? 'committed' : 'committed and pushed'}`,
+      { description: result.message?.split('\n')[0] }
+    );
+    if (result.mirrorWarning) toast.warning(result.mirrorWarning);
+    return 'completed';
+  };
+
+  const createEpicRepositoryPr = async (
+    epic: Epic,
+    repository: EpicRepository
+  ): Promise<EpicRepositoryActionResult> => {
+    if (!window.orion?.epicCreatePr) return 'failed';
+    const project = projects.find((candidate) => candidate.id === repository.projectId);
+    const projectPath = repository.riftPath ?? repository.projectPath ?? project?.path;
+    if (!projectPath) return 'failed';
+    const result = await window.orion.epicCreatePr({
+      epicId: epic.id,
+      projectPath,
+      ...resolveUtilityTurn(),
+      epicName: `${epic.name} (${project?.name ?? repository.projectId})`,
+      baseBranch: repository.sourceBranch ?? '',
+      ...(repository.riftPath
+        ? {
+            isRift: true,
+            expectedGitRoot: repository.riftPath,
+            expectedBranch: repository.gitBranch,
+          }
+        : {
+            expectedGitRoot: repository.gitRoot,
+            expectedBranch: repository.gitBranch,
+            claimedBranches: claimedBranchesForEpic(epic.id),
+          }),
+    });
+    if (!result.ok) {
+      if (result.aborted) {
+        toast.info(`${project?.name ?? 'Project'}: opening the pull request was aborted`);
+        return 'aborted';
+      }
+      toast.error(`${project?.name ?? 'Project'}: ${result.error ?? 'Could not open a pull request'}`);
+      return 'failed';
+    }
+    updateEpicRepository(epic.id, repository.projectId, {
+      ...(result.branch ? { gitBranch: result.branch } : {}),
+      ...(result.url
+        ? {
+            prUrl: result.url,
+            prState: 'OPEN',
+            prStateCheckedAt: new Date().toISOString(),
+          }
+        : {}),
+    });
+    toast.success(
+      `${project?.name ?? 'Project'}: ${result.alreadyExists ? 'pull request already open' : 'pull request opened'}`,
+      result.url
+        ? { action: { label: 'Open', onClick: () => openEpicPrUrl(result.url!) } }
+        : undefined
+    );
+    return 'completed';
+  };
+
+  const runMultiRepositoryAction = async (
+    epic: Epic,
+    kind: 'commit' | 'pr',
+    repository?: EpicRepository
+  ) => {
+    if (kind === 'commit' ? epicCommitBlocked(epic) : epicCreatePrBlocked(epic)) return;
+    if (epicHasRunningAgents(epic.id)) {
+      toast.error(`Agents are still running in this epic — wait for them to finish before ${kind === 'commit' ? 'committing' : 'opening pull requests'}`);
+      return;
+    }
+    let targets = repository ? [repository] : (epic.repositories ?? []);
+    if (targets.length === 0) return;
+    markEpicGitBusy(
+      epic.id,
+      kind,
+      epic.riftPath
+        ? `rift:${normalizeRepositoryPath(epic.riftPath)}`
+        : UNCLAIMED_EPIC_GIT_WORKSPACE_KEY
+    );
+    try {
+      if (kind === 'commit' && window.orion?.epicGitStatus) {
+        const statuses = await Promise.all(
+          targets.map(async (target) => {
+            try {
+              const status = await window.orion!.epicGitStatus!({
+                projectPath: target.riftPath ?? target.projectPath,
+              });
+              return status.ok ? status : null;
+            } catch {
+              return null;
+            }
+          })
+        );
+        const beforePreflight = targets.length;
+        targets = targets.filter((_, index) => {
+          const status = statuses[index];
+          return !status || status.hasChangesToCommit || (!epic.commitWithoutPush && status.hasUnpushedCommits);
+        });
+        if (targets.length === 0) {
+          toast.info(beforePreflight === 1 ? 'This project is already clean and fully pushed' : 'All projects are already clean and fully pushed');
+          return;
+        }
+      }
+      let completed = 0;
+      for (const target of targets) {
+        const result = kind === 'commit'
+          ? await commitEpicRepository(epic, target)
+          : await createEpicRepositoryPr(epic, target);
+        if (result === 'aborted') break;
+        if (result === 'completed') completed += 1;
+      }
+      if (targets.length > 1 && completed === targets.length) {
+        toast.success(
+          kind === 'commit'
+            ? `Committed${epic.commitWithoutPush ? '' : ' and pushed'} all ${targets.length} projects`
+            : `Opened pull requests for all ${targets.length} projects`
+        );
+      }
     } finally {
       markEpicGitBusy(epic.id, null);
     }
@@ -6502,6 +6833,14 @@ const App: React.FC = () => {
         epicId: epic.id,
         ...(epic.gitRoot ? { gitRoot: epic.gitRoot } : {}),
         ...(projectPath ? { projectPath } : {}),
+        ...(epic.repositories?.length
+          ? {
+              gitRoots: epic.repositories.flatMap((repository) =>
+                repository.gitRoot ? [repository.gitRoot] : []
+              ),
+              projectPaths: epic.repositories.map((repository) => repository.projectPath),
+            }
+          : {}),
       });
       if (result.ok) {
         if (result.warning) {
@@ -6745,9 +7084,24 @@ const App: React.FC = () => {
         removalResult = await removeRift({
           epicId: currentEpic.id,
           riftPath: currentEpic.riftPath,
+          ...(currentEpic.repositories && currentEpic.repositories.length > 1
+            ? {
+                riftPaths: currentEpic.repositories.flatMap((repository) =>
+                  repository.riftPath ? [repository.riftPath] : []
+                ),
+              }
+            : {}),
           runtimeThreadIds: runtimeThreads.map((thread) => thread.id),
           ...(currentEpic.gitRoot ? { gitRoot: currentEpic.gitRoot } : {}),
           ...(projectPath ? { projectPath } : {}),
+          ...(currentEpic.repositories?.length
+            ? {
+                gitRoots: currentEpic.repositories.flatMap((repository) =>
+                  repository.gitRoot ? [repository.gitRoot] : []
+                ),
+                projectPaths: currentEpic.repositories.map((repository) => repository.projectPath),
+              }
+            : {}),
         });
       } catch (error) {
         // An IPC failure is ambiguous: main may have completed the move before
@@ -6911,15 +7265,40 @@ const App: React.FC = () => {
       toast.info(`Enable Rifts before restoring ${epic.name}`);
       return;
     }
-    const project = epic.gitRoot
+    const recordedRepositories = (epic.repositories?.length ?? 0) > 1 ? epic.repositories! : null;
+    const restoreProjects = recordedRepositories
+      ? recordedRepositories.map((repository) => {
+          const project =
+            projects.find((candidate) => candidate.id === repository.projectId) ??
+            (repository.gitRoot ? projectForGitRoot(repository.gitRoot, repository.projectId) : null);
+          return project && repository.gitBranch
+            ? {
+                project,
+                request: {
+                  projectId: project.id,
+                  projectPath: project.path,
+                  existingBranch: repository.gitBranch,
+                  ...(repository.sourceBranch ? { sourceBranch: repository.sourceBranch } : {}),
+                },
+              }
+            : null;
+        })
+      : null;
+    const project = restoreProjects?.[0]?.project ?? (epic.gitRoot
       ? projectForGitRoot(epic.gitRoot, epic.repositoryProjectId)
-      : projects.find((candidate) => candidate.id === epic.repositoryProjectId);
-    if (!project) {
-      toast.error(`Could not restore ${epic.name} because its project is unavailable`);
+      : projects.find((candidate) => candidate.id === epic.repositoryProjectId));
+    if (!project || (restoreProjects && restoreProjects.some((entry) => entry === null))) {
+      toast.error(`Could not restore ${epic.name} because one or more projects are unavailable`);
       return;
     }
     updateEpic(epic.id, {
-      riftRequest: { projectId: project.id, projectPath: project.path },
+      riftRequest: {
+        projectId: project.id,
+        projectPath: project.path,
+        ...(restoreProjects
+          ? { projects: restoreProjects.map((entry) => entry!.request) }
+          : {}),
+      },
     });
     unsettleEpic(epic.id);
     toast.info(`Recreating the rift for ${epic.name} on ${epic.gitBranch}`);
@@ -10213,20 +10592,19 @@ const App: React.FC = () => {
     setNewEpicName,
     newEpicDescription,
     setNewEpicDescription,
-    newEpicProjectId,
-    setNewEpicProjectId,
-    setCreateEpicProjectPickerOpen,
-    createEpicProjectPickerOpen,
+    newEpicProjectIds,
+    setNewEpicProjectIds,
+    setCreateEpicProjectPickerIndex,
+    createEpicProjectPickerIndex,
     setCreateEpicRiftBranchPickerOpen,
     createEpicRiftBranchPickerOpen,
     newEpicCreateRift,
     setNewEpicCreateRift,
-    newEpicRiftBaseBranch,
-    setNewEpicRiftBaseBranch,
+    newEpicRiftBaseBranches,
+    setNewEpicRiftBaseBranches,
     newEpicRiftBranches,
     createEpicTitleRef,
     createEpicProjectPickerRef,
-    createEpicRiftBranchPickerRef,
     riftsActive,
     closeCreateEpicModal,
     handleCreateEpic,
@@ -12339,6 +12717,79 @@ const App: React.FC = () => {
                           <span className="truncate">Rift · {selectedEpic.riftPath}</span>
                         </div>
                       )}
+                      {selectedEpicRepositories.length > 1 && (
+                        <div className="mt-2 flex w-full flex-col gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              className="btn"
+                              disabled={selectedEpicOperationBusy || activeRiftUnavailable || selectedEpicHasRunningAgents}
+                              onClick={() => void runMultiRepositoryAction(selectedEpic, 'commit')}
+                            >
+                              <GitCommit size={14} />
+                              {selectedEpicGitBusy === 'commit'
+                                ? 'Committing projects…'
+                                : selectedEpic.commitWithoutPush
+                                  ? 'Commit all projects'
+                                  : 'Commit & push all projects'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn secondary"
+                              disabled={selectedEpicOperationBusy || activeRiftUnavailable || selectedEpicHasRunningAgents}
+                              onClick={() => void runMultiRepositoryAction(selectedEpic, 'pr')}
+                            >
+                              <GitPullRequest size={14} />
+                              {selectedEpicGitBusy === 'pr' ? 'Opening PRs…' : 'Create PRs for all'}
+                            </button>
+                          </div>
+                          {selectedEpicRepositories.map(({ repository, project }) => (
+                            <div
+                              key={repository.projectId}
+                              className="flex items-center gap-3 rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] px-3 py-2"
+                            >
+                              <ProjectIcon projectPath={repository.projectPath} size={15} />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
+                                  {project?.name ?? repository.projectPath}
+                                </div>
+                                <div className="truncate text-[11px] text-[var(--text-muted)]" title={repository.riftPath}>
+                                  {repository.gitBranch ?? 'Branch pending'}
+                                </div>
+                              </div>
+                              {repository.prUrl ? (
+                                <button
+                                  type="button"
+                                  className="btn secondary"
+                                  onClick={() => openEpicPrUrl(repository.prUrl!)}
+                                >
+                                  <SquareArrowOutUpRight size={13} />
+                                  View PR
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="btn secondary"
+                                  disabled={selectedEpicOperationBusy || selectedEpicHasRunningAgents}
+                                  onClick={() => void runMultiRepositoryAction(selectedEpic, 'pr', repository)}
+                                >
+                                  <GitPullRequest size={13} />
+                                  Create PR
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="btn secondary"
+                                disabled={selectedEpicOperationBusy || selectedEpicHasRunningAgents}
+                                onClick={() => void runMultiRepositoryAction(selectedEpic, 'commit', repository)}
+                              >
+                                <GitCommit size={13} />
+                                {selectedEpic.commitWithoutPush ? 'Commit' : 'Commit & push'}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       <span className="epic-view-repository-hint">
                         {selectedEpic.riftPath
                           ? 'Threads and git actions run inside this epic’s rift workspace.'
@@ -12351,6 +12802,8 @@ const App: React.FC = () => {
                     </div>
 
                     <div className="epic-view-actions">
+                      {selectedEpicRepositories.length <= 1 && (
+                      <>
                       <div className="flex flex-col items-start gap-1.5">
                         <button
                           type="button"
@@ -12510,6 +12963,8 @@ const App: React.FC = () => {
                                 ? 'Create replacement PR'
                                 : 'Create PR'}
                         </button>
+                      )}
+                      </>
                       )}
                       <button
                         type="button"

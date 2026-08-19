@@ -3,11 +3,10 @@ import type { RiftStorageEntry } from '../types';
 
 export type EpicPrStatus = 'open' | 'merged' | 'closed';
 
-export type NewEpicRiftBranches = {
-  projectId: string;
+export type NewEpicRiftBranches = Record<string, {
   currentBranch: string | null;
   branches: string[];
-};
+}>;
 
 export type EpicCommitDialogState = {
   epic: Epic;

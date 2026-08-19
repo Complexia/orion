@@ -58,12 +58,27 @@ export const collectPendingRiftOwnersByPath = (
   const owners = new Map();
   for (const ownership of unacknowledgedRifts?.values?.() ?? []) {
     if (typeof ownership?.riftPath !== 'string' || !ownership.riftPath) continue;
-    owners.set(ownership.riftPath, {
+    const owner = {
       ...ownership,
       cleanupPending: false,
       settledAt: null,
       gitBranch: ownership.gitBranch ?? ownership.branch ?? null,
-    });
+    };
+    owners.set(ownership.riftPath, owner);
+    for (const repository of Array.isArray(ownership.repositories)
+      ? ownership.repositories
+      : []) {
+      if (typeof repository?.riftPath !== 'string' || !repository.riftPath) continue;
+      owners.set(repository.riftPath, {
+        ...owner,
+        repositoryChild: true,
+        workspaceRiftPath: ownership.riftPath,
+        gitBranch: repository.gitBranch ?? owner.gitBranch,
+        gitRoot: repository.gitRoot ?? owner.gitRoot,
+        prUrl: repository.prUrl ?? null,
+        prState: repository.prState ?? null,
+      });
+    }
   }
   for (const creation of pendingCreations ?? []) {
     const riftPath = creation?.riftPath?.();
@@ -292,4 +307,23 @@ export const deleteRiftRestoreRef = async (gitRoot, epicId) => {
     '-d',
     releasedRiftRefForEpic(epicId),
   ]);
+};
+
+/** Delete an Epic's restore ref from every distinct source repository. */
+export const deleteRiftRestoreRefs = async (gitRoots, epicId) => {
+  const errors = [];
+  let deleted = 0;
+  for (const gitRoot of new Set(
+    (Array.isArray(gitRoots) ? gitRoots : []).filter(
+      (candidate) => typeof candidate === 'string' && candidate
+    )
+  )) {
+    try {
+      await deleteRiftRestoreRef(gitRoot, epicId);
+      deleted += 1;
+    } catch (error) {
+      errors.push(error?.stderr?.toString().trim() || error?.message || String(error));
+    }
+  }
+  return { deleted, errors };
 };

@@ -8,6 +8,26 @@ export type Project = {
   path: string;
 };
 
+export type EpicRepository = {
+  /** Orion project represented by this repository. */
+  projectId: string;
+  /** Original project path, retained for Rift recovery if the project is re-added. */
+  projectPath: string;
+  /** Source branch this Rift snapshot was based on and its pull request targets. */
+  sourceBranch?: string;
+  /** Git root inside the shared Epic Rift workspace. */
+  riftPath?: string;
+  /** Project-relative directory inside this repository's Rift copy. */
+  riftWorkingDir?: string;
+  /** Canonical source repository root. */
+  gitRoot?: string;
+  /** Feature branch owned by this Epic in this repository. */
+  gitBranch?: string;
+  prUrl?: string;
+  prState?: 'OPEN' | 'CLOSED' | 'MERGED';
+  prStateCheckedAt?: string;
+};
+
 /**
  * A big-ticket epic ("Optimize memory usage") that groups threads in the
  * sidebar Epics section. Threads keep living in Recent agents and under their
@@ -48,17 +68,23 @@ export type Epic = {
   prStateCheckedAt?: string;
   /** Project explicitly selected as the repository for this epic's git actions. */
   repositoryProjectId?: string;
+  /**
+   * Every repository participating in the Epic. The first entry is mirrored
+   * into the legacy single-repository fields above so older persisted Epics
+   * and older renderer paths continue to work.
+   */
+  repositories?: EpicRepository[];
   /** Canonical repository root claimed by this epic's git actions. */
   gitRoot?: string;
   /** Dedicated feature branch claimed by this epic's git actions. */
   gitBranch?: string;
   /**
-   * Root of the copy-on-write rift workspace created for this epic. Git and
-   * removal use this root; threads use riftWorkingDir when the project is a
-   * repository subdirectory.
+   * Root of the copy-on-write Rift workspace created for this epic. A
+   * multi-project Epic stores its agent-visible container here; repository
+   * controls and removal use the child paths in repositories.
    */
   riftPath?: string;
-  /** Project-relative directory inside the rift where this epic's threads run. */
+  /** Directory where this Epic's agents run (the shared container for multiple projects). */
   riftWorkingDir?: string;
   /**
    * Durable record that the user chose to work in a rift. It remains until
@@ -68,12 +94,21 @@ export type Epic = {
   riftRequest?: {
     projectId: string;
     projectPath: string;
+    /** All requested repositories. Absent on single-project legacy Epics. */
+    projects?: Array<{
+      projectId: string;
+      projectPath: string;
+      baseBranch?: string;
+      sourceBranch?: string;
+      existingBranch?: string;
+    }>;
     /**
      * Local branch the rift's feature branch starts from. Only set when it
      * differs from the source checkout's current branch; the switch happens
      * inside the rift so the source worktree is never touched.
      */
     baseBranch?: string;
+    sourceBranch?: string;
     error?: string;
   };
   /**
@@ -783,6 +818,7 @@ interface OrionState {
     options?: {
       description?: string;
       repositoryProjectId?: string;
+      repositoryProjectIds?: string[];
       riftRequest?: Epic['riftRequest'];
     }
   ) => string; // returns new epic id
@@ -1586,10 +1622,21 @@ export const useOrionStore = create<OrionState>()(
           createdAt: new Date().toISOString(),
         };
         set((state) => {
-          const repositoryProject = options?.repositoryProjectId
-            ? state.projects.find((project) => project.id === options.repositoryProjectId)
-            : undefined;
+          const requestedProjectIds = [
+            ...(options?.repositoryProjectIds ?? []),
+            ...(options?.repositoryProjectId ? [options.repositoryProjectId] : []),
+          ];
+          const repositoryProjects = [...new Set(requestedProjectIds)]
+            .map((projectId) => state.projects.find((project) => project.id === projectId))
+            .filter((project): project is Project => Boolean(project));
+          const repositoryProject = repositoryProjects[0];
           if (repositoryProject) newEpic.repositoryProjectId = repositoryProject.id;
+          if (repositoryProjects.length > 0) {
+            newEpic.repositories = repositoryProjects.map((project) => ({
+              projectId: project.id,
+              projectPath: project.path,
+            }));
+          }
           return {
             epics: [newEpic, ...state.epics],
             selectedEpicId: newEpic.id,
@@ -1677,6 +1724,11 @@ export const useOrionStore = create<OrionState>()(
                   riftWorkingDir: undefined,
                   riftCleanupPending: undefined,
                   riftReleased: true,
+                  repositories: epic.repositories?.map((repository) => ({
+                    ...repository,
+                    riftPath: undefined,
+                    riftWorkingDir: undefined,
+                  })),
                 }
               : epic
           ),
