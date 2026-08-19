@@ -10,6 +10,7 @@ import {
   collectPendingRiftOwnersByPath,
   createRiftRemovalCoordinator,
   deleteRiftRestoreRef,
+  deleteRiftRestoreRefs,
   guardedEpicIdsForRiftReleaseJournal,
   isEpicDeletionPersisted,
   isManualRiftReleaseEntryCurrent,
@@ -17,6 +18,7 @@ import {
   isRetainedRiftOwnerEligible,
   preserveRiftHeadForRestore,
   reconcileRiftReleaseJournal,
+  releasedRiftRefForEpic,
 } from '../src/main/rift-release.js';
 import {
   collapseNestedPaths,
@@ -34,6 +36,14 @@ const pendingOwners = collectPendingRiftOwnersByPath(
         epicId: 'unacknowledged-epic',
         riftPath: '/rift/unacknowledged',
         branch: 'orion/unacknowledged',
+        repositories: [
+          {
+            projectId: 'child-project',
+            riftPath: '/rift/unacknowledged/child',
+            gitRoot: '/source/child',
+            gitBranch: 'orion/child',
+          },
+        ],
       },
     ],
   ]),
@@ -49,6 +59,19 @@ assert.equal(pendingOwners.get('/rift/unacknowledged')?.settledAt, null);
 assert.equal(
   pendingOwners.get('/rift/unacknowledged')?.gitBranch,
   'orion/unacknowledged'
+);
+assert.equal(
+  pendingOwners.get('/rift/unacknowledged/child')?.epicId,
+  'unacknowledged-epic',
+  'every child Rift must remain owned until the shared workspace is acknowledged'
+);
+assert.equal(
+  pendingOwners.get('/rift/unacknowledged/child')?.workspaceRiftPath,
+  '/rift/unacknowledged'
+);
+assert.equal(
+  pendingOwners.get('/rift/unacknowledged/child')?.gitBranch,
+  'orion/child'
 );
 assert.deepEqual(pendingOwners.get('/rift/creating'), {
   epicId: 'creating-epic',
@@ -343,6 +366,26 @@ try {
   await fs.writeFile(path.join(source, 'README.md'), 'base\n');
   await git(source, 'add', 'README.md');
   await git(source, 'commit', '-m', 'base');
+
+  const secondSource = path.join(tempRoot, 'second-source');
+  await fs.mkdir(secondSource);
+  await git(secondSource, 'init', '-b', 'main');
+  await git(secondSource, 'config', 'user.name', 'Orion test');
+  await git(secondSource, 'config', 'user.email', 'orion-test@example.invalid');
+  await fs.writeFile(path.join(secondSource, 'README.md'), 'second base\n');
+  await git(secondSource, 'add', 'README.md');
+  await git(secondSource, 'commit', '-m', 'second base');
+  const multiRestoreEpicId = 'multi-repository-restore-ref';
+  const multiRestoreRef = releasedRiftRefForEpic(multiRestoreEpicId);
+  await git(source, 'update-ref', multiRestoreRef, 'HEAD');
+  await git(secondSource, 'update-ref', multiRestoreRef, 'HEAD');
+  const multiDelete = await deleteRiftRestoreRefs(
+    [source, secondSource, source],
+    multiRestoreEpicId
+  );
+  assert.deepEqual(multiDelete, { deleted: 2, errors: [] });
+  await assert.rejects(git(source, 'rev-parse', '--verify', multiRestoreRef));
+  await assert.rejects(git(secondSource, 'rev-parse', '--verify', multiRestoreRef));
 
   await execFileAsync('git', ['clone', '--no-local', source, rift]);
   await git(rift, 'config', 'user.name', 'Orion test');

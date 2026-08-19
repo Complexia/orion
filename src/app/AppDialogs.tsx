@@ -1,5 +1,5 @@
 import React from 'react';
-import { Archive, Check, ChevronDown, GitCommit, GitPullRequest, LoaderCircle, Trash2 } from 'lucide-react';
+import { Archive, Check, ChevronDown, GitCommit, GitPullRequest, LoaderCircle, Plus, Trash2, X } from 'lucide-react';
 import type { Epic, Project } from '../store';
 import type { RiftStorageEntry } from '../types';
 import type {
@@ -18,20 +18,19 @@ export type AppDialogsModel = {
   setNewEpicName: React.Dispatch<React.SetStateAction<string>>;
   newEpicDescription: string;
   setNewEpicDescription: React.Dispatch<React.SetStateAction<string>>;
-  newEpicProjectId: string | null;
-  setNewEpicProjectId: React.Dispatch<React.SetStateAction<string | null>>;
-  setCreateEpicProjectPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  createEpicProjectPickerOpen: boolean;
-  setCreateEpicRiftBranchPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  createEpicRiftBranchPickerOpen: boolean;
+  newEpicProjectIds: string[];
+  setNewEpicProjectIds: React.Dispatch<React.SetStateAction<string[]>>;
+  setCreateEpicProjectPickerIndex: React.Dispatch<React.SetStateAction<number | null>>;
+  createEpicProjectPickerIndex: number | null;
+  setCreateEpicRiftBranchPickerOpen: React.Dispatch<React.SetStateAction<number | null>>;
+  createEpicRiftBranchPickerOpen: number | null;
   newEpicCreateRift: boolean;
   setNewEpicCreateRift: React.Dispatch<React.SetStateAction<boolean>>;
-  newEpicRiftBaseBranch: string | null;
-  setNewEpicRiftBaseBranch: React.Dispatch<React.SetStateAction<string | null>>;
-  newEpicRiftBranches: NewEpicRiftBranches | null;
+  newEpicRiftBaseBranches: Record<string, string | null>;
+  setNewEpicRiftBaseBranches: React.Dispatch<React.SetStateAction<Record<string, string | null>>>;
+  newEpicRiftBranches: NewEpicRiftBranches;
   createEpicTitleRef: React.RefObject<HTMLInputElement | null>;
   createEpicProjectPickerRef: React.RefObject<HTMLDivElement | null>;
-  createEpicRiftBranchPickerRef: React.RefObject<HTMLDivElement | null>;
   riftsActive: boolean;
   closeCreateEpicModal: () => void;
   handleCreateEpic: () => void;
@@ -71,20 +70,19 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
     setNewEpicName,
     newEpicDescription,
     setNewEpicDescription,
-    newEpicProjectId,
-    setNewEpicProjectId,
-    setCreateEpicProjectPickerOpen,
-    createEpicProjectPickerOpen,
+    newEpicProjectIds,
+    setNewEpicProjectIds,
+    setCreateEpicProjectPickerIndex,
+    createEpicProjectPickerIndex,
     setCreateEpicRiftBranchPickerOpen,
     createEpicRiftBranchPickerOpen,
     newEpicCreateRift,
     setNewEpicCreateRift,
-    newEpicRiftBaseBranch,
-    setNewEpicRiftBaseBranch,
+    newEpicRiftBaseBranches,
+    setNewEpicRiftBaseBranches,
     newEpicRiftBranches,
     createEpicTitleRef,
     createEpicProjectPickerRef,
-    createEpicRiftBranchPickerRef,
     riftsActive,
     closeCreateEpicModal,
     handleCreateEpic,
@@ -522,90 +520,187 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 />
               </label>
               {projects.length > 0 && (
-                <div className="modal-field">
-                  <span className="modal-field-label">Project</span>
-                  <div className="relative" ref={createEpicProjectPickerRef}>
-                    {(() => {
-                      const selectedProject = projects.find((project) => project.id === newEpicProjectId) ?? null;
+                <div className="modal-field" ref={createEpicProjectPickerRef}>
+                  <span className="modal-field-label">Projects</span>
+                  <div className="flex flex-col gap-2">
+                    {newEpicProjectIds.map((projectId, index) => {
+                      const selectedProject = projects.find((project) => project.id === projectId) ?? null;
+                      const pickerOpen = createEpicProjectPickerIndex === index;
+                      const branchState = newEpicRiftBranches[projectId];
+                      const branchPickerOpen = createEpicRiftBranchPickerOpen === index;
+                      const selectedBranch = Object.prototype.hasOwnProperty.call(newEpicRiftBaseBranches, projectId)
+                        ? newEpicRiftBaseBranches[projectId]
+                        : branchState?.currentBranch ?? null;
                       return (
-                        <button
-                          type="button"
-                          className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
-                          onClick={() => {
-                            setCreateEpicRiftBranchPickerOpen(false);
-                            setCreateEpicProjectPickerOpen((open) => !open);
-                          }}
-                          aria-haspopup="listbox"
-                          aria-expanded={createEpicProjectPickerOpen}
-                        >
-                          <span className="flex min-w-0 items-center gap-2">
-                            {selectedProject ? (
-                              <>
-                                <ProjectIcon projectPath={selectedProject.path} size={13} />
-                                <span className="truncate">{selectedProject.name}</span>
-                              </>
-                            ) : (
-                              <span className="truncate text-[var(--text-muted)]">No project</span>
-                            )}
-                          </span>
-                          <ChevronDown
-                            size={14}
-                            className={`shrink-0 text-[var(--text-muted)] transition-transform ${
-                              createEpicProjectPickerOpen ? 'rotate-180' : ''
-                            }`}
-                          />
-                        </button>
-                      );
-                    })()}
-                    {createEpicProjectPickerOpen && (
-                      <div
-                        role="listbox"
-                        aria-label="Project"
-                        className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
-                      >
-                        <button
-                          type="button"
-                          role="option"
-                          aria-selected={!newEpicProjectId}
-                          className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                            !newEpicProjectId
-                              ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                              : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                          }`}
-                          onClick={() => {
-                            setNewEpicProjectId(null);
-                            setCreateEpicProjectPickerOpen(false);
-                          }}
-                        >
-                          <span className="min-w-0 flex-1 truncate">No project</span>
-                          {!newEpicProjectId && <Check size={13} className="shrink-0" />}
-                        </button>
-                        {projects.map((project) => {
-                          const selected = project.id === newEpicProjectId;
-                          return (
+                        <div className="flex flex-col gap-1.5" key={`${index}-${projectId}`}>
+                          <div className="relative flex items-center gap-2">
                             <button
-                              key={project.id}
                               type="button"
-                              role="option"
-                              aria-selected={selected}
-                              title={project.path}
-                              className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                                selected
-                                  ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                                  : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                              }`}
+                              className="modal-input flex min-w-0 flex-1 cursor-pointer items-center justify-between gap-2 text-left"
                               onClick={() => {
-                                setNewEpicProjectId(project.id);
-                                setCreateEpicProjectPickerOpen(false);
+                                setCreateEpicRiftBranchPickerOpen(null);
+                                setCreateEpicProjectPickerIndex((openIndex) => openIndex === index ? null : index);
                               }}
+                              aria-haspopup="listbox"
+                              aria-expanded={pickerOpen}
                             >
-                              <ProjectIcon projectPath={project.path} size={13} />
-                              <span className="min-w-0 flex-1 truncate">{project.name}</span>
-                              {selected && <Check size={13} className="shrink-0" />}
+                              <span className="flex min-w-0 items-center gap-2">
+                                {selectedProject ? (
+                                  <>
+                                    <ProjectIcon projectPath={selectedProject.path} size={13} />
+                                    <span className="truncate">{selectedProject.name}</span>
+                                  </>
+                                ) : (
+                                  <span className="truncate text-[var(--text-muted)]">Select project…</span>
+                                )}
+                              </span>
+                              <ChevronDown
+                                size={14}
+                                className={`shrink-0 text-[var(--text-muted)] transition-transform ${
+                                  pickerOpen ? 'rotate-180' : ''
+                                }`}
+                              />
                             </button>
-                          );
-                        })}
-                      </div>
+                            {(newEpicProjectIds.length > 1 || !newEpicCreateRift) && (
+                              <button
+                                type="button"
+                                className="btn icon-btn shrink-0"
+                                aria-label={`Remove project ${index + 1}`}
+                                title="Remove project"
+                                onClick={() => {
+                                  setNewEpicProjectIds((ids) => ids.filter((_, candidateIndex) => candidateIndex !== index));
+                                  setCreateEpicProjectPickerIndex(null);
+                                  setCreateEpicRiftBranchPickerOpen(null);
+                                }}
+                              >
+                                <X size={14} />
+                              </button>
+                            )}
+                            {pickerOpen && (
+                              <div
+                                role="listbox"
+                                aria-label="Project"
+                                className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
+                              >
+                                {projects.map((project) => {
+                                  const selected = project.id === projectId;
+                                  const usedElsewhere = newEpicProjectIds.some(
+                                    (candidateId, candidateIndex) => candidateIndex !== index && candidateId === project.id
+                                  );
+                                  return (
+                                    <button
+                                      key={project.id}
+                                      type="button"
+                                      role="option"
+                                      aria-selected={selected}
+                                      disabled={usedElsewhere}
+                                      title={project.path}
+                                      className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                                        selected
+                                          ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                                          : usedElsewhere
+                                            ? 'cursor-not-allowed bg-transparent text-[var(--text-muted)] opacity-50'
+                                            : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                                      }`}
+                                      onClick={() => {
+                                        if (usedElsewhere) return;
+                                        setNewEpicProjectIds((ids) => ids.map((id, candidateIndex) => candidateIndex === index ? project.id : id));
+                                        setCreateEpicProjectPickerIndex(null);
+                                      }}
+                                    >
+                                      <ProjectIcon projectPath={project.path} size={13} />
+                                      <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                                      {selected && <Check size={13} className="shrink-0" />}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                          {riftsActive && newEpicCreateRift && branchState && branchState.branches.length > 0 && (
+                            <div className="relative ml-5">
+                              <button
+                                type="button"
+                                className="flex w-full cursor-pointer items-center justify-between gap-2 border-0 bg-transparent px-1 py-0.5 text-left text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+                                onClick={() => {
+                                  setCreateEpicProjectPickerIndex(null);
+                                  setCreateEpicRiftBranchPickerOpen((openIndex) => openIndex === index ? null : index);
+                                }}
+                                aria-haspopup="listbox"
+                                aria-expanded={branchPickerOpen}
+                              >
+                                <span className="truncate">
+                                  Branch from: {selectedBranch
+                                    ? selectedBranch === branchState.currentBranch
+                                      ? `${selectedBranch} (current)`
+                                      : selectedBranch
+                                    : 'current commit (detached HEAD)'}
+                                </span>
+                                <ChevronDown size={12} className={`shrink-0 transition-transform ${branchPickerOpen ? 'rotate-180' : ''}`} />
+                              </button>
+                              {branchPickerOpen && (
+                                <div
+                                  role="listbox"
+                                  aria-label={`Rift branch from for ${selectedProject?.name ?? `project ${index + 1}`}`}
+                                  className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
+                                >
+                                  {branchState.currentBranch === null && (
+                                    <button
+                                      type="button"
+                                      role="option"
+                                      aria-selected={selectedBranch === null}
+                                      className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${selectedBranch === null ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'}`}
+                                      onClick={() => {
+                                        setNewEpicRiftBaseBranches((current) => ({ ...current, [projectId]: null }));
+                                        setCreateEpicRiftBranchPickerOpen(null);
+                                      }}
+                                    >
+                                      <span className="min-w-0 flex-1 truncate">Current commit (detached HEAD)</span>
+                                      {selectedBranch === null && <Check size={13} className="shrink-0" />}
+                                    </button>
+                                  )}
+                                  {branchState.branches.map((name) => {
+                                    const selected = name === selectedBranch;
+                                    return (
+                                      <button
+                                        key={name}
+                                        type="button"
+                                        role="option"
+                                        aria-selected={selected}
+                                        className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${selected ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'}`}
+                                        onClick={() => {
+                                          setNewEpicRiftBaseBranches((current) => ({ ...current, [projectId]: name }));
+                                          setCreateEpicRiftBranchPickerOpen(null);
+                                        }}
+                                      >
+                                        <span className="min-w-0 flex-1 truncate">
+                                          {name === branchState.currentBranch ? `${name} (current)` : name}
+                                        </span>
+                                        {selected && <Check size={13} className="shrink-0" />}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {newEpicProjectIds.length < projects.length && (
+                      <button
+                        type="button"
+                        className="btn secondary self-start"
+                        onClick={() => {
+                          const nextProject = projects.find((project) => !newEpicProjectIds.includes(project.id));
+                          if (!nextProject) return;
+                          setNewEpicProjectIds((ids) => [...ids, nextProject.id]);
+                          setCreateEpicProjectPickerIndex(newEpicProjectIds.length);
+                        }}
+                      >
+                        <Plus size={14} />
+                        Add another project
+                      </button>
                     )}
                   </div>
                 </div>
@@ -620,104 +715,11 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                       onChange={(e) => setNewEpicCreateRift(e.target.checked)}
                     />
                     <span className="modal-checkbox-text">
-                      Work in a rift — a copy-on-write clone of{' '}
-                      {projects.find((project) => project.id === newEpicProjectId)?.name ?? 'the selected project'} on
-                      its own branch
+                      Work in a rift — copy all selected projects into one shared workspace, each on its own branch
                     </span>
                   </span>
                 </label>
               )}
-              {riftsActive &&
-                newEpicCreateRift &&
-                newEpicRiftBranches &&
-                newEpicRiftBranches.projectId === newEpicProjectId &&
-                newEpicRiftBranches.branches.length > 0 && (
-                  <div className="modal-field">
-                    <span className="modal-field-label">Rift branch from</span>
-                    <div className="relative" ref={createEpicRiftBranchPickerRef}>
-                      <button
-                        type="button"
-                        className="modal-input flex w-full cursor-pointer items-center justify-between gap-2 text-left"
-                        onClick={() => {
-                          setCreateEpicProjectPickerOpen(false);
-                          setCreateEpicRiftBranchPickerOpen((open) => !open);
-                        }}
-                        aria-haspopup="listbox"
-                        aria-expanded={createEpicRiftBranchPickerOpen}
-                      >
-                        <span className="truncate">
-                          {(() => {
-                            const selectedBranch = newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch ?? '';
-                            if (!selectedBranch) return 'Current commit (detached HEAD)';
-                            return selectedBranch === newEpicRiftBranches.currentBranch
-                              ? `${selectedBranch} (current)`
-                              : selectedBranch;
-                          })()}
-                        </span>
-                        <ChevronDown
-                          size={14}
-                          className={`shrink-0 text-[var(--text-muted)] transition-transform ${
-                            createEpicRiftBranchPickerOpen ? 'rotate-180' : ''
-                          }`}
-                        />
-                      </button>
-                      {createEpicRiftBranchPickerOpen && (
-                        <div
-                          role="listbox"
-                          aria-label="Rift branch from"
-                          className="absolute left-0 right-0 top-[calc(100%+4px)] z-[100] max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-lg)]"
-                        >
-                          {newEpicRiftBranches.currentBranch === null && (
-                            <button
-                              type="button"
-                              role="option"
-                              aria-selected={!(newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch)}
-                              className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                                !(newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch)
-                                  ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                                  : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                              }`}
-                              onClick={() => {
-                                setNewEpicRiftBaseBranch(null);
-                                setCreateEpicRiftBranchPickerOpen(false);
-                              }}
-                            >
-                              <span className="min-w-0 flex-1 truncate">Current commit (detached HEAD)</span>
-                              {!(newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch) && (
-                                <Check size={13} className="shrink-0" />
-                              )}
-                            </button>
-                          )}
-                          {newEpicRiftBranches.branches.map((name) => {
-                            const selectedBranch = newEpicRiftBaseBranch ?? newEpicRiftBranches.currentBranch ?? '';
-                            const selected = name === selectedBranch;
-                            const label = name === newEpicRiftBranches.currentBranch ? `${name} (current)` : name;
-                            return (
-                              <button
-                                key={name}
-                                type="button"
-                                role="option"
-                                aria-selected={selected}
-                                className={`flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                                  selected
-                                    ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                                    : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                                }`}
-                                onClick={() => {
-                                  setNewEpicRiftBaseBranch(name === newEpicRiftBranches.currentBranch ? null : name);
-                                  setCreateEpicRiftBranchPickerOpen(false);
-                                }}
-                              >
-                                <span className="min-w-0 flex-1 truncate">{label}</span>
-                                {selected && <Check size={13} className="shrink-0" />}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
               <div className="modal-actions">
                 <button type="button" className="btn secondary" onClick={closeCreateEpicModal}>
                   Cancel
@@ -725,7 +727,7 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 <button
                   type="submit"
                   className="btn"
-                  disabled={!newEpicName.trim() || (newEpicCreateRift && !newEpicProjectId)}
+                  disabled={!newEpicName.trim() || (newEpicCreateRift && newEpicProjectIds.length === 0)}
                 >
                   Create epic
                 </button>

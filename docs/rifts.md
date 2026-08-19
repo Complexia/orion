@@ -8,8 +8,12 @@ almost no disk space.
 ## Using it
 
 1. Enable **Settings → Experimental → Rifts**.
-2. Create an epic. With **Create a rift per epic** on (the default), the create
-   dialog pre-checks "Work in a rift"; uncheck it to opt out for that epic.
+2. Create an epic. The project picker has **Add another project**, so one epic
+   can span several repositories. With **Create a rift per epic** on (the
+   default), the create dialog pre-checks "Work in a rift"; uncheck it to opt
+   out for that epic. Each selected project has its own **Branch from** picker.
+   Orion snapshots that source branch independently and later uses it as that
+   repository's pull-request base.
 3. Orion registers the project with rift (`rift init`, idempotent), creates a
    rift from a clean `HEAD` snapshot, and checks out a fresh branch inside the
    rift — the branch is always namespaced `orion/`, the readable part is chosen
@@ -18,7 +22,15 @@ almost no disk space.
    refused while the source has staged, unstaged, or untracked changes, or if
    the source already has a local `orion` branch that conflicts with the
    namespace.
-4. Every thread grouped under the epic runs its agent processes inside the rift,
+4. A multi-project epic creates one shared parent workspace with a sibling Rift
+   copy for every selected repository (`<epic-rift>/<repo-a>`,
+   `<epic-rift>/<repo-b>`). Every thread grouped under the epic runs its agent
+   processes from that shared parent, so the agent can see and change every
+   project. The epic view lists each repository with its own Commit & push and
+   Create PR controls, plus batch buttons that run the same operations once per
+   repository. Git commits, pushes, and PRs always stay scoped to each child
+   repository.
+5. Every thread grouped under a single-project epic runs its agent processes inside the rift,
    and so do the repository controls for those threads: git state and the
    branch picker, Commit & push, Orion Cloud, the Code tab and Open With all
    point at the rift, not the source project. The epic's **Commit & push** /
@@ -26,9 +38,9 @@ almost no disk space.
    — inside a rift the workspace only ever contains that epic's work. If the
    Orion project is a monorepo subdirectory, threads and project-scoped tools
    keep that same relative directory inside the rift.
-5. Turns are blocked while a rift is still being created, so an epic's first
+6. Turns are blocked while a rift is still being created, so an epic's first
    turn never starts in the source repository and then has to move.
-6. Deleting the epic moves its rift into rift-owned trash (recoverable until
+7. Deleting the epic moves its rift into rift-owned trash (recoverable until
    `rift gc`); nothing is deleted physically. Its threads survive, so they are
    reset to a fresh agent session — the sessions recorded against the removed
    workspace cannot be resumed. Removing one thread from a rift-backed epic

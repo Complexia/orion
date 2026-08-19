@@ -730,6 +730,7 @@ type OrionCodexBrowserIntegrationStatus = {
         claimedBranches?: Array<{
           gitRoot: string;
           branch: string;
+          sourceBranch?: string;
           epicName?: string;
         }>;
       }) => Promise<{
@@ -847,6 +848,15 @@ type OrionCodexBrowserIntegrationStatus = {
           riftWorkingDir: string;
           gitRoot: string;
           branch: string;
+          repositories?: Array<{
+            projectId: string;
+            projectPath: string;
+            sourceBranch?: string;
+            riftPath?: string;
+            riftWorkingDir?: string;
+            gitRoot?: string;
+            gitBranch?: string;
+          }>;
         }>;
       }>;
       epicCreateRift: (input: {
@@ -859,17 +869,40 @@ type OrionCodexBrowserIntegrationStatus = {
         reasoningEffort?: string | null;
         /** Local branch the feature branch starts from; checked out inside the rift only. */
         baseBranch?: string;
+        /** Source branch this snapshot is based on and its pull request should target. */
+        sourceBranch?: string;
         /**
          * Recreate a freed epic's workspace on the branch it already owns
          * instead of naming a new one. Takes precedence over baseBranch.
          */
         existingBranch?: string;
+        /** Two or more projects create sibling repository copies in one shared Epic workspace. */
+        projects?: Array<{
+          projectId: string;
+          projectPath: string;
+          baseBranch?: string;
+          sourceBranch?: string;
+          existingBranch?: string;
+        }>;
       }) => Promise<{
         ok: boolean;
         riftPath?: string;
         riftWorkingDir?: string;
         gitRoot?: string;
         branch?: string;
+        sourceBranch?: string;
+        repositories?: Array<{
+          projectId: string;
+          projectPath: string;
+          sourceBranch?: string;
+          riftPath?: string;
+          riftWorkingDir?: string;
+          gitRoot?: string;
+          gitBranch?: string;
+          prUrl?: string;
+          prState?: 'OPEN' | 'CLOSED' | 'MERGED';
+          prStateCheckedAt?: string;
+        }>;
         error?: string;
       }>;
       epicAcknowledgeRift: (input: { epicId: string; riftPath: string }) => Promise<{
@@ -880,9 +913,13 @@ type OrionCodexBrowserIntegrationStatus = {
       epicRemoveRift: (input: {
         epicId: string;
         riftPath: string;
+        /** Child Git roots for a shared multi-project Rift workspace. */
+        riftPaths?: string[];
         runtimeThreadIds?: string[];
         gitRoot?: string;
         projectPath?: string;
+        gitRoots?: string[];
+        projectPaths?: string[];
       }) => Promise<{
         ok: boolean;
         skipped?: boolean;
@@ -893,6 +930,8 @@ type OrionCodexBrowserIntegrationStatus = {
         epicId: string;
         gitRoot?: string;
         projectPath?: string;
+        gitRoots?: string[];
+        projectPaths?: string[];
       }) => Promise<{ ok: boolean; skipped?: boolean; error?: string; warning?: string }>;
       getRiftStorageState: () => Promise<RiftStorageState>;
       acknowledgeRiftStorageReleases?: (input: {
