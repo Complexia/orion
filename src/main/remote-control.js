@@ -1473,6 +1473,7 @@ export const resolveRemoteCommand = (payload) => {
   settlePendingRendererCommand(payload.commandId, pending, {
     ok: payload?.ok === true,
     threadId: typeof payload?.threadId === 'string' ? payload.threadId : undefined,
+    epicId: typeof payload?.epicId === 'string' ? payload.epicId : undefined,
     error: typeof payload?.error === 'string' ? payload.error : undefined,
   });
   return { ok: true };
@@ -1487,6 +1488,12 @@ const buildSnapshot = async () => {
   return {
     machine: { id: identity.machineId, name: identity.machineName },
     capturedAt: new Date().toISOString(),
+    features: {
+      epics: state.epicsSettings?.enabled !== false,
+      rifts: state.riftsSettings?.enabled === true,
+      autoCreateRiftsForEpics:
+        state.riftsSettings?.enabled === true && state.riftsSettings?.autoCreateForEpics === true,
+    },
     projects: (Array.isArray(state.projects) ? state.projects : []).map((project) => ({
       id: project.id,
       name: project.name,
@@ -1628,6 +1635,33 @@ const handleHostRequest = async (session, message) => {
       case 'models':
         respond({ ok: true, models: buildModelCatalog(await deps.listAgentModels()) });
         return;
+      case 'createEpic': {
+        const name = typeof message?.name === 'string' ? message.name.trim() : '';
+        if (!name) {
+          respond({ ok: false, error: 'Epic title is required.' });
+          return;
+        }
+        const description =
+          typeof message?.description === 'string' ? message.description.trim().slice(0, 20_000) : '';
+        const projectIds = Array.isArray(message?.projectIds)
+          ? [...new Set(message.projectIds.filter((value) => typeof value === 'string' && value.length <= 500))].slice(0, 32)
+          : [];
+        const result = await requestRendererCommand(
+          {
+            kind: 'createEpic',
+            name: name.slice(0, 500),
+            ...(description ? { description } : {}),
+            ...(projectIds.length > 0 ? { projectIds } : {}),
+            ...(message?.createRift === true ? { createRift: true } : {}),
+            source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
+          },
+          Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
+          session,
+          acknowledgeClaim
+        );
+        respond(result);
+        return;
+      }
       case 'thread': {
         const threadId = String(message?.threadId ?? '');
         const isContinuation = message?.threadOffset !== undefined;
@@ -2600,6 +2634,33 @@ export const runRemoteTurn = async ({
       ok: response.ok === true,
       threadId: typeof response.threadId === 'string' ? response.threadId : undefined,
       error: response.ok ? undefined : (response.error ?? 'The remote turn could not start.'),
+    };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+export const createRemoteEpic = async ({ machineId, name, description, projectIds, createRift } = {}) => {
+  try {
+    const response = await clientRequest(
+      String(machineId ?? ''),
+      {
+        t: 'createEpic',
+        name: String(name ?? ''),
+        ...(description ? { description: String(description) } : {}),
+        ...(Array.isArray(projectIds) ? { projectIds: projectIds.map(String) } : {}),
+        ...(createRift === true ? { createRift: true } : {}),
+      },
+      (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
+        (Number.isFinite(deps?.clientResponseGraceMs)
+          ? Math.max(0, deps.clientResponseGraceMs)
+          : CLIENT_RESPONSE_GRACE_MS),
+      { extendOnClaim: true }
+    );
+    return {
+      ok: response.ok === true,
+      epicId: typeof response.epicId === 'string' ? response.epicId : undefined,
+      error: response.ok ? undefined : (response.error ?? 'The epic could not be created.'),
     };
   } catch (error) {
     return clientErrorResult(error);
