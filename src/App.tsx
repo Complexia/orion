@@ -10019,11 +10019,81 @@ const App: React.FC = () => {
       command: RemoteCommandRequest['command'],
       canPrepare: () => boolean,
       claimStart: () => Promise<boolean>
-    ) => Promise<{ ok: boolean; threadId?: string; error?: string }>
+    ) => Promise<{ ok: boolean; threadId?: string; epicId?: string; error?: string }>
   >(async () => ({ ok: false, error: 'Remote commands are unavailable.' }));
   useLayoutEffect(() => {
     remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
       const state = useOrionStore.getState();
+      if (command.kind === 'createEpic') {
+        const name = (command.name ?? '').trim();
+        if (!name) return { ok: false, error: 'Epic title is required.' };
+        if (!(state.epicsSettings?.enabled ?? defaultEpicsSettings.enabled)) {
+          return { ok: false, error: 'Enable Epics in Settings on the host first.' };
+        }
+        const projectIds = [...new Set(command.projectIds ?? [])];
+        if (projectIds.some((projectId) => !state.projects.some((project) => project.id === projectId))) {
+          return { ok: false, error: 'One or more selected projects are no longer available on the host.' };
+        }
+        if (command.createRift && projectIds.length === 0) {
+          return { ok: false, error: 'Select at least one project to create a Rift.' };
+        }
+        const currentRiftsActive =
+          (state.riftsSettings?.enabled ?? defaultRiftsSettings.enabled) && riftsAvailable;
+        if (command.createRift && !currentRiftsActive) {
+          return { ok: false, error: 'Rifts are not available on the host.' };
+        }
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The remote create Epic command expired or was cancelled.' };
+        }
+        // Claiming yields to main. Recheck the authoritative store immediately
+        // before the mutation so a project removal or Settings change cannot
+        // race the remote dialog's stale snapshot.
+        const latest = useOrionStore.getState();
+        if (!(latest.epicsSettings?.enabled ?? defaultEpicsSettings.enabled)) {
+          return { ok: false, error: 'Enable Epics in Settings on the host first.' };
+        }
+        if (projectIds.some((projectId) => !latest.projects.some((project) => project.id === projectId))) {
+          return { ok: false, error: 'One or more selected projects are no longer available on the host.' };
+        }
+        const latestRiftsActive =
+          (latest.riftsSettings?.enabled ?? defaultRiftsSettings.enabled) && riftsAvailable;
+        if (command.createRift && !latestRiftsActive) {
+          return { ok: false, error: 'Rifts are not available on the host.' };
+        }
+        const description = command.description?.trim();
+        const epicProjects = projectIds
+          .map((projectId) => latest.projects.find((project) => project.id === projectId))
+          .filter((project): project is Project => Boolean(project));
+        const riftProjects = epicProjects.map((project) => ({
+          projectId: project.id,
+          projectPath: project.path,
+        }));
+        const primaryRiftProject = riftProjects[0];
+        const riftRequest =
+          command.createRift && primaryRiftProject
+            ? {
+                projectId: primaryRiftProject.projectId,
+                projectPath: primaryRiftProject.projectPath,
+                projects: riftProjects,
+              }
+            : undefined;
+        const epicId = latest.addEpic(name, {
+          ...(description ? { description } : {}),
+          ...(projectIds[0] ? { repositoryProjectId: projectIds[0] } : {}),
+          ...(projectIds.length > 0 ? { repositoryProjectIds: projectIds } : {}),
+          ...(riftRequest ? { riftRequest } : {}),
+        });
+        setEpicsSectionOpen(true);
+        if (!(await flushOrionStoreSave())) {
+          return {
+            ok: false,
+            epicId,
+            error: 'The remote command created the Epic, but its workspace state could not be saved.',
+          };
+        }
+        if (riftRequest) void setupRiftForEpic(epicId);
+        return { ok: true, epicId };
+      }
       if (command.kind === 'runTurn') {
         const promptText = (command.prompt ?? '').trim();
         if (!promptText) return { ok: false, error: 'Empty prompt.' };
@@ -10209,7 +10279,7 @@ const App: React.FC = () => {
     if (!window.orion?.onRemoteCommandRequest) return undefined;
     const unsubscribe = window.orion.onRemoteCommandRequest((request) => {
       void (async () => {
-        let outcome: { ok: boolean; threadId?: string; error?: string };
+        let outcome: { ok: boolean; threadId?: string; epicId?: string; error?: string };
         const canPrepare = () => Date.now() < request.expiresAt;
         let claimPromise: Promise<boolean> | null = null;
         const claimStart = () => {
@@ -10226,7 +10296,9 @@ const App: React.FC = () => {
           // Main serves remote snapshots and transcripts from disk. Do not
           // expose a successful mutation until the exact thread state the
           // controller will immediately read has crossed that boundary.
-          outcome = await persistSuccessfulRemoteCommand(outcome, flushOrionThreadsSave);
+          if (request.command.kind !== 'createEpic') {
+            outcome = await persistSuccessfulRemoteCommand(outcome, flushOrionThreadsSave);
+          }
         } catch (error) {
           outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
         }

@@ -65,6 +65,7 @@ import {
   cancelRemotePairing,
   configureRemoteControl,
   connectRemoteMachine,
+  createRemoteEpic,
   deregisterRelayMachine,
   disconnectRemoteMachine,
   fetchRemoteSnapshot,
@@ -1527,6 +1528,7 @@ ipcMain.handle('remote:disconnectMachine', (_event, input) => disconnectRemoteMa
 ipcMain.handle('remote:fetchSnapshot', (_event, input) => fetchRemoteSnapshot(input));
 ipcMain.handle('remote:fetchThread', (_event, input) => fetchRemoteThread(input));
 ipcMain.handle('remote:runTurn', (_event, input) => runRemoteTurn(input));
+ipcMain.handle('remote:createEpic', (_event, input) => createRemoteEpic(input));
 ipcMain.handle('remote:stopTurn', (_event, input) => stopRemoteTurn(input));
 // Registered only after the renderer has installed onRemoteCommandRequest.
 // did-start-loading/destroyed clear this authority until the next mount.

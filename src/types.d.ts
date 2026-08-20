@@ -275,6 +275,11 @@ export type RemoteThreadMeta = {
 export type RemoteSnapshot = {
   machine: { id: string; name: string };
   capturedAt: string;
+  features?: {
+    epics: boolean;
+    rifts?: boolean;
+    autoCreateRiftsForEpics?: boolean;
+  };
   projects: Array<{ id: string; name: string; path: string }>;
   epics: Array<{
     id: string;
@@ -302,8 +307,12 @@ export type RemoteCommandRequest = {
   /** Main-process startup deadline, checked around renderer-side preparation. */
   expiresAt: number;
   command: {
-    kind: 'runTurn' | 'stopTurn';
+    kind: 'runTurn' | 'stopTurn' | 'createEpic';
     prompt?: string;
+    name?: string;
+    description?: string;
+    projectIds?: string[];
+    createRift?: boolean;
     threadId?: string;
     projectId?: string;
     epicId?: string;
@@ -1480,6 +1489,13 @@ type OrionCodexBrowserIntegrationStatus = {
         claudeContextWindow?: '200k' | '1m';
         prompt: string;
       }) => Promise<{ ok: boolean; threadId?: string; error?: string }>;
+      remoteCreateEpic?: (input: {
+        machineId: string;
+        name: string;
+        description?: string;
+        projectIds?: string[];
+        createRift?: boolean;
+      }) => Promise<{ ok: boolean; epicId?: string; error?: string }>;
       remoteStopTurn?: (input: {
         machineId: string;
         threadId: string;
@@ -1490,6 +1506,7 @@ type OrionCodexBrowserIntegrationStatus = {
         commandId: string;
         ok: boolean;
         threadId?: string;
+        epicId?: string;
         error?: string;
       }) => Promise<{ ok: boolean }>;
       onRemoteState?: (cb: (state: RemoteControlState) => void) => () => void;
