@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { epicHasActionableCommitWork } from '../src/app/epicGit.ts';
+import {
+  epicHasActionableCommitWork,
+  epicRepositoryShouldAutoCreatePr,
+} from '../src/app/epicGit.ts';
 
 const [appSource, chatSource, mainSource, preloadSource, dialogsSource, storeSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
@@ -57,6 +60,33 @@ assert.equal(
   'a clean, fully pushed workspace has no actionable commit work'
 );
 
+assert.equal(
+  epicRepositoryShouldAutoCreatePr({ autoPrAfterCommit: true }, {}),
+  true,
+  'a pushed multi-project repository without a PR must continue into PR creation'
+);
+assert.equal(
+  epicRepositoryShouldAutoCreatePr(
+    { autoPrAfterCommit: true },
+    { prUrl: 'https://example.test/pull/1', prState: 'OPEN' }
+  ),
+  false,
+  'an existing open repository PR must not be recreated after a push'
+);
+assert.equal(
+  epicRepositoryShouldAutoCreatePr(
+    { autoPrAfterCommit: true },
+    { prUrl: 'https://example.test/pull/1', prState: 'CLOSED' }
+  ),
+  true,
+  'a closed repository PR must allow the multi-project flow to create a replacement'
+);
+assert.equal(
+  epicRepositoryShouldAutoCreatePr({ autoPrAfterCommit: true, commitWithoutPush: true }, {}),
+  false,
+  'commit-only mode must suppress multi-project auto-PR creation'
+);
+
 const backgroundSettled = section(
   appSource,
   "      if (event.type === 'background-settled') {",
@@ -108,6 +138,21 @@ assert.match(
   appSource,
   /Commit & push all projects[\s\S]*Create PRs for all[\s\S]*runMultiRepositoryAction/,
   'the Epic view must expose batch and per-project repository actions'
+);
+const multiRepositoryActions = section(
+  appSource,
+  '                      {selectedEpicRepositories.length > 1 && (',
+  '                      <span className="epic-view-repository-hint">'
+);
+assert.match(
+  multiRepositoryActions,
+  /checked=\{Boolean\(selectedEpic\.autoPrAfterCommit\)\}[\s\S]*Auto create PR on commit/,
+  'the multi-project Epic view must expose the persisted auto-create-PR checkbox'
+);
+assert.match(
+  appSource,
+  /epicRepositoryShouldAutoCreatePr\(latestEpic, latestRepository\)[\s\S]*createEpicRepositoryPr\(latestEpic, latestRepository\)/,
+  'a successful multi-project commit must continue into PR creation when enabled'
 );
 assert.match(
   dialogsSource,

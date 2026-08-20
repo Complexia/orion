@@ -115,7 +115,7 @@ import {
 } from './agentCatalog';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
-import { epicHasActionableCommitWork } from './app/epicGit';
+import { epicHasActionableCommitWork, epicRepositoryShouldAutoCreatePr } from './app/epicGit';
 import { epicThreadRows } from './app/epicThreads';
 import { AgentsSidebar, type AgentsSidebarModel, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { ThreadPane } from './app/ThreadPane';
@@ -6725,7 +6725,24 @@ const App: React.FC = () => {
           ? await commitEpicRepository(epic, target)
           : await createEpicRepositoryPr(epic, target);
         if (result === 'aborted') break;
-        if (result === 'completed') completed += 1;
+        if (result === 'completed') {
+          completed += 1;
+          if (kind === 'commit') {
+            // Match the single-project flow: read the setting and repository
+            // state after the push, then carry straight on into a promptless PR.
+            const latestEpic = useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id);
+            const latestRepository = latestEpic?.repositories?.find(
+              (candidate) => candidate.projectId === target.projectId
+            );
+            if (
+              latestEpic &&
+              latestRepository &&
+              epicRepositoryShouldAutoCreatePr(latestEpic, latestRepository)
+            ) {
+              await createEpicRepositoryPr(latestEpic, latestRepository);
+            }
+          }
+        }
       }
       if (targets.length > 1 && completed === targets.length) {
         toast.success(
@@ -12815,6 +12832,37 @@ const App: React.FC = () => {
                               {selectedEpicGitBusy === 'pr' ? 'Opening PRs…' : 'Create PRs for all'}
                             </button>
                           </div>
+                          <label
+                            className={`inline-flex w-fit items-center gap-1.5 select-none group ${
+                              selectedEpic.commitWithoutPush ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+                            }`}
+                            title={
+                              selectedEpic.commitWithoutPush
+                                ? 'A pull request needs a push — untick “Only commit” first'
+                                : 'Open a pull request for each project as soon as its commit & push succeeds'
+                            }
+                          >
+                            <input
+                              type="checkbox"
+                              className="peer sr-only"
+                              disabled={Boolean(selectedEpic.commitWithoutPush)}
+                              checked={Boolean(selectedEpic.autoPrAfterCommit)}
+                              onChange={(e) =>
+                                updateEpic(selectedEpic.id, {
+                                  autoPrAfterCommit: e.target.checked,
+                                })
+                              }
+                            />
+                            <span
+                              className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
+                              aria-hidden
+                            >
+                              <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
+                            </span>
+                            <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
+                              Auto create PR on commit
+                            </span>
+                          </label>
                           {selectedEpicRepositories.map(({ repository, project }) => (
                             <div
                               key={repository.projectId}
