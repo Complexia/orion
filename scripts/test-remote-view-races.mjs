@@ -11,6 +11,7 @@ import {
   remoteControlIsAuthenticated,
   remoteThreadRunError,
   remoteThreadRuntime,
+  reportedSubagentSettingsPatch,
 } from '../src/app/remote-control-policy.ts';
 import { withThreadStartReservation } from '../src/app/turnStart.ts';
 
@@ -56,6 +57,12 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     providerLabel: 'Codex',
     label: 'GPT-5.6 Sol',
     slug: 'gpt-5.6-sol',
+  };
+  const lunaModel = {
+    ...codexModel,
+    id: 'codex:gpt-5.6-luna',
+    label: 'GPT-5.6 Luna',
+    slug: 'gpt-5.6-luna',
   };
 
   assert.deepEqual(
@@ -103,6 +110,21 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     }),
     {},
     'codex must drop claude-only effort and unknown tiers'
+  );
+  assert.deepEqual(
+    reportedSubagentSettingsPatch(
+      { modelId: codexModel.id, codexReasoningEffort: 'high' },
+      lunaModel,
+      lunaModel.id,
+      'low'
+    ),
+    { modelId: lunaModel.id, codexReasoningEffort: 'low' },
+    'reported Codex model and effort must update the canonical thread settings together'
+  );
+  assert.deepEqual(
+    reportedSubagentSettingsPatch({}, lunaModel, lunaModel.id, 'ultra'),
+    { modelId: lunaModel.id },
+    'reported effort must be valid for the reported model before it reaches thread settings'
   );
   console.log('ok  remote agent settings map onto the right thread fields per provider');
 }

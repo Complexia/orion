@@ -27,6 +27,7 @@ const GPT56_CODEX_SLUGS = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna
 const CLAUDE_1M_ONLY_SLUGS = new Set(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5']);
 
 type RemoteAgentSettingsThread = {
+  modelId?: string;
   codexReasoningEffort?: string;
   codexServiceTier?: string;
   claudeReasoningEffort?: string;
@@ -111,6 +112,23 @@ export const remoteAgentSettingsPatch = (
 
   return patch;
 };
+
+/**
+ * Keep a provider-native subagent's persisted execution settings aligned with
+ * the model and effort reported by its own transcript. The effort still goes
+ * through the same provider/model validation as a remote composer change.
+ */
+export const reportedSubagentSettingsPatch = (
+  thread: RemoteAgentSettingsThread,
+  model: RemoteAgentSettingsModel | undefined,
+  reportedModelId: string | undefined,
+  reasoningEffort: string | undefined
+): RemoteAgentSettingsThread => ({
+  ...(reportedModelId && thread.modelId !== reportedModelId
+    ? { modelId: reportedModelId }
+    : {}),
+  ...remoteAgentSettingsPatch(thread, model, { reasoningEffort }),
+});
 
 // A pairing code is usable over ANY live inbound route. In internet mode the
 // LAN listener stays up too, so a relay outage must not disable "Generate

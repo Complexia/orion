@@ -491,6 +491,7 @@ export type NativeSubagentInfo = {
   /** Subagent type/role label (Explore, general-purpose, codex nickname role, …). */
   kind?: string;
   model?: string;
+  reasoningEffort?: string;
   prompt?: string;
   /** Final output summary, when the provider reports one. */
   summary?: string;

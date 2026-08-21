@@ -134,6 +134,7 @@ import {
   remoteControlIsAuthenticated,
   remoteThreadRunError,
   remoteThreadRuntime,
+  reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
 import {
   AttachmentThumb,
@@ -4172,7 +4173,8 @@ const App: React.FC = () => {
           providerId,
           trackedRun?.threadId === runThread.id ? trackedRun.messageId : undefined
         );
-        const nativeModelId = qualifyProviderModelId(providerId, info?.model) ?? dispatchedModelId;
+        const reportedNativeModelId = qualifyProviderModelId(providerId, info?.model);
+        const nativeModelId = reportedNativeModelId ?? dispatchedModelId;
         const key = `${event.threadId}:${providerId}:${subagentId}`;
         const familyThreadIds = descendantThreadIds(state.threads, runThread.id);
         const findFamilySubagent = (providerSubagentId: string) =>
@@ -4271,14 +4273,41 @@ const App: React.FC = () => {
         } else if (info) {
           const fresh = useOrionStore.getState();
           const childThread = fresh.threads.find((t) => t.id === target.threadId);
-          if (childThread?.subagent && (info.prompt || info.summary)) {
-            updateThread(target.threadId, {
-              subagent: {
+          if (childThread) {
+            const threadPatch: Partial<Thread> = {};
+            if (
+              childThread.subagent &&
+              (info.model || info.reasoningEffort || info.prompt || info.summary)
+            ) {
+              threadPatch.subagent = {
                 ...childThread.subagent,
+                ...(info.model ? { model: info.model } : {}),
+                ...(info.reasoningEffort ? { reasoningEffort: info.reasoningEffort } : {}),
                 ...(info.prompt ? { prompt: info.prompt } : {}),
                 ...(info.summary ? { summary: info.summary } : {}),
-              },
-            });
+              };
+            }
+            const settingsModelId = reportedNativeModelId ?? childThread.modelId;
+            const reportedModel = agentModelsRef.current.find(
+              (model) => model.id === settingsModelId && model.providerId === providerId
+            );
+            Object.assign(
+              threadPatch,
+              reportedSubagentSettingsPatch(
+                childThread,
+                reportedModel,
+                reportedNativeModelId,
+                info.reasoningEffort
+              ) as Partial<Thread>
+            );
+            if (threadPatch.modelId) {
+              updateThreadMessage(target.threadId, target.messageId, {
+                modelId: threadPatch.modelId,
+              });
+            }
+            if (Object.keys(threadPatch).length > 0) {
+              updateThread(target.threadId, threadPatch);
+            }
           }
           // A late-arriving prompt (codex delivers it inside the rollout)
           // fills in the transcript's opening user bubble.

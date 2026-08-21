@@ -211,6 +211,16 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
     stats: (stats) => {
       sub.meta.stats = { ...sub.meta.stats, ...stats };
     },
+    metadata: ({ model, reasoningEffort } = {}) => {
+      const patch = {};
+      if (typeof model === 'string' && model) patch.model = model;
+      if (typeof reasoningEffort === 'string' && reasoningEffort) {
+        patch.reasoningEffort = reasoningEffort;
+      }
+      if (Object.keys(patch).length > 0) {
+        emitMeta(sub, patch, { notify: !sub.finished });
+      }
+    },
     prompt: (prompt) => {
       if (!sub.meta.prompt && prompt) {
         // The final tail can discover a prompt after the parent run has
@@ -668,6 +678,18 @@ export const handleCodexRolloutLine = (value, api, ctx) => {
       ctx.awaitingAgentPathHandoff = false;
       if (!ctx.ownTurnId && ctx.pendingOwnTurnId) ctx.ownTurnId = ctx.pendingOwnTurnId;
       ctx.pendingOwnTurnId = null;
+    }
+    return;
+  }
+  if (value.type === 'turn_context') {
+    const turnId = typeof payload.turn_id === 'string' ? payload.turn_id : null;
+    const belongsToChild =
+      Boolean(turnId) && (turnId === ctx.ownTurnId || turnId === ctx.pendingOwnTurnId);
+    if (belongsToChild) {
+      api.metadata({
+        model: typeof payload.model === 'string' ? payload.model : undefined,
+        reasoningEffort: typeof payload.effort === 'string' ? payload.effort : undefined,
+      });
     }
     return;
   }

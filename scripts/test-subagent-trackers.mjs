@@ -39,6 +39,7 @@ const createRolloutHarness = () => {
       reasoning: () => {},
       activity: () => {},
       stats: () => {},
+      metadata: (metadata) => events.push(['metadata', metadata]),
       prompt: () => {},
       finish: (info) => events.push(['finish', info]),
     },
@@ -240,6 +241,75 @@ assert.deepEqual(fork.events, [
   ['finish', { status: 'done' }],
 ]);
 
+const modelFork = createRolloutHarness();
+handleCodexRolloutLine(
+  {
+    type: 'session_meta',
+    payload: { id: '01a01e7f-199e-7283-abc8-5f350314ac4b' },
+  },
+  modelFork.api,
+  modelFork.ctx
+);
+handleCodexRolloutLine(
+  {
+    type: 'session_meta',
+    payload: { id: '01a01d7c-7fb9-7e50-9e6b-6c88f3497903' },
+  },
+  modelFork.api,
+  modelFork.ctx
+);
+handleCodexRolloutLine(
+  {
+    type: 'event_msg',
+    payload: {
+      type: 'task_started',
+      turn_id: '01a01e7a-13a9-7013-ab59-2406334aa33d',
+    },
+  },
+  modelFork.api,
+  modelFork.ctx
+);
+handleCodexRolloutLine(
+  {
+    type: 'turn_context',
+    payload: {
+      turn_id: '01a01e7a-13a9-7013-ab59-2406334aa33d',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+    },
+  },
+  modelFork.api,
+  modelFork.ctx
+);
+handleCodexRolloutLine(
+  {
+    type: 'event_msg',
+    payload: {
+      type: 'task_started',
+      turn_id: '01a01e7f-19f1-72a3-8998-6ed0556b2452',
+    },
+  },
+  modelFork.api,
+  modelFork.ctx
+);
+handleCodexRolloutLine(
+  {
+    type: 'turn_context',
+    payload: {
+      turn_id: '01a01e7f-19f1-72a3-8998-6ed0556b2452',
+      model: 'gpt-5.6-luna',
+      effort: 'low',
+    },
+  },
+  modelFork.api,
+  modelFork.ctx
+);
+assert.deepEqual(
+  modelFork.events,
+  [['metadata', { model: 'gpt-5.6-luna', reasoningEffort: 'low' }]],
+  'a forked child must report its own model and effort without replaying the parent settings'
+);
+
 assert.equal(
   codexSubagentTitle({
     agentPath: '/root/review_findings',
@@ -270,6 +340,7 @@ tracker.start(
   {
     resolveFile: async () => trackerFile,
     handleLine: (_value, trackerApi) => {
+      trackerApi.metadata({ model: 'gpt-5.6-luna', reasoningEffort: 'low' });
       trackerApi.text('native child output');
       trackerApi.reasoning('first thought');
       trackerApi.reasoning(' and second thought');
@@ -301,6 +372,15 @@ assert.deepEqual(
 assert.ok(
   reasoningEvents.every((event) => event.activity.detail === undefined),
   'reasoning activity transport must not resend the cumulative detail'
+);
+assert.ok(
+  emitted.some(
+    (event) =>
+      event.type === 'subagent' &&
+      event.subagent?.model === 'gpt-5.6-luna' &&
+      event.subagent?.reasoningEffort === 'low'
+  ),
+  'child model metadata must be emitted as a lifecycle update'
 );
 tracker.finish('short-task');
 assert.equal(
