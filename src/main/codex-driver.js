@@ -196,6 +196,7 @@ export const createCodexAppServerDriver = ({
   let activeTurnId = null;
   let continuationTimer = null;
   let ended = false;
+  let actionAccepted = false;
 
   // The goal runtime decides whether to continue after each turn; give it
   // this long to start the next turn (or flip the goal status) before Orion
@@ -236,6 +237,12 @@ export const createCodexAppServerDriver = ({
     clearContinuationTimer();
     if (note) emitText(note);
     callbacks.onRunEnd();
+  };
+
+  const markActionAccepted = () => {
+    if (actionAccepted) return;
+    actionAccepted = true;
+    callbacks.onActionAccepted?.();
   };
 
   const fail = (error) => {
@@ -449,6 +456,7 @@ export const createCodexAppServerDriver = ({
         target: codexReviewTarget(review),
       });
       if (startedReview.error) return fail(startedReview.error);
+      markActionAccepted();
       return;
     }
 
@@ -463,6 +471,7 @@ export const createCodexAppServerDriver = ({
         ],
       });
       if (startedTurn.error) return fail(startedTurn.error);
+      markActionAccepted();
       return;
     }
 
@@ -480,6 +489,7 @@ export const createCodexAppServerDriver = ({
           };
     const set = await request('thread/goal/set', setParams);
     if (set.error) return fail(set.error);
+    markActionAccepted();
     if (set.result?.goal) handleGoalUpdated(set.result.goal);
     // If no turn starts (e.g. the runtime immediately declines idle work),
     // the continuation watchdog pauses the goal and ends the run.
@@ -584,6 +594,9 @@ export const createCodexAppServerDriver = ({
         handleItem(params, true);
         return;
       case 'turn/started': {
+        // This notification can race ahead of the turn/start response. Once
+        // seen, replaying the prompt on a replacement connection is unsafe.
+        markActionAccepted();
         turnActive = true;
         activeTurnId = typeof params.turn?.id === 'string' ? params.turn.id : null;
         clearContinuationTimer();
@@ -661,18 +674,29 @@ export const codexGoalRunDrivers = new Map();
 
 
 // Goal ops on a thread with no live goal run (pause after the run already
-// ended, clear, status refresh). Runs a short-lived app-server dialog:
-// initialize → thread/resume → goal op → kill.
-export const runCodexGoalOp = ({ sessionId, threadId, cwd, action, signal }) => {
+// ended, clear, status refresh). Runs a short-lived app-server client dialog:
+// initialize → thread/resume → goal op → disconnect. `appServerChild` can be
+// an isolated connection to Orion's persistent server; direct app-server
+// remains the compatibility fallback.
+export const runCodexGoalOp = ({
+  sessionId,
+  threadId,
+  cwd,
+  action,
+  signal,
+  appServerChild = null,
+}) => {
   if (signal?.aborted) {
     return Promise.resolve({ ok: false, error: 'Codex goal operation was cancelled.' });
   }
   return new Promise((resolve) => {
-    const child = spawn(loginShell, ['-lc', 'codex app-server'], {
-      cwd,
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const child =
+      appServerChild ??
+      spawn(loginShell, ['-lc', 'codex app-server'], {
+        cwd,
+        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
     let nextId = 1;
     let buffer = '';
     const pending = new Map();

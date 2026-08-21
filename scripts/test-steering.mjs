@@ -203,6 +203,7 @@ const codexChild = {
   },
 };
 let codexRunEnded = 0;
+let codexActionsAccepted = 0;
 codexDriver = createCodexAppServerDriver({
   child: codexChild,
   cwd: '/tmp/project',
@@ -214,6 +215,9 @@ codexDriver = createCodexAppServerDriver({
   accessMode: 'full-access',
   callbacks: {
     onActivity: () => {},
+    onActionAccepted: () => {
+      codexActionsAccepted += 1;
+    },
     onFatal: (error) => assert.fail(error),
     onGoal: () => {},
     onReasoning: () => {},
@@ -226,6 +230,11 @@ codexDriver = createCodexAppServerDriver({
   },
 });
 await codexDriver.start();
+assert.equal(
+  codexActionsAccepted,
+  1,
+  'A successfully started Codex turn must be marked accepted exactly once'
+);
 assert.equal(
   codexRunEnded,
   0,

@@ -41,6 +41,7 @@ import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeS
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexBrowserUseMode, codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
+import { codexAppServerManager } from './main/codex-app-server-manager.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
@@ -143,6 +144,7 @@ let quitAfterPendingWork = false;
 let quitBarrierSatisfied = false;
 let appShutdownRequested = false;
 let riftShutdownRequested = false;
+let codexAppServerShutdownPromise = null;
 const pendingRiftCreations = new Set();
 const pendingRiftEpicIds = new Set();
 // Destructive Rift operations share one queue. Its reference-counted epic
@@ -1395,6 +1397,13 @@ const disposeForQuit = () => {
   disposeAllTitleGenerations();
   cancelActiveProviderUpdate();
   reapActiveAgentRuns();
+  if (!codexAppServerShutdownPromise) {
+    // Goal runs must record their pause through the shared server before it
+    // exits. Once all per-run connections are reaped, stop the server itself.
+    codexAppServerShutdownPromise = waitForPendingAgentShutdowns().then(() =>
+      codexAppServerManager.shutdown()
+    );
+  }
 };
 
 // Resolves once active children have exited (including the SIGKILL fallback),
@@ -1407,6 +1416,7 @@ const waitForPendingQuitWork = () =>
     waitForProviderUpdateShutdown(),
     waitForPendingRiftCreations(),
     waitForRemoteControlPersistence(),
+    codexAppServerShutdownPromise ?? Promise.resolve(),
   ])
     .then(() => threadsSaveQueue.catch(() => {}));
 
@@ -7288,7 +7298,24 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         };
       }
     }
-    const startAttempt = (resumeSessionId) => {
+    // Per-process Codex flags cannot be isolated on a shared server. Keep
+    // those uncommon customized runs on the direct path; ordinary turns use
+    // one Orion-owned server and an isolated WebSocket per active run.
+    const codexHasProcessArgs =
+      typeof runtimeInput.providerOptions?.extraArgs === 'string' &&
+      runtimeInput.providerOptions.extraArgs.trim().length > 0;
+    let codexAppServerLease =
+      useCodexAppServer && !codexHasProcessArgs
+        ? await codexAppServerManager.acquire()
+        : null;
+
+    const startAttempt = (resumeSessionId, forceDirectCodexAppServer = false) => {
+    const persistentCodexAppServer = Boolean(
+      useCodexAppServer &&
+        !forceDirectCodexAppServer &&
+        codexAppServerLease?.persistent &&
+        codexAppServerLease.child
+    );
     const args = commandForModel(model, {
       ...runtimeInput,
       acp: useAcp,
@@ -7298,22 +7325,26 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       orionMcp,
     });
     const commandString = args.map(shellQuote).join(' ');
-    const child = spawn(loginShell, ['-lc', commandString], {
-      cwd: input.projectPath,
-      env: {
-        ...process.env,
-        FORCE_COLOR: '0',
-        NO_COLOR: '1',
-        ...(openCodeConfig ? { OPENCODE_CONFIG_CONTENT: openCodeConfig } : {}),
-        ...(museConfigRoot ? { XDG_CONFIG_HOME: museConfigRoot } : {}),
-      },
-      // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
-      // take no input.
-      stdio: [useAcp || useCodexAppServer ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-    });
+    const child = persistentCodexAppServer
+      ? codexAppServerLease.child
+      : spawn(loginShell, ['-lc', commandString], {
+          cwd: input.projectPath,
+          env: {
+            ...process.env,
+            FORCE_COLOR: '0',
+            NO_COLOR: '1',
+            ...(openCodeConfig ? { OPENCODE_CONFIG_CONTENT: openCodeConfig } : {}),
+            ...(museConfigRoot ? { XDG_CONFIG_HOME: museConfigRoot } : {}),
+          },
+          // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
+          // take no input.
+          stdio: [useAcp || useCodexAppServer ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        });
 
     let stderr = '';
     let stdoutSeen = false;
+    let acceptedCodexSessionId = resumeSessionId;
+    let codexActionAccepted = false;
     let jsonBuffer = '';
     const streamContext = { textSeen: false };
     const knownToolActivities = new Map();
@@ -7519,6 +7550,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       codexGoalRunDrivers.delete(runId);
       codexSteerableRunDrivers.delete(runId);
       acpDriver?.dispose?.();
+      codexAppServerLease?.release();
+      codexAppServerLease = null;
       orionMcp?.release();
       codexSpawnWatcher?.stop();
       kimiSpawnWatcher?.stop();
@@ -7693,6 +7726,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // the same emit helpers the adapter path uses.
     const sharedDriverCallbacks = {
       onSessionId: (sessionId) => {
+        acceptedCodexSessionId = sessionId;
         if (sessionIdReported) return;
         sessionIdReported = true;
         emitAgentEvent(event.sender, {
@@ -7717,6 +7751,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         });
       },
       onActivity: emitActivity,
+      onActionAccepted: () => {
+        codexActionAccepted = true;
+      },
       onResumeFallback: () => {
         emitAgentEvent(event.sender, {
           runId,
@@ -7738,8 +7775,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         finalizeRun(1);
       },
     };
-    // The driver's completion signal: the server process idles once the work
-    // resolves, so kill it shortly after and finalize the run as done.
+    // The driver's completion signal: its per-run protocol connection idles
+    // once the work resolves, so close it shortly after and finalize as done.
     const finishDriverRun = () => {
       turnCompleted = true;
       if (!terminalEventTimer && !finalized) {
@@ -7874,9 +7911,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       threadId: input.threadId,
       type: 'started',
       // App-server runs have no trailing prompt to strip.
-      command: `${model.command} ${(
-        useCodexAppServer ? args.slice(1) : args.slice(1, -1)
-      ).join(' ')}`,
+      command: persistentCodexAppServer
+        ? `${model.command} app-server (persistent)`
+        : `${model.command} ${(
+            useCodexAppServer ? args.slice(1) : args.slice(1, -1)
+          ).join(' ')}`,
     });
 
     child.stdout.on('data', (data) => {
@@ -7957,9 +7996,51 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       const wasStopped = stoppedAgentRuns.delete(runId);
       if (finalized) return;
 
+      // A failed shared-server connection is infrastructure failure, not a
+      // missing Codex thread. Preserve the same resume id and retry once
+      // against a direct app-server instead of silently throwing the
+      // conversation away.
+      if (
+        exitCode !== 0 &&
+        persistentCodexAppServer &&
+        !stdoutSeen &&
+        !codexActionAccepted &&
+        !wasStopped &&
+        !turnCompleted
+      ) {
+        finalized = true;
+        clearFinalizeTimers();
+        codexSteerableRunDrivers.delete(runId);
+        acpDriver?.dispose?.();
+        codexSpawnWatcher?.stop();
+        kimiSpawnWatcher?.stop();
+        subagentTracker.dispose('error');
+        codexAppServerLease?.release();
+        codexAppServerLease = null;
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'chunk',
+          chunk: resumeSessionId
+            ? '_Codex service connection restarted; resuming the previous session._\n\n'
+            : '_Codex service connection restarted; retrying this turn._\n\n',
+        });
+        // thread/start may have succeeded before the socket failed. Resume
+        // the reported thread so retrying cannot fork an unrelated session.
+        startAttempt(acceptedCodexSessionId, true);
+        return;
+      }
+
       // The stored session may be gone (harness cache cleared, expired, or a
       // CLI update). If resuming produced no output at all, run fresh once.
-      if (exitCode !== 0 && resumeSessionId && !stdoutSeen && !wasStopped && !turnCompleted) {
+      if (
+        exitCode !== 0 &&
+        resumeSessionId &&
+        !stdoutSeen &&
+        !codexActionAccepted &&
+        !wasStopped &&
+        !turnCompleted
+      ) {
         finalized = true;
         clearFinalizeTimers();
         codexSteerableRunDrivers.delete(runId);
@@ -7988,6 +8069,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // already settled and untracked.
     const abortedStartup = startingAgentRuns.get(runId);
     if (abortedStartup?.aborted) {
+      codexAppServerLease?.release();
+      codexAppServerLease = null;
       orionMcp?.release();
       // A normal stop is already settled by the renderer and retains the
       // historical successful-startup result. Runtime disposal can also come
@@ -8003,6 +8086,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     try {
       startAttempt(initialResumeId);
     } catch (error) {
+      codexAppServerLease?.release();
+      codexAppServerLease = null;
       orionMcp?.release();
       throw error;
     }
@@ -8105,13 +8190,21 @@ ipcMain.handle('agent:codexGoal', async (_event, input) => {
         return { ok: false, error: 'Codex goal operation was cancelled.' };
       }
       if (!available) return { ok: false, error: 'codex is not installed or not on PATH.' };
-      return await runCodexGoalOp({
-        sessionId: input.sessionId,
-        threadId,
-        cwd: input.projectPath,
-        action: input.action,
-        signal: controller.signal,
-      });
+      const appServerLease = await codexAppServerManager.acquire();
+      try {
+        return await runCodexGoalOp({
+          sessionId: input.sessionId,
+          threadId,
+          cwd: input.projectPath,
+          action: input.action,
+          signal: controller.signal,
+          ...(appServerLease.persistent
+            ? { appServerChild: appServerLease.child }
+            : {}),
+        });
+      } finally {
+        appServerLease.release();
+      }
     })();
     operationEntry.promise = operation;
     try {
