@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { FileText } from 'lucide-react';
+import { Code2, Eye, FileText } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
 import { getLanguageFromPath } from './language';
+import { MarkdownBaseDirContext, MarkdownContent } from './markdown';
 
 // Keep both @monaco-editor/react and Monaco itself out of the startup graph.
 // MonacoEditor configures the bundled Electron-safe loader when the Code
@@ -39,6 +40,7 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
   const savedContentsRef = useRef(new Map<string, string>());
   const previousActiveFilePathRef = useRef(activeFilePath);
   const [editorBottomPadding, setEditorBottomPadding] = useState(280);
+  const [markdownViews, setMarkdownViews] = useState<Record<string, 'code' | 'preview'>>({});
 
   if (activeFilePath && activeFile && !buffersRef.current.has(activeFilePath)) {
     buffersRef.current.set(activeFilePath, activeFile.content);
@@ -183,32 +185,86 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
   }, [activeFilePath, closeFile, saveActiveFile]);
 
   const currentLanguage = activeFilePath ? getLanguageFromPath(activeFilePath) : 'plaintext';
+  const isMarkdownFile = Boolean(activeFilePath?.toLowerCase().endsWith('.md'));
+  const markdownView = activeFilePath ? (markdownViews[activeFilePath] ?? 'code') : 'code';
   const activeBuffer =
     activeFilePath && activeFile
       ? (buffersRef.current.get(activeFilePath) ?? activeFile.content)
       : undefined;
+  const markdownBaseDirs = React.useMemo(() => {
+    if (!activeFilePath) return [];
+    const lastSeparator = Math.max(activeFilePath.lastIndexOf('/'), activeFilePath.lastIndexOf('\\'));
+    return lastSeparator > 0 ? [activeFilePath.slice(0, lastSeparator)] : [];
+  }, [activeFilePath]);
+
+  const setMarkdownView = useCallback(
+    (view: 'code' | 'preview') => {
+      if (!activeFilePath) return;
+      setMarkdownViews((current) =>
+        current[activeFilePath] === view ? current : { ...current, [activeFilePath]: view }
+      );
+    },
+    [activeFilePath]
+  );
 
   return (
     <div className="editor-container" ref={editorContainerRef}>
       {activeFilePath && activeFile ? (
-        <React.Suspense fallback={<div className="editor-loading" />}>
-          <MonacoEditor
-            height="100%"
-            language={currentLanguage}
-            value={activeBuffer}
-            onChange={handleEditorChange}
-            theme="vs-dark"
-            options={{
-              fontSize: 13,
-              minimap: { enabled: true },
-              scrollBeyondLastLine: false,
-              padding: { bottom: editorBottomPadding },
-              automaticLayout: true,
-              tabSize: 2,
-              wordWrap: 'on',
-            }}
-          />
-        </React.Suspense>
+        <>
+          {isMarkdownFile && markdownView === 'preview' ? (
+            <div className="markdown-preview" role="tabpanel" aria-label="Markdown preview">
+              <MarkdownBaseDirContext.Provider value={markdownBaseDirs}>
+                <MarkdownContent content={activeBuffer ?? ''} />
+              </MarkdownBaseDirContext.Provider>
+            </div>
+          ) : (
+            <React.Suspense fallback={<div className="editor-loading" />}>
+              <MonacoEditor
+                height="100%"
+                language={currentLanguage}
+                value={activeBuffer}
+                onChange={handleEditorChange}
+                theme="vs-dark"
+                options={{
+                  fontSize: 13,
+                  minimap: { enabled: true },
+                  scrollBeyondLastLine: false,
+                  padding: { bottom: editorBottomPadding },
+                  automaticLayout: true,
+                  tabSize: 2,
+                  wordWrap: 'on',
+                }}
+              />
+            </React.Suspense>
+          )}
+
+          {isMarkdownFile && (
+            <div className="markdown-view-toggle" role="tablist" aria-label="Markdown view">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={markdownView === 'preview'}
+                aria-label="Preview Markdown"
+                title="Preview Markdown"
+                className={markdownView === 'preview' ? 'active' : ''}
+                onClick={() => setMarkdownView('preview')}
+              >
+                <Eye size={15} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={markdownView === 'code'}
+                aria-label="Show Markdown source"
+                title="Show Markdown source"
+                className={markdownView === 'code' ? 'active' : ''}
+                onClick={() => setMarkdownView('code')}
+              >
+                <Code2 size={15} aria-hidden="true" />
+              </button>
+            </div>
+          )}
+        </>
       ) : (
         <div className="empty-state">
           <FileText size={42} className="opacity-30" />
