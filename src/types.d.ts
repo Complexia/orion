@@ -1349,6 +1349,7 @@ type OrionCodexBrowserIntegrationStatus = {
           /** Subagent type/role (Explore, general-purpose, codex nickname role, …). */
           kind?: string;
           model?: string;
+          reasoningEffort?: string;
           prompt?: string;
           summary?: string;
           /** Provider id of the subagent that spawned this one, when it was not the run's own thread. */
