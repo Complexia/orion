@@ -34,11 +34,13 @@ type RemoteAgentSettingsThread = {
   claudeContextWindow?: string;
   grokReasoningEffort?: string;
   museReasoningEffort?: string;
+  openCodeReasoningEffort?: string;
 };
 
 type RemoteAgentSettingsModel = {
   providerId?: string;
   slug?: string;
+  reasoningVariants?: string[];
 };
 
 /**
@@ -85,6 +87,14 @@ export const remoteAgentSettingsPatch = (
           : new Set(['low', 'medium', 'high', 'xhigh']);
       if (allowed.has(input.reasoningEffort) && thread.codexReasoningEffort !== input.reasoningEffort) {
         patch.codexReasoningEffort = input.reasoningEffort;
+      }
+    } else if (model.providerId === 'opencode') {
+      const allowed = new Set(['default', ...(model.reasoningVariants ?? [])]);
+      if (
+        allowed.has(input.reasoningEffort) &&
+        thread.openCodeReasoningEffort !== input.reasoningEffort
+      ) {
+        patch.openCodeReasoningEffort = input.reasoningEffort;
       }
     }
   }

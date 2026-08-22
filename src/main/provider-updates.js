@@ -89,8 +89,9 @@ export const providerUpdaterConfigs = [
     label: 'OpenCode',
     command: 'opencode',
     packageName: 'opencode-ai',
-    updateCommands: [['update'], ['upgrade']],
-    authCommands: [['auth', 'login'], ['login']],
+    updateCommands: [['upgrade']],
+    authCommands: [['providers', 'login'], ['auth', 'login']],
+    statusCommand: ['models'],
   },
 ];
 
@@ -434,6 +435,23 @@ export const getProviderAuthStatus = async (config) => {
         status: authenticated ? 'authenticated' : lowerOutput ? 'unauthenticated' : 'unknown',
         label: authenticated ? 'Authenticated' : 'Not authenticated',
         detail: output.split(/\r?\n/).find((line) => line.trim()) || output,
+      };
+    }
+
+    if (config.id === 'opencode') {
+      const models = output
+        .replace(/\u001b\[[0-9;]*m/g, '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:/-]*$/i.test(line));
+      const ready = models.length > 0;
+      return {
+        authenticated: ready,
+        status: ready ? 'authenticated' : lowerOutput ? 'unauthenticated' : 'unknown',
+        label: ready ? 'Ready' : 'No models available',
+        detail: ready
+          ? `Ready — ${models.length} model${models.length === 1 ? '' : 's'} available`
+          : output,
       };
     }
 

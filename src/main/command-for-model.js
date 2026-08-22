@@ -297,5 +297,28 @@ export const commandForModel = (model, input) => {
     return ['kimi', ...extraArgs, 'acp'];
   }
 
-  return ['opencode', 'run', '--model', modelArg, ...extraArgs, prompt];
+  // OpenCode's JSONL stream carries the session id, text deltas, reasoning,
+  // and completed tool calls. Its run command resumes with --session and can
+  // fork that session natively, keeping branched Orion threads isolated.
+  const resumeArgs = resumeSessionId
+    ? ['--session', resumeSessionId, ...(input.forkSession ? ['--fork'] : [])]
+    : [];
+  const variantArgs =
+    input.openCodeReasoningEffort && input.openCodeReasoningEffort !== 'default'
+      ? ['--variant', input.openCodeReasoningEffort]
+      : [];
+  const accessArgs = accessMode === 'full-access' ? ['--auto'] : [];
+  return [
+    'opencode',
+    'run',
+    '--format',
+    'json',
+    '--model',
+    modelArg,
+    ...resumeArgs,
+    ...variantArgs,
+    ...accessArgs,
+    ...extraArgs,
+    prompt,
+  ];
 };

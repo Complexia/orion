@@ -230,6 +230,30 @@ export const museFallbackModels = [
   },
 ];
 
+// OpenCode exposes the models that are actually usable with the current
+// installation (built-in Zen models plus models from configured providers)
+// through `opencode models`. Keep its current built-ins as a launch fallback;
+// live discovery replaces this entire block whenever the CLI is available.
+export const openCodeFallbackModels = [
+  ['opencode/x-preview-f-free', '0x Alpha Free (Unlimited)', ['low', 'high', 'max']],
+  ['opencode/nemotron-3.5-lightning-free', 'Nemotron 3.5 Lightning Free', []],
+  ['opencode/muse-spark-1.2-contributor-free', 'Muse Spark 1.2 Free', ['minimal', 'low', 'medium', 'high', 'xhigh']],
+  ['opencode/hy3-free', 'Hy3 Free', ['low', 'medium', 'high']],
+  ['opencode/nemotron-3-ultra-free', 'Nemotron 3 Ultra Free', []],
+  ['opencode/mimo-v2.5-free', 'MiMo V2.5 Free', []],
+  ['opencode/big-pickle', 'Big Pickle', []],
+].map(([slug, label, reasoningVariants], index) => ({
+  id: `opencode:${slug}`,
+  providerId: 'opencode',
+  providerLabel: 'OpenCode',
+  label,
+  slug,
+  command: 'opencode',
+  ...(reasoningVariants.length > 0 ? { reasoningVariants } : {}),
+  ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+  favorite: slug === 'opencode/big-pickle',
+}));
+
 export const agentModels = [
   // Pseudo-model: the renderer resolves it to the configured main-driver
   // model (and attaches an `orchestration` payload) before agent:runTurn.
@@ -421,21 +445,17 @@ export const agentModels = [
   ...kimiFallbackModels,
   ...museFallbackModels,
   ...cursorFallbackModels,
-  {
-    id: 'opencode:anthropic/claude-sonnet-4-6',
-    providerId: 'opencode',
-    providerLabel: 'OpenCode',
-    label: 'Claude Sonnet 4.6',
-    slug: 'anthropic/claude-sonnet-4-6',
-    command: 'opencode',
-  },
+  ...openCodeFallbackModels,
 ];
 export const humanizeModelSlug = (slug) =>
   String(slug)
     .replace(/^[^/]+\//, '')
     .replace(/[-_]+/g, ' ')
     .replace(/\b\w/g, (char) => char.toUpperCase())
+    .replace(/(\d) (?=\d\b)/g, '$1.')
     .replace(/\bGpt\b/g, 'GPT')
+    .replace(/\bMimo\b/g, 'MiMo')
+    .replace(/\bOpenai\b/g, 'OpenAI')
     .replace(/\bAi\b/g, 'AI');
 
 export const cleanCursorModelLabel = (label) =>
@@ -646,6 +666,88 @@ export const listMuseModels = async () => {
   }
 };
 
+export const openCodeModelFromCliRow = (slug, metadata = {}, index = 0) => {
+  const cleanSlug = String(slug || '').trim();
+  if (!/^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:/-]*$/i.test(cleanSlug)) return null;
+  const slashIndex = cleanSlug.indexOf('/');
+  const providerSlug = cleanSlug.slice(0, slashIndex);
+  const modelSlug = cleanSlug.slice(slashIndex + 1);
+  const modelLabel = humanizeModelSlug(modelSlug);
+  const discoveredLabel = typeof metadata.name === 'string' ? metadata.name.trim() : '';
+  const baseLabel = discoveredLabel || modelLabel;
+  const label = cleanSlug === 'opencode/x-preview-f-free'
+    ? '0x Alpha Free (Unlimited)'
+    : providerSlug === 'opencode'
+      ? baseLabel
+      : `${baseLabel} (${humanizeModelSlug(providerSlug)})`;
+  const reasoningVariants =
+    metadata.variants && typeof metadata.variants === 'object'
+      ? Object.keys(metadata.variants).filter(Boolean)
+      : [];
+  return {
+    id: `opencode:${cleanSlug}`,
+    providerId: 'opencode',
+    providerLabel: 'OpenCode',
+    label,
+    slug: cleanSlug,
+    command: 'opencode',
+    ...(reasoningVariants.length > 0 ? { reasoningVariants } : {}),
+    ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+    favorite: cleanSlug === 'opencode/big-pickle',
+  };
+};
+
+export const parseOpenCodeModelsOutput = (output) => {
+  const text = String(output || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const matches = [...text.matchAll(/^([a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:/-]*)\s*$/gim)];
+  const seen = new Set();
+  const records = matches
+    .map((match, index) => {
+      const slug = match[1];
+      if (seen.has(slug)) return null;
+      seen.add(slug);
+      const block = text
+        .slice((match.index ?? 0) + match[0].length, matches[index + 1]?.index ?? text.length)
+        .trim();
+      let metadata = {};
+      if (block.startsWith('{')) {
+        try {
+          metadata = JSON.parse(block);
+        } catch {}
+      }
+      return {
+        slug,
+        metadata,
+        index,
+        releasedAt: Date.parse(metadata.release_date || '') || 0,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.releasedAt - a.releasedAt || a.index - b.index);
+  return records
+    .map((record, index) => openCodeModelFromCliRow(record.slug, record.metadata, index))
+    .filter(Boolean);
+};
+
+export const listOpenCodeModels = async () => {
+  if (!(await checkCommandAvailable('opencode'))) return [];
+  for (const args of [['models', '--verbose'], ['models']]) {
+    try {
+      const { stdout } = await execFileAsync('opencode', args, {
+        timeout: 20000,
+        maxBuffer: 8 * 1024 * 1024,
+        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      });
+      const models = parseOpenCodeModelsOutput(stdout);
+      if (models.length > 0) return models;
+    } catch (error) {
+      const models = parseOpenCodeModelsOutput(`${error?.stdout || ''}\n${error?.stderr || ''}`);
+      if (models.length > 0) return models;
+    }
+  }
+  return [];
+};
+
 // Replace a provider's static catalog block with its discovered models,
 // keeping the block's position in the picker order.
 export const spliceProviderModels = (models, providerId, replacements) => {
@@ -664,14 +766,21 @@ export const discoverAgentModels = async () => {
   // request models as soon as its window loads, so do not let that first
   // request cache fallback catalogs before the interactive-shell PATH arrives.
   await shellPathSyncPromise;
-  const [discoveredCursorModels, discoveredKimiModels, discoveredMuseModels] = await Promise.all([
+  const [
+    discoveredCursorModels,
+    discoveredKimiModels,
+    discoveredMuseModels,
+    discoveredOpenCodeModels,
+  ] = await Promise.all([
     listCursorAgentModels(),
     listKimiModels(),
     listMuseModels(),
+    listOpenCodeModels(),
   ]);
   let models = spliceProviderModels(agentModels, 'cursor', discoveredCursorModels);
   models = spliceProviderModels(models, 'kimi', discoveredKimiModels);
   models = spliceProviderModels(models, 'muse', discoveredMuseModels);
+  models = spliceProviderModels(models, 'opencode', discoveredOpenCodeModels);
   return models;
 };
 
