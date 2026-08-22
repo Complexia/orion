@@ -380,7 +380,7 @@ export type ChangedFileSummary = {
   deletions: number;
 };
 
-export type ImageAttachment = {
+export type FileAttachment = {
   id: string;
   name: string;
   path: string;
@@ -393,7 +393,7 @@ export type Message = {
   role: 'user' | 'agent' | 'system';
   content: string;
   ts: string;
-  attachments?: ImageAttachment[];
+  attachments?: FileAttachment[];
   kind?: 'text' | 'agent-run' | 'claude-background-intervention';
   status?: 'running' | 'done' | 'error' | 'stopped';
   statusText?: string;
@@ -431,7 +431,7 @@ export type Message = {
 export type QueuedMessage = {
   id: string;
   text: string;
-  attachments?: ImageAttachment[];
+  attachments?: FileAttachment[];
 };
 
 /**
@@ -619,6 +619,8 @@ export type OpenFile = {
   path: string;
   content: string;
   isDirty: boolean;
+  /** Changes whenever a clean tab is refreshed from disk, including binary previews. */
+  diskRevision?: number;
 };
 
 export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'muse' | 'opencode';
@@ -907,6 +909,7 @@ interface OrionState {
   setActiveFile: (path: string) => void;
   updateOpenFileContent: (path: string, content: string) => void;
   markFileSaved: (path: string, content?: string) => void;
+  refreshOpenFileFromDisk: (path: string, content?: string) => void;
   closeAllFiles: () => void;
 }
 
@@ -2363,7 +2366,7 @@ export const useOrionStore = create<OrionState>()(
           return;
         }
         set((state) => ({
-          openFiles: [...state.openFiles, { path, content, isDirty: false }],
+          openFiles: [...state.openFiles, { path, content, isDirty: false, diskRevision: 0 }],
           activeFilePath: path,
         }));
       },
@@ -2404,6 +2407,25 @@ export const useOrionStore = create<OrionState>()(
             openFiles: state.openFiles.map((candidate) =>
               candidate.path === path
                 ? { ...candidate, content: nextContent, isDirty: false }
+                : candidate
+            ),
+          };
+        }),
+
+      refreshOpenFileFromDisk: (path, content) =>
+        set((state) => {
+          const file = state.openFiles.find((candidate) => candidate.path === path);
+          // External writes may refresh clean tabs, but must never replace an
+          // unsaved Monaco buffer.
+          if (!file || file.isDirty) return state;
+          return {
+            openFiles: state.openFiles.map((candidate) =>
+              candidate.path === path
+                ? {
+                    ...candidate,
+                    content: content ?? candidate.content,
+                    diskRevision: (candidate.diskRevision ?? 0) + 1,
+                  }
                 : candidate
             ),
           };

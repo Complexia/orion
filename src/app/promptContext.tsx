@@ -1,4 +1,4 @@
-import { type ImageAttachment, type LinkedBoardTask, type OrchestrationRoleId, type Thread } from '../store';
+import { type FileAttachment, type LinkedBoardTask, type OrchestrationRoleId, type Thread } from '../store';
 import { type AgentModel } from '../agentCatalog';
 import { getThreadActivityTime } from './time';
 
@@ -17,14 +17,10 @@ export const linkedTaskFromBoardTask = (task: OrionBoardTask): LinkedBoardTask =
   injected: false,
 });
 
-export const linkedTaskMediaAttachments = (tasks: LinkedBoardTask[]): ImageAttachment[] =>
+export const linkedTaskAttachments = (tasks: LinkedBoardTask[]): FileAttachment[] =>
   tasks.flatMap((task) =>
     (task.attachments ?? [])
-      .filter(
-        (attachment) =>
-          Boolean(attachment.path) &&
-          (attachment.mimeType.startsWith('image/') || attachment.mimeType.startsWith('video/'))
-      )
+      .filter((attachment) => Boolean(attachment.path))
       .map((attachment) => ({
         id: `board-${task.id}-${attachment.id}`,
         name: attachment.name,

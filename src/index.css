@@ -56,7 +56,7 @@ body {
   position: relative;
 }
 
-.image-drop-overlay {
+.file-drop-overlay {
   position: fixed;
   inset: 0;
   z-index: 1000;
@@ -68,7 +68,7 @@ body {
   backdrop-filter: blur(2px);
 }
 
-.image-drop-target {
+.file-drop-target {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -1711,6 +1711,50 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.code-sidebar {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.code-sidebar-resize-handle {
+  position: absolute;
+  z-index: 20;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 7px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.code-sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.code-sidebar-resize-handle:hover::after,
+.code-sidebar-resize-handle:focus-visible::after,
+.code-sidebar-resizing .code-sidebar-resize-handle::after {
+  opacity: 0.9;
+}
+
+.code-sidebar-resizing,
+.code-sidebar-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 
 .agents-sidebar {
@@ -3647,7 +3691,7 @@ body {
   background: rgb(0 0 0 / 20%);
 }
 
-.message-attachment span {
+.message-attachment > span:last-child {
   display: block;
   padding: 5px 7px;
   overflow: hidden;
@@ -3655,6 +3699,11 @@ body {
   white-space: nowrap;
   font-size: 11px;
   color: rgb(255 255 255 / 78%);
+}
+
+.message-attachment .attachment-file-thumb {
+  width: 100%;
+  aspect-ratio: 4 / 3;
 }
 
 .message.agent {
@@ -5035,6 +5084,34 @@ body {
   background: rgb(0 0 0 / 18%);
 }
 
+.composer-attachment .attachment-file-thumb {
+  width: 48px;
+  height: 48px;
+  border-radius: calc(var(--radius-md) - 3px);
+}
+
+.attachment-file-thumb {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: linear-gradient(145deg, rgb(77 141 255 / 16%), rgb(255 255 255 / 5%));
+  color: var(--accent);
+}
+
+.attachment-file-thumb > span {
+  max-width: 90%;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .composer-attachment-meta {
   min-width: 0;
   display: flex;
@@ -5117,6 +5194,7 @@ body {
 .model-trigger,
 .codex-settings-trigger,
 .access-select,
+.attachment-trigger,
 .send-button {
   height: 34px;
   border: 1px solid var(--border-default);
@@ -5155,6 +5233,7 @@ body {
 .model-trigger:hover,
 .codex-settings-trigger:hover,
 .access-select:hover,
+.attachment-trigger:hover:not(:disabled),
 .send-button:hover:not(:disabled) {
   background: var(--bg-elevated);
   border-color: var(--border-strong);
@@ -5164,6 +5243,7 @@ body {
 .model-trigger:disabled,
 .codex-settings-trigger:disabled,
 .access-select:disabled,
+.attachment-trigger:disabled,
 .send-button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -5988,6 +6068,18 @@ body {
   flex-shrink: 0;
 }
 
+.composer-file-input {
+  display: none;
+}
+
+.attachment-trigger {
+  width: 34px;
+  padding: 0;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
 .send-button:hover:not(:disabled) {
   background: linear-gradient(135deg, #4d8dff, #3b7aed);
   box-shadow: 0 4px 14px rgb(37 99 235 / 35%);
@@ -6260,6 +6352,21 @@ body {
   flex: 1;
   overflow: hidden;
   position: relative;
+}
+
+.pdf-preview {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #252526;
+}
+
+.pdf-preview iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #252526;
 }
 
 .markdown-view-toggle {

@@ -131,7 +131,7 @@ export type AgentsSidebarModel = {
 };
 
 // Dragging a sidebar thread onto the main view opens it as an extra pane. The
-// payload rides on a private MIME type so the shell's image-drop handling —
+// payload rides on a private MIME type so the shell's file-drop handling —
 // which only looks for 'Files' — stays out of the way, and so a thread dropped
 // on anything else (the composer, another app) is simply ignored.
 export const THREAD_DRAG_MIME = 'application/x-orion-thread';

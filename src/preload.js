@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld('orion', {
   // File system
   readDirectory: (dirPath) => ipcRenderer.invoke('fs:readDirectory', dirPath),
   readFile: (filePath) => ipcRenderer.invoke('fs:readFile', filePath),
+  readFileResult: (filePath) => ipcRenderer.invoke('fs:readFileResult', filePath),
+  setWatchedFiles: (filePaths) => ipcRenderer.invoke('fs:setWatchedFiles', filePaths),
+  openLinkedFile: (input) => ipcRenderer.invoke('fs:openLinkedFile', input),
   writeFile: (filePath, content) => ipcRenderer.invoke('fs:writeFile', filePath, content),
   createFile: (filePath, content = '') => ipcRenderer.invoke('fs:createFile', filePath, content),
   createDirectory: (dirPath) => ipcRenderer.invoke('fs:createDirectory', dirPath),
@@ -27,6 +30,9 @@ contextBridge.exposeInMainWorld('orion', {
   renamePath: (oldPath, newPath) => ipcRenderer.invoke('fs:renamePath', oldPath, newPath),
   showFileTreeMenu: (input) => ipcRenderer.invoke('fileTree:showContextMenu', input),
   confirmDeletePath: (input) => ipcRenderer.invoke('fileTree:confirmDelete', input),
+  saveAttachment: (input) => ipcRenderer.invoke('attachment:save', input),
+  // Kept for one release so a renderer hot-reload can still talk to an older
+  // preload/main pair while Orion is being restarted after an update.
   saveImageAttachment: (input) => ipcRenderer.invoke('attachment:saveImage', input),
   getPathForFile: (file) => webUtils.getPathForFile(file),
 
@@ -218,7 +224,6 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('agent:turnEvent', listener);
   },
 
-  // Listen for file changes if needed (future)
   onFileChange: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('fs:fileChanged', listener);

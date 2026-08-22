@@ -55,6 +55,24 @@ assert.equal(
 );
 
 const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const appUpdaterSource = await readFile(new URL('../src/main/app-updater.js', import.meta.url), 'utf8');
+const providerUpdateCadence = appSource.match(
+  /const PROVIDER_UPDATE_CHECK_INTERVAL_MS = ([^;]+);/
+)?.[1];
+const appUpdateCadence = appUpdaterSource.match(
+  /appUpdateCheckTimer = setInterval\(runScheduledAppUpdateCheck, ([^)]+)\);/
+)?.[1];
+assert.equal(
+  providerUpdateCadence,
+  appUpdateCadence,
+  'provider update checks should use the same two-hour cadence as app update checks'
+);
+assert.match(
+  appSource,
+  /const interval = window\.setInterval\(\(\) => \{\s*void refreshProviderUpdates\(\);\s*\}, PROVIDER_UPDATE_CHECK_INTERVAL_MS\);[\s\S]*?return \(\) => \{\s*window\.clearInterval\(interval\);\s*\};/,
+  'provider update checks should repeat during a long-running renderer and clean up their timer'
+);
 const windowAllClosedHandler = mainSource.match(
   /app\.on\('window-all-closed',[\s\S]*?\n}\);/
 )?.[0];

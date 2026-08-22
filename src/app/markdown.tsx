@@ -1,6 +1,8 @@
 import React, { useContext, useRef } from 'react';
-import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { toast } from 'sonner';
+import { useOrionStore } from '../store';
 import { localMediaSrc, videoFileNamePattern } from './attachments';
 
 // Candidate base directories (in priority order) used to resolve relative
@@ -9,10 +11,14 @@ import { localMediaSrc, videoFileNamePattern } from './attachments';
 // Imagine saves generated images and references them relatively).
 export const MarkdownBaseDirContext = React.createContext<string[]>([]);
 
+const bareSourceLocationPattern = /^(?!(?:javascript|data|vbscript|https?|mailto|tel):)(?:[^:/?#]+[\\/])*[^:/?#]+:\d+(?::\d+)?(?:-\d+(?::\d+)?)?$/i;
+
 // react-markdown's default transform strips unknown schemes; let local file
 // references through so MarkdownMedia can route them via orion-attachment.
 export const markdownUrlTransform = (url: string) =>
-  /^(orion-attachment|file):/i.test(url) || /^[a-zA-Z]:[\\/]/.test(url)
+  /^(orion-attachment|file):/i.test(url) ||
+  /^[a-zA-Z]:[\\/]/.test(url) ||
+  bareSourceLocationPattern.test(url)
     ? url
     : defaultUrlTransform(url);
 
@@ -42,7 +48,51 @@ export const MarkdownMedia: React.FC<{ src?: string; alt?: string; title?: strin
   return <img className="markdown-media" src={resolvedSrc} alt={alt ?? ''} title={title} loading="lazy" />;
 };
 
-export const markdownComponents = { img: MarkdownMedia };
+export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraProps> = ({
+  href,
+  children,
+  node: _node,
+  ...props
+}) => {
+  const baseDirs = useContext(MarkdownBaseDirContext);
+
+  const handleClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!href || href.startsWith('#') || !window.orion) return;
+
+    void (async () => {
+      try {
+        const webHref = href.startsWith('//') ? `https:${href}` : href;
+        if (/^https?:\/\//i.test(webHref)) {
+          const result = await window.orion.openExternalUrl(webHref);
+          if (!result.ok) toast.error(result.error ?? 'Could not open the link.');
+          return;
+        }
+
+        const result = await window.orion.openLinkedFile({ href, baseDirs });
+        if (!result.ok || !result.path || result.content === undefined) {
+          toast.error(result.error ?? 'Could not open the linked file.');
+          return;
+        }
+        const store = useOrionStore.getState();
+        store.openFile(result.path, result.content);
+        store.setSettingsOpen(false);
+        store.setActiveTab('code');
+      } catch {
+        toast.error('Could not open the link.');
+      }
+    })();
+  };
+
+  return (
+    <a {...props} href={href} onClick={handleClick}>
+      {children}
+    </a>
+  );
+};
+
+export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink };
 
 export const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (
   <div className="markdown-content">

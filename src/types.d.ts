@@ -618,6 +618,14 @@ type OrionCodexBrowserIntegrationStatus = {
         hasChildGitStatus: boolean;
       }>>;
       readFile: (filePath: string) => Promise<string>;
+      readFileResult: (filePath: string) => Promise<
+        { ok: true; content: string } | { ok: false; error?: string }
+      >;
+      setWatchedFiles: (filePaths: string[]) => Promise<boolean>;
+      openLinkedFile: (input: {
+        href: string;
+        baseDirs: string[];
+      }) => Promise<{ ok: boolean; path?: string; content?: string; error?: string }>;
       writeFile: (filePath: string, content: string) => Promise<boolean>;
       createFile: (filePath: string, content?: string) => Promise<boolean>;
       createDirectory: (dirPath: string) => Promise<boolean>;
@@ -996,7 +1004,7 @@ type OrionCodexBrowserIntegrationStatus = {
         error?: string;
       }>;
       getPathForFile?: (file: File) => string;
-      saveImageAttachment: (input: {
+      saveAttachment: (input: {
         name: string;
         mimeType: string;
         data: ArrayBuffer;
@@ -1011,6 +1019,8 @@ type OrionCodexBrowserIntegrationStatus = {
         };
         error?: string;
       }>;
+      /** @deprecated Restart compatibility for legacy renderer/main pairs. */
+      saveImageAttachment?: NonNullable<Window['orion']>['saveAttachment'];
       listAgentModels: (input?: { force?: boolean }) => Promise<Array<{
         id: string;
         providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'muse' | 'opencode';
@@ -1415,7 +1425,7 @@ type OrionCodexBrowserIntegrationStatus = {
       onSubagentSpawnRequest(callback: (request: SubagentSpawnRequest) => void): () => void;
       reportSubagentStopResult(payload: { stopId: string; ok: boolean; result: string }): Promise<void>;
       onSubagentStopRequest(callback: (request: SubagentStopRequest) => void): () => void;
-      onFileChange?: (cb: (data: any) => void) => () => void;
+      onFileChange?: (cb: (data: { path: string; exists: boolean; mtimeMs: number | null }) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
       onRiftStorageState?: (cb: (state: RiftStorageState) => void) => () => void;
       /** The startup retention sweep freed rifts; the renderer clears their epic pointers. */

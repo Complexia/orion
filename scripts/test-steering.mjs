@@ -65,8 +65,8 @@ assert.match(
 );
 assert.match(
   steerRenderer,
-  /linkedTaskMediaAttachments\(tasksToInject\)[\s\S]*injected: true/,
-  'A successful steer must retain Board media in the transcript and consume its task context once'
+  /linkedTaskAttachments\(tasksToInject\)[\s\S]*injected: true/,
+  'A successful steer must retain Board attachments in the transcript and consume its task context once'
 );
 assert.match(
   steerRenderer,
