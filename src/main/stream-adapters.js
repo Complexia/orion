@@ -5,6 +5,9 @@ import path from 'node:path';
 // can resume the same conversation.
 export const extractSessionIdFromJsonEvent = (providerId, value) => {
   if (!value || typeof value !== 'object') return null;
+  if (providerId === 'opencode') {
+    return typeof value.sessionID === 'string' && value.sessionID ? value.sessionID : null;
+  }
   if (providerId === 'codex') {
     return value.type === 'thread.started' && typeof value.thread_id === 'string'
       ? value.thread_id
@@ -643,6 +646,39 @@ export const extractKimiTextFromJsonEvent = (value) => {
   return '';
 };
 
+export const extractOpenCodeTextFromJsonEvent = (value) =>
+  value?.type === 'text' && typeof value.part?.text === 'string' ? value.part.text : '';
+
+export const extractOpenCodeReasoningFromJsonEvent = (value) => {
+  if (!['reasoning', 'thinking'].includes(value?.type)) return '';
+  return typeof value.part?.text === 'string' ? value.part.text : '';
+};
+
+export const extractOpenCodeActivitiesFromJsonEvent = (value) => {
+  if (value?.type !== 'tool_use' || value.part?.type !== 'tool') return [];
+  const part = value.part;
+  const state = part.state && typeof part.state === 'object' ? part.state : {};
+  const tool = String(part.tool || 'tool');
+  const command =
+    tool === 'bash' && typeof state.input?.command === 'string' ? state.input.command : null;
+  const failed = state.status === 'error' || state.status === 'failed';
+  const activity = {
+    key: part.callID || part.id,
+    type: failed ? 'error' : command ? 'command' : 'tool',
+    title: command
+      ? `Command - ${stringifySummary(command, 80)}`
+      : `Tool - ${part.title || tool}`,
+    detail: stringifySummary(part.title || command || tool),
+    status: failed ? 'error' : state.status === 'completed' ? 'done' : 'running',
+  };
+  const input = formatToolInput(state.input);
+  if (input) activity.input = input;
+  const output = formatToolOutput(state.output ?? state.error);
+  if (output) activity.output = output;
+  if (typeof state.metadata?.exit === 'number') activity.exitCode = state.metadata.exit;
+  return [activity];
+};
+
 // muse exec --json emits an event-sourced JSONL stream: every line is an
 // envelope { payload_type, payload, stream: {kind:'session', id} } where
 // payload_type is dotted (runtime.command.accepted, task.lifecycle.*,
@@ -783,6 +819,11 @@ export const providerJsonAdapters = {
     reasoning: extractMuseReasoningFromJsonEvent,
     activities: extractMuseActivitiesFromJsonEvent,
   },
+  opencode: {
+    text: extractOpenCodeTextFromJsonEvent,
+    reasoning: extractOpenCodeReasoningFromJsonEvent,
+    activities: extractOpenCodeActivitiesFromJsonEvent,
+  },
 };
 
 export const genericJsonAdapter = {
@@ -808,4 +849,4 @@ export const isTerminalJsonEvent = (providerId, value) =>
   (providerId === 'muse' && value?.payload_type === 'run.terminal.completed');
 
 export const sendsJsonEvents = (providerId) =>
-  ['claude', 'codex', 'cursor', 'grok', 'kimi', 'muse'].includes(providerId);
+  ['claude', 'codex', 'cursor', 'grok', 'kimi', 'muse', 'opencode'].includes(providerId);

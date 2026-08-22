@@ -7352,7 +7352,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         ? input.resumeSessionId
         : null;
     const forkRequested = Boolean(input.forkSession) && Boolean(initialResumeId);
-    const forkWithNativeFlag = forkRequested && model.providerId === 'claude';
+    const forkWithNativeFlag =
+      forkRequested && (model.providerId === 'claude' || model.providerId === 'opencode');
     if (forkRequested && !forkWithNativeFlag) {
       initialResumeId = await forkSessionOnDisk(model.providerId, initialResumeId);
       if (!initialResumeId) {

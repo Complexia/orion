@@ -41,6 +41,7 @@
     "test:grok-access-mode": "electron scripts/test-grok-access-mode.mjs",
     "test:provider-updates": "node --no-warnings scripts/test-provider-updates.mjs",
     "test:agent-models": "node --no-warnings scripts/test-agent-models.mjs",
+    "test:opencode-provider": "electron scripts/test-opencode-provider.mjs",
     "test:source-control": "node --no-warnings scripts/test-source-control.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",

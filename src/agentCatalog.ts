@@ -28,6 +28,7 @@ export type AgentModel = {
   slug: string;
   shortcut?: string;
   favorite?: boolean;
+  reasoningVariants?: string[];
   available?: boolean;
   unavailableReason?: string;
 };
@@ -196,6 +197,27 @@ export const museReasoningOptions: Array<{
   { value: 'xhigh', label: 'Extra High' },
   { value: 'ultra', label: 'Ultra' },
 ];
+
+export type OpenCodeReasoningOption = {
+  value: string;
+  label: string;
+  default?: boolean;
+};
+
+export const openCodeReasoningOptionsForModel = (
+  model: AgentModel | undefined
+): OpenCodeReasoningOption[] => [
+  { value: 'default', label: 'Default', default: true },
+  ...(model?.reasoningVariants ?? []).map((variant) => ({ value: variant, label: variant })),
+];
+
+export const getEffectiveOpenCodeReasoningEffort = (
+  model: AgentModel | undefined,
+  effort: string | undefined
+): string => {
+  const options = openCodeReasoningOptionsForModel(model);
+  return effort && options.some((option) => option.value === effort) ? effort : 'default';
+};
 
 export type ProviderOptionDef = {
   key:
@@ -688,13 +710,24 @@ export const fallbackAgentModels: AgentModel[] = [
     label: 'GPT-5.5 1M High',
     slug: 'gpt-5.5-high',
   },
-  {
-    id: 'opencode:anthropic/claude-sonnet-4-6',
-    providerId: 'opencode',
+  ...([
+    ['opencode/x-preview-f-free', '0x Alpha Free (Unlimited)', ['low', 'high', 'max']],
+    ['opencode/nemotron-3.5-lightning-free', 'Nemotron 3.5 Lightning Free', []],
+    ['opencode/muse-spark-1.2-contributor-free', 'Muse Spark 1.2 Free', ['minimal', 'low', 'medium', 'high', 'xhigh']],
+    ['opencode/hy3-free', 'Hy3 Free', ['low', 'medium', 'high']],
+    ['opencode/nemotron-3-ultra-free', 'Nemotron 3 Ultra Free', []],
+    ['opencode/mimo-v2.5-free', 'MiMo V2.5 Free', []],
+    ['opencode/big-pickle', 'Big Pickle', []],
+  ] as Array<[string, string, string[]]>).map(([slug, label, reasoningVariants], index) => ({
+    id: `opencode:${slug}`,
+    providerId: 'opencode' as const,
     providerLabel: 'OpenCode',
-    label: 'Claude Sonnet 4.6',
-    slug: 'anthropic/claude-sonnet-4-6',
-  },
+    label,
+    slug,
+    ...(reasoningVariants.length > 0 ? { reasoningVariants } : {}),
+    ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+    favorite: slug === 'opencode/big-pickle',
+  })),
 ];
 
 export const defaultAgentModelId = 'grok:grok-4.6';
@@ -715,4 +748,9 @@ export const isOrionModelId = (modelId: string | undefined | null): boolean =>
   modelId === orionOrchestratorModelId || (modelId ?? '').startsWith('orion:');
 
 export const findAgentModel = (models: AgentModel[], id: string | null | undefined) =>
-  models.find((model) => model.id === id) ?? models.find((model) => model.id === defaultAgentModelId) ?? models[0];
+  models.find((model) => model.id === id) ??
+  (id?.startsWith('opencode:')
+    ? models.find((model) => model.providerId === 'opencode')
+    : undefined) ??
+  models.find((model) => model.id === defaultAgentModelId) ??
+  models[0];

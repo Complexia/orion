@@ -1178,7 +1178,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     subtitle = `Not found – ${provider.label} CLI (${cmd}) is not installed or not on PATH.`;
                   } else if (authenticated) {
                     const raw = status?.auth?.detail || 'Authenticated';
-                    subtitle = /authenticated/i.test(raw) ? raw : `Authenticated as ${raw}`;
+                    subtitle =
+                      provider.id === 'opencode'
+                        ? raw
+                        : /authenticated/i.test(raw)
+                          ? raw
+                          : `Authenticated as ${raw}`;
                   } else if (status?.auth?.authenticated === false) {
                     subtitle = 'Available – Installed and ready, but authentication could not be verified.';
                   } else if (status?.installed) {

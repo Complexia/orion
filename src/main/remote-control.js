@@ -1541,6 +1541,9 @@ const sanitizeAccessMode = (value) =>
 // the thread field for the turn's model (codex / claude / grok). Unknown
 // values are dropped so older hosts and newer controllers stay compatible.
 const REASONING_EFFORTS = new Set([
+  'default',
+  'none',
+  'minimal',
   'low',
   'medium',
   'high',
@@ -1573,6 +1576,9 @@ const buildModelCatalog = (models) =>
       slug: String(model.slug ?? ''),
       ...(typeof model.shortcut === 'string' ? { shortcut: model.shortcut } : {}),
       ...(model.favorite === true ? { favorite: true } : {}),
+      ...(Array.isArray(model.reasoningVariants)
+        ? { reasoningVariants: model.reasoningVariants.filter((value) => typeof value === 'string') }
+        : {}),
       ...(typeof model.available === 'boolean' ? { available: model.available } : {}),
       ...(typeof model.unavailableReason === 'string'
         ? { unavailableReason: model.unavailableReason }

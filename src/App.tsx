@@ -97,8 +97,10 @@ import {
   defaultMuseReasoningEffort,
   getEffectiveCodexReasoningEffort,
   getEffectiveGrokReasoningEffort,
+  getEffectiveOpenCodeReasoningEffort,
   grokReasoningOptionsForModel,
   museReasoningOptions,
+  openCodeReasoningOptionsForModel,
   fallbackAgentModels,
   findAgentModel,
   isClaudeCodeCliModelId,
@@ -407,6 +409,7 @@ const reasoningOptionsForModel = (model: AgentModel | null | undefined): Reasoni
   if (model.providerId === 'claude') return toOptions(claudeReasoningOptions);
   if (model.providerId === 'grok') return toOptions(grokReasoningOptionsForModel(model));
   if (model.providerId === 'muse') return toOptions(museReasoningOptions);
+  if (model.providerId === 'opencode') return toOptions(openCodeReasoningOptionsForModel(model));
   return [];
 };
 
@@ -416,13 +419,18 @@ const defaultReasoningEffortForModel = (model: AgentModel | null | undefined): s
   if (model.providerId === 'claude') return getDefaultClaudeReasoningEffort(model);
   if (model.providerId === 'grok') return getEffectiveGrokReasoningEffort(model, undefined);
   if (model.providerId === 'muse') return defaultMuseReasoningEffort;
+  if (model.providerId === 'opencode') return getEffectiveOpenCodeReasoningEffort(model, undefined);
   return null;
 };
 
 type ThreadReasoningPatch = Partial<
   Pick<
     Thread,
-    'codexReasoningEffort' | 'claudeReasoningEffort' | 'grokReasoningEffort' | 'museReasoningEffort'
+    | 'codexReasoningEffort'
+    | 'claudeReasoningEffort'
+    | 'grokReasoningEffort'
+    | 'museReasoningEffort'
+    | 'openCodeReasoningEffort'
   >
 >;
 
@@ -435,6 +443,7 @@ const threadReasoningPatchForModel = (
   if (model.providerId === 'claude') return { claudeReasoningEffort: effort as ClaudeReasoningEffort };
   if (model.providerId === 'grok') return { grokReasoningEffort: effort as GrokReasoningEffort };
   if (model.providerId === 'muse') return { museReasoningEffort: effort as MuseReasoningEffort };
+  if (model.providerId === 'opencode') return { openCodeReasoningEffort: effort };
   return {};
 };
 
@@ -540,6 +549,7 @@ const threadShellSignature = (thread: Thread): string => {
     thread.claudeContextWindow,
     thread.grokReasoningEffort,
     thread.museReasoningEffort,
+    thread.openCodeReasoningEffort,
     thread.createdAt,
     thread.hiddenFromRecent ? '1' : '0',
     thread.pinnedAt,
@@ -1688,6 +1698,14 @@ const App: React.FC = () => {
   const selectedMuseReasoning = selectedThread?.museReasoningEffort ?? defaultMuseReasoningEffort;
   const selectedMuseReasoningLabel =
     museReasoningOptions.find((option) => option.value === selectedMuseReasoning)?.label ?? 'High';
+  const selectedOpenCodeReasoningOptions = openCodeReasoningOptionsForModel(selectedAgentModel);
+  const selectedOpenCodeReasoning = getEffectiveOpenCodeReasoningEffort(
+    selectedAgentModel,
+    selectedThread?.openCodeReasoningEffort
+  );
+  const selectedOpenCodeReasoningLabel =
+    selectedOpenCodeReasoningOptions.find((option) => option.value === selectedOpenCodeReasoning)?.label ??
+    'Default';
   const selectedAccessMode = selectedThread?.accessMode ?? 'full-access';
   const selectedAccessModeLabel =
     accessModeOptions.find((option) => option.value === selectedAccessMode)?.label ?? 'Full access';
@@ -1696,7 +1714,8 @@ const App: React.FC = () => {
     (selectedAgentModel?.providerId === 'codex' ||
       selectedAgentModel?.providerId === 'claude' ||
       selectedAgentModel?.providerId === 'grok' ||
-      selectedAgentModel?.providerId === 'muse');
+      selectedAgentModel?.providerId === 'muse' ||
+      (selectedAgentModel?.providerId === 'opencode' && selectedOpenCodeReasoningOptions.length > 1));
   const normalizedProviderSettings = useMemo(
     () => ({
       ...defaultProviderSettings,
@@ -7976,6 +7995,14 @@ const App: React.FC = () => {
               museReasoningEffort: thread.museReasoningEffort ?? defaultMuseReasoningEffort,
             }
           : {}),
+        ...(model.providerId === 'opencode'
+          ? {
+              openCodeReasoningEffort: getEffectiveOpenCodeReasoningEffort(
+                model,
+                thread.openCodeReasoningEffort
+              ),
+            }
+          : {}),
         ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
         ...(mentionedThreads.length > 0 ? { hasThreadMentions: true } : {}),
         ...(orchestration ? { orchestration } : {}),
@@ -10210,6 +10237,7 @@ const App: React.FC = () => {
               | 'claudeContextWindow'
               | 'grokReasoningEffort'
               | 'museReasoningEffort'
+              | 'openCodeReasoningEffort'
             >
           > = {};
           if (
@@ -11057,7 +11085,9 @@ const App: React.FC = () => {
     if (shouldShowAgentSettings) {
       widths.push(
         estimateChipWidth(
-          selectedAgentModel?.providerId === 'grok'
+          selectedAgentModel?.providerId === 'opencode'
+            ? selectedOpenCodeReasoningLabel
+            : selectedAgentModel?.providerId === 'grok'
             ? selectedGrokReasoningLabel
             : selectedAgentModel?.providerId === 'muse'
               ? selectedMuseReasoningLabel
@@ -11173,7 +11203,30 @@ const App: React.FC = () => {
   // Popover bodies, lifted out of their chips so the overflow menu can show the
   // same options inline instead of duplicating them.
   const agentSettingsOptions = selectedThread && shouldShowAgentSettings ? (
-    selectedAgentModel?.providerId === 'muse' ? (
+    selectedAgentModel?.providerId === 'opencode' ? (
+      <div className="codex-settings-section">
+        <div className="codex-settings-heading">Variant</div>
+        <div className="codex-settings-options">
+          {selectedOpenCodeReasoningOptions.map((option) => {
+            const selected = selectedOpenCodeReasoning === option.value;
+            return (
+              <button
+                key={option.value}
+                className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                onClick={() =>
+                  updateThread(selectedThread.id, {
+                    openCodeReasoningEffort: option.value,
+                  })
+                }
+              >
+                <span className="settings-check">{selected && <Check size={17} />}</span>
+                <span>{option.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    ) : selectedAgentModel?.providerId === 'muse' ? (
       <div className="codex-settings-section">
         <div className="codex-settings-heading">Reasoning</div>
         <div className="codex-settings-options">
@@ -11382,7 +11435,9 @@ const App: React.FC = () => {
   ) : null;
 
   const agentSettingsSummary =
-    selectedAgentModel?.providerId === 'grok'
+    selectedAgentModel?.providerId === 'opencode'
+      ? selectedOpenCodeReasoningLabel
+      : selectedAgentModel?.providerId === 'grok'
       ? selectedGrokReasoningLabel
       : selectedAgentModel?.providerId === 'muse'
         ? selectedMuseReasoningLabel
@@ -11861,7 +11916,8 @@ const App: React.FC = () => {
                           <span className="composer-menu-row-label">
                             {selectedAgentModel?.providerId === 'claude'
                               ? 'Reasoning & context'
-                              : selectedAgentModel?.providerId === 'grok'
+                              : selectedAgentModel?.providerId === 'grok' ||
+                                  selectedAgentModel?.providerId === 'opencode'
                                 ? 'Reasoning'
                                 : 'Reasoning & tier'}
                           </span>
@@ -11958,9 +12014,11 @@ const App: React.FC = () => {
                         ? 'Claude reasoning and context window'
                         : selectedAgentModel?.providerId === 'grok'
                           ? 'Grok reasoning effort'
-                          : selectedAgentModel?.providerId === 'muse'
-                            ? 'Muse reasoning effort'
-                            : 'Codex reasoning and service tier'
+                        : selectedAgentModel?.providerId === 'muse'
+                          ? 'Muse reasoning effort'
+                          : selectedAgentModel?.providerId === 'opencode'
+                            ? 'OpenCode model variant'
+                          : 'Codex reasoning and service tier'
                     }
                   >
                     <span>
@@ -11970,9 +12028,13 @@ const App: React.FC = () => {
                           ? selectedGrokReasoningLabel
                           : selectedAgentModel?.providerId === 'muse'
                             ? selectedMuseReasoningLabel
+                            : selectedAgentModel?.providerId === 'opencode'
+                              ? selectedOpenCodeReasoningLabel
                             : selectedCodexReasoningLabel}
                     </span>
-                    {selectedAgentModel?.providerId !== 'grok' && selectedAgentModel?.providerId !== 'muse' && (
+                    {selectedAgentModel?.providerId !== 'grok' &&
+                      selectedAgentModel?.providerId !== 'muse' &&
+                      selectedAgentModel?.providerId !== 'opencode' && (
                       <>
                         <span className="control-dot">·</span>
                         <span>

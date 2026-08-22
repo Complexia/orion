@@ -562,6 +562,7 @@ export type Thread = {
   claudeContextWindow?: '200k' | '1m';
   grokReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
+  openCodeReasoningEffort?: string;
   createdAt: string;
   /** Removed from the sidebar Recent agents list (still listed under its project). */
   hiddenFromRecent?: boolean;
@@ -1877,6 +1878,7 @@ export const useOrionStore = create<OrionState>()(
           claudeContextWindow: lastProjectThread?.claudeContextWindow,
           grokReasoningEffort: lastProjectThread?.grokReasoningEffort,
           museReasoningEffort: lastProjectThread?.museReasoningEffort,
+          openCodeReasoningEffort: lastProjectThread?.openCodeReasoningEffort,
           createdAt: new Date().toISOString(),
           parentThreadId: options?.parentThreadId,
           spawnId: options?.spawnId,
