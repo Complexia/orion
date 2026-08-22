@@ -4,6 +4,11 @@ import {
   epicHasActionableCommitWork,
   epicRepositoryShouldAutoCreatePr,
 } from '../src/app/epicGit.ts';
+import {
+  CODE_SIDEBAR_MAX_WIDTH,
+  CODE_SIDEBAR_MIN_WIDTH,
+  clampCodeSidebarWidth,
+} from '../src/app/codeSidebarResize.ts';
 
 const [appSource, chatSource, mainSource, preloadSource, dialogsSource, storeSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
@@ -85,6 +90,27 @@ assert.equal(
   epicRepositoryShouldAutoCreatePr({ autoPrAfterCommit: true, commitWithoutPush: true }, {}),
   false,
   'commit-only mode must suppress multi-project auto-PR creation'
+);
+
+assert.equal(
+  clampCodeSidebarWidth(400, 1200),
+  400,
+  'the Code explorer should accept an editor-safe drag width'
+);
+assert.equal(
+  clampCodeSidebarWidth(100, 1200),
+  CODE_SIDEBAR_MIN_WIDTH,
+  'the Code explorer must retain its usable minimum width'
+);
+assert.equal(
+  clampCodeSidebarWidth(900, 1200),
+  CODE_SIDEBAR_MAX_WIDTH,
+  'the Code explorer must stop at its normal editor-style maximum width'
+);
+assert.equal(
+  clampCodeSidebarWidth(600, 700),
+  380,
+  'the Code explorer must leave a usable editor area in a narrow window'
 );
 
 const backgroundSettled = section(

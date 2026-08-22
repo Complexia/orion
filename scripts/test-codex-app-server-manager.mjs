@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
 
 import {
   CodexAppServerClient,
@@ -7,6 +8,37 @@ import {
 } from '../src/main/codex-app-server-manager.js';
 
 const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+const pendingQuitWorkSource = mainSource.match(
+  /const waitForPendingQuitWork = \(\) =>[\s\S]*?\.then\(\(\) => threadsSaveQueue/
+)?.[0];
+assert.ok(pendingQuitWorkSource, 'the pending quit-work barrier should remain present');
+assert.doesNotMatch(
+  pendingQuitWorkSource,
+  /codexAppServerShutdownPromise/,
+  'the auxiliary Codex server must not strand Orion inside the global quit barrier'
+);
+assert.match(
+  mainSource,
+  /codexAppServerShutdownPromise = waitForPendingAgentShutdowns\(\)\.then\(\(\) =>\s*codexAppServerManager\.shutdown\(\)/,
+  'the shared server should still stop after active agent connections are reaped'
+);
+assert.match(
+  mainSource,
+  /const appShutdownError = \(\) =>\s*appShutdownReason === 'update'[\s\S]*?'Orion is shutting down\.'/,
+  'ordinary shutdown must not be mislabeled as an update installation'
+);
+assert.match(
+  mainSource,
+  /const settleQuitBarrierForUpdate = async \(\) =>[\s\S]*?disposeForQuit\('update'\)/,
+  'only the updater pre-drain should select the update-specific shutdown message'
+);
+assert.match(
+  mainSource,
+  /app\.on\('activate', \(\) => \{\s*\/\/[\s\S]*?if \(appShutdownRequested\) return;/,
+  'macOS activation must not recreate an unusable renderer during shutdown'
+);
 
 class FakeChild extends EventEmitter {
   exitCode = null;

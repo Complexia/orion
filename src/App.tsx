@@ -25,7 +25,7 @@ import {
   Bot,
   Sparkles,
   ArrowUp,
-  Image as ImageIcon,
+  Paperclip,
   RefreshCw,
   Archive,
   CloudUpload,
@@ -59,7 +59,7 @@ import {
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
-  type ImageAttachment,
+  type FileAttachment,
   type LinkedBoardTask,
   type Message,
   type OrchestrationRoleId,
@@ -138,12 +138,12 @@ import {
 } from './app/remote-control-policy';
 import {
   AttachmentThumb,
+  attachmentKindLabel,
   buildPromptWithAttachments,
   formatAttachmentSize,
   getDroppedFilePath,
   isEphemeralDropPath,
-  isMediaFile,
-  isVideoAttachment,
+  isImageFile,
   isVideoFile,
 } from './app/attachments';
 import {
@@ -169,7 +169,7 @@ import {
   buildReviewThreadContext,
   buildThreadMentionsContext,
   linkedTaskFromBoardTask,
-  linkedTaskMediaAttachments,
+  linkedTaskAttachments,
   linkedTaskStatusLabel,
   modelMentionToken,
   orchestrationRoleMeta,
@@ -442,6 +442,8 @@ const threadReasoningPatchForModel = (
 // settles, then give up so a build that never reports back stops costing
 // requests for the rest of the session.
 const CLOUD_DEPLOY_POLL_INTERVAL_MS = 4000;
+// Match the packaged app update scheduler so both update banners stay fresh.
+const PROVIDER_UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const CLOUD_DEPLOY_POLL_TIMEOUT_MS = 20 * 60 * 1000;
 
 const cloudAppHost = (url: string) => {
@@ -873,8 +875,8 @@ const App: React.FC = () => {
   // runningAgentCount-based refresh below, but its files are on disk.
   const [treeTurnRefreshTick, setTreeTurnRefreshTick] = useState(0);
   const [chatInput, setChatInput] = useState('');
-  const [chatAttachments, setChatAttachments] = useState<ImageAttachment[]>([]);
-  const [draggingImages, setDraggingImages] = useState(false);
+  const [chatAttachments, setChatAttachments] = useState<FileAttachment[]>([]);
+  const [draggingFiles, setDraggingFiles] = useState(false);
   // One agent run may be active per thread; runs in other threads are
   // independent, so starting/stopping one never blocks the rest.
   const [activeRunsByThread, setActiveRunsByThread] = useState<Record<string, string>>({});
@@ -1287,7 +1289,7 @@ const App: React.FC = () => {
     | ((
         threadId: string,
         promptText: string,
-        attachments: ImageAttachment[],
+        attachments: FileAttachment[],
         claimStart?: () => Promise<boolean>,
         applyClaimedSettings?: () => void
       ) => Promise<ThreadTurnStartResult>)
@@ -1340,6 +1342,7 @@ const App: React.FC = () => {
   const taskPickerRef = useRef<HTMLDivElement>(null);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const accessModeRef = useRef<HTMLDivElement>(null);
   // Composer controls collapse into one overflow menu when the row runs out of
@@ -1596,7 +1599,7 @@ const App: React.FC = () => {
   // draft instead of carrying it along, and a fresh thread starts with an
   // empty composer.
   const composerDraftKey = selectedThreadId ?? null;
-  const composerDraftsRef = useRef(new Map<string, { text: string; attachments: ImageAttachment[] }>());
+  const composerDraftsRef = useRef(new Map<string, { text: string; attachments: FileAttachment[] }>());
   const composerDraftKeyRef = useRef<string | null>(composerDraftKey);
 
   useEffect(() => {
@@ -2610,6 +2613,14 @@ const App: React.FC = () => {
   useEffect(() => {
     void refreshAgentModels();
     void refreshProviderUpdates();
+
+    const interval = window.setInterval(() => {
+      void refreshProviderUpdates();
+    }, PROVIDER_UPDATE_CHECK_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(interval);
+    };
   }, [refreshAgentModels, refreshProviderUpdates]);
 
   useEffect(() => {
@@ -7494,10 +7505,10 @@ const App: React.FC = () => {
     }
   };
 
-  const attachMediaFiles = useCallback(
+  const attachFiles = useCallback(
     async (files: FileList | File[]) => {
-      const mediaFiles = Array.from(files).filter(isMediaFile);
-      if (mediaFiles.length === 0) return false;
+      const selectedFiles = Array.from(files);
+      if (selectedFiles.length === 0) return false;
 
       let targetThreadId = selectedThreadId;
       if (!targetThreadId) {
@@ -7514,14 +7525,19 @@ const App: React.FC = () => {
       }
       selectThread(targetThreadId);
 
-      if (!window.orion?.saveImageAttachment) {
+      const saveAttachment = window.orion?.saveAttachment ?? window.orion?.saveImageAttachment;
+      if (!saveAttachment) {
         toast.error('Attachments are unavailable');
         return true;
       }
 
-      const savedAttachments: ImageAttachment[] = [];
-      for (const file of mediaFiles) {
-        const fallbackMimeType = isVideoFile(file) ? 'video/*' : 'image/*';
+      const savedAttachments: FileAttachment[] = [];
+      for (const file of selectedFiles) {
+        const fallbackMimeType = isVideoFile(file)
+          ? 'video/*'
+          : isImageFile(file)
+            ? 'image/*'
+            : 'application/octet-stream';
         const droppedPath = getDroppedFilePath(file);
         if (droppedPath && !isEphemeralDropPath(droppedPath)) {
           savedAttachments.push({
@@ -7535,7 +7551,7 @@ const App: React.FC = () => {
         }
 
         try {
-          const result = await window.orion.saveImageAttachment({
+          const result = await saveAttachment({
             name: file.name || 'file',
             mimeType: file.type || fallbackMimeType,
             data: await file.arrayBuffer(),
@@ -7569,7 +7585,7 @@ const App: React.FC = () => {
     if (!Array.from(event.dataTransfer.types).includes('Files')) return;
     event.preventDefault();
     dragDepth.current += 1;
-    setDraggingImages(true);
+    setDraggingFiles(true);
   }, []);
 
   const handleRootDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
@@ -7582,7 +7598,7 @@ const App: React.FC = () => {
     if (!Array.from(event.dataTransfer.types).includes('Files')) return;
     dragDepth.current = Math.max(0, dragDepth.current - 1);
     if (dragDepth.current === 0) {
-      setDraggingImages(false);
+      setDraggingFiles(false);
     }
   }, []);
 
@@ -7591,10 +7607,10 @@ const App: React.FC = () => {
       if (!Array.from(event.dataTransfer.types).includes('Files')) return;
       event.preventDefault();
       dragDepth.current = 0;
-      setDraggingImages(false);
-      void attachMediaFiles(event.dataTransfer.files);
+      setDraggingFiles(false);
+      void attachFiles(event.dataTransfer.files);
     },
-    [attachMediaFiles]
+    [attachFiles]
   );
 
   const removeChatAttachment = (id: string) => {
@@ -7607,7 +7623,7 @@ const App: React.FC = () => {
     async (
       threadId: string,
       promptText: string,
-      attachments: ImageAttachment[],
+      attachments: FileAttachment[],
       claimStart?: () => Promise<boolean>,
       applyClaimedSettings?: () => void
     ): Promise<ThreadTurnStartResult> => {
@@ -7791,9 +7807,9 @@ const App: React.FC = () => {
       if (!promptText && attachments.length === 0 && tasksToInject.length === 0) {
         return { ok: false, error: 'Type a message first' };
       }
-      const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
-      const turnAttachments = [...taskMediaAttachments, ...attachments];
-      const userContent = promptText || (attachments.length > 0 ? 'Attached image' : '');
+      const taskAttachments = linkedTaskAttachments(tasksToInject);
+      const turnAttachments = [...taskAttachments, ...attachments];
+      const userContent = promptText || (attachments.length > 0 ? 'Attached file' : '');
       let agentPrompt = buildPromptWithAttachments(promptText, attachments);
       const preserveSlashCommandStart =
         model.providerId === 'claude' && promptText.trimStart().startsWith('/');
@@ -8013,7 +8029,7 @@ const App: React.FC = () => {
     async (
       threadId: string,
       promptText: string,
-      attachments: ImageAttachment[],
+      attachments: FileAttachment[],
       claimStart?: () => Promise<boolean>,
       applyClaimedSettings?: () => void
     ): Promise<ThreadTurnStartResult> => {
@@ -9301,7 +9317,7 @@ const App: React.FC = () => {
   // Async delivery can outlive the originating thread selection. Restore a
   // failed submission to that thread's draft rather than overwriting whatever
   // the user is currently composing elsewhere.
-  const restoreComposerDraft = (threadId: string, promptText: string, attachments: ImageAttachment[]) => {
+  const restoreComposerDraft = (threadId: string, promptText: string, attachments: FileAttachment[]) => {
     if (composerDraftKeyRef.current === threadId) {
       setChatInput((current) => [promptText, current].filter(Boolean).join('\n\n'));
       setChatAttachments((current) => [...attachments, ...current]);
@@ -9601,7 +9617,7 @@ const App: React.FC = () => {
   const performSteerWithContent = async (
     threadId: string,
     promptText: string,
-    attachments: ImageAttachment[],
+    attachments: FileAttachment[],
     cancelled: () => boolean
   ) => {
     if (!promptText && attachments.length === 0) return;
@@ -9622,7 +9638,7 @@ const App: React.FC = () => {
       | {
           agentPrompt: string;
           tasksToInject: LinkedBoardTask[];
-          turnAttachments: ImageAttachment[];
+          turnAttachments: FileAttachment[];
           userContent: string;
         }
       | undefined;
@@ -9671,8 +9687,8 @@ const App: React.FC = () => {
       }
 
       const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
-      const taskMediaAttachments = linkedTaskMediaAttachments(tasksToInject);
-      const turnAttachments = [...taskMediaAttachments, ...attachments];
+      const taskAttachments = linkedTaskAttachments(tasksToInject);
+      const turnAttachments = [...taskAttachments, ...attachments];
       let agentPrompt = buildPromptWithAttachments(promptText, attachments);
       const preserveSlashCommandStart = promptText.trimStart().startsWith('/');
       const addAgentContext = (context: string | null) => {
@@ -9700,7 +9716,7 @@ const App: React.FC = () => {
         agentPrompt,
         tasksToInject,
         turnAttachments,
-        userContent: promptText || (attachments.length > 0 ? 'Attached image' : ''),
+        userContent: promptText || (attachments.length > 0 ? 'Attached file' : ''),
       };
     } catch {
       prepared = undefined;
@@ -9827,7 +9843,7 @@ const App: React.FC = () => {
   const steerWithContent = (
     threadId: string,
     promptText: string,
-    attachments: ImageAttachment[]
+    attachments: FileAttachment[]
   ): Promise<void> => {
     // enqueue captures cancellation identity and publishes the reservation
     // synchronously. Later submissions preserve user order through preflight,
@@ -11055,6 +11071,7 @@ const App: React.FC = () => {
     }
     widths.push(estimateChipWidth(selectedAccessModeLabel, 7.4, 60));
     if (!isTerminalThread) widths.push(34);
+    widths.push(34); // File attachment picker.
     widths.push(36); // Send, or stop while a run is in flight.
     if (isSending && (chatInput.trim() || chatAttachments.length > 0)) {
       widths.push(36); // Queue.
@@ -11676,7 +11693,7 @@ const App: React.FC = () => {
                       ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
                       : 'Queue a follow-up — sends when the agent finishes (⏎)…'
                     : chatAttachments.length > 0
-                      ? `Ask something about the attached ${chatAttachments.some(isVideoAttachment) ? 'media' : 'image'}...`
+                      ? `Ask something about the attached ${attachmentKindLabel(chatAttachments)}...`
                       : hasPendingLinkedTasks
                         ? `Add details (optional) — send starts on the linked ${
                             pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
@@ -12024,6 +12041,31 @@ const App: React.FC = () => {
             </>
           )}
 
+          <input
+            ref={attachmentInputRef}
+            className="composer-file-input"
+            type="file"
+            multiple
+            tabIndex={-1}
+            aria-hidden="true"
+            onChange={(event) => {
+              const files = event.currentTarget.files;
+              if (files?.length) void attachFiles(files);
+              // Let the same file be selected again after it is removed.
+              event.currentTarget.value = '';
+            }}
+          />
+          <button
+            type="button"
+            className="attachment-trigger"
+            onClick={() => attachmentInputRef.current?.click()}
+            disabled={isNativeSubagentThread || selectedThreadRiftUnavailable}
+            title="Attach files"
+            aria-label="Attach files"
+          >
+            <Paperclip size={15} />
+          </button>
+
           {isSending ? (
             <>
               {(chatInput.trim() || chatAttachments.length > 0) && (
@@ -12075,18 +12117,18 @@ const App: React.FC = () => {
 
   return (
     <div
-      className={`app-container ${draggingImages ? 'dragging-images' : ''}`}
+      className={`app-container ${draggingFiles ? 'dragging-files' : ''}`}
       onDragEnter={handleRootDragEnter}
       onDragOver={handleRootDragOver}
       onDragLeave={handleRootDragLeave}
       onDrop={handleRootDrop}
     >
       <Toaster position="top-center" richColors closeButton />
-      {draggingImages && (
-        <div className="image-drop-overlay">
-          <div className="image-drop-target">
-            <ImageIcon size={28} />
-            <span>Drop images or videos to attach</span>
+      {draggingFiles && (
+        <div className="file-drop-overlay">
+          <div className="file-drop-target">
+            <Paperclip size={28} />
+            <span>Drop files to attach</span>
           </div>
         </div>
       )}

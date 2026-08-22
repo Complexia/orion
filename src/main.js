@@ -13,7 +13,9 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  unwatchFile,
   watch as watchFsPath,
+  watchFile,
   writeFileSync,
 } from 'node:fs';
 import { Readable } from 'node:stream';
@@ -50,7 +52,7 @@ import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiS
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
-import { extensionFromMediaInput, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
+import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import { getAgentModels, invalidateAgentModelsCache, listAgentModelsWithAvailability } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
@@ -62,6 +64,7 @@ import { deleteSkill, ensureBundledSkills, importSkills, listSkills, openSkillsF
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
+import { externalWebUrl, linkedFileCandidates } from './main/linked-navigation.js';
 import {
   cancelRemotePairing,
   configureRemoteControl,
@@ -143,6 +146,7 @@ const hiddenSystemDirectories = new Set(['.git']);
 let quitAfterPendingWork = false;
 let quitBarrierSatisfied = false;
 let appShutdownRequested = false;
+let appShutdownReason = null;
 let riftShutdownRequested = false;
 let codexAppServerShutdownPromise = null;
 const pendingRiftCreations = new Set();
@@ -1049,8 +1053,34 @@ const createWindow = () => {
     ...macWindowChrome,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
+      // Electron disables Chromium plugins by default; its built-in PDF
+      // viewer needs them in order to render Code-tab PDF iframes.
+      plugins: true,
       // Security best practices: nodeIntegration false, contextIsolation true (default)
     },
+  });
+
+  // Never let an anchor replace Orion's only renderer document. Markdown
+  // links are routed explicitly in the renderer, while this main-process
+  // guard safely catches target=_blank and any future unhandled anchors.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    const externalUrl = externalWebUrl(url);
+    if (externalUrl) {
+      void shell.openExternal(externalUrl).catch((error) =>
+        console.error('Could not open external window URL', error)
+      );
+    }
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (url === mainWindow.webContents.getURL()) return;
+    event.preventDefault();
+    const externalUrl = externalWebUrl(url);
+    if (externalUrl) {
+      void shell.openExternal(externalUrl).catch((error) =>
+        console.error('Could not open external navigation URL', error)
+      );
+    }
   });
 
   // and load the index.html of the app.
@@ -1265,6 +1295,10 @@ app.whenReady().then(async () => {
   // On OS X it's common to re-create a window in the app when the
   // dock icon is clicked and there are no other windows open.
   app.on('activate', () => {
+    // A quit may be briefly draining agent persistence after the old window
+    // closes. Do not recreate an interactive renderer that can only reject
+    // new turns while the process is committed to exiting.
+    if (appShutdownRequested) return;
     if (BrowserWindow.getAllWindows().length === 0) {
       // Closing the previous window can still be pausing a live /goal and
       // patching that state into the separately persisted transcripts. Do not
@@ -1384,8 +1418,9 @@ app.on('window-all-closed', () => {
 
 // Persistent claude sessions outlive individual turns; kill their CLI
 // processes (and any background subagents inside them) when Orion exits.
-const disposeForQuit = () => {
+const disposeForQuit = (reason = 'quit') => {
   appShutdownRequested = true;
+  appShutdownReason ??= reason;
   riftShutdownRequested = true;
   rememberRiftCleanupForQuit(
     [...pendingRiftCreations].map((creation) => creation.riftPath()).filter(Boolean)
@@ -1400,6 +1435,9 @@ const disposeForQuit = () => {
   if (!codexAppServerShutdownPromise) {
     // Goal runs must record their pause through the shared server before it
     // exits. Once all per-run connections are reaped, stop the server itself.
+    // This server owns no Orion persistence, so do not put its process reap in
+    // the global quit barrier: a wedged helper must not leave a live renderer
+    // permanently rejecting every follow-up as if an update were installing.
     codexAppServerShutdownPromise = waitForPendingAgentShutdowns().then(() =>
       codexAppServerManager.shutdown()
     );
@@ -1416,9 +1454,13 @@ const waitForPendingQuitWork = () =>
     waitForProviderUpdateShutdown(),
     waitForPendingRiftCreations(),
     waitForRemoteControlPersistence(),
-    codexAppServerShutdownPromise ?? Promise.resolve(),
   ])
     .then(() => threadsSaveQueue.catch(() => {}));
+
+const appShutdownError = () =>
+  appShutdownReason === 'update'
+    ? 'Orion is restarting to install an update.'
+    : 'Orion is shutting down.';
 
 app.on('will-quit', (event) => {
   shutdownWorkspaceSync();
@@ -1449,7 +1491,7 @@ const settleQuitBarrierForUpdate = async () => {
   // when will-quit sees the already-satisfied updater barrier.
   shutdownWorkspaceSync();
   shutdownRemoteControl();
-  disposeForQuit();
+  disposeForQuit('update');
   // If a quit is already draining this same work, waiting on it here settles at
   // the same time; either way the barrier is open once the work has landed.
   await waitForPendingQuitWork().catch(() => {});
@@ -1821,6 +1863,117 @@ ipcMain.handle('fs:readFile', async (_event, filePath) => {
     console.error('readFile error', e);
     return '';
   }
+});
+
+// Watcher refreshes must distinguish a genuinely empty file from a failed
+// read. Keep the legacy readFile contract for existing callers, and expose a
+// result-bearing variant for external-change reconciliation.
+ipcMain.handle('fs:readFileResult', async (_event, filePath) => {
+  try {
+    return { ok: true, content: await fs.readFile(filePath, 'utf-8') };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+
+// Poll the small set of open files rather than an entire workspace.
+// fs.watchFile survives the atomic-save replacements used by editors and
+// agents, where a watcher attached to the old inode can silently go stale.
+const openFileWatchersByRenderer = new Map();
+
+const disposeOpenFileWatchers = (webContentsId) => {
+  const record = openFileWatchersByRenderer.get(webContentsId);
+  if (!record) return;
+  for (const [filePath, listener] of record.listeners) {
+    unwatchFile(filePath, listener);
+  }
+  record.webContents.removeListener('did-start-navigation', record.disposeOnNavigation);
+  record.webContents.removeListener('render-process-gone', record.dispose);
+  record.webContents.removeListener('destroyed', record.dispose);
+  openFileWatchersByRenderer.delete(webContentsId);
+};
+
+ipcMain.handle('fs:setWatchedFiles', (event, requestedPaths) => {
+  const webContents = event.sender;
+  if (!webContents || webContents.isDestroyed()) return false;
+
+  let record = openFileWatchersByRenderer.get(webContents.id);
+  if (!record) {
+    const dispose = () => disposeOpenFileWatchers(webContents.id);
+    const disposeOnNavigation = (_event, _url, isInPlace, isMainFrame) => {
+      // PDF previews load in a child frame and must not tear down the
+      // renderer's open-file watchers. Only a real top-level document change
+      // invalidates the renderer subscription.
+      if (isMainFrame && !isInPlace) dispose();
+    };
+    record = { webContents, listeners: new Map(), dispose, disposeOnNavigation };
+    openFileWatchersByRenderer.set(webContents.id, record);
+    webContents.on('did-start-navigation', disposeOnNavigation);
+    webContents.once('render-process-gone', dispose);
+    webContents.once('destroyed', dispose);
+  }
+
+  const nextPaths = new Set(
+    (Array.isArray(requestedPaths) ? requestedPaths : [])
+      .filter((filePath) => typeof filePath === 'string' && filePath.length > 0)
+      .slice(0, 250)
+      .map((filePath) => path.resolve(filePath))
+  );
+
+  for (const [filePath, listener] of record.listeners) {
+    if (nextPaths.has(filePath)) continue;
+    unwatchFile(filePath, listener);
+    record.listeners.delete(filePath);
+  }
+
+  for (const filePath of nextPaths) {
+    if (record.listeners.has(filePath)) continue;
+    const listener = (current, previous) => {
+      const exists = current.nlink > 0;
+      if (
+        exists === (previous.nlink > 0) &&
+        current.mtimeMs === previous.mtimeMs &&
+        current.size === previous.size &&
+        current.ino === previous.ino
+      ) {
+        return;
+      }
+      if (webContents.isDestroyed()) return;
+      webContents.send('fs:fileChanged', {
+        path: filePath,
+        exists,
+        mtimeMs: exists ? current.mtimeMs : null,
+      });
+    };
+    record.listeners.set(filePath, listener);
+    watchFile(filePath, { persistent: false, interval: 350 }, listener);
+  }
+
+  return true;
+});
+
+ipcMain.handle('fs:openLinkedFile', async (_event, input) => {
+  const candidates = linkedFileCandidates(
+    input?.href,
+    Array.isArray(input?.baseDirs) ? input.baseDirs.slice(0, 16) : [],
+    os.homedir()
+  );
+  for (const candidate of candidates) {
+    try {
+      const stats = await fs.stat(candidate);
+      if (!stats.isFile()) continue;
+      return {
+        ok: true,
+        path: candidate,
+        content: path.extname(candidate).toLowerCase() === '.pdf'
+          ? ''
+          : await fs.readFile(candidate, 'utf-8'),
+      };
+    } catch {
+      // Try the next base directory or the path with its source location removed.
+    }
+  }
+  return { ok: false, error: 'The linked file could not be found.' };
 });
 
 // Write file content
@@ -6422,11 +6575,9 @@ ipcMain.handle('tasks:threadStatus', async (_event, input) => {
 
 ipcMain.handle('app:openExternalUrl', async (_event, url) => {
   try {
-    const parsed = new URL(String(url));
-    if (parsed.protocol !== 'https:') {
-      return { ok: false, error: 'Only https URLs can be opened.' };
-    }
-    await shell.openExternal(parsed.toString());
+    const externalUrl = externalWebUrl(url);
+    if (!externalUrl) return { ok: false, error: 'Only web URLs can be opened.' };
+    await shell.openExternal(externalUrl);
     return { ok: true };
   } catch {
     return { ok: false, error: 'Invalid URL.' };
@@ -6676,24 +6827,18 @@ ipcMain.handle('cloud:openInBrowser', async (_event, projectPath) => {
   }
 });
 
-ipcMain.handle('attachment:saveImage', async (_event, input) => {
+const saveAttachment = async (_event, input) => {
   try {
     const mimeType = String(input?.mimeType || '').toLowerCase();
     const originalName = sanitizeAttachmentName(input?.name);
     const data = input?.data;
 
-    const isImage =
-      mimeType.startsWith('image/') || /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i.test(originalName);
-    const isVideo =
-      mimeType.startsWith('video/') || /\.(mp4|webm|mov|m4v|ogv|mkv|avi)$/i.test(originalName);
-    if (!data || (!isImage && !isVideo)) {
-      return { ok: false, error: 'Only image and video attachments are supported.' };
+    if (!data) {
+      return { ok: false, error: 'The attachment data is missing.' };
     }
 
     const id = crypto.randomUUID();
-    const ext = extensionFromMediaInput(originalName, mimeType);
-    const nameWithoutExtension = originalName.replace(/\.[^.]+$/, '') || 'file';
-    const safeFileName = `${id}-${nameWithoutExtension}${ext}`;
+    const safeFileName = `${id}-${ensureMediaExtension(originalName, mimeType)}`;
     const attachmentDir = getAttachmentDirectoryPath();
     const filePath = path.join(attachmentDir, safeFileName);
     const buffer = Buffer.from(data);
@@ -6707,15 +6852,18 @@ ipcMain.handle('attachment:saveImage', async (_event, input) => {
         id,
         name: originalName,
         path: filePath,
-        mimeType: mimeType || (isVideo ? 'video/*' : 'image/*'),
+        mimeType: mimeType || 'application/octet-stream',
         size: buffer.byteLength,
       },
     };
   } catch (e) {
-    console.error('saveImageAttachment error', e);
+    console.error('saveAttachment error', e);
     return { ok: false, error: e?.message ?? String(e) };
   }
-});
+};
+
+ipcMain.handle('attachment:save', saveAttachment);
+ipcMain.handle('attachment:saveImage', saveAttachment);
 
 ipcMain.handle('agent:listModels', async (_event, input) => {
   if (input?.force === true) invalidateAgentModelsCache();
@@ -7105,7 +7253,7 @@ ipcMain.handle('orchestration:subagentStopResult', (_event, payload) => {
 
 ipcMain.handle('agent:runTurn', async (event, input) => {
   if (appShutdownRequested) {
-    return { ok: false, error: 'Orion is restarting to install an update.' };
+    return { ok: false, error: appShutdownError() };
   }
   const runId = input?.runId || crypto.randomUUID();
   // Synchronous, before the first await: IPC handlers start in arrival
@@ -8164,7 +8312,7 @@ ipcMain.handle('agent:codexGoal', async (_event, input) => {
   const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
   try {
     if (appShutdownRequested) {
-      return { ok: false, error: 'Orion is restarting to install an update.' };
+      return { ok: false, error: appShutdownError() };
     }
     if (!input?.sessionId || !threadId || !input?.projectPath || !input?.action) {
       return { ok: false, error: 'Missing sessionId, threadId, projectPath, or action.' };
@@ -8603,7 +8751,7 @@ const disposeAllTerminalSessions = () => {
 ipcMain.handle('terminal:ensure', async (_event, input) => {
   try {
     if (appShutdownRequested) {
-      return { ok: false, error: 'Orion is restarting to install an update.' };
+      return { ok: false, error: appShutdownError() };
     }
     const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
     const projectPath = typeof input?.projectPath === 'string' ? input.projectPath : '';

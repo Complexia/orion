@@ -3,6 +3,8 @@ import { Code2, Eye, FileText } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
+import { localMediaSrc } from './attachments';
+import { isPdfFilePath } from './codeFiles';
 import { getLanguageFromPath } from './language';
 import { MarkdownBaseDirContext, MarkdownContent } from './markdown';
 
@@ -49,6 +51,17 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
     } else {
       savedContentsRef.current.set(activeFilePath, activeFile.content);
     }
+  } else if (
+    activeFilePath &&
+    activeFile &&
+    !activeFile.isDirty &&
+    !dirtyPathsRef.current.has(activeFilePath) &&
+    savedContentsRef.current.get(activeFilePath) !== activeFile.content
+  ) {
+    // A clean tab changed on disk. Replace Monaco's cached value so the
+    // already-open editor updates without requiring the tab to be reopened.
+    buffersRef.current.set(activeFilePath, activeFile.content);
+    savedContentsRef.current.set(activeFilePath, activeFile.content);
   }
 
   const flushFileBuffer = useCallback(
@@ -121,7 +134,7 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
 
   const saveActiveFile = useCallback(async () => {
     const path = useOrionStore.getState().activeFilePath;
-    if (!path || !window.orion) return;
+    if (!path || isPdfFilePath(path) || !window.orion) return;
     const currentFile = useOrionStore.getState().openFiles.find((file) => file.path === path);
     const content = buffersRef.current.get(path) ?? currentFile?.content;
     if (content === undefined) return;
@@ -186,6 +199,7 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
 
   const currentLanguage = activeFilePath ? getLanguageFromPath(activeFilePath) : 'plaintext';
   const isMarkdownFile = Boolean(activeFilePath?.toLowerCase().endsWith('.md'));
+  const isPdfFile = isPdfFilePath(activeFilePath);
   const markdownView = activeFilePath ? (markdownViews[activeFilePath] ?? 'code') : 'code';
   const activeBuffer =
     activeFilePath && activeFile
@@ -196,6 +210,10 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
     const lastSeparator = Math.max(activeFilePath.lastIndexOf('/'), activeFilePath.lastIndexOf('\\'));
     return lastSeparator > 0 ? [activeFilePath.slice(0, lastSeparator)] : [];
   }, [activeFilePath]);
+  const pdfPreviewSrc = React.useMemo(() => {
+    if (!activeFilePath || !isPdfFile) return '';
+    return `${localMediaSrc(activeFilePath, [])}&revision=${activeFile?.diskRevision ?? 0}`;
+  }, [activeFile?.diskRevision, activeFilePath, isPdfFile]);
 
   const setMarkdownView = useCallback(
     (view: 'code' | 'preview') => {
@@ -211,7 +229,15 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
     <div className="editor-container" ref={editorContainerRef}>
       {activeFilePath && activeFile ? (
         <>
-          {isMarkdownFile && markdownView === 'preview' ? (
+          {isPdfFile ? (
+            <div className="pdf-preview" role="document" aria-label="PDF preview">
+              <iframe
+                key={`${activeFilePath}:${activeFile.diskRevision ?? 0}`}
+                src={pdfPreviewSrc}
+                title={activeFilePath.split(/[\\/]/).pop() ?? 'PDF preview'}
+              />
+            </div>
+          ) : isMarkdownFile && markdownView === 'preview' ? (
             <div className="markdown-preview" role="tabpanel" aria-label="Markdown preview">
               <MarkdownBaseDirContext.Provider value={markdownBaseDirs}>
                 <MarkdownContent content={activeBuffer ?? ''} />

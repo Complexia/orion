@@ -1,5 +1,6 @@
 import React from 'react';
-import { type ImageAttachment } from '../store';
+import { FileText } from 'lucide-react';
+import { type FileAttachment } from '../store';
 
 export const imageFileNamePattern = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 export const videoFileNamePattern = /\.(mp4|webm|mov|m4v|ogv|mkv|avi)(?:[?#]|$)/i;
@@ -10,9 +11,18 @@ export const isImageFile = (file: File) =>
 export const isVideoFile = (file: File) =>
   file.type.startsWith('video/') || videoFileNamePattern.test(file.name);
 
-// Models that accept image input can generally interpret video too, so any
-// image-capable model gets both — same behavior as the codex desktop app.
-export const isMediaFile = (file: File) => isImageFile(file) || isVideoFile(file);
+export const attachmentKindLabel = (attachments: FileAttachment[]) => {
+  if (attachments.length === 0) return 'files';
+  const imageCount = attachments.filter(
+    (attachment) =>
+      attachment.mimeType.startsWith('image/') || imageFileNamePattern.test(attachment.name)
+  ).length;
+  const videoCount = attachments.filter(isVideoAttachment).length;
+  if (imageCount === attachments.length) return attachments.length === 1 ? 'image' : 'images';
+  if (videoCount === attachments.length) return attachments.length === 1 ? 'video' : 'videos';
+  if (imageCount + videoCount === attachments.length) return 'media files';
+  return attachments.length === 1 ? 'file' : 'files';
+};
 
 export const formatAttachmentSize = (size: number) => {
   if (!Number.isFinite(size) || size <= 0) return '';
@@ -21,26 +31,45 @@ export const formatAttachmentSize = (size: number) => {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 };
 
-export const imageAttachmentSrc = (attachment: ImageAttachment) => {
+export const imageAttachmentSrc = (attachment: FileAttachment) => {
   if (/^(blob|data|orion-attachment):/i.test(attachment.path)) return attachment.path;
 
   const normalizedPath = attachment.path.replace(/\\/g, '/');
   return `orion-attachment://local/image?path=${encodeURIComponent(normalizedPath)}`;
 };
 
-export const isVideoAttachment = (attachment: ImageAttachment) =>
+export const isVideoAttachment = (attachment: FileAttachment) =>
   attachment.mimeType.startsWith('video/') ||
   videoFileNamePattern.test(attachment.name) ||
   videoFileNamePattern.test(attachment.path);
 
-// Small still-frame preview used in the composer, queued messages, and
-// message history — branches <video> vs <img> the same way MarkdownMedia does.
-export const AttachmentThumb: React.FC<{ attachment: ImageAttachment }> = ({ attachment }) =>
-  isVideoAttachment(attachment) ? (
-    <video src={imageAttachmentSrc(attachment)} muted preload="metadata" />
-  ) : (
-    <img src={imageAttachmentSrc(attachment)} alt={attachment.name} />
+const attachmentExtension = (attachment: FileAttachment) => {
+  const extension = attachment.name.match(/\.([^.]+)$/)?.[1]?.toUpperCase();
+  if (!extension || extension.length > 8) return 'FILE';
+  return extension;
+};
+
+// Small preview used in the composer, queued messages, and message history.
+// Arbitrary files deliberately render as a file tile: their local path is for
+// the agent to inspect, not for the renderer to execute or embed.
+export const AttachmentThumb: React.FC<{ attachment: FileAttachment }> = ({ attachment }) => {
+  if (isVideoAttachment(attachment)) {
+    return <video src={imageAttachmentSrc(attachment)} muted preload="metadata" />;
+  }
+  if (
+    attachment.mimeType.startsWith('image/') ||
+    imageFileNamePattern.test(attachment.name) ||
+    imageFileNamePattern.test(attachment.path)
+  ) {
+    return <img src={imageAttachmentSrc(attachment)} alt={attachment.name} />;
+  }
+  return (
+    <span className="attachment-file-thumb" aria-hidden="true">
+      <FileText size={22} />
+      <span>{attachmentExtension(attachment)}</span>
+    </span>
   );
+};
 
 export const isLocalFilePath = (src: string) =>
   src.startsWith('/') || src.startsWith('~/') || /^[a-zA-Z]:[\\/]/.test(src);
@@ -89,20 +118,17 @@ export const localMediaSrc = (src: string, baseDirs: string[]) => {
   return toProtocolUrl(baseDirs.map((dir) => `${dir.replace(/[\\/]+$/, '')}/${relativePath}`));
 };
 
-export const buildPromptWithAttachments = (prompt: string, attachments: ImageAttachment[]) => {
+export const buildPromptWithAttachments = (prompt: string, attachments: FileAttachment[]) => {
   const trimmedPrompt = prompt.trim();
   if (attachments.length === 0) return trimmedPrompt;
 
-  const mediaLines = attachments.map(
+  const attachmentLines = attachments.map(
     (attachment, index) => `${index + 1}. ${attachment.name}: ${attachment.path}`
   );
-  const hasVideo = attachments.some(isVideoAttachment);
-  const hasImage = attachments.some((attachment) => !isVideoAttachment(attachment));
-  const label = hasVideo && hasImage ? 'media files' : hasVideo ? 'videos' : 'images';
   const attachmentText = [
-    `Attached ${label}:`,
-    `Use these local file paths as visual references for the request.`,
-    ...mediaLines,
+    `Attached ${attachmentKindLabel(attachments)}:`,
+    `Use these local file paths as references for the request. Inspect the files as needed.`,
+    ...attachmentLines,
   ].join('\n');
 
   return trimmedPrompt ? `${trimmedPrompt}\n\n${attachmentText}` : attachmentText;
