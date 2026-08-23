@@ -150,6 +150,13 @@ export const parseNamedGitRefs = ({ stdout, namespace, field }) => {
 export const canReuseLinkedCloudRepo = ({ repo, expectedName }) =>
   Boolean(repo?.id && repo?.name === expectedName);
 
+export const shouldReconcileDefaultBranch = ({ repo, authoritativeDefaultBranch }) =>
+  Boolean(
+    repo?.id &&
+    authoritativeDefaultBranch &&
+    repo.defaultBranch !== authoritativeDefaultBranch
+  );
+
 const uniquePreservedRefName = (original, used) => {
   const base = `orion-local/${original}`;
   let candidate = base;

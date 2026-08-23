@@ -20,6 +20,7 @@ import {
   planGithubRefImport,
   pushSourceControl,
   runAuthenticatedGit,
+  shouldReconcileDefaultBranch,
   shouldMirrorGithubLocally,
   switchSourceControlToOrion,
   withGitAskPass,
@@ -171,6 +172,22 @@ try {
   assert.equal(switched.initialized, true);
   assert.equal(git(provisionProject, 'remote', 'get-url', 'origin'), switched.originUrl);
   console.log('ok  provisioning is injectable for new projects without Git or an origin');
+
+  assert.equal(
+    shouldReconcileDefaultBranch({
+      repo: { id: 'repo_existing', defaultBranch: 'grok-attempt-2' },
+      authoritativeDefaultBranch: 'main',
+    }),
+    true
+  );
+  assert.equal(
+    shouldReconcileDefaultBranch({
+      repo: { id: 'repo_existing', defaultBranch: 'main' },
+      authoritativeDefaultBranch: 'main',
+    }),
+    false
+  );
+  console.log('ok  reused cloud repositories reconcile to the authoritative default branch');
 
   const detachedRepo = await initRepo('detached-source');
   const detachedGithubUrl = 'https://github.com/Complexia/detached-source.git';
@@ -389,6 +406,12 @@ try {
   assert.match(conversionSource, /\+refs\/heads\/\*:refs\/remotes\/origin\/\*/);
   assert.match(conversionSource, /\+refs\/tags\/\*:refs\/orion-import\/github-tags\/\*/);
   assert.match(conversionSource, /planGithubRefImport/);
+  assert.match(conversionSource, /shouldReconcileDefaultBranch/);
+  assert.ok(
+    conversionSource.indexOf("args: ['push', '--atomic', cloneUrl, ...refspecs]") <
+      conversionSource.indexOf("body: { defaultBranch: githubDefaultBranch }"),
+    'default-branch reconciliation must happen after the authoritative branch is imported'
+  );
   assert.match(conversionSource, /clearGithubImportTagRefs/);
   assert.ok(
     conversionSource.indexOf("args: ['push', '--atomic', cloneUrl, ...refspecs]") <

@@ -116,6 +116,7 @@ import {
   pushSourceControl,
   runAuthenticatedGit,
   sanitizeRepositoryName,
+  shouldReconcileDefaultBranch,
   shouldMirrorGithubLocally,
   switchSourceControlToOrion,
 } from './main/source-control.js';
@@ -5816,6 +5817,16 @@ const convertGithubSourceControl = async ({ projectPath, state, session }) => {
         token: session.token,
         args: ['push', '--atomic', cloneUrl, ...refspecs],
       });
+    }
+    if (shouldReconcileDefaultBranch({
+      repo: provisioned.repo,
+      authoritativeDefaultBranch: githubDefaultBranch,
+    })) {
+      const updated = await cloudGitApiRequest(
+        `/api/git/repos/${encodeURIComponent(provisioned.repo.id)}`,
+        { method: 'PATCH', body: { defaultBranch: githubDefaultBranch } }
+      );
+      provisioned.repo = updated.repo;
     }
   } catch (error) {
     await restoreCloudRepoLink(gitRoot, provisioned.previousLink);
