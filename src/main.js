@@ -44,6 +44,7 @@ import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-
 import { codexBrowserUseMode, codexUtilityPrivacyOptions } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
+import { readLatestCodexContextUsage } from './main/codex-context.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
@@ -7440,6 +7441,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       };
     }
     let runtimeInput = input;
+    if (model.providerId === 'codex' && !input.aside && initialResumeId) {
+      const codexContextUsage = await readLatestCodexContextUsage(initialResumeId);
+      if (codexContextUsage) runtimeInput = { ...runtimeInput, codexContextUsage };
+    }
     if (
       model.providerId === 'codex' &&
       (input.accessMode || 'full-access') !== 'read-only' &&
@@ -7450,7 +7455,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         // Never tell Codex to use extension tools that Orion cannot verify.
         // The dedicated MCP browser is the supported, self-contained fallback.
         runtimeInput = {
-          ...input,
+          ...runtimeInput,
           providerOptions: codexBrowserOptionsForIntegration(
             input.providerOptions,
             browserIntegration

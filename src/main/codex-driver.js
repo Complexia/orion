@@ -1,6 +1,7 @@
 import { app, protocol } from 'electron';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { shouldAutoCompactCodexContext } from './codex-context.js';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
@@ -52,8 +53,30 @@ export const codexStatsFromTokenUsage = (tokenUsage, modelId) => {
   if (typeof total.outputTokens === 'number') stats.outputTokens = total.outputTokens;
   if (typeof total.cachedInputTokens === 'number') stats.cachedReadTokens = total.cachedInputTokens;
   if (typeof total.reasoningOutputTokens === 'number') stats.reasoningTokens = total.reasoningOutputTokens;
+  if (typeof tokenUsage?.last?.inputTokens === 'number') stats.contextTokens = tokenUsage.last.inputTokens;
+  if (typeof tokenUsage?.modelContextWindow === 'number') stats.contextWindow = tokenUsage.modelContextWindow;
   return stats;
 };
+
+const CODEX_CONTEXT_ACTIVITY_KEY = 'codex-context-compaction';
+const CODEX_RETRY_ACTIVITY_KEY = 'codex-response-retry';
+
+const codexErrorInfoSummary = (error) => {
+  const info = error?.codexErrorInfo;
+  if (!info) return '';
+  if (typeof info === 'string') return info.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase();
+  if (typeof info !== 'object') return '';
+  const [kind, value] = Object.entries(info)[0] ?? [];
+  if (!kind) return '';
+  const label = kind.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase();
+  const status = Number(value?.httpStatusCode);
+  return Number.isFinite(status) && status > 0 ? `${label} (HTTP ${status})` : label;
+};
+
+export const codexErrorDetail = (error) =>
+  [stringifySummary(error?.message ?? '', 300), codexErrorInfoSummary(error)]
+    .filter(Boolean)
+    .join(' · ');
 
 // Wire goal → the shape persisted on Thread.goal in the renderer store.
 export const codexGoalForRenderer = (goal) => ({
@@ -197,6 +220,11 @@ export const createCodexAppServerDriver = ({
   let continuationTimer = null;
   let ended = false;
   let actionAccepted = false;
+  let preflightCompactionActive = false;
+  let preflightCompactionTurnId = null;
+  let preflightCompactionErrorDetail = '';
+  let resolvePreflightCompaction = null;
+  let retryActivityOpen = false;
 
   // The goal runtime decides whether to continue after each turn; give it
   // this long to start the next turn (or flip the goal status) before Orion
@@ -239,6 +267,19 @@ export const createCodexAppServerDriver = ({
     callbacks.onRunEnd();
   };
 
+  const finishRetryActivity = () => {
+    if (!retryActivityOpen) return;
+    retryActivityOpen = false;
+    callbacks.onActivity({
+      key: CODEX_RETRY_ACTIVITY_KEY,
+      type: 'tool',
+      kind: 'network',
+      title: 'Codex reconnected',
+      detail: 'The response stream recovered.',
+      status: 'done',
+    });
+  };
+
   const markActionAccepted = () => {
     if (actionAccepted) return;
     actionAccepted = true;
@@ -249,9 +290,57 @@ export const createCodexAppServerDriver = ({
     if (ended) return;
     ended = true;
     clearContinuationTimer();
+    resolvePreflightCompaction?.(false);
+    resolvePreflightCompaction = null;
     callbacks.onFatal(
       typeof error === 'string' ? error : error?.message ?? 'Codex app-server protocol error.'
     );
+  };
+
+  const compactThreadBeforeTurn = async () => {
+    preflightCompactionActive = true;
+    preflightCompactionTurnId = null;
+    preflightCompactionErrorDetail = '';
+    callbacks.onActivity({
+      key: CODEX_CONTEXT_ACTIVITY_KEY,
+      type: 'tool',
+      kind: 'context',
+      title: 'Optimizing Codex context',
+      detail: 'Compacting this long-running thread before continuing.',
+      status: 'running',
+    });
+    const completion = new Promise((resolve) => {
+      resolvePreflightCompaction = resolve;
+    });
+    const started = await request('thread/compact/start', { threadId });
+    if (started.error) {
+      resolvePreflightCompaction = null;
+      preflightCompactionActive = false;
+      callbacks.onActivity({
+        key: CODEX_CONTEXT_ACTIVITY_KEY,
+        type: 'error',
+        title: 'Codex context optimization failed',
+        detail: codexErrorDetail(started.error) || 'Codex could not compact this thread.',
+        status: 'error',
+      });
+      return false;
+    }
+    const compacted = await completion;
+    resolvePreflightCompaction = null;
+    preflightCompactionActive = false;
+    preflightCompactionTurnId = null;
+    if (ended) return false;
+    callbacks.onActivity({
+      key: CODEX_CONTEXT_ACTIVITY_KEY,
+      type: compacted ? 'tool' : 'error',
+      kind: 'context',
+      title: compacted ? 'Codex context optimized' : 'Codex context optimization failed',
+      detail: compacted
+        ? 'The conversation was compacted before this turn.'
+        : preflightCompactionErrorDetail || 'Codex could not compact this thread.',
+      status: compacted ? 'done' : 'error',
+    });
+    return compacted;
   };
 
   const armContinuationTimer = () => {
@@ -434,10 +523,14 @@ export const createCodexAppServerDriver = ({
     };
 
     let resolvedThreadId = null;
+    let resumedExistingThread = false;
     if (resumeSessionId) {
       const resumed = await request('thread/resume', { threadId: resumeSessionId, ...threadParams });
       if (resumed.error) callbacks.onResumeFallback?.();
-      else resolvedThreadId = resumed.result?.thread?.id ?? resumeSessionId;
+      else {
+        resolvedThreadId = resumed.result?.thread?.id ?? resumeSessionId;
+        resumedExistingThread = true;
+      }
     }
     if (!resolvedThreadId) {
       const started = await request('thread/start', threadParams);
@@ -448,6 +541,14 @@ export const createCodexAppServerDriver = ({
     }
     threadId = resolvedThreadId;
     callbacks.onSessionId(threadId);
+
+    if (
+      resumedExistingThread &&
+      shouldAutoCompactCodexContext(input.codexContextUsage)
+    ) {
+      await compactThreadBeforeTurn();
+      if (ended) return;
+    }
 
     if (review) {
       const startedReview = await request('review/start', {
@@ -525,6 +626,8 @@ export const createCodexAppServerDriver = ({
   const dispose = () => {
     ended = true;
     clearContinuationTimer();
+    resolvePreflightCompaction?.(false);
+    resolvePreflightCompaction = null;
     for (const resolve of pendingRequests.values()) {
       resolve({ error: { message: 'Codex app-server run ended.' } });
     }
@@ -571,6 +674,57 @@ export const createCodexAppServerDriver = ({
     const params = message.params ?? {};
     // Defensive: the app-server can host many threads; only ours matters.
     if (params.threadId && threadId && params.threadId !== threadId) return;
+
+    if (preflightCompactionActive) {
+      if (message.method === 'turn/started' && !preflightCompactionTurnId) {
+        preflightCompactionTurnId = params.turn?.id ?? null;
+        return;
+      }
+      if (
+        message.method === 'turn/completed' &&
+        preflightCompactionTurnId &&
+        params.turn?.id === preflightCompactionTurnId
+      ) {
+        resolvePreflightCompaction?.(params.turn?.status === 'completed');
+        return;
+      }
+      if (message.method === 'thread/tokenUsage/updated') {
+        const stats = codexStatsFromTokenUsage(params.tokenUsage, model.id);
+        if (stats) callbacks.onStats(stats);
+        return;
+      }
+      if (message.method === 'error') {
+        const detail = codexErrorDetail(params.error);
+        if (!params.willRetry) {
+          preflightCompactionErrorDetail =
+            detail || 'Codex reported a context-compaction error.';
+        }
+        callbacks.onActivity({
+          key: CODEX_CONTEXT_ACTIVITY_KEY,
+          type: params.willRetry ? 'tool' : 'error',
+          kind: 'context',
+          title: params.willRetry
+            ? 'Optimizing Codex context'
+            : 'Codex context optimization failed',
+          detail: detail || 'Codex reported a context-compaction error.',
+          status: params.willRetry ? 'running' : 'error',
+        });
+        if (!params.willRetry) resolvePreflightCompaction?.(false);
+        return;
+      }
+      // Compaction is an internal preflight turn. Keep its reasoning/items out
+      // of the user's requested turn while still consuming its lifecycle.
+      return;
+    }
+
+    if (
+      retryActivityOpen &&
+      (message.method?.startsWith('item/') ||
+        message.method === 'turn/completed' ||
+        message.method === 'thread/tokenUsage/updated')
+    ) {
+      finishRetryActivity();
+    }
 
     switch (message.method) {
       case 'item/agentMessage/delta': {
@@ -626,13 +780,21 @@ export const createCodexAppServerDriver = ({
         return;
       }
       case 'error': {
-        const detail = stringifySummary(params.error?.message ?? '', 300);
+        const detail = codexErrorDetail(params.error);
         if (detail) {
+          const updatesRetryActivity = params.willRetry || retryActivityOpen;
+          retryActivityOpen = Boolean(params.willRetry);
           callbacks.onActivity({
-            type: 'error',
-            title: params.willRetry ? 'Codex retrying' : 'Codex error',
+            key: updatesRetryActivity ? CODEX_RETRY_ACTIVITY_KEY : undefined,
+            type: params.willRetry ? 'tool' : 'error',
+            kind: params.willRetry ? 'network' : undefined,
+            title: params.willRetry
+              ? 'Codex reconnecting'
+              : updatesRetryActivity
+                ? 'Codex reconnect failed'
+                : 'Codex error',
             detail,
-            status: 'error',
+            status: params.willRetry ? 'running' : 'error',
           });
         }
         return;

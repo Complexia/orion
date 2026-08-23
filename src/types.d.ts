@@ -1394,6 +1394,8 @@ type OrionCodexBrowserIntegrationStatus = {
           outputTokens?: number;
           cachedReadTokens?: number;
           reasoningTokens?: number;
+          contextTokens?: number;
+          contextWindow?: number;
           modelId?: string;
         };
         activity?: {
