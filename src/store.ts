@@ -370,6 +370,9 @@ export type TurnTokenStats = {
   outputTokens?: number;
   cachedReadTokens?: number;
   reasoningTokens?: number;
+  /** Input carried by the most recent model request, not the cumulative thread total. */
+  contextTokens?: number;
+  contextWindow?: number;
   modelId?: string;
 };
 

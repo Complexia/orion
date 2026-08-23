@@ -38,6 +38,8 @@
     "test:slash-commands": "node --no-warnings --experimental-strip-types scripts/test-slash-commands.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "test:codex-app-server": "node --no-warnings scripts/test-codex-app-server-manager.mjs",
+    "test:codex-context": "node --no-warnings scripts/test-codex-context.mjs",
+    "test:codex-driver": "electron scripts/test-codex-driver.mjs",
     "test:grok-access-mode": "electron scripts/test-grok-access-mode.mjs",
     "test:provider-updates": "node --no-warnings scripts/test-provider-updates.mjs",
     "test:agent-models": "node --no-warnings scripts/test-agent-models.mjs",

@@ -73,6 +73,13 @@ export const formatTurnStats = (stats: TurnTokenStats) => {
   }
   const reasoning = formatTokenCount(stats.reasoningTokens);
   if (reasoning && stats.reasoningTokens! > 0) parts.push(`${reasoning} reasoning`);
+  if (
+    typeof stats.contextTokens === 'number' &&
+    typeof stats.contextWindow === 'number' &&
+    stats.contextWindow > 0
+  ) {
+    parts.push(`${Math.round((stats.contextTokens / stats.contextWindow) * 100)}% context`);
+  }
   return parts.join(' · ');
 };
 
