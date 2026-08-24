@@ -22,6 +22,9 @@ import {
 } from '../src/main/rift-release.js';
 import {
   collapseNestedPaths,
+  isExternalRiftLinkedFromWorkspace,
+  isRiftRepositoryIncludedInWorkspaceSize,
+  planRiftStorageEntries,
   reclaimedBytesAcrossVolumes,
 } from '../src/main/rift-storage-accounting.js';
 
@@ -122,6 +125,89 @@ assert.deepEqual(removalOrder, [
   'second-start',
   'second-end',
 ]);
+
+assert.equal(
+  isRiftRepositoryIncludedInWorkspaceSize('/rifts/epics/shared/child', {
+    repositoryChild: true,
+    workspaceRiftPath: '/rifts/epics/shared',
+  }),
+  true,
+  'a real shared-workspace child is already included in its parent size'
+);
+assert.equal(
+  isRiftRepositoryIncludedInWorkspaceSize('/rifts/original/legacy-abcd', {
+    repositoryChild: true,
+    workspaceRiftPath: '/rifts/epics/shared',
+  }),
+  false,
+  'an externally linked legacy Rift must be measured outside its parent directory'
+);
+assert.equal(
+  isExternalRiftLinkedFromWorkspace('/rifts/epics/shared', {
+    riftPath: '/rifts/original/legacy-abcd',
+    workspaceLinkPath: '/rifts/epics/shared/original',
+  }),
+  true,
+  'missing-parent cleanup can identify the persisted external legacy link shape'
+);
+assert.equal(
+  isExternalRiftLinkedFromWorkspace('/rifts/epics/shared', {
+    riftPath: '/rifts/epics/shared/child',
+    workspaceLinkPath: '/rifts/epics/shared/child-link',
+  }),
+  false,
+  'missing-parent cleanup must not classify an ordinary child as an external link'
+);
+
+const linkedWorkspaceOwners = new Map([
+  ['/rifts/epics/shared', { epicId: 'shared-epic', repositories: [] }],
+  ['/rifts/epics/shared/child', {
+    epicId: 'shared-epic',
+    repositoryChild: true,
+    workspaceRiftPath: '/rifts/epics/shared',
+  }],
+  ['/rifts/original/legacy-abcd', {
+    epicId: 'shared-epic',
+    repositoryChild: true,
+    workspaceRiftPath: '/rifts/epics/shared',
+    workspaceLinkPath: '/rifts/epics/shared/original',
+  }],
+]);
+const linkedWorkspacePlan = planRiftStorageEntries(
+  [
+    { riftPath: '/rifts/epics/shared', riftRoot: '/rifts/epics' },
+    { riftPath: '/rifts/epics/shared/child', riftRoot: '/rifts/epics/shared' },
+    { riftPath: '/rifts/original/legacy-abcd', riftRoot: '/rifts/original' },
+  ],
+  linkedWorkspaceOwners,
+  (candidate) => candidate === '/rifts/epics/shared'
+);
+assert.deepEqual(
+  linkedWorkspacePlan.visibleRifts.map(({ riftPath }) => riftPath),
+  ['/rifts/epics/shared'],
+  'linked repository children must not become independently releasable Storage rows'
+);
+assert.deepEqual(
+  linkedWorkspacePlan.externalSizePathsByWorkspace.get('/rifts/epics/shared'),
+  ['/rifts/original/legacy-abcd'],
+  'the external legacy repository size must be folded into its parent row'
+);
+
+const missingLinkedWorkspacePlan = planRiftStorageEntries(
+  [{ riftPath: '/rifts/original/legacy-abcd', riftRoot: '/rifts/original' }],
+  linkedWorkspaceOwners,
+  () => false
+);
+assert.deepEqual(
+  missingLinkedWorkspacePlan.visibleRifts,
+  [{ riftPath: '/rifts/epics/shared', riftRoot: '/rifts/epics' }],
+  'a missing linked parent must retain one parent-owned cleanup row'
+);
+assert.deepEqual(
+  missingLinkedWorkspacePlan.externalSizePathsByWorkspace.get('/rifts/epics/shared'),
+  ['/rifts/original/legacy-abcd'],
+  'a missing parent row must still account for its external repository bytes'
+);
 
 assert.deepEqual(
   guardedEpicIdsForRiftReleaseJournal({

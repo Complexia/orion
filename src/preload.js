@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('orion', {
   // Rifts (experimental copy-on-write epic workspaces)
   riftStatus: () => ipcRenderer.invoke('rift:status'),
   epicCreateRift: (input) => ipcRenderer.invoke('epic:createRift', input),
+  epicAddRiftProject: (input) => ipcRenderer.invoke('epic:addRiftProject', input),
   epicAcknowledgeRift: (input) => ipcRenderer.invoke('epic:acknowledgeRift', input),
   epicRemoveRift: (input) => ipcRenderer.invoke('epic:removeRift', input),
   epicDeleteRiftRestoreRef: (input) =>

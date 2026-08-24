@@ -10,13 +10,14 @@ import {
   clampCodeSidebarWidth,
 } from '../src/app/codeSidebarResize.ts';
 
-const [appSource, chatSource, mainSource, preloadSource, dialogsSource, storeSource] = await Promise.all([
+const [appSource, chatSource, mainSource, preloadSource, dialogsSource, storeSource, sidebarSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/app/chat.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/main.js', import.meta.url), 'utf8'),
   readFile(new URL('../src/preload.js', import.meta.url), 'utf8'),
   readFile(new URL('../src/app/AppDialogs.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/store.ts', import.meta.url), 'utf8'),
+  readFile(new URL('../src/app/AgentsSidebar.tsx', import.meta.url), 'utf8'),
 ]);
 
 const section = (source, start, end) => {
@@ -234,6 +235,91 @@ assert.match(
   appSource,
   /epic-view-actions[\s\S]*selectedEpicRepositories\.length <= 1/,
   'legacy primary-only git controls must be hidden for multi-project Epics'
+);
+assert.match(
+  sidebarSource,
+  /openAddProjectToEpicDialog\(epic\)[\s\S]*Add project to Rift/,
+  'the Epic options menu must expose the add-project flow'
+);
+assert.match(
+  appSource,
+  /className="sidebar-section-action epic-view-add-project"[\s\S]*title="Add project"[\s\S]*aria-label="Add project"[\s\S]*openAddProjectToEpicDialog\(selectedEpic\)[\s\S]*<Plus size=\{14\}/,
+  'the Epic repository row must expose the add-project flow as an accessible plus icon'
+);
+assert.match(
+  dialogsSource,
+  /aria-label="Project to add"[\s\S]*role="option"[\s\S]*Add project/,
+  'the add-project dialog must use the styled project picker instead of a native select'
+);
+assert.match(
+  appSource,
+  /epicAddRiftProject\([\s\S]*persistAndAcknowledgeRift\([\s\S]*Project added, but Rift ownership could not be persisted/,
+  'the renderer must durably persist and acknowledge an appended Rift repository'
+);
+assert.match(
+  mainSource,
+  /addProjectToExistingRift[\s\S]*readPersistedRiftOwners[\s\S]*existingGitRoots[\s\S]*riftCreate\(canonicalGitRoot,[\s\S]*unacknowledgedRifts\.set/,
+  'main must validate durable ownership and duplicate Git roots before journaling an appended repository'
+);
+assert.match(
+  mainSource,
+  /workspaceLinkPath[\s\S]*fs\.symlink[\s\S]*sharedRiftRepositories[\s\S]*isSymbolicLink\(\)[\s\S]*realpathSync/,
+  'expanding a legacy one-project Rift must retain and validate its original repository through the shared workspace link'
+);
+const addRiftProject = section(
+  mainSource,
+  'const addProjectToExistingRift = async (event, input) => {',
+  "ipcMain.handle('epic:addRiftProject'"
+);
+assert.match(
+  addRiftProject,
+  /pendingRiftEpicIds\.add\(epicId\)[\s\S]*riftRemovalCoordinator\.run\(\[epicId\]/,
+  'adding a project must synchronously reserve the destructive-operation coordinator'
+);
+const removeRift = section(
+  mainSource,
+  "ipcMain.handle('epic:removeRift'",
+  "ipcMain.handle('epic:deleteRiftRestoreRef'"
+);
+assert.match(
+  removeRift,
+  /pendingRiftEpicIds\.has\(epicId\)[\s\S]*still being updated[\s\S]*riftRemovalCoordinator\.run/,
+  'Epic deletion must reject a Rift setup whose ownership is not durable yet'
+);
+assert.match(
+  removeRift,
+  /if \(!existsSync\(riftPath\)\)[\s\S]*isExternalRiftLinkedFromWorkspace[\s\S]*riftRemove\(repositoryRiftPath\)[\s\S]*deleteEpicRestoreRefBestEffort/,
+  'missing shared parents must not orphan an externally linked legacy Rift'
+);
+const storageRelease = section(
+  mainSource,
+  "ipcMain.handle('riftStorage:release'",
+  '// Age-based retention.'
+);
+assert.match(
+  storageRelease,
+  /owner\?\.repositoryChild[\s\S]*workspace-owned/,
+  'Storage release must reject standalone child-repository requests'
+);
+assert.match(
+  storageRelease,
+  /if \(!existsSync\(riftPath\)\)[\s\S]*linkedRepositoriesForMissingWorkspace[\s\S]*readRepositoryRiftsWorkState[\s\S]*preserveRepositoryRiftHeadsForRestore[\s\S]*riftRemove\(repository\.riftPath\)[\s\S]*completeRiftRelease/,
+  'Storage release must preserve and remove linked repositories before settling a missing parent'
+);
+const persistRift = section(
+  appSource,
+  'const persistAndAcknowledgeRift = useCallback(',
+  '  useEffect(() => {'
+);
+assert.match(
+  persistRift,
+  /flushOrionThreadsSave\(\)[\s\S]*updateEpic\(ownership\.epicId[\s\S]*flushOrionStoreSave\(\)/,
+  'provider session resets must reach thread storage before the new workspace is activated'
+);
+assert.match(
+  preloadSource,
+  /epicAddRiftProject:[\s\S]*epic:addRiftProject/,
+  'the add-project operation must cross the preload boundary'
 );
 assert.match(
   mainSource,

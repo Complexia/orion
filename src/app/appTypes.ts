@@ -32,6 +32,12 @@ export type EpicSettleDialogState = {
   releaseRift: boolean;
 };
 
+export type AddProjectToEpicDialogState = {
+  epicId: string;
+  projectId: string;
+  submitting: boolean;
+};
+
 export type RiftSweepDialogState = {
   entries: RiftStorageEntry[];
   runGc: boolean;

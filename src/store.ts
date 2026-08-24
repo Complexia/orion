@@ -15,8 +15,13 @@ export type EpicRepository = {
   projectPath: string;
   /** Source branch this Rift snapshot was based on and its pull request targets. */
   sourceBranch?: string;
-  /** Git root inside the shared Epic Rift workspace. */
+  /** Git root participating in the Epic Rift workspace. */
   riftPath?: string;
+  /**
+   * Symlink inside the shared workspace for a legacy one-project Rift that
+   * was later expanded without relocating its existing repository copy.
+   */
+  workspaceLinkPath?: string;
   /** Project-relative directory inside this repository's Rift copy. */
   riftWorkingDir?: string;
   /** Canonical source repository root. */
@@ -1736,6 +1741,7 @@ export const useOrionStore = create<OrionState>()(
                     ...repository,
                     riftPath: undefined,
                     riftWorkingDir: undefined,
+                    workspaceLinkPath: undefined,
                   })),
                 }
               : epic

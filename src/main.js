@@ -135,7 +135,7 @@ import {
   reconcileRiftReleaseJournal,
   releasedRiftRefForEpic,
 } from './main/rift-release.js';
-import { collapseNestedPaths, readVolumeFreeSpace, reclaimedBytesAcrossVolumes } from './main/rift-storage-accounting.js';
+import { collapseNestedPaths, isExternalRiftLinkedFromWorkspace, planRiftStorageEntries, readVolumeFreeSpace, reclaimedBytesAcrossVolumes } from './main/rift-storage-accounting.js';
 import { isRiftDirectoryPath, listRiftRootEntries, loadSizeCache, measurePathSize, riftHasMarker, riftRootForGitRoot, saveSizeCache } from './main/rift-storage.js';
 
 // Set the application name as early as possible.
@@ -523,6 +523,10 @@ const readPersistedRiftOwners = async (state) => {
           ...owner,
           repositoryChild: true,
           workspaceRiftPath: epic.riftPath,
+          workspaceLinkPath:
+            typeof repository.workspaceLinkPath === 'string'
+              ? repository.workspaceLinkPath
+              : null,
           gitBranch:
             typeof repository.gitBranch === 'string'
               ? repository.gitBranch
@@ -3830,6 +3834,345 @@ const createMultiProjectRift = async (event, input) => {
   }
 };
 
+const addProjectToExistingRift = async (event, input) => {
+  if (riftShutdownRequested) {
+    return { ok: false, error: 'Rift project setup was cancelled because Orion is quitting.' };
+  }
+  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
+  const projectId = typeof input?.projectId === 'string' ? input.projectId : '';
+  const requestedProjectPath = typeof input?.projectPath === 'string' ? input.projectPath : '';
+  const requestedRiftPath = typeof input?.riftPath === 'string' ? input.riftPath : '';
+  if (!epicId || !projectId || !requestedProjectPath || !requestedRiftPath) {
+    return { ok: false, error: 'Missing epic, project, or Rift workspace details.' };
+  }
+  if (pendingRiftEpicIds.has(epicId)) {
+    return { ok: false, error: 'This epic’s Rift workspace is already being updated.' };
+  }
+  if (epicGitOperations.has(epicId)) {
+    return { ok: false, error: 'This epic already has a Git operation in progress.' };
+  }
+  if (riftRemovalCoordinator.hasEpic(epicId) || pendingRiftReleaseEpicIds.has(epicId)) {
+    return { ok: false, error: 'This epic’s Rift workspace is being removed.' };
+  }
+
+  // Take the same main-owned launch lock used by initial Rift creation before
+  // the first await. Existing agents may finish, but no new turn can enter the
+  // shared workspace while its repository set is changing.
+  pendingRiftEpicIds.add(epicId);
+  const abortController = new AbortController();
+  const cancelForDestroyedSender = () => abortController.abort();
+  event.sender.once('destroyed', cancelForDestroyedSender);
+  let settlePendingCreation;
+  const pendingCreation = new Promise((resolve) => { settlePendingCreation = resolve; });
+  let createdRepositoryPath = '';
+  let createdWorkspaceContainerPath = '';
+  let awaitingPersistenceAck = false;
+  const pendingEntry = {
+    epicId,
+    epicName: '',
+    promise: pendingCreation,
+    cancel: () => abortController.abort(),
+    riftPath: () => createdWorkspaceContainerPath || createdRepositoryPath,
+  };
+  pendingRiftCreations.add(pendingEntry);
+
+  const cleanupCreatedRepository = async () => {
+    try {
+      if (createdRepositoryPath && existsSync(createdRepositoryPath)) {
+        await removeRememberedRiftCleanup(createdRepositoryPath, { allowMarkerless: true });
+      }
+      if (createdRepositoryPath) await forgetRiftCleanup(createdRepositoryPath);
+      if (createdWorkspaceContainerPath && existsSync(createdWorkspaceContainerPath)) {
+        await removeRememberedRiftCleanup(createdWorkspaceContainerPath, { allowMarkerless: true });
+      }
+      if (createdWorkspaceContainerPath) {
+        await forgetRiftCleanup(createdWorkspaceContainerPath);
+      }
+    } catch {}
+  };
+
+  return riftRemovalCoordinator.run([epicId], async () => {
+  try {
+    if (!riftBinaryPath()) {
+      return { ok: false, error: 'Rift is not available on this platform.' };
+    }
+    const persistedState = await readPersistedStoreState();
+    const epic = (Array.isArray(persistedState?.epics) ? persistedState.epics : [])
+      .find((candidate) => candidate?.id === epicId);
+    if (!epic || typeof epic.riftPath !== 'string' || !epic.riftPath) {
+      return { ok: false, error: 'This epic does not have an active Rift workspace.' };
+    }
+    const existingWorkspacePath = path.resolve(epic.riftPath);
+    let workspacePath = existingWorkspacePath;
+    if (path.resolve(requestedRiftPath) !== existingWorkspacePath) {
+      return { ok: false, error: 'The requested Rift workspace no longer belongs to this epic.' };
+    }
+    const persistedOwners = await readPersistedRiftOwners(persistedState);
+    const persistedOwner = persistedOwners.get(epic.riftPath);
+    if (persistedOwner?.epicId !== epicId) {
+      return { ok: false, error: 'The epic’s Rift ownership is not durably recorded.' };
+    }
+    const workspaceStat = await fs.lstat(existingWorkspacePath).catch(() => null);
+    if (!workspaceStat?.isDirectory() || workspaceStat.isSymbolicLink()) {
+      return { ok: false, error: 'The epic’s Rift workspace is missing or unsafe to update.' };
+    }
+
+    const existingRepositories = Array.isArray(epic.repositories)
+      ? epic.repositories.filter(
+          (repository) =>
+            repository &&
+            typeof repository.projectId === 'string' &&
+            typeof repository.projectPath === 'string'
+        )
+      : [];
+    if (!existsSync(path.join(existingWorkspacePath, '.rift'))) {
+      const sharedRepositories = sharedRiftRepositories(epic.riftPath, persistedOwner);
+      const recordedRiftCount = existingRepositories.filter(
+        (repository) => typeof repository.riftPath === 'string' && repository.riftPath
+      ).length;
+      if (sharedRepositories === null || sharedRepositories.length !== recordedRiftCount) {
+        return { ok: false, error: 'The shared Rift contains an invalid repository path.' };
+      }
+    }
+    if (existingRepositories.some((repository) => repository.projectId === projectId)) {
+      return { ok: false, error: 'That project is already part of this epic.' };
+    }
+
+    const [canonicalProjectPath, canonicalGitRoot] = await (async () => {
+      const projectPath = await fs.realpath(requestedProjectPath);
+      const gitRoot = await fs.realpath(await getGitRoot(projectPath));
+      return [projectPath, gitRoot];
+    })();
+    const existingGitRoots = new Set(
+      (await Promise.all(
+        existingRepositories.map(async (repository) => {
+          if (typeof repository.gitRoot === 'string' && repository.gitRoot) {
+            return fs.realpath(repository.gitRoot).catch(() => path.resolve(repository.gitRoot));
+          }
+          try {
+            return await fs.realpath(await getGitRoot(repository.projectPath));
+          } catch {
+            return null;
+          }
+        })
+      )).filter(Boolean)
+    );
+    if (existingGitRoots.has(canonicalGitRoot)) {
+      return {
+        ok: false,
+        error: 'That project belongs to a Git repository already present in this Rift.',
+      };
+    }
+    const projectRelativePath = path.relative(canonicalGitRoot, canonicalProjectPath);
+    if (
+      path.isAbsolute(projectRelativePath) ||
+      projectRelativePath === '..' ||
+      projectRelativePath.startsWith(`..${path.sep}`)
+    ) {
+      return { ok: false, error: 'The selected project is outside its Git repository.' };
+    }
+    const sourceChanges = await readGitStatusEntries(canonicalGitRoot);
+    if (sourceChanges.length > 0) {
+      const examples = sourceChanges.slice(0, 3).map((entry) => entry.relativePath).join(', ');
+      return {
+        ok: false,
+        error:
+          `${path.basename(canonicalGitRoot)} has staged, unstaged, or untracked changes. ` +
+          'Commit, stash, or remove them before adding it to the Rift.' +
+          (examples ? ` Changed: ${examples}${sourceChanges.length > 3 ? ', …' : ''}` : ''),
+      };
+    }
+    const namespaceBranchExists = await commandSucceeds('git', [
+      '-C', canonicalGitRoot, 'rev-parse', '--verify', '--quiet', EPIC_BRANCH_NAMESPACE_REF,
+    ]);
+    if (namespaceBranchExists) {
+      return {
+        ok: false,
+        error: `${path.basename(canonicalGitRoot)} has a local branch named orion, which conflicts with Orion’s Rift branch namespace.`,
+      };
+    }
+    const targetBranch =
+      (typeof epic.gitBranch === 'string' && epic.gitBranch) ||
+      existingRepositories.find((repository) => typeof repository.gitBranch === 'string')?.gitBranch ||
+      '';
+    if (!targetBranch) {
+      return { ok: false, error: 'The epic does not have a feature branch for the new project.' };
+    }
+    if (await commandSucceeds('git', [
+      '-C', canonicalGitRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${targetBranch}`,
+    ])) {
+      return {
+        ok: false,
+        error: `${path.basename(canonicalGitRoot)} already has a local branch named ${targetBranch}.`,
+      };
+    }
+    const [{ stdout: headOutput }, sourceBranch] = await Promise.all([
+      execFileAsync('git', ['-C', canonicalGitRoot, 'rev-parse', '--verify', 'HEAD']),
+      getCurrentGitBranch(canonicalGitRoot),
+    ]);
+    const sourceHead = headOutput.trim();
+
+    const runtimeThreadIds = Array.isArray(input?.runtimeThreadIds)
+      ? [...new Set(input.runtimeThreadIds.filter((threadId) => typeof threadId === 'string' && threadId))]
+      : [];
+    if (runtimeThreadIds.length > 0) {
+      await Promise.all(runtimeThreadIds.map((threadId) => disposeAgentThreadRuntime(threadId)));
+    }
+
+    // Older one-project Epics use the repository Rift itself as their agent
+    // cwd. Turn that into a shared view without moving the live Rift (its
+    // metadata may contain absolute paths): create a neutral container and a
+    // validated symlink to the original repository, then place new Rift
+    // children beside that link. Cleanup continues to target real Rift paths.
+    let persistedRepositories = existingRepositories;
+    if (existsSync(path.join(existingWorkspacePath, '.rift'))) {
+      if (!isRiftDirectoryPath(existingWorkspacePath)) {
+        throw new Error('The existing Rift path is not safe to expand into a shared workspace.');
+      }
+      const suffix = crypto.randomBytes(12).toString('hex');
+      const workspaceName = `${riftSlug(epic.name)}-${suffix}`;
+      const workspaceParent = path.join(
+        path.dirname(path.dirname(existingWorkspacePath)),
+        'epics'
+      );
+      workspacePath = path.resolve(workspaceParent, workspaceName);
+      if (existsSync(workspacePath)) {
+        throw new Error(`The planned shared Rift workspace already exists: ${workspacePath}`);
+      }
+      createdWorkspaceContainerPath = workspacePath;
+      await fs.mkdir(workspacePath, { recursive: true });
+      await rememberRiftCleanup(workspacePath);
+
+      const primaryProject = (Array.isArray(persistedState?.projects) ? persistedState.projects : [])
+        .find((candidate) => candidate?.id === epic.repositoryProjectId);
+      const primary = existingRepositories[0] ?? {
+        projectId: epic.repositoryProjectId,
+        projectPath: primaryProject?.path ?? epic.gitRoot,
+        riftPath: existingWorkspacePath,
+        riftWorkingDir: epic.riftWorkingDir ?? existingWorkspacePath,
+        gitRoot: epic.gitRoot,
+        gitBranch: epic.gitBranch,
+      };
+      if (!primary.projectId || !primary.projectPath) {
+        throw new Error('The existing Rift repository is missing its project identity.');
+      }
+      const primaryRiftPath = path.resolve(primary.riftPath || existingWorkspacePath);
+      if (primaryRiftPath !== existingWorkspacePath) {
+        throw new Error('The existing Rift repository does not match its workspace.');
+      }
+      let primaryName = path.basename(primary.gitRoot || primary.projectPath) || 'project';
+      let primaryIndex = 2;
+      while (existsSync(path.join(workspacePath, primaryName))) {
+        primaryName = `${path.basename(primary.gitRoot || primary.projectPath) || 'project'}-${primaryIndex++}`;
+      }
+      const workspaceLinkPath = path.join(workspacePath, primaryName);
+      await fs.symlink(primaryRiftPath, workspaceLinkPath, 'dir');
+      persistedRepositories = [{ ...primary, riftPath: primaryRiftPath, workspaceLinkPath }];
+    }
+
+    const usedNames = new Set(
+      persistedRepositories
+        .map((repository) =>
+          typeof repository.workspaceLinkPath === 'string'
+            ? path.basename(repository.workspaceLinkPath)
+            : typeof repository.riftPath === 'string'
+              ? path.basename(repository.riftPath)
+              : ''
+        )
+        .filter(Boolean)
+    );
+    const baseName = path.basename(canonicalGitRoot) || 'project';
+    let repositoryName = baseName;
+    let duplicateIndex = 2;
+    while (usedNames.has(repositoryName) || existsSync(path.join(workspacePath, repositoryName))) {
+      repositoryName = `${baseName}-${duplicateIndex++}`;
+    }
+    const expectedRepositoryPath = path.join(workspacePath, repositoryName);
+    createdRepositoryPath = expectedRepositoryPath;
+    await rememberRiftCleanup(expectedRepositoryPath);
+    await riftInit(canonicalGitRoot, { signal: abortController.signal });
+    const reportedPath = await riftCreate(canonicalGitRoot, {
+      name: repositoryName,
+      into: workspacePath,
+      signal: abortController.signal,
+    });
+    const repositoryRiftPath = path.resolve(reportedPath);
+    if (repositoryRiftPath !== expectedRepositoryPath) {
+      throw new Error(`rift create reported an unexpected workspace path: ${repositoryRiftPath}`);
+    }
+    const { stdout: excludeOutput } = await execFileAsync('git', [
+      '-C', repositoryRiftPath, 'rev-parse', '--git-path', 'info/exclude',
+    ]);
+    const excludePath = path.isAbsolute(excludeOutput.trim())
+      ? excludeOutput.trim()
+      : path.resolve(repositoryRiftPath, excludeOutput.trim());
+    await fs.appendFile(excludePath, '\n# Orion Rift metadata\n.rift\n');
+    await execFileAsync('git', ['-C', repositoryRiftPath, 'reset', '--hard', sourceHead]);
+    await execFileAsync('git', [
+      '-C', repositoryRiftPath, 'clean', '-ffd', '-e', '.rift', '-e', '.rift/**',
+    ]);
+    await execFileAsync('git', ['-C', repositoryRiftPath, 'checkout', '-b', targetBranch]);
+    if ((await readGitStatusEntries(repositoryRiftPath)).length > 0) {
+      throw new Error(`${baseName} could not switch cleanly to its Rift branch.`);
+    }
+    const riftWorkingDir = projectRelativePath
+      ? path.join(repositoryRiftPath, projectRelativePath)
+      : repositoryRiftPath;
+    if (!(await fs.stat(riftWorkingDir).catch(() => null))?.isDirectory()) {
+      throw new Error(`${baseName} does not contain the selected project directory.`);
+    }
+    if (abortController.signal.aborted || riftShutdownRequested) {
+      throw new Error('Rift project setup was cancelled because its Orion window closed.');
+    }
+
+    const repositories = [
+      ...persistedRepositories,
+      {
+        projectId,
+        projectPath: canonicalProjectPath,
+        sourceBranch: sourceBranch || undefined,
+        riftPath: repositoryRiftPath,
+        riftWorkingDir,
+        gitRoot: canonicalGitRoot,
+        gitBranch: targetBranch,
+      },
+    ];
+    const primary = repositories[0];
+    const ownership = {
+      epicId,
+      projectId: primary?.projectId ?? epic.repositoryProjectId,
+      projectPath: primary?.projectPath ?? canonicalProjectPath,
+      riftPath: workspacePath,
+      riftWorkingDir:
+        createdWorkspaceContainerPath ||
+        (typeof epic.riftWorkingDir === 'string' && epic.riftWorkingDir) ||
+        workspacePath,
+      gitRoot: (typeof epic.gitRoot === 'string' && epic.gitRoot) || primary?.gitRoot,
+      branch: targetBranch,
+      sourceBranch: primary?.sourceBranch,
+      repositories,
+      resetRuntimeSessions: Boolean(createdWorkspaceContainerPath),
+    };
+    unacknowledgedRifts.set(epicId, ownership);
+    awaitingPersistenceAck = true;
+    return { ok: true, ...ownership, addedProjectId: projectId };
+  } catch (error) {
+    const message = error?.stderr?.toString().trim() || error?.message || String(error);
+    await cleanupCreatedRepository();
+    return { ok: false, error: message };
+  } finally {
+    event.sender.removeListener('destroyed', cancelForDestroyedSender);
+    settlePendingCreation();
+    pendingRiftCreations.delete(pendingEntry);
+    if (!awaitingPersistenceAck) pendingRiftEpicIds.delete(epicId);
+  }
+  });
+};
+
+ipcMain.handle('epic:addRiftProject', (event, input) =>
+  addProjectToExistingRift(event, input)
+);
+
 ipcMain.handle('epic:createRift', async (event, input) => {
   if (Array.isArray(input?.projects) && input.projects.length > 1) {
     return createMultiProjectRift(event, input);
@@ -4442,6 +4785,12 @@ ipcMain.handle('epic:removeRift', async (_event, input) => {
   if (!epicId) {
     return { ok: false, error: 'Missing epic id.' };
   }
+  // Setup takes this main-owned flag before its first await and also reserves
+  // the coordinator synchronously. Reject instead of queueing deletion behind
+  // a workspace mutation whose new ownership is not durable yet.
+  if (pendingRiftEpicIds.has(epicId)) {
+    return { ok: false, error: 'This epic’s Rift workspace is still being updated.' };
+  }
   return riftRemovalCoordinator.run([epicId], async () => {
     try {
       const riftPath = input?.riftPath;
@@ -4466,6 +4815,17 @@ ipcMain.handle('epic:removeRift', async (_event, input) => {
             ),
           ]
         : [];
+      const requestedRiftRepositories = Array.isArray(input?.riftRepositories)
+        ? input.riftRepositories.filter(
+            (repository) =>
+              repository && typeof repository.riftPath === 'string' && repository.riftPath
+          )
+        : [];
+      let repositoryRiftPaths = requestedRiftRepositories.length > 0
+        ? [...new Set(requestedRiftRepositories.map((repository) => repository.riftPath))]
+        : Array.isArray(input?.riftPaths)
+          ? [...new Set(input.riftPaths.filter((value) => typeof value === 'string' && value))]
+          : [];
       // Join the shared removal queue before runtime teardown. Retention and
       // manual release cannot cross this deletion's disposal/ref/removal
       // sequence, and agent launches remain guarded for the full operation.
@@ -4474,18 +4834,35 @@ ipcMain.handle('epic:removeRift', async (_event, input) => {
       );
       // A path already gone is an idempotent success.
       if (!existsSync(riftPath)) {
+        const linkedRepositoryRiftPaths = requestedRiftRepositories
+          .filter((repository) => isExternalRiftLinkedFromWorkspace(riftPath, repository))
+          .map((repository) => path.resolve(repository.riftPath))
+          .filter((repositoryRiftPath, index, paths) => paths.indexOf(repositoryRiftPath) === index)
+          .filter((repositoryRiftPath) => existsSync(repositoryRiftPath));
+        for (const repositoryRiftPath of linkedRepositoryRiftPaths) {
+          if (
+            !isRiftDirectoryPath(repositoryRiftPath) ||
+            !existsSync(path.join(repositoryRiftPath, '.rift'))
+          ) {
+            return { ok: false, error: 'The linked Rift repository is unsafe to remove.' };
+          }
+        }
+        for (const repositoryRiftPath of [...linkedRepositoryRiftPaths].reverse()) {
+          await riftRemove(repositoryRiftPath);
+          await forgetRiftCleanup(repositoryRiftPath).catch(() => {});
+        }
         try {
           await forgetRiftCleanup(riftPath);
         } catch (error) {
           console.error('Could not clear old deleted Rift cleanup entry', riftPath, error);
         }
         const restoreRefResult = await deleteEpicRestoreRefBestEffort(input);
-        return { ok: true, skipped: true, warning: restoreRefResult.warning };
+        return {
+          ok: true,
+          ...(linkedRepositoryRiftPaths.length === 0 ? { skipped: true } : {}),
+          warning: restoreRefResult.warning,
+        };
       }
-
-      let repositoryRiftPaths = Array.isArray(input?.riftPaths)
-        ? [...new Set(input.riftPaths.filter((value) => typeof value === 'string' && value))]
-        : [];
       if (
         repositoryRiftPaths.length === 0 &&
         !existsSync(path.join(riftPath, '.rift')) &&
@@ -4503,13 +4880,26 @@ ipcMain.handle('epic:removeRift', async (_event, input) => {
           const resolvedRepositoryPath = path.resolve(repositoryRiftPath);
           const relative = path.relative(resolvedWorkspace, resolvedRepositoryPath);
           if (!existsSync(resolvedRepositoryPath)) continue;
-          if (
-            !relative ||
-            path.isAbsolute(relative) ||
-            relative === '..' ||
-            relative.startsWith(`..${path.sep}`) ||
-            !existsSync(path.join(resolvedRepositoryPath, '.rift'))
-          ) {
+          const directChild =
+            Boolean(relative) &&
+            !path.isAbsolute(relative) &&
+            relative !== '..' &&
+            !relative.startsWith(`..${path.sep}`) &&
+            path.dirname(resolvedRepositoryPath) === resolvedWorkspace;
+          const requestedRepository = requestedRiftRepositories.find(
+            (repository) => path.resolve(repository.riftPath) === resolvedRepositoryPath
+          );
+          let validatedExternalLink = false;
+          if (!directChild && typeof requestedRepository?.workspaceLinkPath === 'string') {
+            const linkPath = path.resolve(requestedRepository.workspaceLinkPath);
+            try {
+              validatedExternalLink =
+                path.dirname(linkPath) === resolvedWorkspace &&
+                lstatSync(linkPath).isSymbolicLink() &&
+                path.resolve(realpathSync(linkPath)) === resolvedRepositoryPath;
+            } catch {}
+          }
+          if ((!directChild && !validatedExternalLink) || !existsSync(path.join(resolvedRepositoryPath, '.rift'))) {
             return { ok: false, error: 'The shared Rift contains an invalid repository path.' };
           }
         }
@@ -4742,14 +5132,31 @@ const sharedRiftRepositories = (riftPath, owner) => {
     if (typeof repository?.riftPath !== 'string' || !repository.riftPath) continue;
     const repositoryPath = path.resolve(repository.riftPath);
     const relative = path.relative(workspacePath, repositoryPath);
-    if (
-      !relative ||
-      path.isAbsolute(relative) ||
-      relative === '..' ||
-      relative.startsWith(`..${path.sep}`) ||
-      path.dirname(repositoryPath) !== workspacePath
-    ) {
-      return null;
+    const directChild =
+      Boolean(relative) &&
+      !path.isAbsolute(relative) &&
+      relative !== '..' &&
+      !relative.startsWith(`..${path.sep}`) &&
+      path.dirname(repositoryPath) === workspacePath;
+    if (!directChild) {
+      // A one-project Rift can later become shared without relocating that
+      // existing copy. In that case its persisted link must be an immediate
+      // symlink child of the shared container and resolve to this exact Rift.
+      if (typeof repository.workspaceLinkPath !== 'string' || !repository.workspaceLinkPath) {
+        return null;
+      }
+      const linkPath = path.resolve(repository.workspaceLinkPath);
+      try {
+        if (
+          path.dirname(linkPath) !== workspacePath ||
+          !lstatSync(linkPath).isSymbolicLink() ||
+          path.resolve(realpathSync(linkPath)) !== repositoryPath
+        ) {
+          return null;
+        }
+      } catch {
+        return null;
+      }
     }
     repositories.push({ ...repository, riftPath: repositoryPath });
   }
@@ -4827,6 +5234,47 @@ const removeOwnedRift = async (riftPath, owner) => {
   if (existsSync(riftPath)) await shell.trashItem(riftPath);
 };
 
+const linkedRepositoriesForMissingWorkspace = (riftPath, owner) => {
+  if (!owner || !Array.isArray(owner.repositories)) return [];
+  const repositories = [];
+  const seen = new Set();
+  for (const repository of owner.repositories) {
+    if (
+      typeof repository?.riftPath !== 'string' ||
+      !repository.riftPath ||
+      !existsSync(repository.riftPath)
+    ) {
+      continue;
+    }
+    if (!isExternalRiftLinkedFromWorkspace(riftPath, repository)) return null;
+    const repositoryRiftPath = path.resolve(repository.riftPath);
+    if (seen.has(repositoryRiftPath)) continue;
+    seen.add(repositoryRiftPath);
+    repositories.push({ ...repository, riftPath: repositoryRiftPath });
+  }
+  return repositories;
+};
+
+const readRepositoryRiftsWorkState = async (repositories) => {
+  const states = await Promise.all(
+    repositories.map((repository) => readRiftWorkState(repository.riftPath))
+  );
+  return {
+    hasUncommittedChanges: states.some((state) => state.hasUncommittedChanges),
+    hasUnpushedCommits: states.some((state) => state.hasUnpushedCommits),
+  };
+};
+
+const preserveRepositoryRiftHeadsForRestore = async (repositories, owner) => {
+  for (const repository of repositories) {
+    await preserveRiftHeadForRestore(repository.riftPath, {
+      ...owner,
+      gitRoot: repository.gitRoot,
+      gitBranch: repository.gitBranch ?? owner.gitBranch,
+    });
+  }
+};
+
 // Rift roots reachable from persisted state: an epic's own rift parent, the
 // root its source repository would use, and every project's. Unowned rifts
 // left behind by crashes or deleted epics only turn up through the last two.
@@ -4878,6 +5326,12 @@ const mapWithConcurrency = async (items, worker) => {
 const scanRiftStorage = async ({ remeasure = false } = {}) => {
   const state = await readPersistedStoreState();
   const owners = await readPersistedRiftOwners(state);
+  const pendingOwners = collectPendingRiftOwnersByPath(
+    unacknowledgedRifts,
+    pendingRiftCreations
+  );
+  const scanOwners = new Map(pendingOwners);
+  for (const [riftPath, owner] of owners) scanOwners.set(riftPath, owner);
   const cache = await loadSizeCache();
   const nextCache = {};
 
@@ -4891,17 +5345,14 @@ const scanRiftStorage = async ({ remeasure = false } = {}) => {
     if (trashPath) trashCandidates.push(trashPath);
     for (const riftPath of rifts) discovered.push({ riftPath, riftRoot });
   }
+  const { visibleRifts, externalSizePathsByWorkspace } = planRiftStorageEntries(
+    discovered,
+    scanOwners,
+    existsSync
+  );
   const trashPaths = collapseNestedPaths(trashCandidates);
 
-  const entries = await mapWithConcurrency(discovered, async ({ riftPath, riftRoot }) => {
-    // Creation can advance while an IO-heavy scan is in flight, so consult
-    // main-owned handshakes at classification time instead of snapshotting
-    // them before directory discovery.
-    const pendingOwner = collectPendingRiftOwnersByPath(
-      unacknowledgedRifts,
-      pendingRiftCreations
-    ).get(riftPath);
-    const owner = owners.get(riftPath) ?? pendingOwner;
+  const measureCachedPath = async (riftPath) => {
     const cached = cache[riftPath];
     const reuseCached = !remeasure && typeof cached?.bytes === 'number';
     const bytes = reuseCached ? cached.bytes : await measurePathSize(riftPath);
@@ -4909,6 +5360,35 @@ const scanRiftStorage = async ({ remeasure = false } = {}) => {
       bytes,
       measuredAt: reuseCached ? cached.measuredAt : new Date().toISOString(),
     };
+    return bytes;
+  };
+
+  const externalSizePaths = [
+    ...new Set([...externalSizePathsByWorkspace.values()].flat()),
+  ];
+  const externalBytes = new Map(
+    await mapWithConcurrency(externalSizePaths, async (riftPath) => [
+      riftPath,
+      await measureCachedPath(riftPath),
+    ])
+  );
+
+  const entries = await mapWithConcurrency(visibleRifts, async ({ riftPath, riftRoot }) => {
+    // Creation can advance while an IO-heavy scan is in flight, so consult
+    // main-owned handshakes at classification time instead of snapshotting
+    // them before directory discovery.
+    const pendingOwner = pendingOwners.get(riftPath);
+    const owner = owners.get(riftPath) ?? pendingOwner;
+    const ownBytes = existsSync(riftPath) ? await measureCachedPath(riftPath) : 0;
+    const measuredBytes = [
+      ownBytes,
+      ...(externalSizePathsByWorkspace.get(path.resolve(riftPath)) ?? []).map(
+        (externalPath) => externalBytes.get(externalPath) ?? null
+      ),
+    ];
+    const bytes = measuredBytes.every((value) => value == null)
+      ? null
+      : measuredBytes.reduce((total, value) => total + (value ?? 0), 0);
 
     let status = 'orphan';
     if (owner) {
@@ -5085,9 +5565,20 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
     return path.basename(current) === '.trash' ? path.dirname(current) : path.dirname(trashPath);
   };
   const measurementPaths = [
-    ...requested.flatMap((value) =>
-      typeof value === 'string' && value ? [path.dirname(path.resolve(value))] : []
-    ),
+    ...requested.flatMap((value) => {
+      if (typeof value !== 'string' || !value) return [];
+      const owner = owners.get(value);
+      const linkedRepositoryParents = Array.isArray(owner?.repositories)
+        ? owner.repositories.flatMap((repository) =>
+            isExternalRiftLinkedFromWorkspace(value, repository) &&
+            typeof repository.riftPath === 'string' &&
+            repository.riftPath
+              ? [path.dirname(path.resolve(repository.riftPath))]
+              : []
+          )
+        : [];
+      return [path.dirname(path.resolve(value)), ...linkedRepositoryParents];
+    }),
     ...[...trashPaths].map(trashSamplePath),
   ];
   const freeBefore = await readVolumeFreeSpace(measurementPaths);
@@ -5119,10 +5610,57 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
       reject(owner && !owner.settledAt && !owner.cleanupPending ? 'epic-active' : 'ownership-changed');
       continue;
     }
+    // Repository children are implementation details of one Epic workspace.
+    // Even a stale renderer request must release the parent so every linked
+    // repository is checked, preserved, and removed as one lifecycle unit.
+    if (owner?.repositoryChild) {
+      reject('workspace-owned');
+      continue;
+    }
     if (!existsSync(riftPath)) {
-      // Already gone; let the renderer clear the epic's pointer anyway.
-      await forgetRiftCleanup(riftPath);
-      if (owner) {
+      const linkedRepositories = linkedRepositoriesForMissingWorkspace(riftPath, owner);
+      if (linkedRepositories === null) {
+        reject('unsafe-path');
+        continue;
+      }
+      if (linkedRepositories.length > 0) {
+        const linkedRepositoriesAreSafe = linkedRepositories.every(
+          (repository) =>
+            isRiftDirectoryPath(repository.riftPath) &&
+            existsSync(path.join(repository.riftPath, '.rift'))
+        );
+        if (!linkedRepositoriesAreSafe) {
+          reject('unsafe-path');
+          continue;
+        }
+        if (owner && !owner.settledAt && !owner.cleanupPending && !manuallyConfirmed) {
+          reject('epic-active');
+          continue;
+        }
+        if (owner && (busyEpicIds.has(owner.epicId) || pendingRiftEpicIds.has(owner.epicId))) {
+          reject('epic-busy');
+          continue;
+        }
+        if (!forcedPaths.has(riftPath)) {
+          const workState = await readRepositoryRiftsWorkState(linkedRepositories);
+          if (workState.hasUncommittedChanges || workState.hasUnpushedCommits) {
+            reject('unpushed-work');
+            continue;
+          }
+        }
+        if (owner && !owner.cleanupPending) {
+          try {
+            await preserveRepositoryRiftHeadsForRestore(linkedRepositories, owner);
+          } catch (error) {
+            results.push({
+              riftPath,
+              ok: false,
+              reason: 'restore-ref-failed',
+              error: error?.message || String(error),
+            });
+            continue;
+          }
+        }
         try {
           await Promise.all(
             runtimeThreadIdsForEpic(owner.epicId).map((threadId) =>
@@ -5138,7 +5676,69 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
           });
           continue;
         }
+        const currentOwner = (await readPersistedRiftOwners()).get(riftPath);
+        if (!isRiftReleaseOwnerCurrent(currentOwner, owner)) {
+          reject(
+            currentOwner && !currentOwner.settledAt && !currentOwner.cleanupPending
+              ? 'epic-active'
+              : 'ownership-changed'
+          );
+          continue;
+        }
+        if (!forcedPaths.has(riftPath)) {
+          const finalWorkState = await readRepositoryRiftsWorkState(linkedRepositories);
+          if (finalWorkState.hasUncommittedChanges || finalWorkState.hasUnpushedCommits) {
+            reject('unpushed-work');
+            continue;
+          }
+        }
+        if (owner && !owner.cleanupPending) {
+          try {
+            await preserveRepositoryRiftHeadsForRestore(linkedRepositories, owner);
+          } catch (error) {
+            results.push({
+              riftPath,
+              ok: false,
+              reason: 'restore-ref-failed',
+              error: error?.message || String(error),
+            });
+            continue;
+          }
+        }
+        const boundaryOwner = (await readPersistedRiftOwners()).get(riftPath);
+        if (!isRiftReleaseOwnerCurrent(boundaryOwner, owner)) {
+          reject(
+            boundaryOwner && !boundaryOwner.settledAt && !boundaryOwner.cleanupPending
+              ? 'epic-active'
+              : 'ownership-changed'
+          );
+          continue;
+        }
         try {
+          for (const repository of [...linkedRepositories].reverse()) {
+            await riftRemove(repository.riftPath);
+            await forgetRiftCleanup(repository.riftPath).catch(() => {});
+          }
+        } catch (error) {
+          results.push({
+            riftPath,
+            ok: false,
+            reason: 'remove-failed',
+            error: error?.message || String(error),
+          });
+          continue;
+        }
+      }
+
+      // The parent was already gone. Clear its cleanup entry only after any
+      // externally linked repository has crossed the same safety boundary.
+      await forgetRiftCleanup(riftPath);
+      if (owner) {
+        try {
+          // A journal keyed to an already-missing parent cannot safely infer
+          // whether external children were removed after a crash. Record the
+          // release only once every surviving child is gone; before then the
+          // persisted Epic metadata remains the recovery source of truth.
           await beginRiftRelease({ riftPath, epicId: owner.epicId });
           await completeRiftRelease({ riftPath, epicId: owner.epicId });
         } catch (error) {
@@ -5151,7 +5751,12 @@ ipcMain.handle('riftStorage:release', async (_event, input) => {
           continue;
         }
       }
-      results.push({ riftPath, ok: true, skipped: true, epicId: owner?.epicId ?? null });
+      results.push({
+        riftPath,
+        ok: true,
+        ...(linkedRepositories.length === 0 ? { skipped: true } : {}),
+        epicId: owner?.epicId ?? null,
+      });
       continue;
     }
     // Only ever remove something shaped exactly like an Orion-created rift.

@@ -211,6 +211,7 @@ import {
 import type { SidebarFooterProps } from './app/SidebarFooter';
 import type { SettingsPageProps } from './app/SettingsPage';
 import type {
+  AddProjectToEpicDialogState,
   AppUpdateState,
   EpicCommitDialogState,
   EpicPrBaseDialogState,
@@ -291,6 +292,7 @@ const RIFT_RELEASE_REASON_LABELS: Record<string, string> = {
   'runtime-dispose-failed': 'its agent runtimes could not be stopped safely',
   'journal-failed': 'its release could not be recorded safely',
   'ownership-changed': 'its epic ownership changed while cleanup was running',
+  'workspace-owned': 'it is managed by its parent Epic workspace',
   'remove-failed': 'could not be removed',
 };
 
@@ -1034,6 +1036,7 @@ const App: React.FC = () => {
       branch?: string;
       sourceBranch?: string;
       repositories?: EpicRepository[];
+      resetRuntimeSessions?: boolean;
     }>;
   } | null>(null);
   // Epics whose rift workspace is still being created (branch naming runs a
@@ -1107,6 +1110,8 @@ const App: React.FC = () => {
   // Message dialog shown before an epic's commit & push. An empty message
   // hands the write back to the epic message model.
   const [epicCommitDialog, setEpicCommitDialog] = useState<EpicCommitDialogState | null>(null);
+  const [addProjectToEpicDialog, setAddProjectToEpicDialog] =
+    useState<AddProjectToEpicDialogState | null>(null);
   // Base-branch and message picker shown before opening an epic's pull
   // request. Holds the origin branches fetched for the picker, the user's
   // current selection, and their optional hand-written title/description.
@@ -2378,6 +2383,14 @@ const App: React.FC = () => {
       })),
     [projects, selectedEpic]
   );
+  const selectedEpicHasProjectAvailable = useMemo(() => {
+    if (!selectedEpic) return false;
+    const existingProjectIds = new Set([
+      ...(selectedEpic.repositories ?? []).map((repository) => repository.projectId),
+      ...(selectedEpic.repositoryProjectId ? [selectedEpic.repositoryProjectId] : []),
+    ]);
+    return projects.some((project) => !existingProjectIds.has(project.id));
+  }, [projects, selectedEpic]);
   const selectedEpicGitStatus = selectedEpic ? epicGitStatuses[selectedEpic.id] : undefined;
   // Fail open until the first status arrives. In commit-only mode, an
   // unpushed commit is not actionable because this button deliberately cannot
@@ -5202,6 +5215,7 @@ const App: React.FC = () => {
       branch?: string;
       sourceBranch?: string;
       repositories?: EpicRepository[];
+      resetRuntimeSessions?: boolean;
     }) => {
       const state = useOrionStore.getState();
       const epic = state.epics.find((candidate) => candidate.id === ownership.epicId);
@@ -5237,6 +5251,35 @@ const App: React.FC = () => {
                 }
               : repository
           );
+      const workspaceChanged =
+        ownership.resetRuntimeSessions === true ||
+        Boolean(epic.riftPath && epic.riftPath !== ownership.riftPath);
+      let threadsChanged = false;
+      for (const thread of runtimeThreadsForEpic(state.threads, ownership.epicId)) {
+        const updates: Partial<Thread> = {};
+        if (thread.epicId === ownership.epicId && thread.projectId !== project.id) {
+          updates.projectId = project.id;
+        }
+        // Expanding a legacy one-project Rift changes its agent cwd to the new
+        // shared container. Never resume a provider session rooted at the old
+        // repository-only cwd after that migration, including crash recovery.
+        if (workspaceChanged) {
+          updates.agentSessionIds = undefined;
+          updates.pendingForkProviders = undefined;
+        }
+        if (Object.keys(updates).length > 0) {
+          updateThread(thread.id, updates);
+          threadsChanged = true;
+        }
+      }
+
+      // A legacy expansion changes the provider cwd. Commit session resets to
+      // thread storage before the store can activate the new shared workspace;
+      // otherwise a crash between independent saves can resume an old session
+      // under the new cwd.
+      if (threadsChanged && !(await flushOrionThreadsSave())) {
+        return { ok: false, error: 'Could not save Rift thread sessions.' };
+      }
       updateEpic(ownership.epicId, {
         riftPath: ownership.riftPath,
         riftWorkingDir: ownership.riftWorkingDir,
@@ -5248,11 +5291,6 @@ const App: React.FC = () => {
         repositoryProjectId: project.id,
         ...(repositories ? { repositories } : {}),
       });
-      for (const thread of useOrionStore.getState().threads) {
-        if (thread.epicId === ownership.epicId && thread.projectId !== project.id) {
-          updateThread(thread.id, { projectId: project.id });
-        }
-      }
 
       // Main verifies the saved store itself before releasing its ownership
       // journal and source-workspace lock.
@@ -5567,6 +5605,7 @@ const App: React.FC = () => {
           branch: result.branch,
           sourceBranch: result.sourceBranch,
           repositories: result.repositories,
+          resetRuntimeSessions: result.resetRuntimeSessions,
         });
         if (!acknowledgement.ok) {
           // The status effect may have gone idle before this local creation
@@ -5633,6 +5672,123 @@ const App: React.FC = () => {
       if (!keepSetupLocked) markRiftSetup(epicId, false);
     }
   }, [markRiftSetup, persistAndAcknowledgeRift, resolveUtilityTurn, updateEpic]);
+
+  const openAddProjectToEpicDialog = useCallback((epic: Epic) => {
+    const state = useOrionStore.getState();
+    const latestEpic = state.epics.find((candidate) => candidate.id === epic.id);
+    if (!latestEpic?.riftPath || latestEpic.riftReleased || latestEpic.riftCleanupPending) {
+      toast.error('Projects can only be added to an active Rift workspace');
+      return;
+    }
+    if (riftSetupEpicIdsRef.current[epic.id] || riftRemovalEpicIdsRef.current.has(epic.id)) {
+      toast.error('Wait for the current Rift operation to finish');
+      return;
+    }
+    if (epicGitBusyRef.current[epic.id]) {
+      toast.error('Wait for the current Epic Git operation to finish');
+      return;
+    }
+    const existingProjectIds = new Set([
+      ...(latestEpic.repositories ?? []).map((repository) => repository.projectId),
+      ...(latestEpic.repositoryProjectId ? [latestEpic.repositoryProjectId] : []),
+    ]);
+    const nextProject = state.projects.find((project) => !existingProjectIds.has(project.id));
+    if (!nextProject) {
+      toast.info('Every Orion project is already part of this epic');
+      return;
+    }
+    setAddProjectToEpicDialog({
+      epicId: latestEpic.id,
+      projectId: nextProject.id,
+      submitting: false,
+    });
+  }, []);
+
+  const handleAddProjectToEpic = useCallback(async () => {
+    const dialog = addProjectToEpicDialog;
+    if (!dialog || dialog.submitting) return;
+    const state = useOrionStore.getState();
+    const epic = state.epics.find((candidate) => candidate.id === dialog.epicId);
+    const project = state.projects.find((candidate) => candidate.id === dialog.projectId);
+    if (!epic?.riftPath || !project) {
+      toast.error('The selected epic or project is no longer available');
+      setAddProjectToEpicDialog(null);
+      return;
+    }
+    if (runningAgentEpicIds.has(epic.id)) {
+      toast.error('Wait for this epic’s agents to finish before adding a project');
+      return;
+    }
+    if (epicGitBusyRef.current[epic.id]) {
+      toast.error('Wait for the current Epic Git operation to finish');
+      return;
+    }
+    if (!window.orion?.epicAddRiftProject) {
+      toast.error('This Orion build cannot add projects to an existing Rift');
+      return;
+    }
+
+    setAddProjectToEpicDialog((current) =>
+      current?.epicId === epic.id ? { ...current, submitting: true } : current
+    );
+    markRiftSetup(epic.id, true);
+    let keepSetupLocked = false;
+    try {
+      // Initial one-project Rifts run agents from the repository copy itself.
+      // Their next run will use a shared container, so stop every retained
+      // provider runtime before main changes the workspace layout.
+      const runtimeThreadIds =
+        (epic.repositories?.length ?? 0) <= 1
+          ? runtimeThreadsForEpic(state.threads, epic.id).map((thread) => thread.id)
+          : [];
+      if (!(await flushOrionStoreSave())) {
+        throw new Error('Could not save the current Rift ownership.');
+      }
+      const result = await window.orion.epicAddRiftProject({
+        epicId: epic.id,
+        riftPath: epic.riftPath,
+        projectId: project.id,
+        projectPath: project.path,
+        ...(runtimeThreadIds.length > 0 ? { runtimeThreadIds } : {}),
+      });
+      if (!result.ok || !result.riftPath || !result.projectPath) {
+        throw new Error(result.error ?? 'Rift project setup failed.');
+      }
+      keepSetupLocked = true;
+      const acknowledgement = await persistAndAcknowledgeRift({
+        epicId: epic.id,
+        projectId: result.projectId,
+        projectPath: result.projectPath,
+        riftPath: result.riftPath,
+        riftWorkingDir: result.riftWorkingDir ?? result.riftPath,
+        gitRoot: result.gitRoot,
+        branch: result.branch,
+        sourceBranch: result.sourceBranch,
+        repositories: result.repositories,
+        resetRuntimeSessions: result.resetRuntimeSessions,
+      });
+      if (!acknowledgement.ok) {
+        setRiftRecoveryRefreshNonce((current) => current + 1);
+        setAddProjectToEpicDialog(null);
+        toast.error('Project added, but Rift ownership could not be persisted', {
+          description: acknowledgement.error,
+        });
+        return;
+      }
+      keepSetupLocked = false;
+      setAddProjectToEpicDialog(null);
+      toast.success(`${project.name} added to ${epic.name}`);
+    } catch (error) {
+      toast.error('Could not add the project to this Rift', {
+        description: error instanceof Error ? error.message : undefined,
+      });
+      setAddProjectToEpicDialog((current) =>
+        current?.epicId === epic.id ? { ...current, submitting: false } : current
+      );
+    } finally {
+      if (!keepSetupLocked) markRiftSetup(epic.id, false);
+    }
+  }, [addProjectToEpicDialog, markRiftSetup, persistAndAcknowledgeRift, runningAgentEpicIds]);
 
   const handleCreateEpic = () => {
     const trimmed = newEpicName.trim();
@@ -7164,6 +7320,16 @@ const App: React.FC = () => {
             ? {
                 riftPaths: currentEpic.repositories.flatMap((repository) =>
                   repository.riftPath ? [repository.riftPath] : []
+                ),
+                riftRepositories: currentEpic.repositories.flatMap((repository) =>
+                  repository.riftPath
+                    ? [{
+                        riftPath: repository.riftPath,
+                        ...(repository.workspaceLinkPath
+                          ? { workspaceLinkPath: repository.workspaceLinkPath }
+                          : {}),
+                      }]
+                    : []
                 ),
               }
             : {}),
@@ -10749,6 +10915,10 @@ const App: React.FC = () => {
 
   const appDialogsModel: AppDialogsModel = {
     projects,
+    epics,
+    addProjectToEpicDialog,
+    setAddProjectToEpicDialog,
+    handleAddProjectToEpic,
     createEpicOpen,
     newEpicName,
     setNewEpicName,
@@ -10789,7 +10959,12 @@ const App: React.FC = () => {
     formatBytes,
   };
   const hasOpenDialog = Boolean(
-    epicCommitDialog || epicPrBaseDialog || epicSettleDialog || riftSweepDialog || createEpicOpen
+    epicCommitDialog ||
+      epicPrBaseDialog ||
+      epicSettleDialog ||
+      riftSweepDialog ||
+      createEpicOpen ||
+      addProjectToEpicDialog
   );
 
   // Keep the memoized sidebar detached from composer typing. These wrappers
@@ -10799,6 +10974,7 @@ const App: React.FC = () => {
     handleNewAgent,
     handleCreateThread,
     handleCreateThreadForEpic,
+    openAddProjectToEpicDialog,
     handleRemoveThreadFromEpic,
     handleDeleteEpic,
     handleSettleEpic,
@@ -10808,6 +10984,7 @@ const App: React.FC = () => {
       handleNewAgent,
       handleCreateThread,
       handleCreateThreadForEpic,
+      openAddProjectToEpicDialog,
       handleRemoveThreadFromEpic,
       handleDeleteEpic,
       handleSettleEpic,
@@ -10821,6 +10998,8 @@ const App: React.FC = () => {
         agentsSidebarActionsRef.current.handleCreateThread(...args),
       handleCreateThreadForEpic: (...args: Parameters<typeof handleCreateThreadForEpic>) =>
         agentsSidebarActionsRef.current.handleCreateThreadForEpic(...args),
+      openAddProjectToEpicDialog: (...args: Parameters<typeof openAddProjectToEpicDialog>) =>
+        agentsSidebarActionsRef.current.openAddProjectToEpicDialog(...args),
       handleRemoveThreadFromEpic: (...args: Parameters<typeof handleRemoveThreadFromEpic>) =>
         agentsSidebarActionsRef.current.handleRemoveThreadFromEpic(...args),
       handleDeleteEpic: (...args: Parameters<typeof handleDeleteEpic>) =>
@@ -12860,6 +13039,25 @@ const App: React.FC = () => {
                             {selectedEpicClaimedProject?.name ?? selectedEpic.gitRoot}
                             {selectedEpic.gitBranch ? ` · ${selectedEpic.gitBranch}` : ''}
                           </span>
+                          <button
+                            type="button"
+                            className="sidebar-section-action epic-view-add-project"
+                            disabled={
+                              !selectedEpic.riftPath ||
+                              Boolean(selectedEpic.riftReleased) ||
+                              Boolean(selectedEpic.riftCleanupPending) ||
+                              Boolean(riftSetupEpicIds[selectedEpic.id]) ||
+                              Boolean(riftRemovalEpicIds[selectedEpic.id]) ||
+                              Boolean(selectedEpicGitBusy) ||
+                              selectedEpicHasRunningAgents ||
+                              !selectedEpicHasProjectAvailable
+                            }
+                            title="Add project"
+                            aria-label="Add project"
+                            onClick={() => openAddProjectToEpicDialog(selectedEpic)}
+                          >
+                            <Plus size={14} />
+                          </button>
                         </div>
                       ) : (
                         <div className="epic-view-repository-picker" ref={epicRepoPickerRef}>
