@@ -77,13 +77,15 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('riftStorage:released', listener);
   },
 
-  // Agent skills (Settings > Skills)
+  // Agent skills and MCP servers (Settings > Skills & MCPs)
   listSkills: () => ipcRenderer.invoke('skills:list'),
   importSkills: (input) => ipcRenderer.invoke('skills:import', input),
   setSkillEnabled: (input) => ipcRenderer.invoke('skills:setEnabled', input),
   deleteSkill: (input) => ipcRenderer.invoke('skills:delete', input),
   revealSkill: (input) => ipcRenderer.invoke('skills:reveal', input),
   openSkillsFolder: () => ipcRenderer.invoke('skills:openFolder'),
+  listMcps: () => ipcRenderer.invoke('mcps:list'),
+  setMcpEnabled: (input) => ipcRenderer.invoke('mcps:setEnabled', input),
   // Dev servers (Settings > Dev Servers)
   listDevServers: (input) => ipcRenderer.invoke('devServers:list', input),
   openDevServer: (input) => ipcRenderer.invoke('devServers:open', input),

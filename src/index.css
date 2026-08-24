@@ -7896,7 +7896,46 @@ body {
   margin-top: 2px;
 }
 
-/* Agent skills (Settings → Skills) */
+/* Agent skills and MCPs (Settings → Skills & MCPs) */
+.skills-mcps-subtabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.skills-mcps-subtab {
+  position: relative;
+  padding: 8px 10px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.skills-mcps-subtab:hover,
+.skills-mcps-subtab.active {
+  color: var(--text-primary);
+}
+
+.skills-mcps-subtab.active::after {
+  content: '';
+  position: absolute;
+  right: 8px;
+  bottom: -1px;
+  left: 8px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--accent);
+}
+
+.skills-mcps-subtabs + .settings-group-label {
+  margin-top: 4px;
+}
+
 .skills-toolbar {
   display: flex;
   align-items: flex-start;
@@ -7998,6 +8037,7 @@ body {
 
 /* Deactivated skills stay legible but read as parked, not installed. */
 .skills-row.inactive .skills-row-name,
+.skills-row.inactive .mcp-row-name,
 .skills-row.inactive .skills-row-desc {
   color: var(--text-muted);
 }
@@ -8035,6 +8075,12 @@ body {
   color: var(--accent, #4d8dff);
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+.mcp-row-name {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 500;
 }
 
 .skills-row-desc {

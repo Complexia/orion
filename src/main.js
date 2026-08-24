@@ -41,7 +41,7 @@ import {
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
-import { codexBrowserUseMode, codexUtilityPrivacyOptions } from './main/codex-config.js';
+import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
 import { readLatestCodexContextUsage } from './main/codex-context.js';
@@ -62,6 +62,7 @@ import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shel
 import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents, stringifySummary } from './main/stream-adapters.js';
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { deleteSkill, ensureBundledSkills, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
+import { listMcps, readMcpRuntimeConfig, setMcpEnabled } from './main/mcps.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
@@ -7390,6 +7391,25 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       Boolean(input.codexReview) &&
       typeof input.codexReview === 'object';
     const useCodexAppServer = model.providerId === 'codex' && !input.aside;
+    // Resolve user/plugin MCP definitions before allocating the per-run
+    // bridge. If Codex cannot list or parse its MCP configuration, startup
+    // fails without leaving a bridge session or temporary plugin directory.
+    // Resolve from the turn's workspace and process-level config flags so
+    // project .codex/config.toml and selected profiles match the app-server
+    // process that consumes the result. Full definitions may contain
+    // environment values or headers, so only the app-server path receives
+    // them over local JSON-RPC. One-shot /btw execs keep inheriting the user's
+    // base Codex MCP configuration unchanged.
+    let runtimeInput =
+      useCodexAppServer
+        ? {
+            ...input,
+            mcpRuntimeConfig: await readMcpRuntimeConfig({
+              cwd: input.projectPath,
+              configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
+            }),
+          }
+        : input;
     // spawn_subagent for non-Claude drivers: hand the CLI the bridge shim as
     // an `orion` MCP server. One token per runTurn call — a resume-fallback
     // reattempt reuses it; the last attempt's finalizeRun releases it.
@@ -7440,7 +7460,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           'Orion could not make read_thread available for this run. Try the referenced-thread turn again.',
       };
     }
-    let runtimeInput = input;
     if (model.providerId === 'codex' && !input.aside && initialResumeId) {
       const codexContextUsage = await readLatestCodexContextUsage(initialResumeId);
       if (codexContextUsage) runtimeInput = { ...runtimeInput, codexContextUsage };
@@ -9474,6 +9493,14 @@ ipcMain.handle('skills:reveal', async (_event, input) =>
 );
 
 ipcMain.handle('skills:openFolder', async () => openSkillsFolder());
+
+// --- MCP servers (Settings → Skills & MCPs) ----------------------------------
+
+ipcMain.handle('mcps:list', async () => listMcps());
+
+ipcMain.handle('mcps:setEnabled', async (_event, input) =>
+  setMcpEnabled({ id: input?.id, enabled: input?.enabled })
+);
 
 // --- Dev servers (Settings → Dev Servers) --------------------------------------
 

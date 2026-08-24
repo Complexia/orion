@@ -1,6 +1,6 @@
 import { app } from 'electron';
 import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, defaultMuseReasoningEffort, parseExtraArgs } from './models.js';
-import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexPersonalizationConfig } from './codex-config.js';
+import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexPersonalizationConfig, splitCodexConfigContextArgs } from './codex-config.js';
 import { grokPermissionModeForAccessMode } from './grok-access-mode.js';
 
 export const commandForModel = (model, input) => {
@@ -21,7 +21,8 @@ export const commandForModel = (model, input) => {
     // native turn/steer input while a turn is still running. Model, sandbox,
     // and config overrides travel in the dialog, not argv.
     if (input.codexAppServer || input.codexGoal || input.codexReview) {
-      return ['codex', 'app-server', ...extraArgs];
+      const { configArgs, commandArgs } = splitCodexConfigContextArgs(options);
+      return ['codex', ...configArgs, 'app-server', ...commandArgs];
     }
     const reasoningEffort = codexReasoningEffortForModel(model, input.codexReasoningEffort);
     const serviceTier = input.codexServiceTier || defaultCodexServiceTier;

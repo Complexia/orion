@@ -147,6 +147,25 @@ export type SkillImportResult = {
   error?: string;
 };
 
+/** A Codex MCP server available to Orion, with secrets intentionally omitted. */
+export type McpEntry = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** State in Codex before Orion's local override is applied. */
+  configuredEnabled: boolean;
+  transport: string;
+  /** Sanitized executable basename or remote origin. */
+  detail: string | null;
+  authStatus: string | null;
+};
+
+export type McpsListResult = {
+  ok: boolean;
+  mcps: McpEntry[];
+  error?: string;
+};
+
 // A process holding a listening TCP socket inside one of the user's project
 // or rift roots (Settings > Dev Servers). Rebuilt from lsof/ps on every scan.
 export type DevServerEntry = {
@@ -993,6 +1012,8 @@ type OrionCodexBrowserIntegrationStatus = {
       }>;
       revealSkill?: (input: { id: string; path: string; enabled: boolean }) => Promise<{ ok: boolean; error?: string }>;
       openSkillsFolder?: () => Promise<{ ok: boolean; error?: string }>;
+      listMcps?: () => Promise<McpsListResult>;
+      setMcpEnabled?: (input: { id: string; enabled: boolean }) => Promise<{ ok: boolean; error?: string }>;
       /** `roots` are project/rift directories; servers outside them (and unattributed to a thread) are excluded. */
       listDevServers?: (input?: { roots?: string[] }) => Promise<DevServersListResult>;
       /** Opens a validated localhost HTTP URL for a listed dev-server port. */
