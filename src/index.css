@@ -7415,9 +7415,24 @@ body {
 }
 
 .epic-view-repository-claimed span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.epic-view-add-project {
+  margin-left: 2px;
+}
+
+.epic-view-add-project:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.epic-view-add-project:hover:disabled {
+  background: transparent;
+  color: var(--text-muted);
 }
 
 /* Rift workspace indicator (experimental Rifts feature). */

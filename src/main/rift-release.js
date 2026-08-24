@@ -73,6 +73,7 @@ export const collectPendingRiftOwnersByPath = (
         ...owner,
         repositoryChild: true,
         workspaceRiftPath: ownership.riftPath,
+        workspaceLinkPath: repository.workspaceLinkPath ?? null,
         gitBranch: repository.gitBranch ?? owner.gitBranch,
         gitRoot: repository.gitRoot ?? owner.gitRoot,
         prUrl: repository.prUrl ?? null,

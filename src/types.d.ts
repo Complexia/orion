@@ -871,9 +871,11 @@ type OrionCodexBrowserIntegrationStatus = {
             sourceBranch?: string;
             riftPath?: string;
             riftWorkingDir?: string;
+            workspaceLinkPath?: string;
             gitRoot?: string;
             gitBranch?: string;
           }>;
+          resetRuntimeSessions?: boolean;
         }>;
       }>;
       epicCreateRift: (input: {
@@ -914,12 +916,47 @@ type OrionCodexBrowserIntegrationStatus = {
           sourceBranch?: string;
           riftPath?: string;
           riftWorkingDir?: string;
+          workspaceLinkPath?: string;
           gitRoot?: string;
           gitBranch?: string;
           prUrl?: string;
           prState?: 'OPEN' | 'CLOSED' | 'MERGED';
           prStateCheckedAt?: string;
         }>;
+        resetRuntimeSessions?: boolean;
+        error?: string;
+      }>;
+      epicAddRiftProject: (input: {
+        epicId: string;
+        riftPath: string;
+        projectId: string;
+        projectPath: string;
+        /** Retained provider runtimes to dispose before a legacy cwd migration. */
+        runtimeThreadIds?: string[];
+      }) => Promise<{
+        ok: boolean;
+        addedProjectId?: string;
+        projectId?: string;
+        projectPath?: string;
+        riftPath?: string;
+        riftWorkingDir?: string;
+        gitRoot?: string;
+        branch?: string;
+        sourceBranch?: string;
+        repositories?: Array<{
+          projectId: string;
+          projectPath: string;
+          sourceBranch?: string;
+          riftPath?: string;
+          riftWorkingDir?: string;
+          workspaceLinkPath?: string;
+          gitRoot?: string;
+          gitBranch?: string;
+          prUrl?: string;
+          prState?: 'OPEN' | 'CLOSED' | 'MERGED';
+          prStateCheckedAt?: string;
+        }>;
+        resetRuntimeSessions?: boolean;
         error?: string;
       }>;
       epicAcknowledgeRift: (input: { epicId: string; riftPath: string }) => Promise<{
@@ -932,6 +969,8 @@ type OrionCodexBrowserIntegrationStatus = {
         riftPath: string;
         /** Child Git roots for a shared multi-project Rift workspace. */
         riftPaths?: string[];
+        /** Child Rift paths plus validated workspace links for expanded legacy Rifts. */
+        riftRepositories?: Array<{ riftPath: string; workspaceLinkPath?: string }>;
         runtimeThreadIds?: string[];
         gitRoot?: string;
         projectPath?: string;

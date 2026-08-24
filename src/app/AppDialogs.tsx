@@ -1,8 +1,9 @@
 import React from 'react';
-import { Archive, Check, ChevronDown, GitCommit, GitPullRequest, LoaderCircle, Plus, Trash2, X } from 'lucide-react';
+import { Archive, Check, ChevronDown, FolderPlus, GitCommit, GitPullRequest, LoaderCircle, Plus, Trash2, X } from 'lucide-react';
 import type { Epic, Project } from '../store';
 import type { RiftStorageEntry } from '../types';
 import type {
+  AddProjectToEpicDialogState,
   EpicCommitDialogState,
   EpicPrBaseDialogState,
   EpicSettleDialogState,
@@ -13,6 +14,10 @@ import { ProjectIcon } from './ProjectIcon';
 
 export type AppDialogsModel = {
   projects: Project[];
+  epics: Epic[];
+  addProjectToEpicDialog: AddProjectToEpicDialogState | null;
+  setAddProjectToEpicDialog: React.Dispatch<React.SetStateAction<AddProjectToEpicDialogState | null>>;
+  handleAddProjectToEpic: () => Promise<void>;
   createEpicOpen: boolean;
   newEpicName: string;
   setNewEpicName: React.Dispatch<React.SetStateAction<string>>;
@@ -65,6 +70,10 @@ export type AppDialogsModel = {
 const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogsModel }) {
   const {
     projects,
+    epics,
+    addProjectToEpicDialog,
+    setAddProjectToEpicDialog,
+    handleAddProjectToEpic,
     createEpicOpen,
     newEpicName,
     setNewEpicName,
@@ -105,8 +114,113 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
     formatBytes,
   } = model;
 
+  const addProjectEpic = addProjectToEpicDialog
+    ? epics.find((epic) => epic.id === addProjectToEpicDialog.epicId) ?? null
+    : null;
+  const existingEpicProjectIds = new Set([
+    ...(addProjectEpic?.repositories ?? []).map((repository) => repository.projectId),
+    ...(addProjectEpic?.repositoryProjectId ? [addProjectEpic.repositoryProjectId] : []),
+  ]);
+  const addProjectCandidates = projects.filter(
+    (project) => !existingEpicProjectIds.has(project.id)
+  );
+
   return (
     <>
+      {addProjectToEpicDialog && addProjectEpic && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => {
+            if (!addProjectToEpicDialog.submitting) setAddProjectToEpicDialog(null);
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-project-to-epic-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleAddProjectToEpic();
+              }}
+            >
+              <h2 id="add-project-to-epic-title" className="modal-title">
+                Add project to “{addProjectEpic.name}”
+              </h2>
+              <p className="modal-subtitle">
+                Orion will create a Rift copy on this epic’s feature branch and add it to the shared workspace.
+              </p>
+              <div className="modal-field">
+                <span className="modal-field-label">Project</span>
+                <div
+                  role="listbox"
+                  aria-label="Project to add"
+                  className="max-h-64 overflow-y-auto rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1"
+                >
+                  {addProjectCandidates.map((project) => {
+                    const selected = project.id === addProjectToEpicDialog.projectId;
+                    return (
+                      <button
+                        key={project.id}
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        disabled={addProjectToEpicDialog.submitting}
+                        title={project.path}
+                        className={`flex w-full items-center gap-2 rounded-[var(--radius-sm)] border-0 px-2.5 py-2 text-left text-[13px] transition-colors ${
+                          selected
+                            ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                            : 'bg-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                        } disabled:cursor-not-allowed disabled:opacity-60`}
+                        onClick={() =>
+                          setAddProjectToEpicDialog((current) =>
+                            current ? { ...current, projectId: project.id } : current
+                          )
+                        }
+                      >
+                        <ProjectIcon projectPath={project.path} size={14} />
+                        <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                        {selected && <Check size={13} className="shrink-0" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn secondary"
+                  disabled={addProjectToEpicDialog.submitting}
+                  onClick={() => setAddProjectToEpicDialog(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="btn"
+                  disabled={
+                    addProjectToEpicDialog.submitting ||
+                    !addProjectCandidates.some(
+                      (project) => project.id === addProjectToEpicDialog.projectId
+                    )
+                  }
+                >
+                  {addProjectToEpicDialog.submitting ? (
+                    <LoaderCircle size={14} className="animate-spin" />
+                  ) : (
+                    <FolderPlus size={14} />
+                  )}
+                  {addProjectToEpicDialog.submitting ? 'Adding project…' : 'Add project'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
       {epicCommitDialog && (
         <div className="modal-backdrop" role="presentation" onClick={() => setEpicCommitDialog(null)}>
           <div
