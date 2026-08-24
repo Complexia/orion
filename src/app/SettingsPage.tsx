@@ -59,6 +59,7 @@ import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
 import SkillsSettings from './SkillsSettings';
+import McpsSettings from './McpsSettings';
 import DeploymentsSettings from './DeploymentsSettings';
 import DevServersSettings from './DevServersSettings';
 import RemoteControlSettings from './RemoteControlSettings';
@@ -318,6 +319,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
   } = props;
   const [archivedEpicsExpanded, setArchivedEpicsExpanded] = React.useState(false);
   const [computerUseSubtab, setComputerUseSubtab] = React.useState<'permissions' | 'browser-use'>('permissions');
+  const [skillsAndMcpsSubtab, setSkillsAndMcpsSubtab] = React.useState<'skills' | 'mcps'>('skills');
   const visibleArchivedEpics = archivedEpicsExpanded
     ? archivedEpics
     : archivedEpics.slice(0, ARCHIVED_EPICS_COLLAPSED_LIMIT);
@@ -414,7 +416,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             { id: 'general', label: 'General', Icon: Settings },
             { id: 'providers', label: 'Providers', Icon: Plug },
             { id: 'orchestration', label: 'Orchestration', Icon: Workflow },
-            { id: 'skills', label: 'Skills', Icon: Sparkles },
+            { id: 'skills', label: 'Skills & MCPs', Icon: Sparkles },
             { id: 'split-view', label: 'Split View', Icon: Columns2 },
             {
               id: 'computer-use',
@@ -453,7 +455,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'general' && 'GENERAL'}
           {settingsTab === 'providers' && 'PROVIDERS'}
           {settingsTab === 'orchestration' && 'ORCHESTRATION'}
-          {settingsTab === 'skills' && 'SKILLS'}
+          {settingsTab === 'skills' && 'SKILLS & MCPS'}
           {settingsTab === 'split-view' && 'SPLIT VIEW'}
           {settingsTab === 'computer-use' && 'COMPUTER USE'}
           {settingsTab === 'dev-servers' && 'DEV SERVERS'}
@@ -1445,7 +1447,33 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           )}
 
           {settingsTab === 'skills' && (
-            <SkillsSettings formatBytes={formatBytes} onOpenInEditor={handleOpenSkillInEditor} />
+            <>
+              <div className="skills-mcps-subtabs" role="tablist" aria-label="Skills and MCP settings">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={skillsAndMcpsSubtab === 'skills'}
+                  className={`skills-mcps-subtab ${skillsAndMcpsSubtab === 'skills' ? 'active' : ''}`}
+                  onClick={() => setSkillsAndMcpsSubtab('skills')}
+                >
+                  Skills
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={skillsAndMcpsSubtab === 'mcps'}
+                  className={`skills-mcps-subtab ${skillsAndMcpsSubtab === 'mcps' ? 'active' : ''}`}
+                  onClick={() => setSkillsAndMcpsSubtab('mcps')}
+                >
+                  MCPs
+                </button>
+              </div>
+              {skillsAndMcpsSubtab === 'skills' ? (
+                <SkillsSettings formatBytes={formatBytes} onOpenInEditor={handleOpenSkillInEditor} />
+              ) : (
+                <McpsSettings />
+              )}
+            </>
           )}
 
           {settingsTab === 'dev-servers' && <DevServersSettings formatBytes={formatBytes} />}

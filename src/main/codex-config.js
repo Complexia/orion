@@ -1,5 +1,52 @@
+import { parseExtraArgs } from './models.js';
+
 const codexSettingMode = (value) =>
   value === 'enabled' || value === 'disabled' ? value : 'inherit';
+
+const codexConfigValueFlags = new Set([
+  '-c',
+  '--config',
+  '-p',
+  '--profile',
+  '--enable',
+  '--disable',
+]);
+
+const isInlineCodexConfigFlag = (argument) =>
+  argument.startsWith('--config=') ||
+  argument.startsWith('--profile=') ||
+  argument.startsWith('--enable=') ||
+  argument.startsWith('--disable=') ||
+  (/^-[cp].+/.test(argument) && argument !== '-c' && argument !== '-p');
+
+/**
+ * Keep process-level Codex config flags in one ordered list so auxiliary
+ * commands (such as `mcp list`) resolve the same profile and overrides as the
+ * app-server process that consumes their output.
+ */
+export const splitCodexConfigContextArgs = (providerOptions) => {
+  const options =
+    providerOptions && typeof providerOptions === 'object' ? providerOptions : {};
+  const extraArgs = parseExtraArgs(options.extraArgs);
+  const configArgs = [];
+  const commandArgs = [];
+
+  for (let index = 0; index < extraArgs.length; index += 1) {
+    const argument = extraArgs[index];
+    if (codexConfigValueFlags.has(argument)) {
+      configArgs.push(argument);
+      if (index + 1 < extraArgs.length) configArgs.push(extraArgs[++index]);
+      continue;
+    }
+    if (argument === '--strict-config' || isInlineCodexConfigFlag(argument)) {
+      configArgs.push(argument);
+      continue;
+    }
+    commandArgs.push(argument);
+  }
+
+  return { configArgs, commandArgs };
+};
 
 // Hidden title/git-message turns should never read from or contribute to the
 // user's memories. Keep this in the shared config module so every utility

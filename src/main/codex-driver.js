@@ -30,6 +30,9 @@ export const codexAppServerConfig = (model, input) => {
   if (options.networkAccess) config['sandbox_workspace_write.network_access'] = true;
   if (options.webSearch) config['tools.web_search'] = true;
   Object.assign(config, codexBrowserMcpConfig(options, input.accessMode, chromeDevtoolsMcpPackage));
+  // Full resolved definitions are required for plugin-provided MCPs. They are
+  // kept off argv and passed only across this local JSON-RPC connection.
+  Object.assign(config, input.mcpRuntimeConfig);
   // Orion's spawn_subagent bridge — same overrides as the exec path builds.
   if (input.orionMcp) {
     config['mcp_servers.orion.command'] = input.orionMcp.command;

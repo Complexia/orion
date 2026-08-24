@@ -38,9 +38,15 @@ module.exports = {
     // The Vite plugin packages only the `.vite` bundle (everything else is
     // ignored), so runtime externals must be copied into the app manually.
     // node-pty stays external (native module) — copy it and restore the
-    // exec bit on its spawn-helper, which npm strips from prebuilds.
+    // exec bit on its spawn-helper, which npm strips from prebuilds. Its gyp
+    // file resolves node-addon-api while Forge rebuilds the copied module, so
+    // that transitive dependency must be present in the otherwise-minimal
+    // Vite package too.
     packageAfterCopy: async (_forgeConfig, buildPath) => {
       const fs = require('node:fs');
+      const nodeAddonApiSrc = path.join(__dirname, 'node_modules', 'node-addon-api');
+      const nodeAddonApiDest = path.join(buildPath, 'node_modules', 'node-addon-api');
+      fs.cpSync(nodeAddonApiSrc, nodeAddonApiDest, { recursive: true, dereference: true });
       const src = path.join(__dirname, 'node_modules', 'node-pty');
       const dest = path.join(buildPath, 'node_modules', 'node-pty');
       fs.cpSync(src, dest, { recursive: true, dereference: true });
