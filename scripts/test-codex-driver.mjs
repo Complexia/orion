@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { app } from 'electron';
 
 import {
@@ -6,6 +7,13 @@ import {
   codexStatsFromTokenUsage,
   createCodexAppServerDriver,
 } from '../src/main/codex-driver.js';
+
+const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+assert.match(
+  mainSource,
+  /onSessionId: \(sessionId\) => \{\s*acceptedCodexSessionId = sessionId;\s*ensureCodexSpawnWatcher\(sessionId\);/,
+  'fresh Codex app-server threads must start their filesystem spawn watcher from onSessionId'
+);
 
 const model = {
   id: 'codex:gpt-test',
@@ -45,6 +53,7 @@ assert.equal(
 const requests = [];
 const activities = [];
 const statsEvents = [];
+const subagentEvents = [];
 let runEnded = 0;
 let driver;
 const child = {
@@ -132,6 +141,7 @@ driver = createCodexAppServerDriver({
     },
     onSessionId: () => {},
     onStats: (stats) => statsEvents.push(stats),
+    onSubagent: (subagent) => subagentEvents.push(subagent),
     onText: () => {},
   },
 });
@@ -141,6 +151,103 @@ assert.deepEqual(
   requests.slice(0, 4).map((request) => request.method),
   ['initialize', 'thread/resume', 'thread/compact/start', 'turn/start'],
   'A resumed thread above the context threshold must compact before its user turn'
+);
+driver.handleMessage({
+  jsonrpc: '2.0',
+  method: 'item/started',
+  params: {
+    threadId: 'compact-thread',
+    turnId: 'user-turn',
+    item: {
+      id: 'spawn-1',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      prompt: 'Implement the durable ledger contract.',
+      model: 'gpt-5.6-luna',
+      reasoningEffort: 'low',
+      receiverThreadIds: [],
+      senderThreadId: 'compact-thread',
+      agentsStates: {},
+      status: 'inProgress',
+    },
+  },
+});
+driver.handleMessage({
+  jsonrpc: '2.0',
+  method: 'item/completed',
+  params: {
+    threadId: 'compact-thread',
+    turnId: 'user-turn',
+    item: {
+      id: 'spawn-1',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      prompt: null,
+      model: null,
+      reasoningEffort: null,
+      receiverThreadIds: ['child-thread'],
+      senderThreadId: 'compact-thread',
+      agentsStates: {},
+      status: 'completed',
+    },
+  },
+});
+assert.deepEqual(subagentEvents, [
+  {
+    id: 'child-thread',
+    prompt: 'Implement the durable ledger contract.',
+    model: 'gpt-5.6-luna',
+    reasoningEffort: 'low',
+  },
+]);
+driver.handleMessage({
+  jsonrpc: '2.0',
+  method: 'item/completed',
+  params: {
+    threadId: 'child-thread',
+    turnId: 'child-turn',
+    item: {
+      id: 'spawn-2',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      prompt: 'Implement the Convex transaction layer.',
+      model: 'gpt-5.6-luna',
+      reasoningEffort: 'low',
+      receiverThreadIds: ['grandchild-thread'],
+      senderThreadId: 'child-thread',
+      agentsStates: {},
+      status: 'completed',
+    },
+  },
+});
+driver.handleMessage({
+  jsonrpc: '2.0',
+  method: 'item/completed',
+  params: {
+    threadId: 'unrelated-thread',
+    turnId: 'unrelated-turn',
+    item: {
+      id: 'spawn-other',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      prompt: 'This belongs to another run.',
+      receiverThreadIds: ['unrelated-child'],
+      senderThreadId: 'unrelated-thread',
+      agentsStates: {},
+      status: 'completed',
+    },
+  },
+});
+assert.deepEqual(subagentEvents.at(-1), {
+  id: 'grandchild-thread',
+  prompt: 'Implement the Convex transaction layer.',
+  model: 'gpt-5.6-luna',
+  reasoningEffort: 'low',
+});
+assert.equal(
+  subagentEvents.some((event) => event.id === 'unrelated-child'),
+  false,
+  'persistent app-server notifications from another run must remain isolated'
 );
 const contextActivities = activities.filter(
   (activity) => activity.key === 'codex-context-compaction'

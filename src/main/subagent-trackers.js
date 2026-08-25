@@ -254,6 +254,29 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
     });
   };
 
+  // Provider streams can announce spawn metadata before or after the
+  // filesystem watcher discovers the child transcript. The child's runtime
+  // settings are authoritative, so only backfill missing values while still
+  // allowing the plaintext prompt to arrive late.
+  const update = (id, { prompt, model, reasoningEffort } = {}) => {
+    const sub = subagents.get(id);
+    if (!sub) return false;
+    const patch = {};
+    if (!sub.meta.prompt && typeof prompt === 'string' && prompt) patch.prompt = prompt;
+    if (!sub.meta.model && typeof model === 'string' && model) patch.model = model;
+    if (
+      !sub.meta.reasoningEffort &&
+      typeof reasoningEffort === 'string' &&
+      reasoningEffort
+    ) {
+      patch.reasoningEffort = reasoningEffort;
+    }
+    if (Object.keys(patch).length > 0) {
+      emitMeta(sub, patch, { notify: !sub.finished });
+    }
+    return true;
+  };
+
   const finish = (id, { status = 'done', stats, summary } = {}) => {
     const sub = subagents.get(id);
     if (!sub || sub.finished) return;
@@ -317,6 +340,7 @@ export const createSubagentTracker = ({ providerId, threadId, getSender, getRunI
 
   return {
     start,
+    update,
     finish,
     finishSoon,
     has: (id) => subagents.has(id),
