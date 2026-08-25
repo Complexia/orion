@@ -8171,6 +8171,26 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       getRunId: () => runId,
       onMeta: model.providerId === 'codex' ? emitCodexSubagentStep : undefined,
     });
+    // Codex app-server exposes the plaintext spawn prompt live, while the
+    // child rollout stores its body encrypted. The app-server item and the
+    // filesystem watcher can arrive in either order, so retain metadata until
+    // the child tracker exists and update it immediately when it already does.
+    const pendingCodexSubagentMetadata = new Map();
+    const receiveCodexSubagentMetadata = ({ id, prompt, model: childModel, reasoningEffort }) => {
+      if (typeof id !== 'string' || !id) return;
+      const previous = pendingCodexSubagentMetadata.get(id) ?? {};
+      const metadata = {
+        ...previous,
+        ...(typeof prompt === 'string' && prompt ? { prompt } : {}),
+        ...(typeof childModel === 'string' && childModel ? { model: childModel } : {}),
+        ...(typeof reasoningEffort === 'string' && reasoningEffort ? { reasoningEffort } : {}),
+      };
+      if (subagentTracker.update(id, metadata)) {
+        pendingCodexSubagentMetadata.delete(id);
+      } else {
+        pendingCodexSubagentMetadata.set(id, metadata);
+      }
+    };
     let codexSpawnWatcher = null;
     let kimiSpawnWatcher = null;
     // Kimi subagents live under the session's own directory; watching can
@@ -8214,11 +8234,13 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         // subagent, not the run's thread, as their spawn parent.
         isTrackedThread: (threadId) => subagentTracker.has(threadId),
         onSpawn: (spawn) => {
+          const metadata = pendingCodexSubagentMetadata.get(spawn.threadId) ?? {};
           subagentTracker.start(
             {
               id: spawn.threadId,
               title: codexSubagentTitle(spawn),
               kind: spawn.role || 'codex agent',
+              ...metadata,
               // Nest under the spawning subagent rather than flattening every
               // descendant onto the run's thread.
               ...(spawn.parentThreadId !== parentThreadId
@@ -8230,6 +8252,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
               handleLine: handleCodexRolloutLine,
             }
           );
+          pendingCodexSubagentMetadata.delete(spawn.threadId);
         },
       });
     };
@@ -8521,6 +8544,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const sharedDriverCallbacks = {
       onSessionId: (sessionId) => {
         acceptedCodexSessionId = sessionId;
+        ensureCodexSpawnWatcher(sessionId);
         if (sessionIdReported) return;
         sessionIdReported = true;
         emitAgentEvent(event.sender, {
@@ -8683,6 +8707,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
               onStats: (stats) => {
                 runStats = stats;
               },
+              onSubagent: receiveCodexSubagentMetadata,
               onGoal: (goal) => {
                 emitAgentEvent(event.sender, {
                   runId,

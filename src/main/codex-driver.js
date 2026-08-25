@@ -260,6 +260,11 @@ export const createCodexAppServerDriver = ({
   let recoveryPromise = null;
   let disposePromise = null;
   let retryActivityOpen = false;
+  // A spawn's started item can carry the plaintext prompt before Codex knows
+  // the receiver thread id. Merge the completed item into the same record so
+  // callers always receive both pieces when the protocol splits them.
+  const collabAgentItems = new Map();
+  const collabThreadIds = new Set();
 
   // The goal runtime decides whether to continue after each turn; give it
   // this long to start the next turn (or flip the goal status) before Orion
@@ -633,6 +638,36 @@ export const createCodexAppServerDriver = ({
       if (item.type === 'contextCompaction') nativeCompactionObserved = true;
       else if (item.type !== 'userMessage') userTurnHadSubstantiveActivity = true;
     }
+    if (item.type === 'collabAgentToolCall') {
+      const previous = collabAgentItems.get(item.id) ?? {};
+      const merged = {
+        ...previous,
+        ...(typeof item.tool === 'string' ? { tool: item.tool } : {}),
+        ...(typeof item.prompt === 'string' && item.prompt ? { prompt: item.prompt } : {}),
+        ...(typeof item.model === 'string' && item.model ? { model: item.model } : {}),
+        ...(typeof item.reasoningEffort === 'string' && item.reasoningEffort
+          ? { reasoningEffort: item.reasoningEffort }
+          : {}),
+        ...(Array.isArray(item.receiverThreadIds) && item.receiverThreadIds.length > 0
+          ? { receiverThreadIds: item.receiverThreadIds }
+          : {}),
+      };
+      collabAgentItems.set(item.id, merged);
+      if (merged.tool === 'spawnAgent' || merged.tool === 'spawn_agent') {
+        for (const id of merged.receiverThreadIds ?? []) {
+          if (typeof id !== 'string' || !id) continue;
+          collabThreadIds.add(id);
+          callbacks.onSubagent?.({
+            id,
+            prompt: merged.prompt,
+            model: merged.model,
+            reasoningEffort: merged.reasoningEffort,
+          });
+        }
+      }
+      if (completed) collabAgentItems.delete(item.id);
+      return;
+    }
     if (item.type === 'agentMessage') {
       if (completed) {
         if (!streamedTextItems.has(item.id) && typeof item.text === 'string' && item.text) {
@@ -878,7 +913,23 @@ export const createCodexAppServerDriver = ({
 
     const params = message.params ?? {};
     // Defensive: the app-server can host many threads; only ours matters.
-    if (params.threadId && threadId && params.threadId !== threadId) return;
+    // Collaboration descendants run on their own Codex thread ids but share
+    // this run's protocol connection. Admit only a known descendant chain so
+    // nested spawn prompts survive without accepting another Orion run's
+    // notifications from the persistent server.
+    const collabItem = params.item?.type === 'collabAgentToolCall' ? params.item : null;
+    const collabSenderId = collabItem?.senderThreadId ?? params.threadId;
+    const belongsToCollabFamily =
+      Boolean(collabItem) &&
+      (collabSenderId === threadId || collabThreadIds.has(collabSenderId));
+    if (
+      params.threadId &&
+      threadId &&
+      params.threadId !== threadId &&
+      !belongsToCollabFamily
+    ) {
+      return;
+    }
 
     if (contextRecoveryActive) {
       if (message.method === 'turn/started' && !recoveryCompactionTurnId) {

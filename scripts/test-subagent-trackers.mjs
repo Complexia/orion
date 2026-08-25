@@ -328,6 +328,14 @@ const stepUpdates = [];
 const trackerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'subagent-tracker-'));
 const trackerFile = path.join(trackerDir, 'events.jsonl');
 await fs.writeFile(trackerFile, `${JSON.stringify({ type: 'line' })}\n`);
+let resolveTrackerFile;
+const trackerFileReady = new Promise((resolve) => {
+  resolveTrackerFile = resolve;
+});
+let resolveChildMetadata;
+const childMetadataObserved = new Promise((resolve) => {
+  resolveChildMetadata = resolve;
+});
 const tracker = createSubagentTracker({
   providerId: 'codex',
   threadId: 'parent-thread',
@@ -338,9 +346,13 @@ const tracker = createSubagentTracker({
 tracker.start(
   { id: 'short-task', title: 'Short task' },
   {
-    resolveFile: async () => trackerFile,
+    resolveFile: async () => {
+      await trackerFileReady;
+      return trackerFile;
+    },
     handleLine: (_value, trackerApi) => {
       trackerApi.metadata({ model: 'gpt-5.6-luna', reasoningEffort: 'low' });
+      resolveChildMetadata();
       trackerApi.text('native child output');
       trackerApi.reasoning('first thought');
       trackerApi.reasoning(' and second thought');
@@ -352,6 +364,48 @@ tracker.start(
       });
     },
   }
+);
+assert.equal(
+  tracker.update('short-task', { model: 'gpt-5.6-sol', reasoningEffort: 'high' }),
+  true,
+  'spawn metadata must fill settings that the child has not reported yet'
+);
+assert.ok(
+  emitted.some(
+    (event) =>
+      event.type === 'subagent' &&
+      event.subagent?.id === 'short-task' &&
+      event.subagent?.model === 'gpt-5.6-sol' &&
+      event.subagent?.reasoningEffort === 'high'
+  ),
+  'requested settings must be emitted while child runtime settings are unavailable'
+);
+resolveTrackerFile();
+await childMetadataObserved;
+assert.equal(
+  tracker.update('short-task', {
+    prompt: 'Inspect the billing transaction boundary.',
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'high',
+  }),
+  true,
+  'live provider metadata must enrich an already-discovered subagent'
+);
+const enrichedSubagent = emitted
+  .filter((event) => event.type === 'subagent' && event.subagent?.id === 'short-task')
+  .at(-1)?.subagent;
+assert.deepEqual(
+  {
+    prompt: enrichedSubagent?.prompt,
+    model: enrichedSubagent?.model,
+    reasoningEffort: enrichedSubagent?.reasoningEffort,
+  },
+  {
+    prompt: 'Inspect the billing transaction boundary.',
+    model: 'gpt-5.6-luna',
+    reasoningEffort: 'low',
+  },
+  'late spawn metadata must add the prompt without replacing child-reported settings'
 );
 await new Promise((resolve) => setTimeout(resolve, 700));
 for (const type of ['subagent', 'subagent-chunk', 'subagent-activity']) {
