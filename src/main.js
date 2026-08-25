@@ -44,7 +44,6 @@ import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
-import { readLatestCodexContextUsage } from './main/codex-context.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
@@ -1391,7 +1390,14 @@ const reapActiveAgentRuns = () => {
         ]).then(() => killAgentChild(run.child))
       );
     } else {
-      shutdowns.push(killAgentChild(run.child));
+      const driver = codexSteerableRunDrivers.get(runId);
+      codexSteerableRunDrivers.delete(runId);
+      shutdowns.push(
+        (async () => {
+          await driver?.dispose?.();
+          await killAgentChild(run.child);
+        })()
+      );
     }
   }
   activeAgentRuns.clear();
@@ -8065,10 +8071,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           'Orion could not make read_thread available for this run. Try the referenced-thread turn again.',
       };
     }
-    if (model.providerId === 'codex' && !input.aside && initialResumeId) {
-      const codexContextUsage = await readLatestCodexContextUsage(initialResumeId);
-      if (codexContextUsage) runtimeInput = { ...runtimeInput, codexContextUsage };
-    }
     if (
       model.providerId === 'codex' &&
       (input.accessMode || 'full-access') !== 'read-only' &&
@@ -8330,6 +8332,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       // keeps any other caller from receiving a false error event.
       const finalExitCode = wasStopped && useCodexGoal ? 0 : exitCode;
       clearFinalizeTimers();
+      // A Codex recovery may have rolled back the failed user turn while its
+      // compaction is still active. Let the driver restore that prompt before
+      // closing its app-server transport.
+      await acpDriver?.dispose?.();
       // The run owns its CLI process; whatever path finalized the run, the
       // process must not outlive it (ACP servers idle forever on their own).
       // No-op when the process already exited.
@@ -8338,7 +8344,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
       codexSteerableRunDrivers.delete(runId);
-      acpDriver?.dispose?.();
       codexAppServerLease?.release();
       codexAppServerLease = null;
       orionMcp?.release();
@@ -8800,7 +8805,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         finalized = true;
         clearFinalizeTimers();
         codexSteerableRunDrivers.delete(runId);
-        acpDriver?.dispose?.();
+        await acpDriver?.dispose?.();
         codexSpawnWatcher?.stop();
         kimiSpawnWatcher?.stop();
         subagentTracker.dispose('error');
@@ -8833,7 +8838,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         finalized = true;
         clearFinalizeTimers();
         codexSteerableRunDrivers.delete(runId);
-        acpDriver?.dispose?.();
+        await acpDriver?.dispose?.();
         codexSpawnWatcher?.stop();
         kimiSpawnWatcher?.stop();
         subagentTracker.dispose('error');
@@ -8922,7 +8927,7 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
     return false;
   }
   stoppedAgentRuns.add(runId);
-  codexSteerableRunDrivers.get(runId)?.dispose?.();
+  await codexSteerableRunDrivers.get(runId)?.dispose?.();
   codexSteerableRunDrivers.delete(runId);
   // Stopping a goal run = pausing the goal: ask the app-server to record the
   // pause (so the stored goal matches reality and /goal resume works) before
