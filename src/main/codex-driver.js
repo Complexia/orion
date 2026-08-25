@@ -1,7 +1,6 @@
 import { app, protocol } from 'electron';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { shouldAutoCompactCodexContext } from './codex-context.js';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
@@ -81,6 +80,20 @@ export const codexErrorDetail = (error) =>
     .filter(Boolean)
     .join(' · ');
 
+const CODEX_CONTEXT_RECOVERY_ERROR_KINDS = new Set([
+  'contextWindowExceeded',
+  'responseStreamConnectionFailed',
+  'responseStreamDisconnected',
+  'responseTooManyFailedAttempts',
+]);
+
+export const isRecoverableCodexContextError = (error) => {
+  const info = error?.codexErrorInfo;
+  if (typeof info === 'string') return CODEX_CONTEXT_RECOVERY_ERROR_KINDS.has(info);
+  if (!info || typeof info !== 'object') return false;
+  return Object.keys(info).some((kind) => CODEX_CONTEXT_RECOVERY_ERROR_KINDS.has(kind));
+};
+
 // Wire goal → the shape persisted on Thread.goal in the renderer store.
 export const codexGoalForRenderer = (goal) => ({
   objective: String(goal.objective ?? ''),
@@ -157,6 +170,17 @@ export const codexAppServerActivityFromItem = (item, completed) => {
   if (item.type === 'imageGeneration') {
     return { ...base, type: 'tool', title: 'Image generation' };
   }
+  if (item.type === 'contextCompaction') {
+    return {
+      ...base,
+      type: 'tool',
+      kind: 'context',
+      title: completed ? 'Codex context optimized' : 'Optimizing Codex context',
+      detail: completed
+        ? 'Codex compacted the conversation and continued this turn.'
+        : 'Codex is compacting this long-running conversation.',
+    };
+  }
   return null;
 };
 
@@ -223,10 +247,18 @@ export const createCodexAppServerDriver = ({
   let continuationTimer = null;
   let ended = false;
   let actionAccepted = false;
-  let preflightCompactionActive = false;
-  let preflightCompactionTurnId = null;
-  let preflightCompactionErrorDetail = '';
-  let resolvePreflightCompaction = null;
+  let resumedExistingThread = false;
+  let userTurnHadSubstantiveActivity = false;
+  let nativeCompactionObserved = false;
+  let lastTerminalTurnError = null;
+  let contextRecoveryAttempted = false;
+  let contextRecoveryActive = false;
+  let recoveryCompactionTurnId = null;
+  let recoveryCompactionErrorDetail = '';
+  let resolveRecoveryCompaction = null;
+  let restoreRolledBackPrompt = null;
+  let recoveryPromise = null;
+  let disposePromise = null;
   let retryActivityOpen = false;
   // A spawn's started item can carry the plaintext prompt before Codex knows
   // the receiver thread id. Merge the completed item into the same record so
@@ -242,15 +274,44 @@ export const createCodexAppServerDriver = ({
   const write = (message) => {
     try {
       child.stdin.write(`${JSON.stringify(message)}\n`);
-    } catch {}
+      return true;
+    } catch {
+      return false;
+    }
   };
 
   const request = (method, params) =>
     new Promise((resolve) => {
       const id = nextRequestId++;
       pendingRequests.set(id, resolve);
-      write({ jsonrpc: '2.0', id, method, params });
+      if (!write({ jsonrpc: '2.0', id, method, params })) {
+        pendingRequests.delete(id);
+        resolve({ error: { message: 'Codex app-server connection is closed.' } });
+      }
     });
+
+  const requestWithTimeout = async (method, params, timeoutMs) => {
+    let timeout = null;
+    const response = await Promise.race([
+      request(method, params),
+      new Promise((resolve) => {
+        timeout = setTimeout(
+          () => resolve({ error: { message: 'Codex app-server request timed out.' } }),
+          timeoutMs
+        );
+        timeout.unref?.();
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+    return response;
+  };
+
+  const settlePendingRequests = () => {
+    for (const resolve of pendingRequests.values()) {
+      resolve({ error: { message: 'Codex app-server run ended.' } });
+    }
+    pendingRequests.clear();
+  };
 
   const emitText = (text) => {
     if (!text) return;
@@ -298,57 +359,11 @@ export const createCodexAppServerDriver = ({
     if (ended) return;
     ended = true;
     clearContinuationTimer();
-    resolvePreflightCompaction?.(false);
-    resolvePreflightCompaction = null;
+    resolveRecoveryCompaction?.(false);
+    resolveRecoveryCompaction = null;
     callbacks.onFatal(
       typeof error === 'string' ? error : error?.message ?? 'Codex app-server protocol error.'
     );
-  };
-
-  const compactThreadBeforeTurn = async () => {
-    preflightCompactionActive = true;
-    preflightCompactionTurnId = null;
-    preflightCompactionErrorDetail = '';
-    callbacks.onActivity({
-      key: CODEX_CONTEXT_ACTIVITY_KEY,
-      type: 'tool',
-      kind: 'context',
-      title: 'Optimizing Codex context',
-      detail: 'Compacting this long-running thread before continuing.',
-      status: 'running',
-    });
-    const completion = new Promise((resolve) => {
-      resolvePreflightCompaction = resolve;
-    });
-    const started = await request('thread/compact/start', { threadId });
-    if (started.error) {
-      resolvePreflightCompaction = null;
-      preflightCompactionActive = false;
-      callbacks.onActivity({
-        key: CODEX_CONTEXT_ACTIVITY_KEY,
-        type: 'error',
-        title: 'Codex context optimization failed',
-        detail: codexErrorDetail(started.error) || 'Codex could not compact this thread.',
-        status: 'error',
-      });
-      return false;
-    }
-    const compacted = await completion;
-    resolvePreflightCompaction = null;
-    preflightCompactionActive = false;
-    preflightCompactionTurnId = null;
-    if (ended) return false;
-    callbacks.onActivity({
-      key: CODEX_CONTEXT_ACTIVITY_KEY,
-      type: compacted ? 'tool' : 'error',
-      kind: 'context',
-      title: compacted ? 'Codex context optimized' : 'Codex context optimization failed',
-      detail: compacted
-        ? 'The conversation was compacted before this turn.'
-        : preflightCompactionErrorDetail || 'Codex could not compact this thread.',
-      status: compacted ? 'done' : 'error',
-    });
-    return compacted;
   };
 
   const armContinuationTimer = () => {
@@ -382,38 +397,221 @@ export const createCodexAppServerDriver = ({
     }
   };
 
+  const userTurnParams = () => ({
+    threadId,
+    input: [
+      {
+        type: 'text',
+        text: `${codexBrowserEnvironmentNote(input.providerOptions, accessMode)}${input.prompt}`,
+      },
+    ],
+  });
+
+  const startUserTurn = async () => {
+    userTurnHadSubstantiveActivity = false;
+    nativeCompactionObserved = false;
+    lastTerminalTurnError = null;
+    const startedTurn = await request('turn/start', userTurnParams());
+    if (startedTurn.error) return { ok: false, error: startedTurn.error };
+    markActionAccepted();
+    return { ok: true };
+  };
+
+  const finishFailedTurn = (turn, fallbackError) => {
+    const error = turn.error ?? fallbackError;
+    const message = error?.message ?? 'Codex turn failed.';
+    callbacks.onActivity({
+      type: 'error',
+      title: 'Turn failed',
+      detail: stringifySummary(message, 300),
+      status: 'error',
+    });
+    if (review) {
+      fail(message);
+      return;
+    }
+    // The goal runtime skips continuation after turn errors — pause the
+    // stored goal so its status matches reality, then end the run.
+    void (async () => {
+      if (goalStatus === 'active' && threadId) {
+        try {
+          const paused = await Promise.race([
+            request('thread/goal/set', { threadId, status: 'paused' }),
+            new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
+          ]);
+          // The adjacent goal-updated notification normally handles this,
+          // but apply the response too in case process output was delayed.
+          if (paused?.result?.goal) handleGoalUpdated(paused.result.goal);
+        } catch {}
+      }
+      endRun('\n\n_Goal run stopped on an error — `/goal resume` to retry._');
+    })();
+  };
+
+  const recoverFailedUserTurn = async (turn, error) => {
+    contextRecoveryAttempted = true;
+    contextRecoveryActive = true;
+    retryActivityOpen = true;
+    callbacks.onActivity({
+      key: CODEX_RETRY_ACTIVITY_KEY,
+      type: 'tool',
+      kind: 'context',
+      title: 'Codex recovering context',
+      detail: 'The resumed turn failed before doing work. Compacting with Codex and retrying once.',
+      status: 'running',
+    });
+
+    // turn/start persists its user item before sampling. Remove only that
+    // side-effect-free failed turn so retrying the original prompt does not
+    // duplicate it in Codex history. This compatibility fallback can go away
+    // once app-server includes incoming items in pre-turn compaction checks.
+    const rolledBack = await request('thread/rollback', { threadId, numTurns: 1 });
+    if (rolledBack.error) {
+      contextRecoveryActive = false;
+      retryActivityOpen = false;
+      if (ended) return;
+      callbacks.onActivity({
+        key: CODEX_RETRY_ACTIVITY_KEY,
+        type: 'error',
+        title: 'Codex context recovery failed',
+        detail: codexErrorDetail(rolledBack.error) || 'Codex could not roll back the failed turn.',
+        status: 'error',
+      });
+      finishFailedTurn(turn, error);
+      return;
+    }
+
+    let failedTurnRolledBack = true;
+    let restorationPromise = null;
+    restoreRolledBackPrompt = async (detail) => {
+      if (!failedTurnRolledBack) return detail;
+      restorationPromise ??= requestWithTimeout(
+        'thread/inject_items',
+        {
+          threadId,
+          items: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_text', text: userTurnParams().input[0].text }],
+            },
+          ],
+        },
+        1500
+      );
+      const restored = await restorationPromise;
+      if (!restored.error) {
+        failedTurnRolledBack = false;
+        return detail;
+      }
+      const restoreDetail = codexErrorDetail(restored.error);
+      return `${detail} The failed prompt could not be restored to Codex history${
+        restoreDetail ? `: ${restoreDetail}` : '.'
+      }`;
+    };
+
+    if (ended) {
+      await restoreRolledBackPrompt('Codex context recovery was cancelled.');
+      return;
+    }
+
+    recoveryCompactionTurnId = null;
+    recoveryCompactionErrorDetail = '';
+    const completion = new Promise((resolve) => {
+      resolveRecoveryCompaction = resolve;
+    });
+    const compactStarted = await request('thread/compact/start', { threadId });
+    if (compactStarted.error) {
+      resolveRecoveryCompaction = null;
+      const detail = await restoreRolledBackPrompt(
+        codexErrorDetail(compactStarted.error) || 'Codex could not compact this thread.'
+      );
+      contextRecoveryActive = false;
+      retryActivityOpen = false;
+      if (ended) return;
+      callbacks.onActivity({
+        key: CODEX_CONTEXT_ACTIVITY_KEY,
+        type: 'error',
+        title: 'Codex context optimization failed',
+        detail,
+        status: 'error',
+      });
+      finishFailedTurn(turn, error);
+      return;
+    }
+
+    const compacted = await completion;
+    resolveRecoveryCompaction = null;
+    recoveryCompactionTurnId = null;
+    if (!compacted) {
+      const detail = await restoreRolledBackPrompt(
+        recoveryCompactionErrorDetail || 'Codex could not compact this thread.'
+      );
+      contextRecoveryActive = false;
+      retryActivityOpen = false;
+      if (ended) return;
+      callbacks.onActivity({
+        key: CODEX_CONTEXT_ACTIVITY_KEY,
+        type: 'error',
+        title: 'Codex context optimization failed',
+        detail,
+        status: 'error',
+      });
+      finishFailedTurn(turn, error);
+      return;
+    }
+    if (ended) {
+      await restoreRolledBackPrompt('Codex context recovery was cancelled.');
+      return;
+    }
+
+    contextRecoveryActive = false;
+    const restarted = await startUserTurn();
+    if (!restarted.ok) {
+      contextRecoveryActive = true;
+      const detail = await restoreRolledBackPrompt(
+        codexErrorDetail(restarted.error) || 'Codex could not retry the turn.'
+      );
+      contextRecoveryActive = false;
+      retryActivityOpen = false;
+      if (ended) return;
+      callbacks.onActivity({
+        key: CODEX_RETRY_ACTIVITY_KEY,
+        type: 'error',
+        title: 'Codex context recovery failed',
+        detail,
+        status: 'error',
+      });
+      finishFailedTurn(turn, restarted.error);
+      return;
+    }
+    failedTurnRolledBack = false;
+  };
+
   const handleTurnCompleted = (params) => {
     turnActive = false;
     activeTurnId = null;
     const turn = params.turn ?? {};
     if (turn.status === 'failed') {
-      const message = turn.error?.message ?? 'Codex turn failed.';
-      callbacks.onActivity({
-        type: 'error',
-        title: 'Turn failed',
-        detail: stringifySummary(message, 300),
-        status: 'error',
-      });
-      if (review) {
-        fail(message);
+      const error = isRecoverableCodexContextError(turn.error)
+        ? turn.error
+        : lastTerminalTurnError ?? turn.error;
+      if (
+        !goal &&
+        !review &&
+        resumedExistingThread &&
+        !contextRecoveryAttempted &&
+        !userTurnHadSubstantiveActivity &&
+        !nativeCompactionObserved &&
+        isRecoverableCodexContextError(error)
+      ) {
+        recoveryPromise = recoverFailedUserTurn(turn, error).finally(() => {
+          recoveryPromise = null;
+          restoreRolledBackPrompt = null;
+        });
         return;
       }
-      // The goal runtime skips continuation after turn errors — pause the
-      // stored goal so its status matches reality, then end the run.
-      void (async () => {
-        if (goalStatus === 'active' && threadId) {
-          try {
-            const paused = await Promise.race([
-              request('thread/goal/set', { threadId, status: 'paused' }),
-              new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
-            ]);
-            // The adjacent goal-updated notification normally handles this,
-            // but apply the response too in case process output was delayed.
-            if (paused?.result?.goal) handleGoalUpdated(paused.result.goal);
-          } catch {}
-        }
-        endRun('\n\n_Goal run stopped on an error — `/goal resume` to retry._');
-      })();
+      finishFailedTurn(turn, error);
       return;
     }
     if (ended) return;
@@ -436,6 +634,10 @@ export const createCodexAppServerDriver = ({
   const handleItem = (params, completed) => {
     const item = params.item;
     if (!item || typeof item !== 'object') return;
+    if (!contextRecoveryActive) {
+      if (item.type === 'contextCompaction') nativeCompactionObserved = true;
+      else if (item.type !== 'userMessage') userTurnHadSubstantiveActivity = true;
+    }
     if (item.type === 'collabAgentToolCall') {
       const previous = collabAgentItems.get(item.id) ?? {};
       const merged = {
@@ -561,7 +763,6 @@ export const createCodexAppServerDriver = ({
     };
 
     let resolvedThreadId = null;
-    let resumedExistingThread = false;
     if (resumeSessionId) {
       const resumed = await request('thread/resume', { threadId: resumeSessionId, ...threadParams });
       if (resumed.error) callbacks.onResumeFallback?.();
@@ -580,14 +781,6 @@ export const createCodexAppServerDriver = ({
     threadId = resolvedThreadId;
     callbacks.onSessionId(threadId);
 
-    if (
-      resumedExistingThread &&
-      shouldAutoCompactCodexContext(input.codexContextUsage)
-    ) {
-      await compactThreadBeforeTurn();
-      if (ended) return;
-    }
-
     if (review) {
       const startedReview = await request('review/start', {
         threadId,
@@ -600,17 +793,8 @@ export const createCodexAppServerDriver = ({
     }
 
     if (!goal) {
-      const startedTurn = await request('turn/start', {
-        threadId,
-        input: [
-          {
-            type: 'text',
-            text: `${codexBrowserEnvironmentNote(input.providerOptions, accessMode)}${input.prompt}`,
-          },
-        ],
-      });
-      if (startedTurn.error) return fail(startedTurn.error);
-      markActionAccepted();
+      const startedTurn = await startUserTurn();
+      if (!startedTurn.ok) return fail(startedTurn.error);
       return;
     }
 
@@ -662,14 +846,32 @@ export const createCodexAppServerDriver = ({
   };
 
   const dispose = () => {
+    if (disposePromise) return disposePromise;
     ended = true;
     clearContinuationTimer();
-    resolvePreflightCompaction?.(false);
-    resolvePreflightCompaction = null;
-    for (const resolve of pendingRequests.values()) {
-      resolve({ error: { message: 'Codex app-server run ended.' } });
-    }
-    pendingRequests.clear();
+    const finishRecoveryCompaction = resolveRecoveryCompaction;
+    resolveRecoveryCompaction = null;
+    // Recovery can itself be awaiting an app-server request. Release those
+    // waits before joining recovery or disposal can deadlock with an
+    // unresponsive app-server. Cleanup requests below remain bounded.
+    settlePendingRequests();
+    disposePromise = (async () => {
+      if (contextRecoveryActive && restoreRolledBackPrompt) {
+        await requestWithTimeout(
+          'turn/interrupt',
+          {
+            threadId,
+            ...(recoveryCompactionTurnId ? { turnId: recoveryCompactionTurnId } : {}),
+          },
+          1000
+        );
+        await restoreRolledBackPrompt('Codex context recovery was cancelled.');
+      }
+      finishRecoveryCompaction?.(false);
+      await recoveryPromise;
+      settlePendingRequests();
+    })();
+    return disposePromise;
   };
 
   // Codex app-server accepts same-turn steering natively. The active turn id
@@ -729,17 +931,17 @@ export const createCodexAppServerDriver = ({
       return;
     }
 
-    if (preflightCompactionActive) {
-      if (message.method === 'turn/started' && !preflightCompactionTurnId) {
-        preflightCompactionTurnId = params.turn?.id ?? null;
+    if (contextRecoveryActive) {
+      if (message.method === 'turn/started' && !recoveryCompactionTurnId) {
+        recoveryCompactionTurnId = params.turn?.id ?? null;
         return;
       }
       if (
         message.method === 'turn/completed' &&
-        preflightCompactionTurnId &&
-        params.turn?.id === preflightCompactionTurnId
+        recoveryCompactionTurnId &&
+        params.turn?.id === recoveryCompactionTurnId
       ) {
-        resolvePreflightCompaction?.(params.turn?.status === 'completed');
+        resolveRecoveryCompaction?.(params.turn?.status === 'completed');
         return;
       }
       if (message.method === 'thread/tokenUsage/updated') {
@@ -750,7 +952,7 @@ export const createCodexAppServerDriver = ({
       if (message.method === 'error') {
         const detail = codexErrorDetail(params.error);
         if (!params.willRetry) {
-          preflightCompactionErrorDetail =
+          recoveryCompactionErrorDetail =
             detail || 'Codex reported a context-compaction error.';
         }
         callbacks.onActivity({
@@ -763,11 +965,19 @@ export const createCodexAppServerDriver = ({
           detail: detail || 'Codex reported a context-compaction error.',
           status: params.willRetry ? 'running' : 'error',
         });
-        if (!params.willRetry) resolvePreflightCompaction?.(false);
+        if (!params.willRetry) resolveRecoveryCompaction?.(false);
         return;
       }
-      // Compaction is an internal preflight turn. Keep its reasoning/items out
-      // of the user's requested turn while still consuming its lifecycle.
+      if (message.method === 'item/started' && params.item?.type === 'contextCompaction') {
+        handleItem(params, false);
+        return;
+      }
+      if (message.method === 'item/completed' && params.item?.type === 'contextCompaction') {
+        handleItem(params, true);
+        return;
+      }
+      // Recovery compaction is an internal app-server turn. Its native
+      // contextCompaction item is visible, but its summarization internals are not.
       return;
     }
 
@@ -782,17 +992,20 @@ export const createCodexAppServerDriver = ({
 
     switch (message.method) {
       case 'item/agentMessage/delta': {
+        userTurnHadSubstantiveActivity = true;
         if (typeof params.itemId === 'string') streamedTextItems.add(params.itemId);
         if (typeof params.delta === 'string') emitText(params.delta);
         return;
       }
       case 'item/reasoning/summaryTextDelta':
       case 'item/reasoning/textDelta': {
+        userTurnHadSubstantiveActivity = true;
         if (typeof params.itemId === 'string') streamedReasoningItems.add(params.itemId);
         if (typeof params.delta === 'string' && params.delta) callbacks.onReasoning(params.delta);
         return;
       }
       case 'item/reasoning/summaryPartAdded':
+        userTurnHadSubstantiveActivity = true;
         callbacks.onReasoning('\n\n');
         return;
       case 'item/started':
@@ -835,6 +1048,7 @@ export const createCodexAppServerDriver = ({
       }
       case 'error': {
         const detail = codexErrorDetail(params.error);
+        if (!params.willRetry) lastTerminalTurnError = params.error ?? null;
         if (detail) {
           const updatesRetryActivity = params.willRetry || retryActivityOpen;
           retryActivityOpen = Boolean(params.willRetry);
