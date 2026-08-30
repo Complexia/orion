@@ -23,6 +23,7 @@ import {
 import {
   collapseNestedPaths,
   isExternalRiftLinkedFromWorkspace,
+  isRiftRepositoryChildPath,
   isRiftRepositoryIncludedInWorkspaceSize,
   planRiftStorageEntries,
   reclaimedBytesAcrossVolumes,
@@ -45,6 +46,22 @@ const pendingOwners = collectPendingRiftOwnersByPath(
             riftPath: '/rift/unacknowledged/child',
             gitRoot: '/source/child',
             gitBranch: 'orion/child',
+          },
+        ],
+      },
+    ],
+    [
+      'single-project-epic',
+      {
+        epicId: 'single-project-epic',
+        riftPath: '/rift/single-project',
+        branch: 'orion/single-project',
+        repositories: [
+          {
+            projectId: 'single-project',
+            riftPath: '/rift/single-project',
+            gitRoot: '/source/single-project',
+            gitBranch: 'orion/single-project',
           },
         ],
       },
@@ -76,6 +93,11 @@ assert.equal(
   pendingOwners.get('/rift/unacknowledged/child')?.gitBranch,
   'orion/child'
 );
+assert.equal(
+  pendingOwners.get('/rift/single-project')?.repositoryChild,
+  undefined,
+  'a single-project Rift must remain the workspace owner when its repository row uses the same path'
+);
 assert.deepEqual(pendingOwners.get('/rift/creating'), {
   epicId: 'creating-epic',
   name: 'Creating epic',
@@ -86,6 +108,27 @@ assert.deepEqual(pendingOwners.get('/rift/creating'), {
   prUrl: null,
   prState: null,
 });
+
+assert.equal(
+  isRiftRepositoryChildPath('/rifts/single-abcd', '/rifts/single-abcd'),
+  false,
+  'the repository row for a single-project Rift is not a child of itself'
+);
+assert.equal(
+  isRiftRepositoryChildPath('/rifts/epics/shared', '/rifts/epics/shared/child'),
+  true,
+  'a distinct repository inside a shared workspace remains a child'
+);
+const singleProjectPlan = planRiftStorageEntries(
+  [{ riftPath: '/rift/single-project', riftRoot: '/rift' }],
+  pendingOwners,
+  () => true
+);
+assert.deepEqual(
+  singleProjectPlan.visibleRifts,
+  [{ riftPath: '/rift/single-project', riftRoot: '/rift' }],
+  'single-project Rifts must remain visible and independently releasable in Storage'
+);
 
 const removalCoordinator = createRiftRemovalCoordinator();
 const removalOrder = [];

@@ -24,6 +24,45 @@ export type SlashCommandContext = {
   isTerminal: boolean;
 };
 
+export type CodexReviewRequest = {
+  mode: 'uncommitted' | 'base' | 'commit' | 'custom';
+  base?: string;
+  commit?: string;
+  instructions?: string;
+};
+
+export type ParsedCodexReviewCommand =
+  | { review: CodexReviewRequest; error?: never }
+  | { review?: never; error: string };
+
+/**
+ * Parse Orion's native Codex `/review` command without depending on composer
+ * state. Remote controllers use the same syntax as the local composer, so the
+ * host can route either entry point into Codex's dedicated review API.
+ */
+export const parseCodexReviewCommand = (value: string): ParsedCodexReviewCommand | null => {
+  const match = value.trim().match(/^\/review(?:\s+([\s\S]+))?$/i);
+  if (!match) return null;
+  const rest = match[1]?.trim() ?? '';
+  if (!rest) return { review: { mode: 'uncommitted' } };
+
+  const baseMatch = rest.match(/^base(?:\s+(\S+))?$/i);
+  if (baseMatch) {
+    return baseMatch[1]
+      ? { review: { mode: 'base', base: baseMatch[1] } }
+      : { error: 'Name a base branch, e.g. “/review base main”.' };
+  }
+
+  const commitMatch = rest.match(/^commit(?:\s+([0-9a-fA-F]{4,40}))?$/i);
+  if (commitMatch) {
+    return commitMatch[1]
+      ? { review: { mode: 'commit', commit: commitMatch[1] } }
+      : { error: 'Name a commit, e.g. “/review commit abc1234”.' };
+  }
+
+  return { review: { mode: 'custom', instructions: rest } };
+};
+
 /**
  * Claude only expands slash commands when the prompt begins with `/`. Keep
  * Orion-owned context without moving it ahead of the command; ordinary

@@ -196,6 +196,7 @@ import {
   completedSlashCommand,
   filterSlashCommands,
   getSlashToken,
+  parseCodexReviewCommand,
   type SlashCommandCandidate,
 } from './app/slashCommands';
 import type { SlashCommandInfo } from './types';
@@ -9475,36 +9476,20 @@ const App: React.FC = () => {
     setChatMention(null);
   };
 
-  const handleReviewCommand = (promptText: string, rest: string) => {
+  const handleReviewCommand = (promptText: string) => {
     if (!selectedThread) return;
     const model = findAgentModel(agentModels, selectedThread.modelId ?? defaultAgentModelId);
     if (model?.providerId !== 'codex') {
       toast.error('/review is only available on Codex agents');
       return;
     }
-    if (!rest) {
-      dispatchReview(promptText, { mode: 'uncommitted' });
+    const parsed = parseCodexReviewCommand(promptText);
+    if (!parsed) return;
+    if (parsed.error) {
+      toast.error(parsed.error);
       return;
     }
-    const baseMatch = rest.match(/^base(?:\s+(\S+))?$/i);
-    if (baseMatch) {
-      if (!baseMatch[1]) {
-        toast.error('Name a base branch, e.g. “/review base main”.');
-        return;
-      }
-      dispatchReview(promptText, { mode: 'base', base: baseMatch[1] });
-      return;
-    }
-    const commitMatch = rest.match(/^commit(?:\s+([0-9a-fA-F]{4,40}))?$/i);
-    if (commitMatch) {
-      if (!commitMatch[1]) {
-        toast.error('Name a commit, e.g. “/review commit abc1234”.');
-        return;
-      }
-      dispatchReview(promptText, { mode: 'commit', commit: commitMatch[1] });
-      return;
-    }
-    dispatchReview(promptText, { mode: 'custom', instructions: rest });
+    dispatchReview(promptText, parsed.review);
   };
 
   // Async delivery can outlive the originating thread selection. Restore a
@@ -9678,9 +9663,9 @@ const App: React.FC = () => {
     // queued as plain follow-up text. Claude-backed threads fall through:
     // Claude Code has its own /review, expanded CLI-side like any other
     // slash command.
-    const reviewMatch = promptText.match(/^\/review(?:\s+([\s\S]+))?$/i);
-    if (reviewMatch && !selectedThreadClaudeBacked) {
-      handleReviewCommand(promptText, reviewMatch[1]?.trim() ?? '');
+    const reviewCommand = parseCodexReviewCommand(promptText);
+    if (reviewCommand && !selectedThreadClaudeBacked) {
+      handleReviewCommand(promptText);
       return;
     }
 
@@ -10370,6 +10355,7 @@ const App: React.FC = () => {
             : undefined;
         let threadId: string;
         let createdThread = false;
+        let turnModelId: string | undefined;
         let applyClaimedSettings: (() => void) | undefined;
         if (command.threadId) {
           const thread = state.threads.find((candidate) => candidate.id === command.threadId);
@@ -10420,6 +10406,7 @@ const App: React.FC = () => {
           // Apply provider-specific agent settings against the model that will
           // actually run (pending model switch, else the thread's current one).
           const targetModelId = patch.modelId ?? thread.modelId;
+          turnModelId = targetModelId;
           const targetModel = findAgentModel(agentModelsRef.current, targetModelId);
           Object.assign(
             patch,
@@ -10454,6 +10441,7 @@ const App: React.FC = () => {
           // any controller-requested settings for the model that actually ran.
           const created = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
           if (created) {
+            turnModelId = created.modelId;
             const targetModel = findAgentModel(agentModelsRef.current, created.modelId);
             const settingsPatch = remoteAgentSettingsPatch(created, targetModel, {
               reasoningEffort: requestedReasoningEffort,
@@ -10468,6 +10456,58 @@ const App: React.FC = () => {
         if (unsupportedError) {
           if (createdThread) useOrionStore.getState().deleteThread(threadId);
           return { ok: false, ...(createdThread ? {} : { threadId }), error: unsupportedError };
+        }
+        // Orion-native slash commands do not belong to an agent's ordinary
+        // prompt stream. In particular, Codex `/review` must use
+        // `review/start`; sending the text through a generic remote run makes
+        // the model see it as prose and silently skips the dedicated reviewer.
+        // Parse on the authoritative host so existing web clients gain the fix
+        // as soon as Desktop is updated. Claude's own `/review` remains an
+        // ordinary Claude slash command and deliberately falls through.
+        const reviewCommand = parseCodexReviewCommand(promptText);
+        const turnModel = findAgentModel(
+          agentModelsRef.current,
+          turnModelId ?? thread?.modelId ?? defaultAgentModelId
+        );
+        if (thread && reviewCommand && turnModel?.providerId === 'codex') {
+          if (reviewCommand.error) {
+            if (createdThread) useOrionStore.getState().deleteThread(threadId);
+            return {
+              ok: false,
+              ...(createdThread ? {} : { threadId }),
+              error: reviewCommand.error,
+            };
+          }
+          if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+            if (createdThread) useOrionStore.getState().deleteThread(threadId);
+            return { ok: false, error: 'The remote review command expired or was cancelled.' };
+          }
+          applyClaimedSettings?.();
+          const latestThread = useOrionStore
+            .getState()
+            .threads.find((candidate) => candidate.id === threadId);
+          const synchronouslyTracked =
+            pendingTurnStartsRef.current.has(threadId) ||
+            [...runOutputMessages.current.values()].some((tracked) => tracked.threadId === threadId);
+          if (
+            !latestThread ||
+            synchronouslyTracked ||
+            Boolean(activeRunsByThreadRef.current[threadId])
+          ) {
+            if (createdThread && latestThread) useOrionStore.getState().deleteThread(threadId);
+            return {
+              ok: false,
+              ...(createdThread ? {} : { threadId }),
+              error: latestThread
+                ? 'That thread is already running a turn.'
+                : 'Thread not found on this machine.',
+            };
+          }
+          const result = startReviewForThread(threadId, promptText, reviewCommand.review);
+          if (!result.ok && createdThread) useOrionStore.getState().deleteThread(threadId);
+          return result.ok
+            ? { ok: true, threadId }
+            : { ok: false, ...(createdThread ? {} : { threadId }), error: result.error };
         }
         const start = thread
           ? startTurnForThreadRef.current?.(

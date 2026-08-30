@@ -158,7 +158,7 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /owners\.set\(repository\.riftPath,[\s\S]*repositoryChild: true[\s\S]*ownedRiftHasMarker[\s\S]*removeOwnedRift/,
+  /isRiftRepositoryChildPath\(epic\.riftPath, repository\.riftPath\)[\s\S]*owners\.set\(repository\.riftPath,[\s\S]*repositoryChild: true[\s\S]*ownedRiftHasMarker[\s\S]*removeOwnedRift/,
   'shared Rift children must be durable owners and the parent lifecycle must delegate to them'
 );
 assert.match(

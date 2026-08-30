@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
+import { isRiftRepositoryChildPath } from './rift-storage-accounting.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -69,6 +70,7 @@ export const collectPendingRiftOwnersByPath = (
       ? ownership.repositories
       : []) {
       if (typeof repository?.riftPath !== 'string' || !repository.riftPath) continue;
+      if (!isRiftRepositoryChildPath(ownership.riftPath, repository.riftPath)) continue;
       owners.set(repository.riftPath, {
         ...owner,
         repositoryChild: true,

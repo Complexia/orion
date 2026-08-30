@@ -135,7 +135,7 @@ import {
   reconcileRiftReleaseJournal,
   releasedRiftRefForEpic,
 } from './main/rift-release.js';
-import { collapseNestedPaths, isExternalRiftLinkedFromWorkspace, planRiftStorageEntries, readVolumeFreeSpace, reclaimedBytesAcrossVolumes } from './main/rift-storage-accounting.js';
+import { collapseNestedPaths, isExternalRiftLinkedFromWorkspace, isRiftRepositoryChildPath, planRiftStorageEntries, readVolumeFreeSpace, reclaimedBytesAcrossVolumes } from './main/rift-storage-accounting.js';
 import { isRiftDirectoryPath, listRiftRootEntries, loadSizeCache, measurePathSize, riftHasMarker, riftRootForGitRoot, saveSizeCache } from './main/rift-storage.js';
 
 // Set the application name as early as possible.
@@ -519,6 +519,7 @@ const readPersistedRiftOwners = async (state) => {
       // actual Rift owners and each is separately present in the crash-cleanup
       // journal, so recovery must recognize them before acknowledgement too.
       for (const repository of repositories) {
+        if (!isRiftRepositoryChildPath(epic.riftPath, repository.riftPath)) continue;
         owners.set(repository.riftPath, {
           ...owner,
           repositoryChild: true,

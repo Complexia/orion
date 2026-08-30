@@ -9,6 +9,17 @@ const isSameOrNestedPath = (candidate, parent) => {
   );
 };
 
+// A single-project Epic persists its repository row at the same path as the
+// Epic workspace. Only distinct paths are children of a shared workspace;
+// treating the same path as both parent and child overwrites the parent owner
+// and makes the whole Rift disappear from Storage.
+export const isRiftRepositoryChildPath = (workspaceRiftPath, repositoryRiftPath) =>
+  typeof workspaceRiftPath === 'string' &&
+  Boolean(workspaceRiftPath) &&
+  typeof repositoryRiftPath === 'string' &&
+  Boolean(repositoryRiftPath) &&
+  path.resolve(workspaceRiftPath) !== path.resolve(repositoryRiftPath);
+
 // Shared-workspace sizing counts real child directories but deliberately does
 // not follow symlinks. An expanded legacy Rift keeps its original repository
 // outside the markerless workspace, so it must be measured separately before

@@ -5,6 +5,7 @@ import {
   buildSlashCommandCandidates,
   filterSlashCommands,
   getSlashToken,
+  parseCodexReviewCommand,
 } from '../src/app/slashCommands.ts';
 
 const [appSource, mainSource, claudeDriverSource] = await Promise.all([
@@ -42,6 +43,22 @@ assert.equal(
 
 assert.deepEqual(getSlashToken('/rev'), { query: 'rev' });
 assert.equal(getSlashToken('/review base '), null);
+assert.deepEqual(parseCodexReviewCommand('/review'), {
+  review: { mode: 'uncommitted' },
+});
+assert.deepEqual(parseCodexReviewCommand('/review base main'), {
+  review: { mode: 'base', base: 'main' },
+});
+assert.deepEqual(parseCodexReviewCommand('/review commit abc1234'), {
+  review: { mode: 'commit', commit: 'abc1234' },
+});
+assert.deepEqual(parseCodexReviewCommand('/review focus on lifecycle races'), {
+  review: { mode: 'custom', instructions: 'focus on lifecycle races' },
+});
+assert.deepEqual(parseCodexReviewCommand('/review base'), {
+  error: 'Name a base branch, e.g. “/review base main”.',
+});
+assert.equal(parseCodexReviewCommand('please review this'), null);
 const filtered = filterSlashCommands(
   buildSlashCommandCandidates(
     { providerId: 'claude', claudeBacked: true, isTerminal: false },
@@ -90,6 +107,22 @@ assert.match(
   modelCommand,
   /if \(isSending\) \{[\s\S]*return;[\s\S]*setModelPickerOpen\(true\)/,
   '/model must reject active runs before opening the picker'
+);
+
+const remoteCommands = section(
+  appSource,
+  '  // Remote runTurn/stopTurn commands from paired controllers',
+  '  // Track the composer\'s active @-mention token:'
+);
+assert.match(
+  remoteCommands,
+  /parseCodexReviewCommand\(promptText\)[\s\S]*turnModel\?\.providerId === 'codex'/,
+  'remote Codex review text must be recognized by the authoritative Desktop host'
+);
+assert.match(
+  remoteCommands,
+  /claimRemoteSideEffect\(canPrepare, claimStart\)[\s\S]*startReviewForThread/,
+  'remote Codex reviews must claim the command before starting the dedicated reviewer'
 );
 
 const draftSwap = section(
