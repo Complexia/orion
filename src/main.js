@@ -5138,6 +5138,9 @@ const sharedRiftRepositories = (riftPath, owner) => {
   const repositories = [];
   for (const repository of owner.repositories) {
     if (typeof repository?.riftPath !== 'string' || !repository.riftPath) continue;
+    // Single-project Epics persist one repository row for their workspace.
+    // It is metadata for the parent itself, not a shared-workspace child.
+    if (!isRiftRepositoryChildPath(riftPath, repository.riftPath)) continue;
     const repositoryPath = path.resolve(repository.riftPath);
     const relative = path.relative(workspacePath, repositoryPath);
     const directChild =

@@ -161,6 +161,16 @@ assert.match(
   /isRiftRepositoryChildPath\(epic\.riftPath, repository\.riftPath\)[\s\S]*owners\.set\(repository\.riftPath,[\s\S]*repositoryChild: true[\s\S]*ownedRiftHasMarker[\s\S]*removeOwnedRift/,
   'shared Rift children must be durable owners and the parent lifecycle must delegate to them'
 );
+const sharedRiftRepositories = section(
+  mainSource,
+  'const sharedRiftRepositories =',
+  'const readOwnedRiftWorkState ='
+);
+assert.match(
+  sharedRiftRepositories,
+  /isRiftRepositoryChildPath\(riftPath, repository\.riftPath\)/,
+  'single-project repository metadata must not be validated as a shared-workspace child'
+);
 assert.match(
   appSource,
   /Commit & push all projects[\s\S]*Create PRs for all[\s\S]*runMultiRepositoryAction/,
