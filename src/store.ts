@@ -702,7 +702,7 @@ export type OrchestrationSettings = {
 
 export const defaultOrchestrationSettings: OrchestrationSettings = {
   models: {
-    mainDriver: 'claude:claude-fable-5',
+    mainDriver: 'claude:claude-fable-5-1',
     computerUse: 'codex:gpt-5.6-sol',
     exploring: 'claude:claude-haiku-4-5',
     implementation: 'codex:gpt-5.6-sol',
@@ -1867,11 +1867,11 @@ export const useOrionStore = create<OrionState>()(
             .sort((a, b) => threadActivityTime(b) - threadActivityTime(a))[0];
 
         // Claude Code CLI is a terminal-hosted pseudo-model; it must be picked
-        // deliberately per thread, so new threads fall back to Claude Fable 5
+        // deliberately per thread, so new threads fall back to Claude Fable 5.1
         // instead of inheriting it.
         const inheritedModelId =
           lastProjectThread?.modelId === 'claude:claude-code-cli'
-            ? 'claude:claude-fable-5'
+            ? 'claude:claude-fable-5-1'
             : lastProjectThread?.modelId;
 
         const newThread: Thread = {
