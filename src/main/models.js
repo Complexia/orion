@@ -351,13 +351,22 @@ export const agentModels = [
     command: 'codex',
   },
   {
+    id: 'claude:claude-fable-5-1',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Fable 5.1',
+    slug: 'claude-fable-5-1',
+    command: 'claude',
+    shortcut: '⌘1',
+  },
+  {
     id: 'claude:claude-fable-5',
     providerId: 'claude',
     providerLabel: 'Claude',
     label: 'Claude Fable 5',
     slug: 'claude-fable-5',
     command: 'claude',
-    shortcut: '⌘1',
+    shortcut: '⌘2',
   },
   {
     id: 'claude:claude-opus-5',
@@ -366,7 +375,7 @@ export const agentModels = [
     label: 'Claude Opus 5',
     slug: 'claude-opus-5',
     command: 'claude',
-    shortcut: '⌘2',
+    shortcut: '⌘3',
   },
   {
     id: 'claude:claude-opus-4-8',
@@ -375,7 +384,7 @@ export const agentModels = [
     label: 'Claude Opus 4.8',
     slug: 'claude-opus-4-8',
     command: 'claude',
-    shortcut: '⌘3',
+    shortcut: '⌘4',
   },
   {
     id: 'claude:claude-sonnet-5',
@@ -384,7 +393,7 @@ export const agentModels = [
     label: 'Claude Sonnet 5',
     slug: 'claude-sonnet-5',
     command: 'claude',
-    shortcut: '⌘4',
+    shortcut: '⌘5',
   },
   {
     id: 'claude:claude-opus-4-7',
@@ -393,7 +402,7 @@ export const agentModels = [
     label: 'Claude Opus 4.7',
     slug: 'claude-opus-4-7',
     command: 'claude',
-    shortcut: '⌘5',
+    shortcut: '⌘6',
   },
   {
     id: 'claude:claude-opus-4-6',
@@ -402,7 +411,7 @@ export const agentModels = [
     label: 'Claude Opus 4.6',
     slug: 'claude-opus-4-6',
     command: 'claude',
-    shortcut: '⌘6',
+    shortcut: '⌘7',
   },
   {
     id: 'claude:claude-opus-4-5',
@@ -411,7 +420,7 @@ export const agentModels = [
     label: 'Claude Opus 4.5',
     slug: 'claude-opus-4-5',
     command: 'claude',
-    shortcut: '⌘7',
+    shortcut: '⌘8',
   },
   {
     id: 'claude:claude-sonnet-4-6',
@@ -420,7 +429,7 @@ export const agentModels = [
     label: 'Claude Sonnet 4.6',
     slug: 'claude-sonnet-4-6',
     command: 'claude',
-    shortcut: '⌘8',
+    shortcut: '⌘9',
   },
   {
     id: 'claude:claude-haiku-4-5',
@@ -429,7 +438,6 @@ export const agentModels = [
     label: 'Claude Haiku 4.5',
     slug: 'claude-haiku-4-5',
     command: 'claude',
-    shortcut: '⌘9',
   },
   {
     // Embedded-terminal pseudo-model: the thread runs the interactive
