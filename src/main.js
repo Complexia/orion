@@ -104,6 +104,7 @@ import {
 import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
 import { listRiftTrashPaths, riftBinaryPath, riftCreate, riftGc, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
+import { scrubRiftWorkspace } from './main/rift-scrub.js';
 import {
   configureOrionSourceControl,
   describeGitPushFailure,
@@ -3793,6 +3794,7 @@ const createMultiProjectRift = async (event, input) => {
       if ((await readGitStatusEntries(repositoryRiftPath)).length > 0) {
         throw new Error(`${baseName} could not switch cleanly to its Rift branch.`);
       }
+      await scrubRiftWorkspace(repositoryRiftPath);
       const riftProjectPath = source.projectRelativePath
         ? path.join(repositoryRiftPath, source.projectRelativePath)
         : repositoryRiftPath;
@@ -4123,6 +4125,7 @@ const addProjectToExistingRift = async (event, input) => {
     if ((await readGitStatusEntries(repositoryRiftPath)).length > 0) {
       throw new Error(`${baseName} could not switch cleanly to its Rift branch.`);
     }
+    await scrubRiftWorkspace(repositoryRiftPath);
     const riftWorkingDir = projectRelativePath
       ? path.join(repositoryRiftPath, projectRelativePath)
       : repositoryRiftPath;
@@ -4510,6 +4513,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
       if (restoredChanges.length > 0) {
         throw new Error(`The rift could not switch cleanly to ${requestedExistingBranch}.`);
       }
+      await scrubRiftWorkspace(createdRiftPath);
 
       let senderGone = false;
       try {
@@ -4613,6 +4617,9 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || slug;
     const branch = `${EPIC_BRANCH_NAMESPACE}${branchBase}-${suffix}`;
     await execFileAsync('git', ['-C', createdRiftPath, 'checkout', '-b', branch]);
+    // Drop copied build caches and stray lockfiles now that no further branch
+    // switch happens inside this flow (see rift-scrub.js for why the order matters).
+    await scrubRiftWorkspace(createdRiftPath);
 
     // The initiating renderer can reload or close while the copy/model turn
     // is in flight. If its frame is gone there is nobody left to persist the

@@ -55,6 +55,23 @@ artifacts. This is the instant copy-on-write path, lets agents build/test
 immediately, and avoids the broken filtered-copy mode in the bundled
 `rift-snapshot@0.0.10` binary.
 
+Two kinds of copied artifact are scrubbed from every new rift right after its
+branch is checked out (`src/main/rift-scrub.js`, applied on all three creation
+paths):
+
+- every `.next/` directory outside `.git`, `node_modules`, and `.rift`. It holds
+  Turbopack's persistent dev cache, dev-server lock, and traces for the source
+  checkout; a dev server started in the rift on top of that cache has pinned
+  every core and exhausted memory.
+- every `package-lock.json`. Orion projects use bun, and a stray npm lockfile
+  next to `bun.lock` makes Next.js guess the workspace root. A tracked
+  `package-lock.json` is deleted and then flagged `skip-worktree`, so it stays
+  out of `git status`, is not staged by `git add -A`, is not restored by
+  `reset --hard`, and remains unchanged in every commit made from the rift.
+  Git refuses to switch branches when a skip-worktree file differs between
+  them, which is why the scrub runs only after the last checkout of the
+  creation flow.
+
 Without rifts enabled, epic git actions run in the claimed repository and
 `git add -A` stages all local changes there — accepted trade-off. Such an epic
 is still locked to the repository and branch it first committed on, and to a
