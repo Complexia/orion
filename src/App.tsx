@@ -399,7 +399,7 @@ const UTILITY_MODEL_PREFERENCE = [
   'cursor:composer-2.5',
   'claude:claude-haiku-4-5',
   'kimi:kimi-code/kimi-for-coding',
-  'muse:muse-spark-1.2',
+  'muse:muse-spark-1.3',
 ];
 
 type ReasoningOption = { value: string; label: string };

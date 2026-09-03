@@ -5,6 +5,8 @@ import {
   agentModels,
   cursorFrontierModelSlugs,
   cursorFallbackModels,
+  museFallbackModels,
+  museModelsFromCatalogRows,
   openCodeFallbackModels,
   parseCursorModelsOutput,
   parseOpenCodeModelsOutput,
@@ -278,3 +280,95 @@ assert.match(
 );
 
 console.log('Agent model catalog regression tests passed.');
+
+// Muse: the static fallback carries both tiers of each Spark generation, and
+// the live catalog reader orders/dedupes the CLI's cached provider rows.
+assert.deepEqual(
+  museFallbackModels.map(({ id, slug, label, shortcut, favorite }) => ({ id, slug, label, shortcut, favorite })),
+  [
+    { id: 'muse:muse-spark-1.3', slug: 'muse-spark-1.3', label: 'Muse Spark 1.3', shortcut: '⌘1', favorite: true },
+    {
+      id: 'muse:muse-spark-1.3-contributor',
+      slug: 'muse-spark-1.3-contributor',
+      label: 'Muse Spark 1.3 Contributor',
+      shortcut: '⌘2',
+      favorite: true,
+    },
+    { id: 'muse:muse-spark-1.2', slug: 'muse-spark-1.2', label: 'Muse Spark 1.2', shortcut: '⌘3', favorite: false },
+    {
+      id: 'muse:muse-spark-1.2-contributor',
+      slug: 'muse-spark-1.2-contributor',
+      label: 'Muse Spark 1.2 Contributor',
+      shortcut: '⌘4',
+      favorite: false,
+    },
+  ],
+  'the Muse fallback should list Spark 1.3 and 1.2 in both standard and contributor tiers'
+);
+assert.deepEqual(
+  agentModels.filter((model) => model.providerId === 'muse').map((model) => model.slug),
+  museFallbackModels.map((model) => model.slug),
+  'the static agent catalog should carry the Muse fallback block'
+);
+
+const museCatalogRow = (model_id, overrides = {}) => ({
+  model_id,
+  display_label: model_id,
+  provider_id: 'meta',
+  profile_id: 'tbh',
+  visibility: 'visible',
+  release_date: '2026-08-05',
+  display_order: null,
+  is_current: false,
+  is_default: false,
+  ...overrides,
+});
+
+const discoveredMuse = museModelsFromCatalogRows([
+  // Cached in an arbitrary order, across two provider profiles, with a
+  // duplicate and a hidden row.
+  museCatalogRow('muse-spark-1.2-contributor'),
+  museCatalogRow('muse-spark-1.3-contributor', { release_date: '2026-09-02', is_default: true, is_current: true }),
+  museCatalogRow('muse-spark-1.2'),
+  museCatalogRow('muse-spark-1.3', { release_date: '2026-09-02' }),
+  museCatalogRow('muse-spark-1.3', { release_date: '2026-09-02', profile_id: 'other' }),
+  museCatalogRow('muse-spark-internal', { visibility: 'hidden', release_date: '2026-09-10' }),
+  { model_id: '' },
+  null,
+]);
+assert.deepEqual(
+  discoveredMuse.map(({ id, slug, label, shortcut, favorite, command }) => ({ id, slug, label, shortcut, favorite, command })),
+  [
+    { id: 'muse:muse-spark-1.3', slug: 'muse-spark-1.3', label: 'Muse Spark 1.3', shortcut: '⌘1', favorite: true, command: 'muse' },
+    {
+      id: 'muse:muse-spark-1.3-contributor',
+      slug: 'muse-spark-1.3-contributor',
+      label: 'Muse Spark 1.3 Contributor',
+      shortcut: '⌘2',
+      favorite: true,
+      command: 'muse',
+    },
+    { id: 'muse:muse-spark-1.2', slug: 'muse-spark-1.2', label: 'Muse Spark 1.2', shortcut: '⌘3', favorite: false, command: 'muse' },
+    {
+      id: 'muse:muse-spark-1.2-contributor',
+      slug: 'muse-spark-1.2-contributor',
+      label: 'Muse Spark 1.2 Contributor',
+      shortcut: '⌘4',
+      favorite: false,
+      command: 'muse',
+    },
+  ],
+  'Muse catalog rows should be deduped, hidden rows dropped, newest generation first with standard ahead of contributor'
+);
+
+assert.deepEqual(
+  museModelsFromCatalogRows([
+    museCatalogRow('muse-spark-1.2', { display_order: 1 }),
+    museCatalogRow('muse-spark-1.3', { display_order: 0, release_date: '2026-09-02' }),
+    museCatalogRow('muse-spark-1.3-contributor', { release_date: '2026-09-02' }),
+  ]).map((model) => model.slug),
+  ['muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.3-contributor'],
+  'an explicit display_order from the provider should win over release date, with unordered rows last'
+);
+
+assert.deepEqual(museModelsFromCatalogRows(undefined), [], 'a missing Muse catalog yields no models');
