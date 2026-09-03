@@ -214,21 +214,30 @@ export const kimiFallbackModels = [
   },
 ];
 
-// Muse Code (Meta) launched with the single Muse Spark model; the CLI caches
-// the provider's live catalog on disk after each run, which listMuseModels
-// reads to replace this block.
-export const museFallbackModels = [
-  {
-    id: 'muse:muse-spark-1.2',
-    providerId: 'muse',
-    providerLabel: 'Muse',
-    label: 'Muse Spark 1.2',
-    slug: 'muse-spark-1.2',
-    command: 'muse',
-    shortcut: '⌘1',
-    favorite: true,
-  },
+// Muse Code (Meta) ships the Muse Spark family. Each generation comes in two
+// tiers: the standard model and a discounted "contributor" tier whose
+// sessions may be used by Meta for product improvement. The CLI caches the
+// provider's live catalog on disk after each run, which listMuseModels reads
+// to replace this block; these are the current rows as of Muse Code 1.0.2.
+export const museFallbackModelSpecs = [
+  ['muse-spark-1.3', 'Muse Spark 1.3'],
+  ['muse-spark-1.3-contributor', 'Muse Spark 1.3 Contributor'],
+  ['muse-spark-1.2', 'Muse Spark 1.2'],
+  ['muse-spark-1.2-contributor', 'Muse Spark 1.2 Contributor'],
 ];
+
+export const museFavoriteModelSlugs = new Set(['muse-spark-1.3', 'muse-spark-1.3-contributor']);
+
+export const museFallbackModels = museFallbackModelSpecs.map(([slug, label], index) => ({
+  id: `muse:${slug}`,
+  providerId: 'muse',
+  providerLabel: 'Muse',
+  label,
+  slug,
+  command: 'muse',
+  ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+  favorite: museFavoriteModelSlugs.has(slug),
+}));
 
 // OpenCode exposes the models that are actually usable with the current
 // installation (built-in Zen models plus models from configured providers)
@@ -638,6 +647,56 @@ export const museModelCatalogDir = () =>
     'model-catalog'
   );
 
+// Turn the catalog rows (possibly from several provider profiles) into
+// picker entries. Rows honour the provider's display_order when it is set;
+// otherwise newest release first, with the standard tier ahead of its
+// contributor tier. The row muse itself marks as the default is a favorite,
+// as is the newest standard model so both tiers of the current generation
+// surface at the top of the picker.
+export const museModelsFromCatalogRows = (rows) => {
+  const seen = new Set();
+  const records = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row.model_id !== 'string' || !row.model_id) continue;
+    if (row.visibility === 'hidden') continue;
+    const slug = row.model_id.trim();
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    records.push({
+      slug,
+      row,
+      index: records.length,
+      releasedAt: Date.parse(row.release_date || '') || 0,
+      contributor: /(^|-)contributor(-|$)/i.test(slug),
+    });
+  }
+  records.sort((a, b) => {
+    const aOrder = typeof a.row.display_order === 'number' ? a.row.display_order : null;
+    const bOrder = typeof b.row.display_order === 'number' ? b.row.display_order : null;
+    if (aOrder !== null || bOrder !== null) {
+      if (aOrder === null) return 1;
+      if (bOrder === null) return -1;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+    }
+    return (
+      b.releasedAt - a.releasedAt ||
+      Number(a.contributor) - Number(b.contributor) ||
+      a.index - b.index
+    );
+  });
+  const newestStandard = records.find((record) => !record.contributor) ?? records[0];
+  return records.map(({ slug, row }, index) => ({
+    id: `muse:${slug}`,
+    providerId: 'muse',
+    providerLabel: 'Muse',
+    label: humanizeModelSlug(row.display_label || slug),
+    slug,
+    command: 'muse',
+    ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+    favorite: row.is_default === true || slug === newestStandard?.slug,
+  }));
+};
+
 export const listMuseModels = async () => {
   if (!(await checkCommandAvailable('muse'))) return [];
   try {
@@ -650,25 +709,7 @@ export const listMuseModels = async () => {
         if (Array.isArray(parsed?.rows)) rows.push(...parsed.rows);
       } catch {}
     }
-    return rows
-      .filter(
-        (row) =>
-          row &&
-          typeof row.model_id === 'string' &&
-          row.model_id &&
-          row.visibility !== 'hidden'
-      )
-      .sort((a, b) => (a.display_order ?? 0) - (b.display_order ?? 0))
-      .map((row, index) => ({
-        id: `muse:${row.model_id}`,
-        providerId: 'muse',
-        providerLabel: 'Muse',
-        label: humanizeModelSlug(row.display_label || row.model_id),
-        slug: row.model_id,
-        command: 'muse',
-        ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
-        favorite: row.is_default === true,
-      }));
+    return museModelsFromCatalogRows(rows);
   } catch {
     return [];
   }

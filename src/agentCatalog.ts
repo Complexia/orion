@@ -607,15 +607,24 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'kimi-code/kimi-for-coding-highspeed',
     shortcut: '⌘3',
   },
-  {
-    id: 'muse:muse-spark-1.2',
-    providerId: 'muse',
+  // Muse Spark ships in two tiers per generation: standard, and a discounted
+  // "contributor" tier whose sessions Meta may use for product improvement.
+  // Mirrors museFallbackModels in src/main/models.js; live discovery from the
+  // CLI's model-catalog cache replaces this block when muse is installed.
+  ...([
+    ['muse-spark-1.3', 'Muse Spark 1.3'],
+    ['muse-spark-1.3-contributor', 'Muse Spark 1.3 Contributor'],
+    ['muse-spark-1.2', 'Muse Spark 1.2'],
+    ['muse-spark-1.2-contributor', 'Muse Spark 1.2 Contributor'],
+  ] as Array<[string, string]>).map(([slug, label], index) => ({
+    id: `muse:${slug}`,
+    providerId: 'muse' as const,
     providerLabel: 'Muse',
-    label: 'Muse Spark 1.2',
-    slug: 'muse-spark-1.2',
-    shortcut: '⌘1',
-    favorite: true,
-  },
+    label,
+    slug,
+    shortcut: `⌘${index + 1}`,
+    favorite: slug.startsWith('muse-spark-1.3'),
+  })),
   {
     id: 'cursor:auto',
     providerId: 'cursor',
