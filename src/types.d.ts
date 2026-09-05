@@ -1259,7 +1259,7 @@ type OrionCodexBrowserIntegrationStatus = {
           size: number;
         }>;
         accessMode: 'read-only' | 'workspace-write' | 'full-access';
-        codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
+        codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
         codexServiceTier?: 'default' | 'priority';
         claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
         claudeContextWindow?: '200k' | '1m';

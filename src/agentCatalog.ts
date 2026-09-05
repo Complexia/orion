@@ -39,7 +39,7 @@ export type AgentProvider = {
   icon: ProviderIconComponent;
 };
 
-export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
+export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 export type CodexServiceTier = 'default' | 'priority';
 export type ClaudeReasoningEffort =
   | 'low'
@@ -75,8 +75,7 @@ export const codexReasoningOptions: CodexReasoningOption[] = [
 ];
 
 // The GPT-5.6 family renames the effort tiers (Light instead of Low), defaults
-// to High, and adds Ultra. The wire values stay the Codex CLI enum; "ultra" is
-// only accepted by 5.6 models. The Codex app offers Ultra on Sol and Terra but
+// to High, and adds Ultra. The Codex app offers Ultra on Sol and Terra but
 // not Luna, so we mirror that.
 const gpt56CodexReasoningOptions: CodexReasoningOption[] = [
   { value: 'low', label: 'Light' },
@@ -88,9 +87,17 @@ const gpt56CodexReasoningOptions: CodexReasoningOption[] = [
 
 const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
 
+// Matches Astra's Codex catalog, including its Medium default.
+const astraCodexReasoningOptions: CodexReasoningOption[] = [
+  ...codexReasoningOptions,
+  { value: 'max', label: 'Max' },
+  { value: 'ultra', label: 'Ultra', description: 'Maximum reasoning with automatic task delegation' },
+];
+
 export const codexReasoningOptionsForModel = (
   model: AgentModel | undefined
 ): CodexReasoningOption[] => {
+  if (model?.slug === 'gpt-6-astra') return astraCodexReasoningOptions;
   if (!model || !gpt56CodexModelSlugs.has(model.slug)) return codexReasoningOptions;
   if (model.slug === 'gpt-5.6-luna') {
     return gpt56CodexReasoningOptions.filter((option) => option.value !== 'ultra');
@@ -446,6 +453,13 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'grok-composer-2.5-fast',
     shortcut: '⌘3',
     favorite: true,
+  },
+  {
+    id: 'codex:gpt-6-astra',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Astra',
+    slug: 'gpt-6-astra',
   },
   {
     id: 'codex:gpt-5.6-sol',

@@ -4,10 +4,11 @@ import path from 'node:path';
 import { checkCommandAvailable, execFileAsync, shellPathSyncPromise } from './shell-env.js';
 
 export const defaultCodexReasoningEffort = 'medium';
-// The GPT-5.6 family defaults to high effort and is the only one that accepts
-// "ultra" as a model_reasoning_effort value.
+// The GPT-5.6 family defaults to high effort. Astra uses the Codex default
+// and also accepts Max and Ultra.
 export const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
 export const codexReasoningEffortForModel = (model, effort) => {
+  if (model.slug === 'gpt-6-astra') return effort || defaultCodexReasoningEffort;
   const isGpt56 = gpt56CodexModelSlugs.has(model.slug);
   if (!effort) return isGpt56 ? 'high' : defaultCodexReasoningEffort;
   if (effort === 'ultra' && !isGpt56) return 'xhigh';
@@ -302,6 +303,14 @@ export const agentModels = [
     command: 'grok',
     shortcut: '⌘3',
     favorite: true,
+  },
+  {
+    id: 'codex:gpt-6-astra',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Astra',
+    slug: 'gpt-6-astra',
+    command: 'codex',
   },
   {
     id: 'codex:gpt-5.6-sol',
