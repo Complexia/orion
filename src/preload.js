@@ -105,6 +105,8 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('agent:slashCommands', listener);
   },
   steerAgentTurn: (runId, text, attachments) => ipcRenderer.invoke('agent:steerTurn', runId, text, attachments),
+  getClaudeQuestions: (threadId) => ipcRenderer.invoke('agent:getClaudeQuestions', threadId),
+  answerClaudeQuestions: (runId, requestId, answers) => ipcRenderer.invoke('agent:answerClaudeQuestions', runId, requestId, answers),
   getCodexQuestions: (threadId) => ipcRenderer.invoke('agent:getCodexQuestions', threadId),
   answerCodexQuestions: (runId, requestId, answers) => ipcRenderer.invoke('agent:answerCodexQuestions', runId, requestId, answers),
   discardClaudeBackgroundShellTasks: (runId) =>

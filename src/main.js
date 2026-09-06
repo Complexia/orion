@@ -8940,7 +8940,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 ipcMain.handle('agent:steerTurn', async (_event, runId, text, attachments) => {
   if (typeof runId !== 'string' || typeof text !== 'string' || !text) return false;
   if (await steerCodexAppServerRun(runId, text, attachments)) return true;
-  return await steerClaudeSdkRun(runId, text);
+  return await steerClaudeSdkRun(runId, text, attachments);
 });
 
 ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => {
@@ -8955,6 +8955,16 @@ ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => {
 ipcMain.handle('agent:answerCodexQuestions', (_event, runId, requestId, answers) => {
   const driver = codexSteerableRunDrivers.get(runId) ?? codexGoalRunDrivers.get(runId);
   return driver?.answerUserInput?.(requestId, answers) ?? false;
+});
+
+ipcMain.handle('agent:getClaudeQuestions', (_event, threadId) =>
+  claudeSdkSessions.get(threadId)?.userInputs?.list() ?? []
+);
+ipcMain.handle('agent:answerClaudeQuestions', (_event, runId, requestId, answers) => {
+  for (const session of claudeSdkSessions.values()) {
+    if (session.userInputs?.answer(runId, requestId, answers)) return true;
+  }
+  return false;
 });
 
 ipcMain.handle('agent:discardClaudeBackgroundShellTasks', (_event, runId) => {
