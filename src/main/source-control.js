@@ -433,7 +433,7 @@ export const runAuthenticatedGit = async ({
 }) => withGitAskPass({ token, username, env }, async ({ env: authenticatedEnv }) => {
   const { stdout = '', stderr = '' } = await execFileImpl(
     'git',
-    ['-C', gitRoot, ...args],
+    ['-C', gitRoot, '-c', 'credential.helper=', '-c', 'http.extraHeader=', '-c', 'http.followRedirects=false', ...args],
     { env: authenticatedEnv, maxBuffer, signal, timeout }
   );
   return { stdout: stdout.toString().trim(), stderr: stderr.toString().trim() };
@@ -470,10 +470,16 @@ export const describeGitPushFailure = (error, { committed = false } = {}) => {
       errorDetail: 'The remote has newer changes. Pull them, resolve any divergence, then try again.',
     };
   }
-  if (/(?:authentication failed|could not read username|access denied|unauthorized|403\b)/i.test(text)) {
+  if (error?.status === 503 || /(?:503\b|authentication service temporarily unavailable)/i.test(text)) {
+    return { error: title, errorDetail: 'Orion Git is temporarily unavailable. Your local changes are safe; retry shortly.' };
+  }
+  if (error?.status === 403 || /(?:requires repo:|insufficient.scope|403\b)/i.test(text)) {
+    return { error: committed ? 'Committed locally, but permission was denied' : 'Push permission denied', errorDetail: 'Your source-control token lacks permission. For Orion repositories, check Settings > Access tokens and enable repo:write.' };
+  }
+  if (error?.status === 401 || error?.needsAuth || /(?:authentication failed|could not read username|access denied|unauthorized)/i.test(text)) {
     return {
       error: title,
-      errorDetail: 'Git authentication failed. Check your source-control account and try again.',
+      errorDetail: 'The source-control credential was rejected. For Orion repositories, sign in again to authorize this device; check Settings > Access tokens for revoked or expired tokens.',
     };
   }
   if (/(?:could not resolve host|enotfound|network is unreachable|connection timed out)/i.test(text)) {

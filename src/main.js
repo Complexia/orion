@@ -1,3 +1,4 @@
+import { createRepositoryCredentials } from './main/repository-credentials.js';
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell, systemPreferences } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -786,12 +787,38 @@ const writeAccountSession = async (session) => {
   await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
 };
 
-const clearAccountSession = async () => {
+const repositoryCredentials = createRepositoryCredentials({
+  readSession: () => readAccountSession(),
+  origin: () => getOrionWebUrl().toString(),
+  deviceName: `Orion Desktop · ${os.hostname()}`.slice(0, 100),
+  readStored: async () => {
+    try {
+      const stored = JSON.parse(await fs.readFile(`${getAccountSessionFilePath()}.repositories`, 'utf8'));
+      return { ...stored, token: decryptAccountToken(stored.token) };
+    } catch { return null; }
+  },
+  writeStored: async (credential) => {
+    if (app.isPackaged && !canUseSafeStorage()) return;
+    const target = `${getAccountSessionFilePath()}.repositories`;
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const temporary = `${target}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify({ ...credential, token: encryptAccountToken(credential.token) }), { mode: 0o600 });
+      await fs.rename(temporary, target);
+    } finally { await fs.rm(temporary, { force: true }); }
+  },
+  removeStored: () => fs.rm(`${getAccountSessionFilePath()}.repositories`, { force: true }),
+});
+const readRepositorySession = () => repositoryCredentials.get();
+
+const clearAccountSession = async ({ preserveRepository = false } = {}) => {
+  const repositoryClear = preserveRepository ? Promise.resolve() : repositoryCredentials.clear({ revokeRemote: true });
   inMemoryAccountSession = null;
   // Authorization ends when sign-out begins, not after the session file has
   // finished being removed. This synchronously closes remote listeners and
   // sessions before any account transition can await filesystem work.
   notifyRemoteControlAccountChanged(null, { reconcile: false });
+  await repositoryClear;
   await fs.rm(getAccountSessionFilePath(), { force: true });
 };
 
@@ -822,7 +849,7 @@ const verifyAccountSession = async () => {
   if (!session?.token) return desktopAccountForRenderer(null);
 
   if (session.expiresAt && Date.parse(session.expiresAt) <= Date.now()) {
-    await clearAccountSession();
+    await clearAccountSession({ preserveRepository: true });
     return publishAccountState(null);
   }
 
@@ -835,7 +862,7 @@ const verifyAccountSession = async () => {
     });
 
     if (response.status === 401) {
-      await clearAccountSession();
+      await clearAccountSession({ preserveRepository: true });
       return publishAccountState(null);
     }
 
@@ -850,6 +877,7 @@ const verifyAccountSession = async () => {
       expiresAt: data.expiresAt ?? session.expiresAt ?? null,
     };
     await writeAccountSession(nextSession);
+    void readRepositorySession().catch(() => {});
     return publishAccountState(nextSession);
   } catch {
     return desktopAccountForRenderer(session);
@@ -948,8 +976,11 @@ const handleDesktopAuthCallback = async (rawUrl) => {
       state,
       codeVerifier: pending.codeVerifier,
     });
+    await repositoryCredentials.clear({ revokeRemote: true });
     await writeAccountSession(session);
+    repositoryCredentials.resume();
     await publishAccountState(session);
+    void readRepositorySession().catch(() => {});
     const [window] = BrowserWindow.getAllWindows();
     if (window) {
       if (window.isMinimized()) window.restore();
@@ -2231,7 +2262,7 @@ ipcMain.handle('git:checkoutBranch', async (_event, input) => {
 const pushBranchToSourceControl = async (gitRoot, branch, { signal } = {}) => {
   const state = await getGitStateForPath(gitRoot);
   if (state.sourceProvider === 'orion') {
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       const error = new Error('Sign in to your Orion account before pushing.');
       error.needsAuth = true;
@@ -2252,7 +2283,7 @@ const pushBranchToSourceControl = async (gitRoot, branch, { signal } = {}) => {
 const runOriginNetworkGit = async (gitRoot, args, options = {}) => {
   const state = await getGitStateForPath(gitRoot);
   if (state.sourceProvider === 'orion') {
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) throw new Error('Sign in to your Orion account first.');
     return await runVerifiedOrionGit({
       gitRoot,
@@ -6128,7 +6159,8 @@ const startRiftRetentionSweep = async () => {
 // --- Orion Cloud repositories -------------------------------------------------
 
 const cloudErrorMessage = (error) => {
-  if (error?.status === 401) return 'Your Orion session expired. Sign in again.';
+  if (error?.status === 401) return 'Orion repository access was revoked or expired. Sign in again to authorize this device.';
+  if (error?.status === 403) return error?.data?.error || 'Your Orion token does not have permission for this operation. Check Settings > Access tokens.';
   if (error?.status === 404) {
     // A real "repo not found" comes back as JSON from the git API; a bare 404
     // (HTML page) means this Orion Web deployment doesn't have the API at all.
@@ -6141,7 +6173,7 @@ const cloudErrorMessage = (error) => {
 };
 
 const cloudGitApiRequest = async (apiPath, { method = 'GET', body, signal } = {}) => {
-  const session = await readAccountSession();
+  const session = await readRepositorySession();
   if (!session?.token) {
     const error = new Error('Sign in to your Orion account first.');
     error.needsAuth = true;
@@ -6178,13 +6210,18 @@ const expectedOrionGitRemote = (gitHttpUrl, repoId) =>
 const verifyOrionGitRemote = async ({ gitRoot, token, signal }) => {
   const link = await getCloudRepoLink(gitRoot);
   if (!link?.repoId) throw new Error('This repository is not linked to Orion Cloud.');
-  const [{ stdout }, connection] = await Promise.all([
+  const [{ stdout }, { stdout: pushUrls }, connection] = await Promise.all([
     execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', 'origin']),
+    execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', '--push', '--all', 'origin']),
     getCloudGitConnection({ baseUrl: getOrionWebUrl(), token, signal }),
   ]);
   const actual = stdout.trim().replace(/\/+$/, '');
   const expected = expectedOrionGitRemote(connection?.gitHttpUrl, link.repoId);
-  if (!connection?.gitHttpUrl || actual !== expected || !isOrionRepoRemoteUrl(actual, link.repoId)) {
+  // Git permits separate (and multiple) push destinations, including URL
+  // rewrites. Validate the effective destinations before supplying a token.
+  const pushDestinations = pushUrls.trim().split('\n').map((url) => url.trim().replace(/\/+$/, ''));
+  if (!connection?.gitHttpUrl || actual !== expected || !isOrionRepoRemoteUrl(actual, link.repoId)
+    || pushDestinations.length !== 1 || pushDestinations[0] !== expected) {
     throw new Error(
       'The origin remote does not match this repository’s authenticated Orion Cloud endpoint.'
     );
@@ -6244,6 +6281,9 @@ const resolveGithubMirrorDelivery = async (gitRoot, { signal } = {}) => {
 };
 
 const pushOrionSourceControl = async ({ gitRoot, branch, token, signal }) => {
+  // Background workspace sync also reaches this path with an account token.
+  // Resolve repository credentials here so every caller uses durable access.
+  token = (await readRepositorySession()).token;
   await verifyOrionGitRemote({ gitRoot, token, signal });
   const delivery = await resolveGithubMirrorDelivery(gitRoot, { signal });
   const pushed = await pushSourceControl({
@@ -6596,7 +6636,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
   try {
     const projectPath = input?.projectPath;
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, needsAuth: true, error: 'Sign in to your Orion account first.' };
     }
@@ -6696,7 +6736,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
 ipcMain.handle('git:authorizeGithubMirror', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, needsAuth: true, error: 'Sign in to your Orion account first.' };
     }
@@ -6726,7 +6766,7 @@ ipcMain.handle('git:authorizeGithubMirror', async (_event, projectPath) => {
 ipcMain.handle('cloud:getState', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: true, authenticated: false, linked: false };
     }
@@ -6743,6 +6783,9 @@ ipcMain.handle('cloud:getState', async (_event, projectPath) => {
       webUrl: state.linked ? cloudRepoWebUrl(state.repoId) : null,
     };
   } catch (error) {
+    if (error?.needsAuth || error?.status === 401) {
+      return { ok: true, authenticated: false, linked: false };
+    }
     return { ok: false, error: cloudErrorMessage(error) };
   }
 });
@@ -6751,7 +6794,7 @@ ipcMain.handle('cloud:publish', async (_event, input) => {
   try {
     const projectPath = input?.projectPath;
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, error: 'Sign in to your Orion account to publish.', needsAuth: true };
     }
@@ -6793,7 +6836,7 @@ ipcMain.handle('cloud:publish', async (_event, input) => {
 ipcMain.handle('cloud:push', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
     }
@@ -6815,7 +6858,7 @@ ipcMain.handle('cloud:push', async (_event, projectPath) => {
 ipcMain.handle('cloud:pull', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
     }
@@ -6921,7 +6964,7 @@ ipcMain.handle('cloud:deployPrecheck', async (_event, projectPath) => {
 ipcMain.handle('cloud:deploy', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
     }
@@ -6981,7 +7024,7 @@ ipcMain.handle('cloud:deploy', async (_event, projectPath) => {
 ipcMain.handle('cloud:getAppState', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
     }
@@ -7005,7 +7048,7 @@ ipcMain.handle('cloud:getAppState', async (_event, projectPath) => {
 ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
   try {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
-    const session = await readAccountSession();
+    const session = await readRepositorySession();
     if (!session?.token) {
       return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
     }
