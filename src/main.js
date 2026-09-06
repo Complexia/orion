@@ -7350,6 +7350,7 @@ const getCodexBrowserIntegrationStatus = async () => {
         pluginInstalled: false,
         pluginEnabled: false,
         nodeReplEnabled: false,
+        browserWorkflowAvailable: false,
         extensionInstalled: null,
         extensionEnabled: null,
         nativeHostReady: null,

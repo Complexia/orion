@@ -1749,7 +1749,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                       <div className="setting-label">
                         <div className="setting-label-title">Codex extension setup</div>
                         <div className="setting-label-desc">
-                          {codexBrowserIntegration?.detail ?? 'Checking the Codex plugin, node_repl, native host, and Chrome extension…'}
+                          {codexBrowserIntegration?.detail ?? 'Checking the browser tools and Chrome extension setup…'}
                         </div>
                       </div>
                       <div className="setting-row-actions">
@@ -1763,7 +1763,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                           }`}
                         >
                           {codexBrowserIntegration?.ready
-                            ? 'Ready'
+                            ? 'Setup detected'
                             : codexBrowserIntegration
                               ? 'Setup needed'
                               : 'Checking…'}

@@ -99,8 +99,11 @@ assert.equal(codexBrowserUseMode({ browserControl: true, browserAutoConnect: tru
 assert.equal(codexBrowserUseMode({ browserControl: true, browserUseMode: 'extension' }), 'extension');
 const extensionNote = codexBrowserEnvironmentNote({ browserUseMode: 'extension' }, 'full-access');
 assert.match(extensionNote, /ChatGPT Chrome extension/);
-assert.match(extensionNote, /control-chrome skill/);
-assert.match(extensionNote, /node_repl/);
+assert.match(extensionNote, /cua_repl/);
+assert.match(extensionNote, /skill actually listed in this session/);
+assert.match(extensionNote, /chrome_devtools MCP tools/);
+assert.match(extensionNote, /dedicated browser profile/);
+assert.doesNotMatch(extensionNote, /control-chrome|verified Codex browser integration/);
 const mcpNote = codexBrowserEnvironmentNote({ browserUseMode: 'mcp' }, 'full-access');
 assert.match(mcpNote, /chrome_devtools MCP tools/);
 assert.match(mcpNote, /real signed-in Chrome/);
@@ -121,8 +124,21 @@ assert.deepEqual(
 );
 assert.deepEqual(
   codexBrowserMcpConfig({ browserUseMode: 'extension' }, 'full-access', 'chrome-devtools-mcp@test'),
-  {}
+  {
+    'mcp_servers.chrome_devtools.command': 'npx',
+    'mcp_servers.chrome_devtools.args': ['-y', 'chrome-devtools-mcp@test'],
+    'mcp_servers.chrome_devtools.startup_timeout_sec': 90,
+  }
 );
+assert.deepEqual(
+  codexBrowserMcpConfig({ browserUseMode: 'extension', browserAutoConnect: true }, 'full-access', 'chrome-devtools-mcp@test'),
+  codexBrowserMcpConfig({ browserUseMode: 'extension' }, 'full-access', 'chrome-devtools-mcp@test'),
+  'extension fallback must never inherit signed-in remote debugging access'
+);
+for (const browserUseMode of ['disabled', 'extension']) {
+  assert.deepEqual(codexBrowserMcpConfig({ browserUseMode }, 'read-only', 'test'), {});
+}
+assert.deepEqual(codexBrowserMcpConfig({ browserUseMode: 'disabled' }, 'full-access', 'test'), {});
 assert.deepEqual(
   codexBrowserMcpConfig(
     { browserUseMode: 'mcp', browserAutoConnect: false },
@@ -147,6 +163,7 @@ assert.deepEqual(parseCodexChromePlugin(pluginList), {
   path: '/tmp/chrome-plugin',
 });
 assert.equal(parseCodexNodeReplEnabled('node_repl  /tmp/node_repl  -  -  -  enabled  Unsupported'), true);
+assert.equal(parseCodexNodeReplEnabled('node_repl_old  /tmp/node_repl  -  -  -  enabled  Unsupported'), false);
 assert.deepEqual(
   codexBrowserOptionsForIntegration({ browserUseMode: 'extension', webSearch: true }, { ready: false }),
   { browserUseMode: 'mcp', browserAutoConnect: false, webSearch: true }
@@ -169,9 +186,36 @@ const readyProbe = await probeCodexBrowserIntegration(async (command) => {
     return { stdout: JSON.stringify({ correct: true }) };
   }
   throw new Error(`Unexpected command: ${command}`);
+}, async (skillPath) => {
+  assert.equal(skillPath, '/tmp/chrome-plugin/skills/control-chrome/SKILL.md');
+  return 'Legacy browser instructions';
 });
 assert.equal(readyProbe.ready, true);
 assert.equal(probeCommands.length, 4);
+
+const browserProbe = (mcpOutput, skillContents) => probeCodexBrowserIntegration(async (command) => {
+  if (command === 'codex plugin list') return { stdout: pluginList };
+  if (command === 'codex mcp list') return { stdout: mcpOutput };
+  return { stdout: JSON.stringify(command.includes('check-extension-installed.js')
+    ? { installed: true, enabled: true } : { correct: true }) };
+}, async () => {
+  if (skillContents === undefined) throw new Error('ENOENT');
+  return skillContents;
+});
+const missingSkillProbe = await browserProbe('node_repl  /tmp/node_repl  enabled');
+assert.equal(missingSkillProbe.ready, false, 'extension and native host cannot conceal a removed browser skill');
+assert.equal(missingSkillProbe.browserWorkflowAvailable, false);
+assert.match(missingSkillProbe.detail, /no available Chrome browser workflow/);
+assert.equal(codexBrowserOptionsForIntegration({ browserUseMode: 'extension' }, missingSkillProbe).browserUseMode, 'mcp');
+assert.equal((await browserProbe('node_repl  /tmp/node_repl  enabled', '')).ready, false);
+const modernProbe = await browserProbe('cua_repl  /tmp/cua_repl  enabled');
+assert.equal(modernProbe.ready, true, 'self-describing CUA does not require the removed skill or old node_repl');
+assert.equal(modernProbe.browserWorkflowAvailable, true);
+assert.match(modernProbe.detail, /checks the connection when a task uses it/);
+assert.equal((await browserProbe('cua_repl  /tmp/cua_repl  disabled')).ready, false);
+const unavailableProbe = await probeCodexBrowserIntegration(async () => { throw new Error('unavailable'); });
+assert.equal(unavailableProbe.ready, false);
+assert.equal(unavailableProbe.browserWorkflowAvailable, false);
 const missingExtensionProbe = await probeCodexBrowserIntegration(async (command) => {
   if (command === 'codex plugin list') return { stdout: pluginList };
   if (command === 'codex mcp list') {
@@ -182,7 +226,7 @@ const missingExtensionProbe = await probeCodexBrowserIntegration(async (command)
     ? JSON.stringify({ installed: false, enabled: false })
     : JSON.stringify({ correct: true });
   throw error;
-});
+}, async () => 'Legacy browser instructions');
 assert.equal(missingExtensionProbe.ready, false);
 assert.equal(missingExtensionProbe.extensionInstalled, false);
 assert.match(missingExtensionProbe.detail, /Install and enable/);

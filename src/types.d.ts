@@ -597,6 +597,7 @@ type OrionCodexBrowserIntegrationStatus = {
   pluginInstalled: boolean;
   pluginEnabled: boolean;
   nodeReplEnabled: boolean;
+  browserWorkflowAvailable: boolean;
   extensionInstalled: boolean | null;
   extensionEnabled: boolean | null;
   nativeHostReady: boolean | null;

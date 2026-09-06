@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { codexBrowserUseMode } from './codex-config.js';
 
 export const codexBrowserExtensionStoreUrl =
@@ -20,12 +21,14 @@ export const parseCodexChromePlugin = (output) => {
   };
 };
 
-export const parseCodexNodeReplEnabled = (output) => {
+const parseMcpEnabled = (output, name) => {
   const row = String(output || '')
     .split(/\r?\n/)
-    .find((line) => line.trim().startsWith('node_repl'));
+    .find((line) => rowColumns(line)[0] === name);
   return row ? rowColumns(row).includes('enabled') : false;
 };
+
+export const parseCodexNodeReplEnabled = (output) => parseMcpEnabled(output, 'node_repl');
 
 export const codexBrowserOptionsForIntegration = (providerOptions, integrationStatus) => {
   const options =
@@ -58,7 +61,7 @@ const runDiagnostic = async (runCommand, command) => {
   }
 };
 
-export const probeCodexBrowserIntegration = async (runCommand) => {
+export const probeCodexBrowserIntegration = async (runCommand, readSkill = readFile) => {
   let pluginOutput = '';
   let mcpOutput = '';
   try {
@@ -73,6 +76,7 @@ export const probeCodexBrowserIntegration = async (runCommand) => {
       pluginInstalled: false,
       pluginEnabled: false,
       nodeReplEnabled: false,
+      browserWorkflowAvailable: false,
       extensionInstalled: null,
       extensionEnabled: null,
       nativeHostReady: null,
@@ -82,6 +86,18 @@ export const probeCodexBrowserIntegration = async (runCommand) => {
 
   const plugin = parseCodexChromePlugin(pluginOutput);
   const nodeReplEnabled = parseCodexNodeReplEnabled(mcpOutput);
+  const cuaReplEnabled = parseMcpEnabled(mcpOutput, 'cua_repl');
+  let legacySkillAvailable = false;
+  if (plugin.enabled && plugin.path && nodeReplEnabled && !cuaReplEnabled) {
+    try {
+      legacySkillAvailable = Boolean(String(await readSkill(
+        path.join(plugin.path, 'skills', 'control-chrome', 'SKILL.md'), 'utf8'
+      )).trim());
+    } catch {}
+  }
+  // New Chrome packages use self-describing CUA tools and no longer ship the
+  // legacy skill. An enabled generic node_repl alone is not a browser workflow.
+  const browserWorkflowAvailable = cuaReplEnabled || (nodeReplEnabled && legacySkillAvailable);
   let extensionInstalled = null;
   let extensionEnabled = null;
   let nativeHostReady = null;
@@ -109,15 +125,15 @@ export const probeCodexBrowserIntegration = async (runCommand) => {
 
   const ready =
     plugin.enabled &&
-    nodeReplEnabled &&
+    browserWorkflowAvailable &&
     extensionInstalled === true &&
     extensionEnabled === true &&
     nativeHostReady === true;
-  let detail = 'Codex browser support is ready to use your signed-in Chrome.';
+  let detail = 'Chrome extension setup detected. Orion checks the connection when a task uses it and keeps a separate browser available if it cannot connect.';
   if (!plugin.installed || !plugin.enabled) {
     detail = 'The Codex Chrome plugin is not installed and enabled. Install or update Codex browser support, or use the dedicated MCP browser.';
-  } else if (!nodeReplEnabled) {
-    detail = 'Codex node_repl browser support is not enabled. Install or update Codex browser support, or use the dedicated MCP browser.';
+  } else if (!browserWorkflowAvailable) {
+    detail = 'This Codex installation has no available Chrome browser workflow. Orion will use a separate browser without your Chrome logins or tabs.';
   } else if (extensionInstalled === false || extensionEnabled === false) {
     detail = 'Install and enable the ChatGPT Chrome extension to let Codex use your signed-in Chrome.';
   } else if (nativeHostReady === false) {
@@ -132,6 +148,7 @@ export const probeCodexBrowserIntegration = async (runCommand) => {
     pluginInstalled: plugin.installed,
     pluginEnabled: plugin.enabled,
     nodeReplEnabled,
+    browserWorkflowAvailable,
     extensionInstalled,
     extensionEnabled,
     nativeHostReady,
