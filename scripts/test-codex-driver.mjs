@@ -3,11 +3,15 @@ import { readFile } from 'node:fs/promises';
 import { app } from 'electron';
 
 import {
+  codexAppServerConfig,
+  codexAppServerActivityFromItem,
+  codexUserInput,
   codexErrorDetail,
   codexStatsFromTokenUsage,
   createCodexAppServerDriver,
   isRecoverableCodexContextError,
 } from '../src/main/codex-driver.js';
+import { commandForModel } from '../src/main/command-for-model.js';
 
 const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
 assert.match(
@@ -678,5 +682,106 @@ assert.equal(
   'restore this prompt when stopped'
 );
 
-console.log('Codex native compaction and context recovery lifecycle tests passed.');
+// Astra keeps native context ownership, vision inputs, asynchronous messages,
+// and user questions through the same driver used for normal turns.
+const astra = { id: 'codex:gpt-6-astra', providerId: 'codex', slug: 'gpt-6-astra' };
+const screenshot = { path: '/tmp/screenshot.png', mimeType: 'image/png' };
+const astraInput = {
+  threadId: 'orion-astra', prompt: 'Inspect this screenshot', attachments: [screenshot],
+  codexReasoningEffort: 'max', codexServiceTier: 'priority',
+};
+assert.equal(codexAppServerConfig(astra, astraInput)['features.context_management.experimental_mode'], true);
+assert.equal(codexAppServerConfig(astra, astraInput).model_reasoning_effort, 'max');
+assert.ok(commandForModel(astra, { ...astraInput, projectPath: '/tmp' }).includes('features.context_management.experimental_mode=true'));
+assert.deepEqual(codexUserInput('inspect', [screenshot, screenshot, { path: '/tmp/readme.md', mimeType: 'text/plain' }, { path: 'relative.png', mimeType: 'image/png' }], astra), [
+  { type: 'text', text: 'inspect' },
+  { type: 'localImage', path: screenshot.path, detail: 'original' },
+]);
+const astraWire = [];
+const astraText = [];
+const astraActivities = [];
+let inputChanges = 0;
+let astraRunEnded = 0;
+let astraDriver;
+const astraChild = { stdin: { write: (line) => {
+  const message = JSON.parse(line);
+  astraWire.push(message);
+  if (!message.method || message.id === undefined) return;
+  const result = message.method === 'thread/resume'
+    ? { thread: { id: 'astra-native' } }
+    : message.method === 'turn/start' || message.method === 'turn/steer'
+      ? { turn: { id: 'astra-turn' }, turnId: 'astra-turn' } : {};
+  queueMicrotask(() => {
+    astraDriver.handleMessage({ id: message.id, result });
+    if (message.method === 'turn/start') astraDriver.handleMessage({ method: 'turn/started', params: { threadId: 'astra-native', turn: { id: 'astra-turn' } } });
+  });
+} } };
+const astraCallbacks = {
+  onActivity: (activity) => astraActivities.push(activity), onActionAccepted: () => {},
+  onFatal: (error) => assert.fail(error), onGoal: () => {}, onReasoning: () => {},
+  onSessionId: () => {}, onText: (text) => astraText.push(text),
+  onRunEnd: () => { astraRunEnded += 1; }, onUserInput: () => { inputChanges += 1; },
+};
+const makeAstraDriver = () => createCodexAppServerDriver({
+  child: astraChild, cwd: '/tmp', model: astra, input: astraInput,
+  resumeSessionId: 'astra-native', accessMode: 'full-access', callbacks: astraCallbacks,
+});
+astraDriver = makeAstraDriver();
+await astraDriver.start();
+const astraTurn = astraWire.find((message) => message.method === 'turn/start');
+assert.equal(astraTurn.params.effort, 'max');
+assert.equal(astraTurn.params.serviceTier, 'priority');
+assert.deepEqual(astraTurn.params.input[1], { type: 'localImage', path: screenshot.path, detail: 'original' });
+assert.equal(await astraDriver.steer('Look at this too', [screenshot]), true);
+assert.deepEqual(astraWire.find((message) => message.method === 'turn/steer').params.input[1], astraTurn.params.input[1]);
+const asyncItem = { id: 'async-message', type: 'agentMessage', text: 'Continuing the task.', questions: [{ title: 'Which design?', options: ['A', 'B'] }] };
+astraDriver.handleMessage({ method: 'item/completed', params: { threadId: 'astra-native', item: asyncItem } });
+assert.match(astraText.join(''), /Which design\?\n- A\n- B/);
+assert.equal(astraRunEnded, 0, 'an asynchronous message is not a turn completion');
+const ask = (id, threadId = 'astra-native') => astraDriver.handleMessage({
+  id, method: 'item/tool/requestUserInput', params: {
+    threadId, turnId: 'astra-turn', isBlocking: true, itemId: 'ask-item',
+    questions: [{ id: 'choice', header: 'Design', question: 'Which design?', options: [{ label: 'A', description: 'First design' }] }],
+  },
+});
+ask('question-1');
+assert.equal(astraDriver.getUserInputs()[0].threadId, 'orion-astra');
+assert.equal(astraDriver.answerUserInput('question-1', { choice: [] }), false);
+assert.equal(astraDriver.answerUserInput('question-1', { choice: ['B'] }), true);
+assert.deepEqual(astraWire.at(-1).result, { answers: { choice: { answers: ['B'] } } });
+assert.equal(astraDriver.answerUserInput('question-1', { choice: ['A'] }), false, 'answers cannot replay');
+ask('foreign-question', 'unrelated-thread');
+assert.equal(astraDriver.getUserInputs().length, 0, 'requests from other shared-server threads are not shown');
+assert.equal(astraWire.some((message) => message.id === 'foreign-question'), false, 'another run must own its question response');
+astraDriver.handleMessage({ method: 'item/started', params: { threadId: 'astra-native', item: { id: 'child-start', type: 'subAgentActivity', agentThreadId: 'astra-child', agentPath: '/root/child', kind: 'started' } } });
+ask('child-question', 'astra-child');
+assert.equal(astraDriver.answerUserInput('child-question', { choice: ['A'] }), true, 'new native subagent activity establishes question ownership');
+ask('question-2');
+astraDriver.handleMessage({ method: 'serverRequest/resolved', params: { threadId: 'unrelated-thread', requestId: 'question-2' } });
+assert.equal(astraDriver.getUserInputs().length, 1);
+astraDriver.handleMessage({ method: 'serverRequest/resolved', params: { threadId: 'astra-native', requestId: 'question-2' } });
+assert.equal(astraDriver.getUserInputs().length, 0, 'server-resolved questions disappear');
+ask('question-3');
+await astraDriver.dispose();
+assert.equal(astraDriver.getUserInputs().length, 0);
+assert.deepEqual(astraWire.find((message) => message.id === 'question-3' && message.result)?.result, { answers: {} }, 'Stop settles unanswered requests without choosing for the user');
+assert.equal(astraDriver.answerUserInput('question-3', { choice: ['A'] }), false);
+assert.ok(inputChanges >= 6);
+
+astraDriver = makeAstraDriver();
+await astraDriver.start();
+astraDriver.handleMessage({ method: 'guardianWarning', params: { threadId: 'astra-native', message: 'Action requires review.' } });
+assert.equal(astraActivities.at(-1).detail, 'Action requires review.');
+astraDriver.handleMessage({ method: 'configWarning', params: { summary: 'Context feature unavailable', details: 'Check account eligibility.' } });
+assert.match(astraActivities.at(-1).detail, /Check account eligibility/);
+astraDriver.handleMessage({ id: 'time-read', method: 'currentTime/read', params: {} });
+assert.ok(Math.abs(astraWire.at(-1).result.currentTimeAt - Date.now() / 1000) < 2);
+astraDriver.handleMessage({ method: 'turn/completed', params: { threadId: 'astra-native', turn: { id: 'astra-turn', status: 'failed', error: { message: 'Context full', codexErrorInfo: 'contextWindowExceeded' } } } });
+assert.equal(astraWire.some((message) => message.method === 'thread/rollback'), false, 'notes/searchable history must not enter legacy rollback recovery');
+assert.equal(astraWire.some((message) => message.method === 'thread/compact/start'), false);
+await astraDriver.dispose();
+assert.equal(codexAppServerActivityFromItem({ id: 'sleep-1', type: 'sleep', durationMs: 5000 }, false).title, 'Waiting');
+assert.match(codexAppServerActivityFromItem({ id: 'call-1', type: 'functionCallOutput', name: 'exec', namespace: 'functions', output: 'completed' }, true).title, /functions.exec/);
+
+console.log('Codex native compaction, Astra capabilities, and context recovery lifecycle tests passed.');
 app.quit();

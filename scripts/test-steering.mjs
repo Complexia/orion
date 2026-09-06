@@ -244,6 +244,8 @@ const codexTurnStart = codexRequests.find((request) => request.method === 'turn/
 assert.deepEqual(codexTurnStart?.params, {
   threadId: 'codex-thread',
   input: [{ type: 'text', text: 'initial direction' }],
+  effort: 'medium',
+  serviceTier: 'default',
 });
 
 codexSteerableRunDrivers.set('codex-run', codexDriver);

@@ -2,7 +2,7 @@ import { app, protocol } from 'electron';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
-import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexPersonalizationConfig } from './codex-config.js';
+import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexModelConfig, codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
@@ -25,6 +25,7 @@ export const codexAppServerConfig = (model, input) => {
     model_reasoning_summary: 'detailed',
     service_tier: input.codexServiceTier || defaultCodexServiceTier,
     ...codexPersonalizationConfig(options),
+    ...codexModelConfig(model, options),
   };
   if (options.networkAccess) config['sandbox_workspace_write.network_access'] = true;
   if (options.webSearch) config['tools.web_search'] = true;
@@ -42,6 +43,25 @@ export const codexAppServerConfig = (model, input) => {
     config['mcp_servers.orion.default_tools_approval_mode'] = 'approve';
   }
   return config;
+};
+
+// Attach images as native vision inputs as well as retaining the file-path
+// references in the prompt. Keep screenshots at original detail for Astra.
+export const codexUserInput = (text, attachments, model) => {
+  const items = [{ type: 'text', text }];
+  const seen = new Set();
+  for (const attachment of Array.isArray(attachments) ? attachments : []) {
+    const filePath = attachment?.path;
+    if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || seen.has(filePath)) continue;
+    if (!/^image\/(png|jpe?g|webp|gif)$/i.test(attachment?.mimeType || '')) continue;
+    seen.add(filePath);
+    items.push({
+      type: 'localImage',
+      path: filePath,
+      ...(model?.slug === 'gpt-6-astra' ? { detail: 'original' } : {}),
+    });
+  }
+  return items;
 };
 
 // thread/tokenUsage/updated carries cumulative totals for the thread's loaded
@@ -170,6 +190,24 @@ export const codexAppServerActivityFromItem = (item, completed) => {
   if (item.type === 'imageGeneration') {
     return { ...base, type: 'tool', title: 'Image generation' };
   }
+  if (item.type === 'functionCallOutput' || item.type === 'dynamicToolCall') {
+    return {
+      ...base,
+      type: 'tool',
+      title: `Tool - ${[item.namespace, item.name || item.tool].filter(Boolean).join('.') || 'Codex'}`,
+      input: formatToolInput(item.arguments),
+      output: formatToolOutput(item.output ?? item.contentItems),
+    };
+  }
+  if (item.type === 'sleep') {
+    return { ...base, type: 'tool', title: 'Waiting', detail: `Up to ${Math.ceil((item.durationMs || 0) / 1000)} seconds; new input can interrupt this wait.` };
+  }
+  if (item.type === 'imageView') {
+    return { ...base, type: 'tool', title: 'Inspecting image', detail: item.path || '' };
+  }
+  if (item.type === 'subAgentActivity') {
+    return { ...base, type: 'tool', title: `Subagent ${item.kind || 'activity'}`, detail: item.agentPath || item.agentThreadId || '' };
+  }
   if (item.type === 'contextCompaction') {
     return {
       ...base,
@@ -234,6 +272,7 @@ export const createCodexAppServerDriver = ({
 }) => {
   let nextRequestId = 1;
   const pendingRequests = new Map();
+  const pendingUserInputs = new Map();
   let threadId = null;
   let textSeen = false;
   let pendingTextBreak = false;
@@ -241,6 +280,7 @@ export const createCodexAppServerDriver = ({
   // payload must not be emitted a second time.
   const streamedTextItems = new Set();
   const streamedReasoningItems = new Set();
+  const renderedQuestionItems = new Set();
   let goalStatus = null;
   let turnActive = false;
   let activeTurnId = null;
@@ -328,9 +368,39 @@ export const createCodexAppServerDriver = ({
     }
   };
 
+  const clearUserInputs = () => {
+    for (const id of pendingUserInputs.keys()) {
+      write({ jsonrpc: '2.0', id, result: { answers: {} } });
+    }
+    pendingUserInputs.clear();
+    callbacks.onUserInput?.();
+  };
+
+  const getUserInputs = () => [...pendingUserInputs.values()].map(({ id, params }) => ({
+    requestId: id,
+    threadId: input.threadId,
+    questions: params.questions,
+  }));
+
+  const answerUserInput = (id, answers) => {
+    const pending = pendingUserInputs.get(id);
+    if (ended || !pending || !answers || typeof answers !== 'object') return false;
+    const entries = [];
+    for (const question of pending.params.questions) {
+      const value = answers[question.id];
+      if (!Array.isArray(value) || !value.length || value.some((answer) => typeof answer !== 'string' || !answer.trim())) return false;
+      entries.push([question.id, { answers: value }]);
+    }
+    if (!write({ jsonrpc: '2.0', id, result: { answers: Object.fromEntries(entries) } })) return false;
+    pendingUserInputs.delete(id);
+    callbacks.onUserInput?.();
+    return true;
+  };
+
   const endRun = (note) => {
     if (ended) return;
     ended = true;
+    clearUserInputs();
     clearContinuationTimer();
     if (note) emitText(note);
     callbacks.onRunEnd();
@@ -358,6 +428,7 @@ export const createCodexAppServerDriver = ({
   const fail = (error) => {
     if (ended) return;
     ended = true;
+    clearUserInputs();
     clearContinuationTimer();
     resolveRecoveryCompaction?.(false);
     resolveRecoveryCompaction = null;
@@ -399,12 +470,13 @@ export const createCodexAppServerDriver = ({
 
   const userTurnParams = () => ({
     threadId,
-    input: [
-      {
-        type: 'text',
-        text: `${codexBrowserEnvironmentNote(input.providerOptions, accessMode)}${input.prompt}`,
-      },
-    ],
+    input: codexUserInput(
+      `${codexBrowserEnvironmentNote(input.providerOptions, accessMode)}${input.prompt}`,
+      input.attachments,
+      model
+    ),
+    effort: codexReasoningEffortForModel(model, input.codexReasoningEffort),
+    serviceTier: input.codexServiceTier || defaultCodexServiceTier,
   });
 
   const startUserTurn = async () => {
@@ -599,6 +671,9 @@ export const createCodexAppServerDriver = ({
       if (
         !goal &&
         !review &&
+        // The notes/searchable-history runtime owns recovery. The legacy
+        // rollback/compact fallback would rewrite the history it searches.
+        codexModelConfig(model, input.providerOptions)['features.context_management.experimental_mode'] !== true &&
         resumedExistingThread &&
         !contextRecoveryAttempted &&
         !userTurnHadSubstantiveActivity &&
@@ -638,6 +713,9 @@ export const createCodexAppServerDriver = ({
       if (item.type === 'contextCompaction') nativeCompactionObserved = true;
       else if (item.type !== 'userMessage') userTurnHadSubstantiveActivity = true;
     }
+    if (item.type === 'subAgentActivity' && typeof item.agentThreadId === 'string') {
+      collabThreadIds.add(item.agentThreadId);
+    }
     if (item.type === 'collabAgentToolCall') {
       const previous = collabAgentItems.get(item.id) ?? {};
       const merged = {
@@ -672,6 +750,18 @@ export const createCodexAppServerDriver = ({
       if (completed) {
         if (!streamedTextItems.has(item.id) && typeof item.text === 'string' && item.text) {
           emitText(item.text);
+        }
+        // Astra can deliver questions alongside an asynchronous message. The
+        // question text is separate from item.text and must not disappear.
+        if (Array.isArray(item.questions) && !renderedQuestionItems.has(item.id)) {
+          const questions = item.questions.filter((question) => typeof question?.title === 'string');
+          if (questions.length) {
+            emitText(`\n\n${questions.map((question) => [
+              question.title,
+              ...(Array.isArray(question.options) ? question.options.filter((option) => typeof option === 'string').map((option) => `- ${option}`) : []),
+            ].join('\n')).join('\n\n')}`);
+          }
+          renderedQuestionItems.add(item.id);
         }
         pendingTextBreak = true;
       }
@@ -721,6 +811,19 @@ export const createCodexAppServerDriver = ({
   const answerServerRequest = (message) => {
     const method = message.method;
     const respond = (result) => write({ jsonrpc: '2.0', id: message.id, result });
+    if (method === 'currentTime/read') return respond({ currentTimeAt: Math.floor(Date.now() / 1000) });
+    if (method === 'item/tool/requestUserInput') {
+      const params = message.params ?? {};
+      if (params.threadId !== threadId && !collabThreadIds.has(params.threadId)) return;
+      if (
+        ended || !callbacks.onUserInput ||
+        !Array.isArray(params.questions) || !params.questions.length
+      ) return respond({ answers: {} });
+      userTurnHadSubstantiveActivity = true;
+      pendingUserInputs.set(message.id, { id: message.id, params });
+      callbacks.onUserInput();
+      return;
+    }
     if (method === 'item/commandExecution/requestApproval' || method === 'execCommandApproval') {
       return respond({ decision: accessMode === 'full-access' ? 'accept' : 'decline' });
     }
@@ -848,6 +951,7 @@ export const createCodexAppServerDriver = ({
   const dispose = () => {
     if (disposePromise) return disposePromise;
     ended = true;
+    clearUserInputs();
     clearContinuationTimer();
     const finishRecoveryCompaction = resolveRecoveryCompaction;
     resolveRecoveryCompaction = null;
@@ -877,14 +981,14 @@ export const createCodexAppServerDriver = ({
   // Codex app-server accepts same-turn steering natively. The active turn id
   // is an ownership precondition, so a racing completion cannot redirect a
   // newer turn or silently turn this into an ordinary follow-up.
-  const steer = async (text) => {
+  const steer = async (text, attachments) => {
     if (ended || !threadId || !activeTurnId || typeof text !== 'string' || !text) return false;
     const expectedTurnId = activeTurnId;
     try {
       const response = await request('turn/steer', {
         threadId,
         expectedTurnId,
-        input: [{ type: 'text', text }],
+        input: codexUserInput(text, attachments, model),
       });
       return (
         !response?.error &&
@@ -912,12 +1016,20 @@ export const createCodexAppServerDriver = ({
     if (message.id !== undefined && message.method) return answerServerRequest(message);
 
     const params = message.params ?? {};
+    if (message.method === 'serverRequest/resolved') {
+      const pending = pendingUserInputs.get(params.requestId);
+      if (pending?.params.threadId === params.threadId) {
+        pendingUserInputs.delete(params.requestId);
+        callbacks.onUserInput?.();
+      }
+      return;
+    }
     // Defensive: the app-server can host many threads; only ours matters.
     // Collaboration descendants run on their own Codex thread ids but share
     // this run's protocol connection. Admit only a known descendant chain so
     // nested spawn prompts survive without accepting another Orion run's
     // notifications from the persistent server.
-    const collabItem = params.item?.type === 'collabAgentToolCall' ? params.item : null;
+    const collabItem = ['collabAgentToolCall', 'subAgentActivity'].includes(params.item?.type) ? params.item : null;
     const collabSenderId = collabItem?.senderThreadId ?? params.threadId;
     const belongsToCollabFamily =
       Boolean(collabItem) &&
@@ -1046,6 +1158,18 @@ export const createCodexAppServerDriver = ({
         if (goal && !review && !turnActive) endRun('\n\n_Goal cleared._');
         return;
       }
+      case 'warning':
+      case 'guardianWarning':
+      case 'configWarning': {
+        const detail = [params.message || params.summary, params.details].filter((part) => typeof part === 'string' && part).join('\n');
+        if (detail) callbacks.onActivity({
+          type: 'tool',
+          title: message.method === 'guardianWarning' ? 'Codex safety notice' : 'Codex notice',
+          detail,
+          status: 'done',
+        });
+        return;
+      }
       case 'error': {
         const detail = codexErrorDetail(params.error);
         if (!params.willRetry) lastTerminalTurnError = params.error ?? null;
@@ -1072,7 +1196,7 @@ export const createCodexAppServerDriver = ({
     }
   };
 
-  return { start, handleMessage, steer, stopGoalRun, dispose };
+  return { start, handleMessage, steer, stopGoalRun, dispose, getUserInputs, answerUserInput };
 };
 
 // Ordinary Codex app-server turns addressable by Orion's renderer run id.
@@ -1080,9 +1204,9 @@ export const createCodexAppServerDriver = ({
 // while those specialized loops own the thread.
 export const codexSteerableRunDrivers = new Map();
 
-export const steerCodexAppServerRun = (runId, text) => {
+export const steerCodexAppServerRun = (runId, text, attachments) => {
   const driver = codexSteerableRunDrivers.get(runId);
-  return driver ? driver.steer(text) : false;
+  return driver ? driver.steer(text, attachments) : false;
 };
 
 // Goal runs whose driver must be asked to pause before the process is killed

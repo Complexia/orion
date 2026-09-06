@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import { CodexQuestions } from './app/CodexQuestions';
 import {
   Plus,
   Trash2,
@@ -9916,7 +9917,8 @@ const App: React.FC = () => {
       injected =
         (await window.orion?.steerAgentTurn?.(
           target.runId,
-          prepared.agentPrompt
+          prepared.agentPrompt,
+          prepared.turnAttachments
         )) === true;
     } catch {
       injected = false;
@@ -11669,6 +11671,7 @@ const App: React.FC = () => {
   // loop, so a six-way split never duplicates the picker/mention machinery.
   const composerNode = selectedThread ? (
     <div className="chat-input-area">
+      <CodexQuestions threadId={selectedThread.id} />
       <AgentFamilySwitcher
         currentThread={selectedThread}
         threads={threads}

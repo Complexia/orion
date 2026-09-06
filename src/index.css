@@ -8669,3 +8669,42 @@ body {
   font-size: 11px;
   color: var(--text-muted);
 }
+.codex-questions {
+  max-height: min(45vh, 440px);
+  overflow: auto;
+  margin-bottom: 10px;
+}
+.codex-question-card {
+  padding: 14px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  background: var(--bg-raised);
+  font-size: 13px;
+}
+.codex-question { display: grid; gap: 8px; margin-bottom: 12px; }
+.codex-question label { line-height: 1.5; }
+.codex-question input {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  color: inherit;
+  background: transparent;
+}
+.codex-question-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.codex-question-options button {
+  display: grid;
+  gap: 3px;
+  max-width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+.codex-question-options button[aria-pressed="true"] { border-color: #548aff; background: #548aff20; }
+.codex-question-options small { opacity: .65; }
+.codex-question-submit { padding: 8px 12px; border-radius: 7px; background: #315fba; color: white; }
+.codex-question-submit:disabled { opacity: .5; cursor: default; }

@@ -231,6 +231,7 @@ export type ProviderOptionDef = {
     | 'allowedTools'
     | 'networkAccess'
     | 'webSearch'
+    | 'codexContextManagementMode'
     | 'codexMemoryMode'
     | 'codexChronicleMode'
     | 'codexMemoryExternalContextMode'
@@ -272,6 +273,19 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
     extraArgsOption('claude'),
   ],
   codex: [
+    {
+      key: 'codexContextManagementMode',
+      label: 'Long-session context',
+      description:
+        'Keep notes and search earlier context windows within a chat. Experimental; requires a recent Codex CLI and eligible ChatGPT sign-in. Automatic enables it for Astra. This is separate from cross-chat memories.',
+      type: 'select',
+      options: [
+        { value: 'inherit', label: 'Automatic (on for Astra)' },
+        { value: 'enabled', label: 'Enabled in Orion' },
+        { value: 'disabled', label: 'Disabled in Orion' },
+        { value: 'codex', label: 'Use Codex configuration' },
+      ],
+    },
     {
       key: 'codexDeveloperInstructions',
       label: 'Custom instructions',

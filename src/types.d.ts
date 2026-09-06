@@ -1289,6 +1289,7 @@ type OrionCodexBrowserIntegrationStatus = {
           networkAccess?: boolean;
           webSearch?: boolean;
           codexMemoryMode?: 'inherit' | 'enabled' | 'disabled';
+          codexContextManagementMode?: 'inherit' | 'enabled' | 'disabled' | 'codex';
           codexChronicleMode?: 'inherit' | 'enabled' | 'disabled';
           codexMemoryExternalContextMode?: 'inherit' | 'enabled' | 'disabled';
           codexPersonality?: 'inherit' | 'none' | 'friendly' | 'pragmatic';
@@ -1317,7 +1318,9 @@ type OrionCodexBrowserIntegrationStatus = {
        * typing while Claude Code works). False = no live mid-turn channel holds
        * this run — queue the message for end-of-turn dispatch instead.
        */
-      steerAgentTurn?: (runId: string, text: string) => Promise<boolean>;
+      steerAgentTurn?: (runId: string, text: string, attachments?: Array<{ path: string; mimeType?: string }>) => Promise<boolean>;
+      getCodexQuestions?: (threadId: string) => Promise<import('./app/CodexQuestions').CodexQuestionRequest[]>;
+      answerCodexQuestions?: (runId: string, requestId: string | number, answers: Record<string, string[]>) => Promise<boolean>;
       /** Stop only a completed Claude turn's remaining local shell tasks and settle its runtime. */
       discardClaudeBackgroundShellTasks?: (runId: string) => Promise<{
         ok: boolean;
@@ -1407,7 +1410,7 @@ type OrionCodexBrowserIntegrationStatus = {
       onAgentTurnEvent?: (cb: (event: {
         runId: string;
         threadId: string;
-        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'suggestion' | 'subagent' | 'subagent-chunk' | 'subagent-activity';
+        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'suggestion' | 'subagent' | 'subagent-chunk' | 'subagent-activity' | 'user-input';
         /** started events only: the persistent claude session opened this turn itself (background task finished). */
         background?: boolean;
         /** suggestion events only: the harness's predicted next user prompt for this thread. */
