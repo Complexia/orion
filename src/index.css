@@ -8708,3 +8708,5 @@ body {
 .codex-question-options small { opacity: .65; }
 .codex-question-submit { padding: 8px 12px; border-radius: 7px; background: #315fba; color: white; }
 .codex-question-submit:disabled { opacity: .5; cursor: default; }
+
+.agent-request-detail { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font-size: 12px; }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { app } from 'electron';
 import { readFile } from 'node:fs/promises';
 
 import {
@@ -556,7 +557,7 @@ assert.equal(
 
 assert.match(
   claudeDriverSource,
-  /if \(activeOwner\) \{[\s\S]*session\.query\.interrupt\(\)[\s\S]*createClaudeTurnState\(runId[\s\S]*session\.pushUserMessage\(text\)[\s\S]*return true;/,
+  /if \(activeOwner\) \{[\s\S]*session\.query\.interrupt\(\)[\s\S]*createClaudeTurnState\(runId[\s\S]*session\.pushUserMessage\(text, \{ content \}\)[\s\S]*return true;/,
   'An active steer must interrupt the blocked loop before pushing its continuation'
 );
 
@@ -567,3 +568,5 @@ claudeSdkSessions.clear();
 claudeBackgroundRunSessions.clear();
 
 console.log('Steering context and lifecycle checks passed.');
+
+app.quit();

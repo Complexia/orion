@@ -1319,6 +1319,8 @@ type OrionCodexBrowserIntegrationStatus = {
        * this run — queue the message for end-of-turn dispatch instead.
        */
       steerAgentTurn?: (runId: string, text: string, attachments?: Array<{ path: string; mimeType?: string }>) => Promise<boolean>;
+      getClaudeQuestions?: (threadId: string) => Promise<import('./app/CodexQuestions').CodexQuestionRequest[]>;
+      answerClaudeQuestions?: (runId: string, requestId: string | number, answers: Record<string, string[]>) => Promise<boolean>;
       getCodexQuestions?: (threadId: string) => Promise<import('./app/CodexQuestions').CodexQuestionRequest[]>;
       answerCodexQuestions?: (runId: string, requestId: string | number, answers: Record<string, string[]>) => Promise<boolean>;
       /** Stop only a completed Claude turn's remaining local shell tasks and settle its runtime. */

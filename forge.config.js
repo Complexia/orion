@@ -13,7 +13,7 @@ module.exports = {
     // executables (no .node extension), so the auto-unpack-natives plugin
     // alone won't unpack them — unpack the whole modules. The plugin merges
     // its own '**/*.node' pattern into this.
-    asar: { unpack: '**/node_modules/{node-pty,rift-snapshot}/**' },
+    asar: { unpack: '**/node_modules/{node-pty,rift-snapshot,@anthropic-ai/claude-agent-sdk-*}/**' },
     icon: path.join(__dirname, 'assets', 'icon'),
     extraResource: [
       path.join(__dirname, 'assets', 'icon.png'),
@@ -42,8 +42,15 @@ module.exports = {
     // file resolves node-addon-api while Forge rebuilds the copied module, so
     // that transitive dependency must be present in the otherwise-minimal
     // Vite package too.
-    packageAfterCopy: async (_forgeConfig, buildPath) => {
+    packageAfterCopy: async (_forgeConfig, buildPath, _electronVersion, platform, arch) => {
       const fs = require('node:fs');
+      // Vite bundles the SDK JavaScript, but its Claude Code executable must
+      // ship separately and outside ASAR for the fallback runtime to launch.
+      const claudePackage = `@anthropic-ai/claude-agent-sdk-${platform}-${arch}`;
+      const claudeSource = path.join(__dirname, 'node_modules', claudePackage);
+      const claudeTarget = path.join(buildPath, 'node_modules', claudePackage);
+      fs.cpSync(claudeSource, claudeTarget, { recursive: true, dereference: true });
+      if (platform !== 'win32') fs.chmodSync(path.join(claudeTarget, 'claude'), 0o755);
       const nodeAddonApiSrc = path.join(__dirname, 'node_modules', 'node-addon-api');
       const nodeAddonApiDest = path.join(buildPath, 'node_modules', 'node-addon-api');
       fs.cpSync(nodeAddonApiSrc, nodeAddonApiDest, { recursive: true, dereference: true });

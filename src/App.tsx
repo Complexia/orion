@@ -8133,11 +8133,10 @@ const App: React.FC = () => {
           thread.agentSessionIds?.[model.providerId] && thread.pendingForkProviders?.includes(model.providerId)
         ),
         providerOptions: normalizedProviderSettings[model.providerId]?.options,
-        // Kimi's ACP adapter accepts native image content blocks. Preserve
-        // the text/path context as a fallback, but also pass the attachment
-        // metadata so main can read the bytes without routing them through
-        // the renderer or relying on Kimi to reproduce a Unicode file path.
-        ...(model.providerId === 'kimi' && turnAttachments.length > 0 ? { attachments: turnAttachments } : {}),
+        // These native providers consume attachments directly as well as
+        // retaining the text/path context for later file and crop tools.
+        ...(['kimi', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
+          ? { attachments: turnAttachments } : {}),
         ...(model.providerId === 'codex'
           ? {
               codexReasoningEffort: getEffectiveCodexReasoningEffort(model, thread.codexReasoningEffort),
@@ -11553,7 +11552,7 @@ const App: React.FC = () => {
                   disabled={disabled}
                   title={
                     disabled && selectedAgentModel
-                      ? `${selectedAgentModel.label} always uses 1M context`
+                      ? `${selectedAgentModel.label} uses 1M context unless limited by Claude configuration or your provider`
                       : undefined
                   }
                 >

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from './claude-input.js';
 import { existsSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
@@ -7,7 +8,7 @@ import { requestSubagentSpawn, requestSubagentStop } from './mcp-bridge.js';
 import { READ_THREAD_DEFAULT_LIMIT, READ_THREAD_MAX_LIMIT, readThreadForAgent } from './thread-reader.js';
 import { claudeEffortForCli, claudeModelArgForContextWindow, defaultClaudeContextWindow, defaultClaudeReasoningEffort, parseExtraArgs } from './models.js';
 import { finalizingAgentRuns, startingAgentRuns } from './run-registry.js';
-import { resolveCommandPath } from './shell-env.js';
+import { execFileAsync, resolveCommandPath } from './shell-env.js';
 import { extractActivitiesFromJsonEvent, extractClaudeReasoningFromJsonEvent, extractClaudeTextFromJsonEvent, extractSessionIdFromJsonEvent, stringifySummary } from './stream-adapters.js';
 import { claudeTaskOutputCandidates, createSubagentTracker, handleClaudeSubagentLine } from './subagent-trackers.js';
 
@@ -23,12 +24,31 @@ export const loadZod = () => {
   return zodModulePromise;
 };
 
-// The SDK defaults to its own pinned CLI binary; prefer the claude the user
-// installed so persistent sessions run the same version, login, and settings
-// the one-shot spawn path used. Falls back to the SDK's binary if missing.
+// Prefer an up-to-date user CLI; an older install must not shadow the bundled
+// runtime and prevent Fable 5.1 or current SDK controls from working.
+export const supportsClaudeSdkRuntime = (version) => {
+  const match = String(version).match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return false;
+  const [major, minor, patch] = match.slice(1).map(Number);
+  return major > 2 || (major === 2 && (minor > 1 || (minor === 1 && patch >= 261)));
+};
+export const bundledClaudeBinary = () => {
+  if (!process.resourcesPath) return null;
+  const binary = path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules',
+    '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`,
+    process.platform === 'win32' ? 'claude.exe' : 'claude');
+  return existsSync(binary) ? binary : null;
+};
 export let claudeBinaryPromise = null;
 export const resolveClaudeBinary = () => {
-  claudeBinaryPromise ??= resolveCommandPath('claude');
+  claudeBinaryPromise ??= (async () => {
+    const binary = await resolveCommandPath('claude');
+    if (!binary) return bundledClaudeBinary();
+    try {
+      const { stdout } = await execFileAsync(binary, ['--version'], { timeout: 5000 });
+      return supportsClaudeSdkRuntime(stdout) ? binary : bundledClaudeBinary();
+    } catch { return bundledClaudeBinary(); }
+  })();
   return claudeBinaryPromise;
 };
 
@@ -1032,6 +1052,10 @@ export const handleClaudeSessionMessage = async (session, message) => {
     flushPendingClaudeTaskNotifications(session, turn);
   }
   if (!turn) return;
+  const notice = claudeNoticeActivity(message);
+  if (notice) emitAgentEvent(session.sender, {
+    runId: turn.runId, threadId: session.threadId, type: 'activity', activity: notice,
+  });
 
   // The SDK yields the same message shapes the CLI's stream-json emits, so
   // the one-shot path's claude adapter functions apply unchanged.
@@ -1122,6 +1146,7 @@ export const handleClaudeSessionMessage = async (session, message) => {
 export const endClaudeSession = (session, error) => {
   if (session.ended) return;
   session.ended = true;
+  session.userInputs?.cancelAll();
   session.resolveEnded?.();
   const terminating = terminatingClaudeSdkSessions.get(session.threadId);
   if (terminating) {
@@ -1172,7 +1197,7 @@ export const endClaudeSession = (session, error) => {
     fresh.activeTurns.push(pendingTurns[0]);
     fresh
       .start()
-      .then(() => fresh.pushUserMessage(session.firstPrompt))
+      .then(() => fresh.pushUserMessage(session.firstPrompt, { content: session.firstContent }))
       .catch((startError) => {
         fresh.dispose();
         endClaudeSession(fresh, startError);
@@ -1319,13 +1344,17 @@ export const createClaudeSdkSession = ({
     lastActivityAt: Date.now(),
   };
 
-  session.pushUserMessage = (text, { expectResult = true } = {}) => {
-    if (session.firstPrompt === null) session.firstPrompt = text;
+  session.userInputs = createClaudeInputRequests(session);
+  session.pushUserMessage = (text, { expectResult = true, content = [{ type: 'text', text }] } = {}) => {
+    if (session.firstPrompt === null) {
+      session.firstPrompt = text;
+      session.firstContent = content;
+    }
     session.lastActivityAt = Date.now();
     if (expectResult) session.resultsOwed += 1;
     inputQueue.push({
       type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text }] },
+      message: { role: 'user', content },
       parent_tool_use_id: null,
     });
   };
@@ -1357,6 +1386,7 @@ export const createClaudeSdkSession = ({
         cwd: projectPath,
         model: sdkOptions.model,
         effort: sdkOptions.effort,
+        canUseTool: session.userInputs.canUseTool,
         includePartialMessages: true,
         // Predicted next user prompt after each turn (drives the suggested
         // task card). Emitted out-of-band after the result message off the
@@ -1394,6 +1424,7 @@ export const createClaudeSdkSession = ({
   session.dispose = () => {
     if (session.disposed) return;
     session.disposed = true;
+    session.userInputs.cancelAll();
     inputQueue.close();
     try {
       abortController.abort();
@@ -1411,6 +1442,8 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
     input.claudeReasoningEffort === 'ultrathink' && !input.prompt.trimStart().startsWith('/')
       ? `ultrathink\n\n${input.prompt}`
       : input.prompt;
+
+  const content = await claudeUserContent(prompt, input.attachments);
 
   // The window can close and reopen (macOS keeps the app alive) while
   // sessions persist; a session bound to the old, destroyed webContents would
@@ -1522,7 +1555,7 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
       sessionId: session.sessionId,
     });
   }
-  session.pushUserMessage(prompt);
+  session.pushUserMessage(prompt, { content });
   // Notifications that landed while the thread sat idle (and never re-invoked
   // the model) surface in this turn — the model reads them here anyway.
   flushPendingClaudeTaskNotifications(session, turn);
@@ -1541,7 +1574,8 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
 // interrupt, so open one and use normal result accounting. Returns false when
 // the run/session disappears or an interrupt cannot be completed promptly;
 // the renderer then preserves the message as an ordinary queued follow-up.
-export const steerClaudeSdkRun = async (runId, text) => {
+export const steerClaudeSdkRun = async (runId, text, attachments) => {
+  const content = await claudeUserContent(text, attachments);
   for (const session of claudeSdkSessions.values()) {
     const activeOwner = session.activeTurns.find((turn) => turn.runId === runId);
     const retainedOwner = session.backgroundRunId === runId;
@@ -1550,6 +1584,7 @@ export const steerClaudeSdkRun = async (runId, text) => {
     if (session.ended || session.disposed || !session.query) return false;
     session.pendingSuggestionRunId = null;
     if (activeOwner) {
+      session.userInputs?.cancelAll();
       let resolveSteerBoundary;
       const steerBoundary = new Promise((resolve) => {
         resolveSteerBoundary = resolve;
@@ -1613,7 +1648,7 @@ export const steerClaudeSdkRun = async (runId, text) => {
       session.activeTurns.push(continuation);
       updateClaudeBackgroundSettle(session);
       flushPendingClaudeTaskNotifications(session, continuation);
-      session.pushUserMessage(text);
+      session.pushUserMessage(text, { content });
       return true;
     }
     clearClaudeBackgroundRun(session);
@@ -1631,7 +1666,7 @@ export const steerClaudeSdkRun = async (runId, text) => {
       command: 'claude — steered background work',
     });
     flushPendingClaudeTaskNotifications(session, turn);
-    session.pushUserMessage(text);
+    session.pushUserMessage(text, { content });
     return true;
   }
   return false;
@@ -1685,6 +1720,7 @@ export const discardClaudeBackgroundShellTasks = async (runId) => {
 export const interruptClaudeSdkRun = async (runId, { terminateBackground = false } = {}) => {
   for (const session of claudeSdkSessions.values()) {
     if (session.activeTurns.some((turn) => turn.runId === runId)) {
+      session.userInputs?.cancelAll();
       // The CLI owes no results: nothing is running, so there is nothing to
       // interrupt and the queued turns can never finalize on their own (a
       // legacy dangling turn, e.g. opened by a task_notification that never
