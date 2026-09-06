@@ -5,6 +5,7 @@ import {
   codexBrowserMcpConfig,
   codexBrowserUseMode,
   codexConfigArgs,
+  codexModelConfig,
   codexPersonalizationConfig,
   codexUtilityPrivacyOptions,
 } from '../src/main/codex-config.js';
@@ -14,6 +15,16 @@ import {
   parseCodexNodeReplEnabled,
   probeCodexBrowserIntegration,
 } from '../src/main/codex-browser-integration.js';
+
+const astraModel = { slug: 'gpt-6-astra' };
+const contextFlag = 'features.context_management.experimental_mode';
+assert.deepEqual(codexModelConfig(astraModel), { [contextFlag]: true });
+assert.deepEqual(codexModelConfig(astraModel, { codexContextManagementMode: 'inherit' }), { [contextFlag]: true });
+assert.deepEqual(codexModelConfig(astraModel, { codexContextManagementMode: 'disabled' }), { [contextFlag]: false });
+assert.deepEqual(codexModelConfig(astraModel, { codexContextManagementMode: 'codex' }), {});
+assert.deepEqual(codexModelConfig({ slug: 'gpt-5.6-sol' }), {}, 'other models keep native context defaults');
+assert.deepEqual(codexModelConfig({ slug: 'gpt-5.6-sol' }, { codexContextManagementMode: 'enabled' }), { [contextFlag]: true });
+assert.deepEqual(codexPersonalizationConfig({ codexContextManagementMode: 'enabled' }), {}, 'within-chat context must not enable cross-chat memories');
 
 assert.deepEqual(codexPersonalizationConfig(), {});
 assert.deepEqual(

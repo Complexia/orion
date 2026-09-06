@@ -57,6 +57,17 @@ export const codexUtilityPrivacyOptions = Object.freeze({
   codexMemoryExternalContextMode: 'disabled',
 });
 
+// This is within-thread context retention, separate from cross-chat memories.
+// Astra opts in by default; other models retain their native Codex settings.
+export const codexModelConfig = (model, providerOptions) => {
+  const mode = providerOptions?.codexContextManagementMode;
+  if (mode === 'disabled') return { 'features.context_management.experimental_mode': false };
+  if (mode === 'enabled' || (mode !== 'codex' && model?.slug === 'gpt-6-astra')) {
+    return { 'features.context_management.experimental_mode': true };
+  }
+  return {};
+};
+
 /**
  * Config shared by `codex exec` and app-server-backed turns.
  *

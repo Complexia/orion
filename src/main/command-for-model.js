@@ -1,6 +1,6 @@
 import { app } from 'electron';
 import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, defaultMuseReasoningEffort, parseExtraArgs } from './models.js';
-import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexPersonalizationConfig, splitCodexConfigContextArgs } from './codex-config.js';
+import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexModelConfig, codexPersonalizationConfig, splitCodexConfigContextArgs } from './codex-config.js';
 import { grokPermissionModeForAccessMode } from './grok-access-mode.js';
 
 export const commandForModel = (model, input) => {
@@ -36,6 +36,7 @@ export const commandForModel = (model, input) => {
       '--config',
       `service_tier="${serviceTier}"`,
       ...codexConfigArgs(codexPersonalizationConfig(options)),
+      ...codexConfigArgs(codexModelConfig(model, options)),
     ];
     if (options.networkAccess) configArgs.push('--config', 'sandbox_workspace_write.network_access=true');
     if (options.webSearch) configArgs.push('--config', 'tools.web_search=true');

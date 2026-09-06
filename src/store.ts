@@ -645,6 +645,8 @@ export type ProviderRuntimeOptions = {
   networkAccess?: boolean;
   /** codex: enable the web search tool */
   webSearch?: boolean;
+  /** codex: automatic enables notes/searchable history for Astra only */
+  codexContextManagementMode?: 'inherit' | 'enabled' | 'disabled' | 'codex';
   /** codex: inherit, enable, or disable local memory use and generation */
   codexMemoryMode?: CodexSettingMode;
   /** codex: inherit, enable, or disable Chronicle integration */

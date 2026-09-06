@@ -8728,6 +8728,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
                 });
               },
               onRunEnd: finishDriverRun,
+              onUserInput: useCodexReview ? undefined : () => {
+                emitAgentEvent(event.sender, { runId, threadId: input.threadId, type: 'user-input' });
+              },
             },
           })
         : null;
@@ -8934,10 +8937,24 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 // Deliver a message into the provider's active turn. Codex has a native
 // turn/steer RPC; Claude interrupts its blocking SDK loop and immediately
 // continues it. False preserves the message as an ordinary queued follow-up.
-ipcMain.handle('agent:steerTurn', async (_event, runId, text) => {
+ipcMain.handle('agent:steerTurn', async (_event, runId, text, attachments) => {
   if (typeof runId !== 'string' || typeof text !== 'string' || !text) return false;
-  if (await steerCodexAppServerRun(runId, text)) return true;
+  if (await steerCodexAppServerRun(runId, text, attachments)) return true;
   return await steerClaudeSdkRun(runId, text);
+});
+
+ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => {
+  const drivers = new Map([...codexSteerableRunDrivers, ...codexGoalRunDrivers]);
+  return [...drivers].flatMap(([runId, driver]) =>
+    (driver.getUserInputs?.() ?? [])
+      .filter((request) => request.threadId === threadId)
+      .map((request) => ({ ...request, runId }))
+  );
+});
+
+ipcMain.handle('agent:answerCodexQuestions', (_event, runId, requestId, answers) => {
+  const driver = codexSteerableRunDrivers.get(runId) ?? codexGoalRunDrivers.get(runId);
+  return driver?.answerUserInput?.(requestId, answers) ?? false;
 });
 
 ipcMain.handle('agent:discardClaudeBackgroundShellTasks', (_event, runId) => {
