@@ -689,10 +689,18 @@ const screenshot = { path: '/tmp/screenshot.png', mimeType: 'image/png' };
 const astraInput = {
   threadId: 'orion-astra', prompt: 'Inspect this screenshot', attachments: [screenshot],
   codexReasoningEffort: 'max', codexServiceTier: 'priority',
+  providerOptions: { browserUseMode: 'extension' },
 };
 assert.equal(codexAppServerConfig(astra, astraInput)['features.context_management.experimental_mode'], true);
 assert.equal(codexAppServerConfig(astra, astraInput).model_reasoning_effort, 'max');
 assert.ok(commandForModel(astra, { ...astraInput, projectPath: '/tmp' }).includes('features.context_management.experimental_mode=true'));
+const extensionInput = { ...astraInput, accessMode: 'full-access', providerOptions: { browserUseMode: 'extension' } };
+const extensionConfig = codexAppServerConfig(astra, extensionInput);
+assert.match(extensionConfig['mcp_servers.chrome_devtools.args'][1], /^chrome-devtools-mcp@/);
+assert.equal(extensionConfig['mcp_servers.chrome_devtools.args'].includes('--autoConnect'), false);
+const extensionCommand = commandForModel(astra, { ...extensionInput, projectPath: '/tmp' });
+assert.match(extensionCommand.join('\n'), /mcp_servers.chrome_devtools/);
+assert.doesNotMatch(extensionCommand.join('\n'), /control-chrome|--autoConnect/);
 assert.deepEqual(codexUserInput('inspect', [screenshot, screenshot, { path: '/tmp/readme.md', mimeType: 'text/plain' }, { path: 'relative.png', mimeType: 'image/png' }], astra), [
   { type: 'text', text: 'inspect' },
   { type: 'localImage', path: screenshot.path, detail: 'original' },
@@ -729,6 +737,13 @@ const makeAstraDriver = () => createCodexAppServerDriver({
 astraDriver = makeAstraDriver();
 await astraDriver.start();
 const astraTurn = astraWire.find((message) => message.method === 'turn/start');
+assert.deepEqual(
+  astraWire.find((message) => message.method === 'thread/resume').params.config['mcp_servers.chrome_devtools.args'],
+  extensionConfig['mcp_servers.chrome_devtools.args'],
+  'resumed Astra sessions also receive the browser fallback'
+);
+assert.match(astraTurn.params.input[0].text, /chrome_devtools MCP tools/);
+assert.doesNotMatch(astraTurn.params.input[0].text, /control-chrome/);
 assert.equal(astraTurn.params.effort, 'max');
 assert.equal(astraTurn.params.serviceTier, 'priority');
 assert.deepEqual(astraTurn.params.input[1], { type: 'localImage', path: screenshot.path, detail: 'original' });

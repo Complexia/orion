@@ -145,7 +145,8 @@ export const codexBrowserUseMode = (providerOptions) => {
 };
 
 export const codexBrowserMcpConfig = (providerOptions, accessMode, mcpPackage) => {
-  if (accessMode === 'read-only' || codexBrowserUseMode(providerOptions) !== 'mcp') return {};
+  const mode = codexBrowserUseMode(providerOptions);
+  if (accessMode === 'read-only' || mode === 'disabled') return {};
   const options =
     providerOptions && typeof providerOptions === 'object' ? providerOptions : {};
   return {
@@ -153,26 +154,29 @@ export const codexBrowserMcpConfig = (providerOptions, accessMode, mcpPackage) =
     'mcp_servers.chrome_devtools.args': [
       '-y',
       mcpPackage,
-      ...(options.browserAutoConnect === false ? [] : ['--autoConnect']),
+      // Extension setup does not guarantee its app-owned runtime can connect
+      // from Orion. Always provide a self-contained fallback, without granting
+      // access to the user's signed-in profile through remote debugging.
+      ...(mode === 'mcp' && options.browserAutoConnect !== false ? ['--autoConnect'] : []),
     ],
     'mcp_servers.chrome_devtools.startup_timeout_sec': 90,
   };
 };
 
 // Keep browser steering shared by exec and app-server turns. The extension
-// mode is only selected at runtime after Orion verifies the local integration;
-// otherwise main.js changes the effective mode to the MCP fallback.
+// setup probe is advisory: the actual tools in a turn determine whether the
+// extension can be used. Both modes retain a working MCP browser path.
 export const codexBrowserEnvironmentNote = (providerOptions, accessMode) => {
   if (accessMode === 'read-only') return '';
   const mode = codexBrowserUseMode(providerOptions);
   if (mode === 'extension') {
-    return `[Environment note: browser control is enabled through the user's installed ChatGPT Chrome extension and verified Codex browser integration. For browser tasks, use the control-chrome skill and its browser-client workflow through node_repl. Control the user's existing signed-in Chrome carefully: preserve tabs you did not open, and do not use chrome_devtools MCP.]\n\n`;
+    return `[Environment note: the user selected the ChatGPT Chrome extension for browser tasks. Discover the browser tools available in this session and follow their tool-provided instructions (for example, cua_repl), or a browser skill actually listed in this session. Extension setup alone does not guarantee a usable connection. If the extension workflow is missing or cannot connect, use the available chrome_devtools MCP tools for browser verification instead of stopping at a missing skill. This fallback uses a dedicated browser profile without the user's signed-in Chrome tabs, logins, or cookies; if the task requires those, explain that limitation. When using signed-in Chrome, preserve tabs you did not open.]\n\n`;
   }
   if (mode === 'mcp') {
     if (providerOptions?.browserAutoConnect === false) {
-      return `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For browser tasks, use the chrome_devtools MCP tools (discover them via tools_search). They run in a dedicated browser profile, so signed-in Chrome tabs, logins, and cookies are unavailable.]\n\n`;
+      return `[Environment note: Orion configured a dedicated browser for this session. For browser tasks, discover and use the chrome_devtools MCP tools available in this session. They run in a dedicated browser profile, so signed-in Chrome tabs, logins, and cookies are unavailable. Browser verification does not require a separate Chrome skill.]\n\n`;
     }
-    return `[Environment note: the ChatGPT-extension browser backend is unavailable here (it only works inside the ChatGPT desktop app). Do not use the control-chrome skill, the browser plugin, or agent.browsers — they cannot connect. For any browser task, use the chrome_devtools MCP tools (discover them via tools_search); they attach to the user's real signed-in Chrome, so treat open tabs and logins with care and do not close tabs you did not open. If those tools report "Could not connect to Chrome", tell the user to open chrome://inspect/#remote-debugging in Chrome, turn the remote debugging toggle on, quit and reopen Chrome (the server only starts on launch), and retry — do not attempt workarounds.]\n\n`;
+    return `[Environment note: for browser tasks, discover and use the chrome_devtools MCP tools available in this session; they attach to the user's real signed-in Chrome, so treat open tabs and logins with care and do not close tabs you did not open. If those tools report "Could not connect to Chrome", tell the user to open chrome://inspect/#remote-debugging in Chrome, turn the remote debugging toggle on, quit and reopen Chrome (the server only starts on launch), and retry — do not attempt workarounds.]\n\n`;
   }
   return '';
 };
