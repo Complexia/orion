@@ -1,9 +1,9 @@
 import { app, protocol } from 'electron';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexModelConfig, codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
+import { spawnCodexServerProcess } from './codex-server-process.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 
@@ -868,11 +868,15 @@ export const createCodexAppServerDriver = ({
     let resolvedThreadId = null;
     if (resumeSessionId) {
       const resumed = await request('thread/resume', { threadId: resumeSessionId, ...threadParams });
-      if (resumed.error) callbacks.onResumeFallback?.();
-      else {
-        resolvedThreadId = resumed.result?.thread?.id ?? resumeSessionId;
-        resumedExistingThread = true;
+      if (ended) return;
+      if (resumed.error) {
+        // A busy writer, transport failure, or missing rollout does not grant
+        // permission to replace the conversation. Retain the stored session
+        // id and surface the provider's reason so the user can retry safely.
+        return fail(`Could not resume the Codex session. The existing conversation has been preserved.\n\n${codexErrorDetail(resumed.error)}`);
       }
+      resolvedThreadId = resumed.result?.thread?.id ?? resumeSessionId;
+      resumedExistingThread = true;
     }
     if (!resolvedThreadId) {
       const started = await request('thread/start', threadParams);
@@ -1246,10 +1250,9 @@ export const runCodexGoalOp = ({
   return new Promise((resolve) => {
     const child =
       appServerChild ??
-      spawn(loginShell, ['-lc', 'codex app-server'], {
+      spawnCodexServerProcess(loginShell, ['-lc', 'codex app-server'], {
         cwd,
         env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
-        stdio: ['pipe', 'pipe', 'pipe'],
       });
     let nextId = 1;
     let buffer = '';

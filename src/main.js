@@ -45,6 +45,7 @@ import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
+import { spawnCodexServerProcess } from './main/codex-server-process.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { commandForModel } from './main/command-for-model.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
@@ -8173,7 +8174,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const commandString = args.map(shellQuote).join(' ');
     const child = persistentCodexAppServer
       ? codexAppServerLease.child
-      : spawn(loginShell, ['-lc', commandString], {
+      : (useCodexAppServer ? spawnCodexServerProcess : spawn)(loginShell, ['-lc', commandString], {
           cwd: input.projectPath,
           env: {
             ...process.env,
@@ -8908,10 +8909,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         return;
       }
 
-      // The stored session may be gone (harness cache cleared, expired, or a
-      // CLI update). If resuming produced no output at all, run fresh once.
+      // Legacy providers can retry a missing session fresh. Codex must retain
+      // its session id on all failures, including an exit before RPC output.
       if (
         exitCode !== 0 &&
+        model.providerId !== 'codex' &&
         resumeSessionId &&
         !stdoutSeen &&
         !codexActionAccepted &&
