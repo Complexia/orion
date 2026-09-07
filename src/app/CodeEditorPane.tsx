@@ -3,8 +3,7 @@ import { Code2, Eye, FileText } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
-import { localMediaSrc } from './attachments';
-import { isPdfFilePath } from './codeFiles';
+import { codeFilePreviewSrc, isPdfFilePath, isPreviewFilePath, isVideoFilePath } from './codeFiles';
 import { getLanguageFromPath } from './language';
 import { MarkdownBaseDirContext, MarkdownContent } from './markdown';
 
@@ -15,6 +14,29 @@ export const MonacoEditor = React.lazy(() => import('../MonacoEditor'));
 
 export type CodeEditorPaneHandle = {
   flushBuffers: () => void;
+};
+
+const VideoPreview = ({ src, name }: { src: string; name: string }) => {
+  const [failed, setFailed] = useState(false);
+  return (
+    <div className="flex h-full min-h-0 flex-col items-center justify-center gap-4 overflow-auto bg-black/20 p-6" role="region" aria-label="Video preview">
+      {failed ? (
+        <div className="max-w-md text-center text-sm text-[#aaa]" role="alert">
+          This video could not be played. Its format or codec may not be supported by Orion, or the file may be unavailable.
+        </div>
+      ) : (
+        <video
+          className="min-h-0 max-h-full w-full rounded-lg bg-black object-contain"
+          src={src}
+          aria-label={name}
+          controls
+          playsInline
+          preload="metadata"
+          onError={() => setFailed(true)}
+        />
+      )}
+    </div>
+  );
 };
 
 /**
@@ -134,7 +156,7 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
 
   const saveActiveFile = useCallback(async () => {
     const path = useOrionStore.getState().activeFilePath;
-    if (!path || isPdfFilePath(path) || !window.orion) return;
+    if (!path || isPreviewFilePath(path) || !window.orion) return;
     const currentFile = useOrionStore.getState().openFiles.find((file) => file.path === path);
     const content = buffersRef.current.get(path) ?? currentFile?.content;
     if (content === undefined) return;
@@ -200,6 +222,7 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
   const currentLanguage = activeFilePath ? getLanguageFromPath(activeFilePath) : 'plaintext';
   const isMarkdownFile = Boolean(activeFilePath?.toLowerCase().endsWith('.md'));
   const isPdfFile = isPdfFilePath(activeFilePath);
+  const isVideoFile = isVideoFilePath(activeFilePath);
   const markdownView = activeFilePath ? (markdownViews[activeFilePath] ?? 'code') : 'code';
   const activeBuffer =
     activeFilePath && activeFile
@@ -210,10 +233,9 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
     const lastSeparator = Math.max(activeFilePath.lastIndexOf('/'), activeFilePath.lastIndexOf('\\'));
     return lastSeparator > 0 ? [activeFilePath.slice(0, lastSeparator)] : [];
   }, [activeFilePath]);
-  const pdfPreviewSrc = React.useMemo(() => {
-    if (!activeFilePath || !isPdfFile) return '';
-    return `${localMediaSrc(activeFilePath, [])}&revision=${activeFile?.diskRevision ?? 0}`;
-  }, [activeFile?.diskRevision, activeFilePath, isPdfFile]);
+  const previewSrc = activeFilePath && (isPdfFile || isVideoFile)
+    ? codeFilePreviewSrc(activeFilePath, activeFile?.diskRevision ?? 0)
+    : '';
 
   const setMarkdownView = useCallback(
     (view: 'code' | 'preview') => {
@@ -229,11 +251,17 @@ const CodeEditorPaneWithRef = React.forwardRef<CodeEditorPaneHandle>(function Co
     <div className="editor-container" ref={editorContainerRef}>
       {activeFilePath && activeFile ? (
         <>
-          {isPdfFile ? (
+          {isVideoFile ? (
+            <VideoPreview
+              key={previewSrc}
+              src={previewSrc}
+              name={activeFilePath.split(/[\\/]/).pop() ?? 'Video preview'}
+            />
+          ) : isPdfFile ? (
             <div className="pdf-preview" role="document" aria-label="PDF preview">
               <iframe
                 key={`${activeFilePath}:${activeFile.diskRevision ?? 0}`}
-                src={pdfPreviewSrc}
+                src={previewSrc}
                 title={activeFilePath.split(/[\\/]/).pop() ?? 'PDF preview'}
               />
             </div>

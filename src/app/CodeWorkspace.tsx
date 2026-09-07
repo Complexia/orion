@@ -4,7 +4,7 @@ import { toast } from 'sonner';
 import { useShallow } from 'zustand/react/shallow';
 import { useOrionStore } from '../store';
 import { CodeEditorPane, type CodeEditorPaneHandle } from './CodeEditorPane';
-import { isPdfFilePath } from './codeFiles';
+import { isPreviewFilePath } from './codeFiles';
 import {
   CODE_SIDEBAR_MAX_WIDTH,
   CODE_SIDEBAR_MIN_WIDTH,
@@ -209,7 +209,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
   const handleOpenFile = useCallback(
     async (filePath: string) => {
       if (!window.orion) return;
-      const content = isPdfFilePath(filePath) ? '' : await window.orion.readFile(filePath);
+      const content = isPreviewFilePath(filePath) ? '' : await window.orion.readFile(filePath);
       openFile(filePath, content);
     },
     [openFile]
@@ -235,7 +235,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
       pendingDiskRefreshPathsRef.current.delete(filePath);
       const sequence = (diskRefreshSequenceByPathRef.current.get(filePath) ?? 0) + 1;
       diskRefreshSequenceByPathRef.current.set(filePath, sequence);
-      if (isPdfFilePath(filePath)) {
+      if (isPreviewFilePath(filePath)) {
         refreshOpenFileFromDisk(filePath);
         return;
       }

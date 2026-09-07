@@ -1,4 +1,5 @@
 import { createRepositoryCredentials } from './main/repository-credentials.js';
+import { isPreviewFilePath } from './app/codeFiles.ts';
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell, systemPreferences } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -2012,7 +2013,7 @@ ipcMain.handle('fs:openLinkedFile', async (_event, input) => {
       return {
         ok: true,
         path: candidate,
-        content: path.extname(candidate).toLowerCase() === '.pdf'
+        content: isPreviewFilePath(candidate)
           ? ''
           : await fs.readFile(candidate, 'utf-8'),
       };
