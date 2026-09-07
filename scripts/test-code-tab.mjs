@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { isPdfFilePath } from '../src/app/codeFiles.ts';
-import { getMimeTypeForMediaPath, mediaPreviewExtensions } from '../src/main/media.js';
+import { codeFilePreviewSrc, isPdfFilePath, isPreviewFilePath, isVideoFilePath } from '../src/app/codeFiles.ts';
+import { getMimeTypeForMediaPath, mediaPreviewExtensions, videoMimeTypeByExtension } from '../src/main/media.js';
 
 const [workspaceSource, paneSource, storeSource, mainSource, preloadSource] = await Promise.all([
   readFile(new URL('../src/app/CodeWorkspace.tsx', import.meta.url), 'utf8'),
@@ -79,23 +79,39 @@ assert.match(
 );
 assert.match(
   workspaceSource,
-  /isPdfFilePath\(filePath\) \? '' : await window\.orion\.readFile\(filePath\)/,
-  'PDF tabs must bypass UTF-8 file reads'
+  /isPreviewFilePath\(filePath\) \? '' : await window\.orion\.readFile\(filePath\)/,
+  'Preview tabs must bypass UTF-8 file reads'
 );
 assert.match(
   paneSource,
-  /className="pdf-preview"[\s\S]*<iframe[\s\S]*src=\{pdfPreviewSrc\}/,
+  /className="pdf-preview"[\s\S]*<iframe[\s\S]*src=\{previewSrc\}/,
   'PDF tabs must render the local streamed preview instead of Monaco'
 );
 assert.match(
   mainSource,
-  /path\.extname\(candidate\)\.toLowerCase\(\) === '\.pdf'[\s\S]*\? ''[\s\S]*fs\.readFile\(candidate, 'utf-8'\)/,
-  'linked PDFs must also avoid conversion to raw text'
+  /isPreviewFilePath\(candidate\)[\s\S]*\? ''[\s\S]*fs\.readFile\(candidate, 'utf-8'\)/,
+  'linked previews must also avoid conversion to raw text'
 );
 assert.match(
   mainSource,
   /webPreferences: \{[\s\S]*plugins: true/,
   'the BrowserWindow must enable Electron\'s built-in PDF viewer'
 );
+
+for (const extension of Object.keys(videoMimeTypeByExtension)) {
+  assert.equal(isVideoFilePath(`/tmp/Recording${extension.toUpperCase()}`), true);
+  assert.equal(isPreviewFilePath(`/tmp/Recording${extension}`), true);
+}
+for (const path of [null, undefined, '', '/tmp/clip.mp4.txt', '/tmp/clip.mp4/notes.md', '/tmp/clip.mp4?query']) {
+  assert.equal(isVideoFilePath(path), false);
+}
+assert.equal(isPreviewFilePath('/tmp/report.PDF'), true);
+assert.equal(isPreviewFilePath('/tmp/source.ts'), false);
+const literalPath = '/tmp/録画 100%20 #1?.mp4';
+const previewUrl = new URL(codeFilePreviewSrc(literalPath, 3));
+assert.equal(previewUrl.searchParams.get('path'), literalPath);
+assert.equal(previewUrl.searchParams.get('revision'), '3');
+assert.match(paneSource, /isPreviewFilePath\(path\).*return;/, 'saving a preview must never write an empty or decoded buffer');
+assert.match(workspaceSource, /if \(isPreviewFilePath\(filePath\)\) \{\s*refreshOpenFileFromDisk\(filePath\);\s*return;/, 'video disk refreshes must bypass text reads');
 
 console.log('Code tab tests passed');
