@@ -798,5 +798,50 @@ await astraDriver.dispose();
 assert.equal(codexAppServerActivityFromItem({ id: 'sleep-1', type: 'sleep', durationMs: 5000 }, false).title, 'Waiting');
 assert.match(codexAppServerActivityFromItem({ id: 'call-1', type: 'functionCallOutput', name: 'exec', namespace: 'functions', output: 'completed' }, true).title, /functions.exec/);
 
-console.log('Codex native compaction, Astra capabilities, and context recovery lifecycle tests passed.');
+// Every resume error must retain the native conversation, including errors
+// that used to be treated as an expired/missing session. Never run the latest
+// prompt in a context-free replacement session.
+for (const reason of [
+  'thread-store conflict: thread saved-thread already has an active writer',
+  'Codex app-server connection is closed.',
+  'no rollout found for thread saved-thread',
+  'authentication failed',
+]) {
+  const wire = [];
+  const failures = [];
+  const sessionIds = [];
+  let resumeDriver;
+  resumeDriver = createCodexAppServerDriver({
+    child: { stdin: { write(line) {
+      const message = JSON.parse(line);
+      wire.push(message);
+      if (message.id === undefined) return;
+      queueMicrotask(() => resumeDriver.handleMessage({
+        id: message.id,
+        ...(message.method === 'thread/resume'
+          ? { error: { code: -32603, message: reason } }
+          : { result: {} }),
+      }));
+    } } },
+    cwd: '/tmp/project', model, input: { prompt: 'fix that friction' },
+    resumeSessionId: 'saved-thread', accessMode: 'full-access',
+    callbacks: {
+      onFatal: (message) => failures.push(message),
+      onSessionId: (id) => sessionIds.push(id),
+      onResumeFallback: () => assert.fail('resume failure must not start a fresh conversation'),
+    },
+  });
+  await resumeDriver.start();
+  assert.deepEqual(wire.filter((message) => message.id).map((message) => message.method),
+    ['initialize', 'thread/resume']);
+  assert.equal(failures.length, 1);
+  assert.ok(failures[0].includes(reason), 'surface the actual provider error');
+  assert.match(failures[0], /conversation has been preserved/);
+  assert.deepEqual(sessionIds, [], 'the renderer must retain the original native session id');
+  await resumeDriver.dispose();
+}
+assert.match(mainSource, /exitCode !== 0 &&\s*model\.providerId !== 'codex' &&\s*resumeSessionId/,
+  'the generic process-exit fallback must not replace a failed Codex session');
+
+console.log('Codex native compaction, Astra capabilities, resume preservation, and context recovery lifecycle tests passed.');
 app.quit();

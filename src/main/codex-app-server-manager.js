@@ -1,9 +1,9 @@
-import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import os from 'node:os';
 import { Agent } from 'undici';
 
 import { killAgentChild } from './run-registry.js';
+import { spawnCodexServerProcess } from './codex-server-process.js';
 import { loginShell, shellQuote } from './shell-env.js';
 
 export const CODEX_APP_SERVER_IDLE_MS = 10 * 60 * 1000;
@@ -14,10 +14,9 @@ export const CODEX_APP_SERVER_CONNECT_TIMEOUT_MS = 3000;
 
 const defaultSpawnServer = () => {
   const args = ['codex', 'app-server', '--listen', 'ws://127.0.0.1:0'];
-  return spawn(loginShell, ['-lc', args.map(shellQuote).join(' ')], {
+  return spawnCodexServerProcess(loginShell, ['-lc', args.map(shellQuote).join(' ')], {
     cwd: os.homedir(),
     env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
-    stdio: ['ignore', 'ignore', 'pipe'],
   });
 };
 
@@ -243,6 +242,9 @@ export const createCodexAppServerManager = ({
         unusable: false,
       };
       server = current;
+      // WebSocket mode uses stderr for discovery; discard any shell/stdout
+      // chatter so the supervised pipe cannot fill and stall the server.
+      child.stdout?.resume?.();
       clientsSinceStart = 0;
       let settled = false;
       const finish = (value) => {
