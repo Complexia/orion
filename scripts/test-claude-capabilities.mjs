@@ -6,6 +6,7 @@ import path from 'node:path';
 import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from '../src/main/claude-input.js';
 import { createClaudeSdkSession, supportsClaudeSdkRuntime, claudeSdkOptionsForInput, steerClaudeSdkRun, claudeSdkSessions } from '../src/main/claude-driver.js';
 import { claudeModelArgForContextWindow } from '../src/main/models.js';
+import { CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV, withClaudeEnv } from '../src/main/claude-env.js';
 
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-claude-test-'));
 try {
@@ -97,5 +98,16 @@ try {
   assert.equal(claudeNoticeActivity({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 3, retry_delay_ms: 2000 }).title, 'Claude is retrying');
   assert.equal(claudeNoticeActivity({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } }), null);
   assert.equal(claudeNoticeActivity({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } }).title, 'Claude usage limit reached');
+  // Claude Code's chrome classifier floor must be opted out for every claude
+  // process Orion launches, while an explicit user value still wins.
+  assert.equal(withClaudeEnv({ PATH: '/bin', FORCE_COLOR: '0' })[CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV], 'false');
+  assert.deepEqual(withClaudeEnv({ PATH: '/bin' }), { [CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV]: 'false', PATH: '/bin' });
+  assert.equal(withClaudeEnv({ [CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV]: 'true' })[CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV], 'true');
+  assert.equal(withClaudeEnv()[CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV], process.env[CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV] ?? 'false');
+  const driverSource = await fs.readFile(new URL('../src/main/claude-driver.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(driverSource, /env: \{ \.\.\.process\.env/, 'every SDK query env must go through withClaudeEnv');
+  const mainSource = await fs.readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(mainSource, /env: withClaudeEnv\(\{ \.\.\.process\.env, TERM: 'xterm-256color'/, 'the claude terminal must opt out of the chrome classifier floor');
+  assert.match(mainSource, /env: withClaudeEnv\(\{\s*\.\.\.process\.env,\s*FORCE_COLOR: '0',\s*NO_COLOR: '1',\s*\.\.\.\(openCodeConfig/, 'claude aside spawns must opt out of the chrome classifier floor');
   console.log('Claude capabilities tests passed');
 } finally { await fs.rm(dir, { recursive: true, force: true }); app.quit(); }

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from './claude-input.js';
+import { withClaudeEnv } from './claude-env.js';
 import { existsSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
@@ -816,7 +817,7 @@ export const harvestClaudeSlashCommands = ({ sender, projectPath }) => {
           strictMcpConfig: true,
           ...(claudeBinary ? { pathToClaudeCodeExecutable: claudeBinary } : {}),
           abortController,
-          env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+          env: withClaudeEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }),
         },
       });
       const commands = await Promise.race([
@@ -1415,7 +1416,7 @@ export const createClaudeSdkSession = ({
         stderr: (data) => {
           session.stderrTail = `${session.stderrTail}${data}`.slice(-2000);
         },
-        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+        env: withClaudeEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }),
       },
     });
     void pumpClaudeSession(session);

@@ -24,6 +24,7 @@ Orion's desktop Claude chat runs the native Claude Code engine through the Agent
 - **Instructions and extensions:** the Claude Code system-prompt preset and user/project/local settings are enabled. Native CLAUDE.md, rules, memory, skills, hooks, configured plugins, and MCP configuration remain owned by Claude Code. Slash-command discovery and expansion remain native. See [SDK feature loading](https://code.claude.com/docs/en/agent-sdk/claude-code-features).
 - **Vision tooling:** original image/video files remain available to the native shell/read tools. Crop/zoom and video analysis depend on the image-processing tools available on the host. Orion does not pre-resize native image inputs.
 - **Browser control:** the existing Claude in Chrome provider option supplies the native Chrome tools when configured and allowed by the selected access mode. Extension setup, sign-in, and computer permissions remain host requirements.
+- **No Orion-side browser gate:** Claude Code applies a "chrome classifier floor" that routes Claude in Chrome actions through the auto-mode permission classifier even under bypass permissions (remote flag `tengu_cowork_chrome_automode_default`), which denies actions such as typing into a page with "denied by the Claude Code auto mode classifier". Every claude process Orion launches (SDK sessions, asides, the terminal, slash-command harvests) sets `CLAUDE_CHROME_CLASSIFIER_FLOOR=false` through `withClaudeEnv` so Orion never exposes fewer capabilities than the CLI. An explicit value already in the environment wins.
 
 ## Boundaries
 
