@@ -41,6 +41,7 @@ import {
   setCloudRepoLink,
 } from './cloud-sync.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
+import { withClaudeEnv } from './main/claude-env.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
@@ -8177,13 +8178,13 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       ? codexAppServerLease.child
       : (useCodexAppServer ? spawnCodexServerProcess : spawn)(loginShell, ['-lc', commandString], {
           cwd: input.projectPath,
-          env: {
+          env: withClaudeEnv({
             ...process.env,
             FORCE_COLOR: '0',
             NO_COLOR: '1',
             ...(openCodeConfig ? { OPENCODE_CONFIG_CONTENT: openCodeConfig } : {}),
             ...(museConfigRoot ? { XDG_CONFIG_HOME: museConfigRoot } : {}),
-          },
+          }),
           // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
           // take no input.
           stdio: [useAcp || useCodexAppServer ? 'pipe' : 'ignore', 'pipe', 'pipe'],
@@ -9629,7 +9630,7 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
       cols,
       rows,
       cwd: projectPath,
-      env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+      env: withClaudeEnv({ ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' }),
     });
 
     let resolveExit;
