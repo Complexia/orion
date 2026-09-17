@@ -1,17 +1,13 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Folder, FolderOpen, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useShallow } from 'zustand/react/shallow';
 import { useOrionStore } from '../store';
 import { CodeEditorPane, type CodeEditorPaneHandle } from './CodeEditorPane';
 import { isPreviewFilePath } from './codeFiles';
-import {
-  CODE_SIDEBAR_MAX_WIDTH,
-  CODE_SIDEBAR_MIN_WIDTH,
-  clampCodeSidebarWidth,
-} from './codeSidebarResize';
 import { type FileTreeItem, FileTreeNode } from './fileTree';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
+import { useSidebarResize } from './useSidebarResize';
 
 type CodeWorkspaceProps = {
   runningAgentCount: number;
@@ -22,7 +18,6 @@ type CodeWorkspaceProps = {
 const isPathWithin = (candidate: string, ancestor: string) =>
   candidate === ancestor || candidate.startsWith(`${ancestor}/`) || candidate.startsWith(`${ancestor}\\`);
 
-const CODE_SIDEBAR_DEFAULT_WIDTH = 280;
 const CODE_SIDEBAR_STORAGE_KEY = 'orion.codeSidebarWidth';
 
 /**
@@ -82,108 +77,10 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
   const codeEditorPaneRef = useRef<CodeEditorPaneHandle>(null);
   const pendingDiskRefreshPathsRef = useRef(new Set<string>());
   const diskRefreshSequenceByPathRef = useRef(new Map<string, number>());
-  const sidebarRef = useRef<HTMLDivElement>(null);
-  const sidebarResizeHandleRef = useRef<HTMLButtonElement>(null);
-  const sidebarWidthRef = useRef(CODE_SIDEBAR_DEFAULT_WIDTH);
-  const preferredSidebarWidthRef = useRef(CODE_SIDEBAR_DEFAULT_WIDTH);
-  const resizePointerIdRef = useRef<number | null>(null);
-  const resizeStartXRef = useRef(0);
-  const resizeStartWidthRef = useRef(CODE_SIDEBAR_DEFAULT_WIDTH);
-
-  const applySidebarWidth = useCallback((requestedWidth: number, remember = false) => {
-    const sidebar = sidebarRef.current;
-    if (!sidebar) return;
-    const appContainer = sidebar.closest<HTMLElement>('.app-container');
-    const availableWidth = sidebar.parentElement?.clientWidth ?? window.innerWidth;
-    const preferredWidth = Math.min(
-      CODE_SIDEBAR_MAX_WIDTH,
-      Math.max(CODE_SIDEBAR_MIN_WIDTH, Math.round(requestedWidth))
-    );
-    const nextWidth = clampCodeSidebarWidth(preferredWidth, availableWidth);
-    const maximumWidth = clampCodeSidebarWidth(CODE_SIDEBAR_MAX_WIDTH, availableWidth);
-    if (remember) preferredSidebarWidthRef.current = preferredWidth;
-    sidebarWidthRef.current = nextWidth;
-    appContainer?.style.setProperty('--sidebar-width', `${nextWidth}px`);
-    sidebarResizeHandleRef.current?.setAttribute('aria-valuenow', String(nextWidth));
-    sidebarResizeHandleRef.current?.setAttribute('aria-valuemax', String(maximumWidth));
-  }, []);
-
-  const persistSidebarWidth = useCallback(() => {
-    try {
-      window.localStorage.setItem(CODE_SIDEBAR_STORAGE_KEY, String(preferredSidebarWidthRef.current));
-    } catch {
-      // A blocked storage backend should not prevent resizing for this session.
-    }
-  }, []);
-
-  useLayoutEffect(() => {
-    try {
-      const storedWidth = Number(window.localStorage.getItem(CODE_SIDEBAR_STORAGE_KEY));
-      if (Number.isFinite(storedWidth) && storedWidth > 0) {
-        preferredSidebarWidthRef.current = storedWidth;
-      }
-    } catch {
-      // Use the default width when local storage is unavailable.
-    }
-
-    applySidebarWidth(preferredSidebarWidthRef.current);
-    const handleWindowResize = () => applySidebarWidth(preferredSidebarWidthRef.current);
-    window.addEventListener('resize', handleWindowResize);
-
-    const appContainer = sidebarRef.current?.closest<HTMLElement>('.app-container');
-    return () => {
-      window.removeEventListener('resize', handleWindowResize);
-      appContainer?.classList.remove('code-sidebar-resizing');
-      appContainer?.style.removeProperty('--sidebar-width');
-    };
-  }, [applySidebarWidth]);
-
-  const handleSidebarResizePointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0) return;
-    resizePointerIdRef.current = event.pointerId;
-    resizeStartXRef.current = event.clientX;
-    resizeStartWidthRef.current = sidebarWidthRef.current;
-    event.currentTarget.focus();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    sidebarRef.current?.closest('.app-container')?.classList.add('code-sidebar-resizing');
-    event.preventDefault();
-  }, []);
-
-  const handleSidebarResizePointerMove = useCallback(
-    (event: React.PointerEvent<HTMLButtonElement>) => {
-      if (resizePointerIdRef.current !== event.pointerId) return;
-      applySidebarWidth(resizeStartWidthRef.current + event.clientX - resizeStartXRef.current, true);
-    },
-    [applySidebarWidth]
-  );
-
-  const finishSidebarResize = useCallback(
-    (pointerId: number) => {
-      if (resizePointerIdRef.current !== pointerId) return;
-      resizePointerIdRef.current = null;
-      sidebarRef.current?.closest('.app-container')?.classList.remove('code-sidebar-resizing');
-      persistSidebarWidth();
-    },
-    [persistSidebarWidth]
-  );
-
-  const handleSidebarResizeKeyDown = useCallback(
-    (event: React.KeyboardEvent<HTMLButtonElement>) => {
-      const availableWidth = sidebarRef.current?.parentElement?.clientWidth ?? window.innerWidth;
-      const maximumWidth = clampCodeSidebarWidth(CODE_SIDEBAR_MAX_WIDTH, availableWidth);
-      const step = event.shiftKey ? 32 : 10;
-      let nextWidth: number | null = null;
-      if (event.key === 'ArrowLeft') nextWidth = sidebarWidthRef.current - step;
-      if (event.key === 'ArrowRight') nextWidth = sidebarWidthRef.current + step;
-      if (event.key === 'Home') nextWidth = CODE_SIDEBAR_MIN_WIDTH;
-      if (event.key === 'End') nextWidth = maximumWidth;
-      if (nextWidth === null) return;
-      event.preventDefault();
-      applySidebarWidth(nextWidth, true);
-      persistSidebarWidth();
-    },
-    [applySidebarWidth, persistSidebarWidth]
-  );
+  const { sidebarRef, resizeHandle: sidebarResizeHandle } = useSidebarResize({
+    storageKey: CODE_SIDEBAR_STORAGE_KEY,
+    label: 'Explorer',
+  });
 
   useEffect(() => {
     treeRootRef.current = workspacePath;
@@ -476,25 +373,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
           )}
         </div>
         <SidebarFooter {...sidebarFooterProps} />
-        <button
-          type="button"
-          ref={sidebarResizeHandleRef}
-          className="code-sidebar-resize-handle"
-          role="separator"
-          tabIndex={0}
-          aria-label="Resize Explorer"
-          aria-orientation="vertical"
-          aria-valuemin={CODE_SIDEBAR_MIN_WIDTH}
-          aria-valuemax={CODE_SIDEBAR_MAX_WIDTH}
-          aria-valuenow={CODE_SIDEBAR_DEFAULT_WIDTH}
-          title="Drag to resize Explorer"
-          onPointerDown={handleSidebarResizePointerDown}
-          onPointerMove={handleSidebarResizePointerMove}
-          onPointerUp={(event) => finishSidebarResize(event.pointerId)}
-          onPointerCancel={(event) => finishSidebarResize(event.pointerId)}
-          onLostPointerCapture={(event) => finishSidebarResize(event.pointerId)}
-          onKeyDown={handleSidebarResizeKeyDown}
-        />
+        {sidebarResizeHandle}
       </div>
 
       <div className="panel">

@@ -1241,7 +1241,7 @@ type OrionCodexBrowserIntegrationStatus = {
       relaunchApp: () => Promise<boolean>;
       focusWindow: () => Promise<boolean>;
       getAppUpdateState: () => Promise<AppUpdateState>;
-      checkForAppUpdate: (input?: { force?: boolean }) => Promise<AppUpdateState>;
+      checkForAppUpdate: (input?: { force?: boolean; background?: boolean }) => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
       restartToUpdate: () => Promise<{ ok: boolean; error?: string }>;
       runAgentTurn: (input: {

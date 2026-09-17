@@ -7841,7 +7841,7 @@ ipcMain.handle('account:signOut', async () => {
 ipcMain.handle('appUpdate:getState', async () => appUpdateState);
 
 ipcMain.handle('appUpdate:check', async (_event, input) =>
-  checkForAppUpdate({ force: input?.force === true })
+  checkForAppUpdate({ force: input?.force === true, background: input?.background === true })
 );
 
 ipcMain.handle('appUpdate:download', async () => {

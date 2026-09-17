@@ -1,4 +1,4 @@
-import { BrowserWindow, app, autoUpdater as nativeAutoUpdater } from 'electron';
+import { BrowserWindow, app, autoUpdater as nativeAutoUpdater, net } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
@@ -16,8 +16,22 @@ export let appUpdateDownloadedVersion = null;
 export let appUpdateCheckPromise = null;
 export let lastAppUpdateCheckAt = 0;
 export let appUpdateRetryTimer = null;
+export let appUpdateRetryAttempt = 0;
+// The check currently in flight, if any. Automatic checks (startup, the 2h
+// interval, retries, the renderer's mount-time check) are `background`; a
+// failure there is never something the user asked for, so it must not be
+// presented as "Update failed". Only user-initiated checks and downloads
+// surface errors.
+export let activeAppUpdateCheck = null;
 export const APP_UPDATE_CHECK_DEDUP_MS = 60 * 1000;
-export const APP_UPDATE_RETRY_MS = 30 * 1000;
+// Orion launched at login reliably runs its first checks before Wi-Fi, DNS or
+// a VPN is up, and the feed request rejects. Keep retrying with a growing
+// delay until one check succeeds rather than giving up after a single retry
+// and leaving a stale error on screen for the next two hours.
+export const APP_UPDATE_RETRY_DELAYS_MS = [30 * 1000, 60 * 1000, 2 * 60 * 1000, 5 * 60 * 1000, 10 * 60 * 1000];
+// States a background check failure must never replace: they belong to a
+// download or restart the user already committed to.
+const APP_UPDATE_PROTECTED_STATUSES = new Set(['downloading', 'downloaded', 'restarting']);
 // Squirrel has to pull the downloaded zip through electron-updater's local
 // proxy server and unpack it before it can install anything. That is a local
 // copy of a few hundred megabytes, so allow for a slow disk before giving up.
@@ -87,7 +101,12 @@ export const publishAppUpdateState = (patch) => {
 };
 
 export const initializeAppUpdaterOnce = async () => {
-  const { autoUpdater } = await import('electron-updater');
+  // electron-updater is CommonJS and defines `autoUpdater` with a getter,
+  // which Node's CJS export lexer cannot see. The Vite bundle resolves it as
+  // a named export; a raw ESM load (the electron test scripts) only finds
+  // it on the default export.
+  const updaterModule = await import('electron-updater');
+  const autoUpdater = updaterModule.autoUpdater ?? updaterModule.default?.autoUpdater;
 
   // electron-forge does not generate the app-update.yml that electron-builder
   // ships in Resources, and electron-updater insists on reading one when
@@ -219,7 +238,16 @@ export const initializeAppUpdaterOnce = async () => {
     });
   });
 
-  autoUpdater.on('error', (error) => {
+  autoUpdater.on('error', (error, detail) => {
+    // electron-updater emits this for a failed checkForUpdates() before the
+    // promise rejects. A background check failing (typically: offline right
+    // after login) is handled by checkForAppUpdate, which keeps the button
+    // hidden and schedules a retry. Publishing 'error' here would flash
+    // "Update failed" for an update that never existed.
+    if (activeAppUpdateCheck?.background && !APP_UPDATE_PROTECTED_STATUSES.has(appUpdateState.status)) return;
+    // A check racing an in-flight download or restart must not clobber it.
+    const isCheckError = typeof detail === 'string' && detail.startsWith('Cannot check for updates');
+    if (isCheckError && APP_UPDATE_PROTECTED_STATUSES.has(appUpdateState.status)) return;
     publishAppUpdateState({
       status: 'error',
       progress: null,
@@ -244,7 +272,7 @@ export const initializeAppUpdater = () => {
   return appUpdaterInitializationPromise;
 };
 
-export const runAppUpdateCheck = async () => {
+export const runAppUpdateCheck = async ({ background = false } = {}) => {
   if (!app.isPackaged) {
     return publishAppUpdateState({
       status: 'not-available',
@@ -253,26 +281,81 @@ export const runAppUpdateCheck = async () => {
     });
   }
 
+  // No network interface yet (the usual state seconds after login). Skip the
+  // request instead of letting electron-updater fail it; the retry schedule
+  // and the renderer's 'online' event bring the check back once connected.
+  if (background && !net.isOnline()) {
+    throw new Error('Orion is offline. The update check will retry once a connection is available.');
+  }
+
   const autoUpdater = await initializeAppUpdater();
   await autoUpdater.checkForUpdates();
   return appUpdateState;
 };
 
-export const checkForAppUpdate = ({ force = false } = {}) => {
-  if (appUpdateCheckPromise) return appUpdateCheckPromise;
+export const clearAppUpdateRetry = () => {
+  if (appUpdateRetryTimer) {
+    clearTimeout(appUpdateRetryTimer);
+    appUpdateRetryTimer = null;
+  }
+  appUpdateRetryAttempt = 0;
+};
+
+export const scheduleAppUpdateRetry = () => {
+  if (appUpdateRetryTimer) return;
+  const delay = APP_UPDATE_RETRY_DELAYS_MS[Math.min(appUpdateRetryAttempt, APP_UPDATE_RETRY_DELAYS_MS.length - 1)];
+  appUpdateRetryAttempt += 1;
+  appUpdateRetryTimer = setTimeout(() => {
+    appUpdateRetryTimer = null;
+    // Forced so the retry cannot be deduplicated against the failed check.
+    void checkForAppUpdate({ force: true, background: true }).catch(() => {});
+  }, delay);
+};
+
+// A background check failed. Restore the last visible result — a known
+// available update stays offered, otherwise the button stays hidden — and
+// keep the message on the state for diagnostics without showing it.
+export const publishQuietAppUpdateCheckFailure = (error) => {
+  if (APP_UPDATE_PROTECTED_STATUSES.has(appUpdateState.status)) return;
+  publishAppUpdateState({
+    status: appUpdateState.availableVersion ? 'available' : 'idle',
+    checkedAt: new Date().toISOString(),
+    progress: null,
+    error: error?.message ?? 'Could not check for updates',
+  });
+};
+
+export const checkForAppUpdate = ({ force = false, background = false } = {}) => {
+  if (appUpdateCheckPromise) {
+    // A user asking while a background check is in flight expects to see the
+    // outcome, so the shared check stops being silent.
+    if (!background && activeAppUpdateCheck) activeAppUpdateCheck.background = false;
+    return appUpdateCheckPromise;
+  }
   if (!force && Date.now() - lastAppUpdateCheckAt < APP_UPDATE_CHECK_DEDUP_MS) {
     return Promise.resolve(appUpdateState);
   }
 
-  const check = runAppUpdateCheck().then((state) => {
-    lastAppUpdateCheckAt = Date.now();
-    if (appUpdateRetryTimer) {
-      clearTimeout(appUpdateRetryTimer);
-      appUpdateRetryTimer = null;
+  const activeCheck = { background };
+  activeAppUpdateCheck = activeCheck;
+  const check = runAppUpdateCheck({ background }).then(
+    (state) => {
+      lastAppUpdateCheckAt = Date.now();
+      clearAppUpdateRetry();
+      return state;
+    },
+    (error) => {
+      if (!activeCheck.background) {
+        publishAppUpdateCheckError(error);
+        throw error;
+      }
+      publishQuietAppUpdateCheckFailure(error);
+      scheduleAppUpdateRetry();
+      return appUpdateState;
     }
-    return state;
-  });
+  );
   const sharedCheck = check.finally(() => {
+    if (activeAppUpdateCheck === activeCheck) activeAppUpdateCheck = null;
     if (appUpdateCheckPromise === sharedCheck) {
       appUpdateCheckPromise = null;
     }
@@ -290,16 +373,9 @@ export const publishAppUpdateCheckError = (error) => {
 };
 
 export const runScheduledAppUpdateCheck = () => {
-  void checkForAppUpdate().catch((error) => {
-    publishAppUpdateCheckError(error);
-    if (appUpdateRetryTimer) return;
-    appUpdateRetryTimer = setTimeout(() => {
-      appUpdateRetryTimer = null;
-      // One forced retry: it cannot rejoin or be suppressed by the failed
-      // primary check. A second failure falls back to the normal interval.
-      void checkForAppUpdate({ force: true }).catch(publishAppUpdateCheckError);
-    }, APP_UPDATE_RETRY_MS);
-  });
+  // Background failures are absorbed by checkForAppUpdate (quiet state plus
+  // the retry schedule); the catch only covers a check a user joined.
+  void checkForAppUpdate({ background: true }).catch(() => {});
 };
 
 export const scheduleAppUpdateChecks = () => {

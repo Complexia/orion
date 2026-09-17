@@ -26,9 +26,11 @@ import { InlineRenameInput } from './fileTree';
 import { ThreadSearchResults } from './threadSearch';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
+import { useSidebarResize } from './useSidebarResize';
 import type { EpicPrStatus } from './appTypes';
 
 const THREADS_VISIBLE_LIMIT = 5;
+const AGENTS_SIDEBAR_STORAGE_KEY = 'orion.agentsSidebarWidth';
 
 export type AgentsSidebarModel = {
   projects: Project[];
@@ -263,6 +265,11 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     localMachineName,
   } = props;
 
+  const { sidebarRef, resizeHandle: sidebarResizeHandle } = useSidebarResize({
+    storageKey: AGENTS_SIDEBAR_STORAGE_KEY,
+    label: 'Agents sidebar',
+  });
+
   // A thread can appear in several sidebar sections at once (pinned, recent,
   // its project, its epic); every copy shows the same open/focused state.
   const threadItemClassName = (threadId: string) =>
@@ -271,7 +278,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     }`;
 
   return (
-    <div className="sidebar agents-sidebar">
+    <div className="sidebar agents-sidebar" ref={sidebarRef}>
       <div className="sidebar-content agents-sidebar-content">
         {projects.length === 0 && (
           <div className="empty-state p-8 text-center">
@@ -1425,6 +1432,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
         })}
       </div>
       <SidebarFooter {...sidebarFooterProps} />
+      {sidebarResizeHandle}
     </div>
   );
 });

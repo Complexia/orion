@@ -2756,13 +2756,22 @@ const App: React.FC = () => {
       setAppUpdateBusy(false);
     });
 
-    void window.orion?.checkForAppUpdate?.().catch(() => {
-      // The main process publishes the visible error state.
-    });
+    // Automatic checks stay silent when they fail: right after login Orion is
+    // usually running before the network is, and a failed check is not an
+    // update failure. The main process retries on its own schedule.
+    void window.orion?.checkForAppUpdate?.({ background: true }).catch(() => {});
+
+    // Connectivity returning is the earliest moment a startup check can
+    // succeed; re-check right away instead of waiting out the retry delay.
+    const handleOnline = () => {
+      void window.orion?.checkForAppUpdate?.({ background: true }).catch(() => {});
+    };
+    window.addEventListener('online', handleOnline);
 
     return () => {
       mounted = false;
       unsubscribe?.();
+      window.removeEventListener('online', handleOnline);
     };
   }, []);
 
