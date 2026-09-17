@@ -13580,7 +13580,7 @@ const App: React.FC = () => {
                                   </span>
                                 )}
                                 {renderThreadCliBadge(thread)}
-                                <span className="thread-title-text">{thread.title}</span>
+                                <span className="thread-title-text" title={thread.title}>{thread.title}</span>
                               </span>
                               <span className="thread-project-tag thread-meta">
                                 {projects.find((p) => p.id === thread.projectId)?.name}

@@ -502,7 +502,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                           ) : (
                             <span className="thread-title">
                               {renderThreadCliBadge(thread)}
-                              <span className="thread-title-text">{thread.title}</span>
+                              <span className="thread-title-text" title={thread.title}>{thread.title}</span>
                             </span>
                           )}
                           <span className="thread-project-tag thread-meta">
@@ -849,7 +849,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                                   ) : (
                                     <span className="thread-title">
                                       {renderThreadCliBadge(thread)}
-                                      <span className="thread-title-text">{thread.title}</span>
+                                      <span className="thread-title-text" title={thread.title}>{thread.title}</span>
                                     </span>
                                   )}
                                   {!epicProjectName && (
@@ -1033,7 +1033,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                             ) : (
                               <span className="thread-title">
                                 {renderThreadCliBadge(thread)}
-                                <span className="thread-title-text">{thread.title}</span>
+                                <span className="thread-title-text" title={thread.title}>{thread.title}</span>
                               </span>
                             )}
                             <span className="thread-project-tag thread-meta">
@@ -1307,7 +1307,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                             ) : (
                               <span className="thread-title">
                                 {renderThreadCliBadge(thread)}
-                                <span className="thread-title-text">{thread.title}</span>
+                                <span className="thread-title-text" title={thread.title}>{thread.title}</span>
                               </span>
                             )}
                             <span className="thread-time thread-meta">
