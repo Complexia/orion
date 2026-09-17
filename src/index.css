@@ -1704,8 +1704,10 @@ body {
 
 /* Sidebar */
 .sidebar {
+  position: relative;
   width: var(--sidebar-width);
   min-width: 240px;
+  flex-shrink: 0;
   background: var(--bg-raised);
   border-right: 1px solid var(--border-subtle);
   display: flex;
@@ -1713,12 +1715,7 @@ body {
   overflow: hidden;
 }
 
-.code-sidebar {
-  position: relative;
-  flex-shrink: 0;
-}
-
-.code-sidebar-resize-handle {
+.sidebar-resize-handle {
   position: absolute;
   z-index: 20;
   top: 0;
@@ -1733,7 +1730,7 @@ body {
   touch-action: none;
 }
 
-.code-sidebar-resize-handle::after {
+.sidebar-resize-handle::after {
   content: '';
   position: absolute;
   top: 0;
@@ -1745,14 +1742,14 @@ body {
   transition: opacity var(--transition-fast);
 }
 
-.code-sidebar-resize-handle:hover::after,
-.code-sidebar-resize-handle:focus-visible::after,
-.code-sidebar-resizing .code-sidebar-resize-handle::after {
+.sidebar-resize-handle:hover::after,
+.sidebar-resize-handle:focus-visible::after,
+.sidebar-resizing .sidebar-resize-handle::after {
   opacity: 0.9;
 }
 
-.code-sidebar-resizing,
-.code-sidebar-resizing * {
+.sidebar-resizing,
+.sidebar-resizing * {
   cursor: col-resize !important;
   user-select: none !important;
 }

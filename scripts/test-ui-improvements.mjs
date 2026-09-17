@@ -5,10 +5,10 @@ import {
   epicRepositoryShouldAutoCreatePr,
 } from '../src/app/epicGit.ts';
 import {
-  CODE_SIDEBAR_MAX_WIDTH,
-  CODE_SIDEBAR_MIN_WIDTH,
-  clampCodeSidebarWidth,
-} from '../src/app/codeSidebarResize.ts';
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  clampSidebarWidth,
+} from '../src/app/sidebarResize.ts';
 
 const [appSource, chatSource, mainSource, preloadSource, dialogsSource, storeSource, sidebarSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
@@ -94,22 +94,22 @@ assert.equal(
 );
 
 assert.equal(
-  clampCodeSidebarWidth(400, 1200),
+  clampSidebarWidth(400, 1200),
   400,
   'the Code explorer should accept an editor-safe drag width'
 );
 assert.equal(
-  clampCodeSidebarWidth(100, 1200),
-  CODE_SIDEBAR_MIN_WIDTH,
+  clampSidebarWidth(100, 1200),
+  SIDEBAR_MIN_WIDTH,
   'the Code explorer must retain its usable minimum width'
 );
 assert.equal(
-  clampCodeSidebarWidth(900, 1200),
-  CODE_SIDEBAR_MAX_WIDTH,
+  clampSidebarWidth(900, 1200),
+  SIDEBAR_MAX_WIDTH,
   'the Code explorer must stop at its normal editor-style maximum width'
 );
 assert.equal(
-  clampCodeSidebarWidth(600, 700),
+  clampSidebarWidth(600, 700),
   380,
   'the Code explorer must leave a usable editor area in a narrow window'
 );
@@ -250,6 +250,11 @@ assert.match(
   sidebarSource,
   /openAddProjectToEpicDialog\(epic\)[\s\S]*Add project to Rift/,
   'the Epic options menu must expose the add-project flow'
+);
+assert.match(
+  sidebarSource,
+  /useSidebarResize\(\{[\s\S]*storageKey: AGENTS_SIDEBAR_STORAGE_KEY[\s\S]*className="sidebar agents-sidebar" ref=\{sidebarRef\}[\s\S]*<SidebarFooter \{\.\.\.sidebarFooterProps\} \/>\s*\{sidebarResizeHandle\}/,
+  'the Agents sidebar must be drag-resizable through the shared sidebar resize hook'
 );
 assert.match(
   appSource,
