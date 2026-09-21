@@ -154,8 +154,14 @@ export const claudeContextWindowOptions: Array<{
 
 // Grok exposes reasoning effort over ACP; labels/descriptions mirror the
 // tiers the agent itself advertises in session/new model metadata. Extra High
-// is currently specific to Grok 4.6.
+// is only advertised by Grok 4.6 and newer (4.7 and 4.7 Fast).
 export const defaultGrokReasoningEffort: GrokReasoningEffort = 'high';
+
+export const grokExtraHighReasoningSlugs: ReadonlySet<string> = new Set([
+  'grok-4.7',
+  'grok-4.7-build-fast',
+  'grok-4.6',
+]);
 
 export type GrokReasoningOption = {
   value: GrokReasoningEffort;
@@ -174,7 +180,7 @@ export const grokReasoningOptions: GrokReasoningOption[] = [
 export const grokReasoningOptionsForModel = (
   model: AgentModel | undefined
 ): GrokReasoningOption[] =>
-  model?.slug === 'grok-4.6'
+  model?.slug && grokExtraHighReasoningSlugs.has(model.slug)
     ? grokReasoningOptions
     : grokReasoningOptions.filter((option) => option.value !== 'xhigh');
 
@@ -443,13 +449,29 @@ export const fallbackAgentModels: AgentModel[] = [
     favorite: true,
   },
   {
+    id: 'grok:grok-4.7',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.7',
+    slug: 'grok-4.7',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
+    id: 'grok:grok-4.7-build-fast',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.7 Fast',
+    slug: 'grok-4.7-build-fast',
+    shortcut: '⌘2',
+  },
+  {
     id: 'grok:grok-4.6',
     providerId: 'grok',
     providerLabel: 'Grok',
     label: 'Grok 4.6',
     slug: 'grok-4.6',
-    shortcut: '⌘1',
-    favorite: true,
+    shortcut: '⌘3',
   },
   {
     id: 'grok:grok-4.5',
@@ -457,7 +479,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Grok',
     label: 'Grok 4.5',
     slug: 'grok-4.5',
-    shortcut: '⌘2',
+    shortcut: '⌘4',
   },
   {
     id: 'grok:grok-composer-2.5-fast',
@@ -465,7 +487,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Grok',
     label: 'Composer 2.5 Fast',
     slug: 'grok-composer-2.5-fast',
-    shortcut: '⌘3',
+    shortcut: '⌘5',
     favorite: true,
   },
   {
@@ -774,7 +796,7 @@ export const fallbackAgentModels: AgentModel[] = [
   })),
 ];
 
-export const defaultAgentModelId = 'grok:grok-4.6';
+export const defaultAgentModelId = 'grok:grok-4.7';
 
 // The Orion pseudo-model: not a CLI harness, resolved by the renderer into
 // the per-role models configured in Settings → Orchestration.

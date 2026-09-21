@@ -280,14 +280,34 @@ export const agentModels = [
     slug: 'orion',
   },
   {
+    id: 'grok:grok-4.7',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.7',
+    slug: 'grok-4.7',
+    command: 'grok',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
+    // The CLI's model id for the fast variant is `grok-4.7-build-fast`
+    // (advertised as "Grok 4.7 Fast — 2x the price").
+    id: 'grok:grok-4.7-build-fast',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.7 Fast',
+    slug: 'grok-4.7-build-fast',
+    command: 'grok',
+    shortcut: '⌘2',
+  },
+  {
     id: 'grok:grok-4.6',
     providerId: 'grok',
     providerLabel: 'Grok',
     label: 'Grok 4.6',
     slug: 'grok-4.6',
     command: 'grok',
-    shortcut: '⌘1',
-    favorite: true,
+    shortcut: '⌘3',
   },
   {
     id: 'grok:grok-4.5',
@@ -296,7 +316,7 @@ export const agentModels = [
     label: 'Grok 4.5',
     slug: 'grok-4.5',
     command: 'grok',
-    shortcut: '⌘2',
+    shortcut: '⌘4',
   },
   {
     id: 'grok:grok-composer-2.5-fast',
@@ -305,7 +325,7 @@ export const agentModels = [
     label: 'Composer 2.5 Fast',
     slug: 'grok-composer-2.5-fast',
     command: 'grok',
-    shortcut: '⌘3',
+    shortcut: '⌘5',
     favorite: true,
   },
   {

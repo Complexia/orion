@@ -708,7 +708,7 @@ export const defaultOrchestrationSettings: OrchestrationSettings = {
     computerUse: 'codex:gpt-5.6-sol',
     exploring: 'claude:claude-haiku-4-5',
     implementation: 'codex:gpt-5.6-sol',
-    imageVideoGen: 'grok:grok-4.6',
+    imageVideoGen: 'grok:grok-4.7',
   },
   generalInstructions: '',
 };
@@ -1881,7 +1881,7 @@ export const useOrionStore = create<OrionState>()(
           projectId,
           title: title || `Thread ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
           status: 'idle',
-          modelId: options?.modelId ?? inheritedModelId ?? 'grok:grok-4.6',
+          modelId: options?.modelId ?? inheritedModelId ?? 'grok:grok-4.7',
           accessMode: options?.accessMode ?? lastProjectThread?.accessMode ?? 'full-access',
           codexReasoningEffort: lastProjectThread?.codexReasoningEffort,
           codexServiceTier: lastProjectThread?.codexServiceTier,

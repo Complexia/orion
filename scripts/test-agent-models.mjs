@@ -17,11 +17,13 @@ const grokModels = agentModels.filter((model) => model.providerId === 'grok');
 assert.deepEqual(
   grokModels.map(({ slug, shortcut }) => ({ slug, shortcut })),
   [
-    { slug: 'grok-4.6', shortcut: '⌘1' },
-    { slug: 'grok-4.5', shortcut: '⌘2' },
-    { slug: 'grok-composer-2.5-fast', shortcut: '⌘3' },
+    { slug: 'grok-4.7', shortcut: '⌘1' },
+    { slug: 'grok-4.7-build-fast', shortcut: '⌘2' },
+    { slug: 'grok-4.6', shortcut: '⌘3' },
+    { slug: 'grok-4.5', shortcut: '⌘4' },
+    { slug: 'grok-composer-2.5-fast', shortcut: '⌘5' },
   ],
-  'the Grok provider should expose Grok 4.6 first without removing existing models'
+  'the Grok provider should expose Grok 4.7 (and its Fast variant) first without removing existing models'
 );
 
 const parsed = parseCursorModelsOutput(`

@@ -44,6 +44,20 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     label: 'Grok 4.6',
     slug: 'grok-4.6',
   };
+  const grok47Model = {
+    id: 'grok:grok-4.7',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.7',
+    slug: 'grok-4.7',
+  };
+  const grok47FastModel = {
+    id: 'grok:grok-4.7-build-fast',
+    providerId: 'grok',
+    providerLabel: 'Grok',
+    label: 'Grok 4.7 Fast',
+    slug: 'grok-4.7-build-fast',
+  };
   const claudeModel = {
     id: 'claude:claude-opus-5',
     providerId: 'claude',
@@ -84,9 +98,19 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     'Grok 4.6 accepts its Extra High effort tier'
   );
   assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, grok47Model, { reasoningEffort: 'xhigh' }),
+    { grokReasoningEffort: 'xhigh' },
+    'Grok 4.7 accepts its Extra High effort tier'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, grok47FastModel, { reasoningEffort: 'xhigh' }),
+    { grokReasoningEffort: 'xhigh' },
+    'Grok 4.7 Fast accepts its Extra High effort tier'
+  );
+  assert.deepEqual(
     remoteAgentSettingsPatch(emptyThread, grokModel, { reasoningEffort: 'xhigh' }),
     {},
-    'older Grok models must not inherit the Grok 4.6-only effort tier'
+    'older Grok models must not inherit the Grok 4.6+ effort tier'
   );
   assert.deepEqual(
     remoteAgentSettingsPatch(emptyThread, claudeModel, {

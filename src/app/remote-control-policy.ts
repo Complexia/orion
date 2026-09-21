@@ -11,7 +11,9 @@ export const remoteThreadRunError = (modelId: string) =>
     : null;
 
 const GROK_REASONING = new Set(['low', 'medium', 'high']);
-const GROK_46_REASONING = new Set([...GROK_REASONING, 'xhigh']);
+const GROK_XHIGH_REASONING = new Set([...GROK_REASONING, 'xhigh']);
+// Extra High is advertised by Grok 4.6 and newer; older Grok models reject it.
+const GROK_XHIGH_SLUGS = new Set(['grok-4.7', 'grok-4.7-build-fast', 'grok-4.6']);
 const MUSE_REASONING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']);
 const CLAUDE_REASONING = new Set([
   'low',
@@ -64,7 +66,8 @@ export const remoteAgentSettingsPatch = (
 
   if (input.reasoningEffort) {
     if (model.providerId === 'grok') {
-      const allowed = model.slug === 'grok-4.6' ? GROK_46_REASONING : GROK_REASONING;
+      const allowed =
+        model.slug && GROK_XHIGH_SLUGS.has(model.slug) ? GROK_XHIGH_REASONING : GROK_REASONING;
       if (allowed.has(input.reasoningEffort) && thread.grokReasoningEffort !== input.reasoningEffort) {
         patch.grokReasoningEffort = input.reasoningEffort;
       }
