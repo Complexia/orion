@@ -87,17 +87,23 @@ const gpt56CodexReasoningOptions: CodexReasoningOption[] = [
 
 const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
 
-// Matches Astra's Codex catalog, including its Medium default.
-const astraCodexReasoningOptions: CodexReasoningOption[] = [
+// Matches the GPT-6 family's Codex catalog, including its Medium default and
+// Max tier. Astra and Sol also offer Ultra; Luna stops at Max.
+const gpt6CodexReasoningOptions: CodexReasoningOption[] = [
   ...codexReasoningOptions,
   { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra', description: 'Maximum reasoning with automatic task delegation' },
 ];
 
+export const gpt6CodexModelSlugs: ReadonlySet<string> = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
+
 export const codexReasoningOptionsForModel = (
   model: AgentModel | undefined
 ): CodexReasoningOption[] => {
-  if (model?.slug === 'gpt-6-astra') return astraCodexReasoningOptions;
+  if (model?.slug === 'gpt-6-luna') {
+    return gpt6CodexReasoningOptions.filter((option) => option.value !== 'ultra');
+  }
+  if (model?.slug && gpt6CodexModelSlugs.has(model.slug)) return gpt6CodexReasoningOptions;
   if (!model || !gpt56CodexModelSlugs.has(model.slug)) return codexReasoningOptions;
   if (model.slug === 'gpt-5.6-luna') {
     return gpt56CodexReasoningOptions.filter((option) => option.value !== 'ultra');
@@ -498,6 +504,20 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'gpt-6-astra',
   },
   {
+    id: 'codex:gpt-6-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Sol',
+    slug: 'gpt-6-sol',
+  },
+  {
+    id: 'codex:gpt-6-luna',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Luna',
+    slug: 'gpt-6-luna',
+  },
+  {
     id: 'codex:gpt-5.6-sol',
     providerId: 'codex',
     providerLabel: 'Codex',
@@ -563,12 +583,20 @@ export const fallbackAgentModels: AgentModel[] = [
     shortcut: '⌘2',
   },
   {
+    id: 'claude:claude-opus-5-5',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Opus 5.5',
+    slug: 'claude-opus-5-5',
+    shortcut: '⌘3',
+  },
+  {
     id: 'claude:claude-opus-5',
     providerId: 'claude',
     providerLabel: 'Claude',
     label: 'Claude Opus 5',
     slug: 'claude-opus-5',
-    shortcut: '⌘3',
+    shortcut: '⌘4',
   },
   {
     id: 'claude:claude-opus-4-8',
@@ -576,7 +604,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 4.8',
     slug: 'claude-opus-4-8',
-    shortcut: '⌘4',
+    shortcut: '⌘5',
   },
   {
     id: 'claude:claude-sonnet-5',
@@ -584,7 +612,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Sonnet 5',
     slug: 'claude-sonnet-5',
-    shortcut: '⌘5',
+    shortcut: '⌘6',
   },
   {
     id: 'claude:claude-opus-4-7',
@@ -592,7 +620,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 4.7',
     slug: 'claude-opus-4-7',
-    shortcut: '⌘6',
+    shortcut: '⌘7',
   },
   {
     id: 'claude:claude-opus-4-6',
@@ -600,7 +628,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 4.6',
     slug: 'claude-opus-4-6',
-    shortcut: '⌘7',
+    shortcut: '⌘8',
   },
   {
     id: 'claude:claude-opus-4-5',
@@ -608,7 +636,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 4.5',
     slug: 'claude-opus-4-5',
-    shortcut: '⌘8',
+    shortcut: '⌘9',
   },
   {
     id: 'claude:claude-sonnet-4-6',
@@ -616,7 +644,6 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Sonnet 4.6',
     slug: 'claude-sonnet-4-6',
-    shortcut: '⌘9',
   },
   {
     id: 'claude:claude-haiku-4-5',

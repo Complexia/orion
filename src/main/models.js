@@ -4,11 +4,15 @@ import path from 'node:path';
 import { checkCommandAvailable, execFileAsync, shellPathSyncPromise } from './shell-env.js';
 
 export const defaultCodexReasoningEffort = 'medium';
-// The GPT-5.6 family defaults to high effort. Astra uses the Codex default
-// and also accepts Max and Ultra.
+// The GPT-5.6 family defaults to high effort. The GPT-6 family (Astra, Sol,
+// Luna) uses the Codex default and also accepts Max (and Ultra, except Luna).
 export const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
+export const gpt6CodexModelSlugs = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
 export const codexReasoningEffortForModel = (model, effort) => {
-  if (model.slug === 'gpt-6-astra') return effort || defaultCodexReasoningEffort;
+  if (gpt6CodexModelSlugs.has(model.slug)) {
+    if (effort === 'ultra' && model.slug === 'gpt-6-luna') return 'max';
+    return effort || defaultCodexReasoningEffort;
+  }
   const isGpt56 = gpt56CodexModelSlugs.has(model.slug);
   if (!effort) return isGpt56 ? 'high' : defaultCodexReasoningEffort;
   if (effort === 'ultra' && !isGpt56) return 'xhigh';
@@ -22,6 +26,7 @@ export const defaultClaudeContextWindow = '200k';
 export const claudeOneMillionContextModels = new Set([
   'claude-fable-5-1',
   'claude-fable-5',
+  'claude-opus-5-5',
   'claude-opus-5',
   'claude-sonnet-5',
   'claude-opus-4-8',
@@ -337,6 +342,22 @@ export const agentModels = [
     command: 'codex',
   },
   {
+    id: 'codex:gpt-6-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Sol',
+    slug: 'gpt-6-sol',
+    command: 'codex',
+  },
+  {
+    id: 'codex:gpt-6-luna',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Luna',
+    slug: 'gpt-6-luna',
+    command: 'codex',
+  },
+  {
     id: 'codex:gpt-5.6-sol',
     providerId: 'codex',
     providerLabel: 'Codex',
@@ -411,13 +432,22 @@ export const agentModels = [
     shortcut: '⌘2',
   },
   {
+    id: 'claude:claude-opus-5-5',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Opus 5.5',
+    slug: 'claude-opus-5-5',
+    command: 'claude',
+    shortcut: '⌘3',
+  },
+  {
     id: 'claude:claude-opus-5',
     providerId: 'claude',
     providerLabel: 'Claude',
     label: 'Claude Opus 5',
     slug: 'claude-opus-5',
     command: 'claude',
-    shortcut: '⌘3',
+    shortcut: '⌘4',
   },
   {
     id: 'claude:claude-opus-4-8',
@@ -426,7 +456,7 @@ export const agentModels = [
     label: 'Claude Opus 4.8',
     slug: 'claude-opus-4-8',
     command: 'claude',
-    shortcut: '⌘4',
+    shortcut: '⌘5',
   },
   {
     id: 'claude:claude-sonnet-5',
@@ -435,7 +465,7 @@ export const agentModels = [
     label: 'Claude Sonnet 5',
     slug: 'claude-sonnet-5',
     command: 'claude',
-    shortcut: '⌘5',
+    shortcut: '⌘6',
   },
   {
     id: 'claude:claude-opus-4-7',
@@ -444,7 +474,7 @@ export const agentModels = [
     label: 'Claude Opus 4.7',
     slug: 'claude-opus-4-7',
     command: 'claude',
-    shortcut: '⌘6',
+    shortcut: '⌘7',
   },
   {
     id: 'claude:claude-opus-4-6',
@@ -453,7 +483,7 @@ export const agentModels = [
     label: 'Claude Opus 4.6',
     slug: 'claude-opus-4-6',
     command: 'claude',
-    shortcut: '⌘7',
+    shortcut: '⌘8',
   },
   {
     id: 'claude:claude-opus-4-5',
@@ -462,7 +492,7 @@ export const agentModels = [
     label: 'Claude Opus 4.5',
     slug: 'claude-opus-4-5',
     command: 'claude',
-    shortcut: '⌘8',
+    shortcut: '⌘9',
   },
   {
     id: 'claude:claude-sonnet-4-6',
@@ -471,7 +501,6 @@ export const agentModels = [
     label: 'Claude Sonnet 4.6',
     slug: 'claude-sonnet-4-6',
     command: 'claude',
-    shortcut: '⌘9',
   },
   {
     id: 'claude:claude-haiku-4-5',

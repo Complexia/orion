@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 
 import {
   agentModels,
+  claudeOneMillionContextModels,
+  codexReasoningEffortForModel,
   cursorFrontierModelSlugs,
   cursorFallbackModels,
   museFallbackModels,
@@ -24,6 +26,62 @@ assert.deepEqual(
     { slug: 'grok-composer-2.5-fast', shortcut: '⌘5' },
   ],
   'the Grok provider should expose Grok 4.7 (and its Fast variant) first without removing existing models'
+);
+
+const codexModels = agentModels.filter((model) => model.providerId === 'codex');
+assert.deepEqual(
+  codexModels.slice(0, 4).map((model) => model.slug),
+  ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol'],
+  'the Codex provider should list the GPT-6 family (Astra, Sol, Luna) ahead of GPT-5.6'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6-sol' }),
+  'medium',
+  'GPT-6 Sol should inherit the Codex Medium default like Astra'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6-sol' }, 'ultra'),
+  'ultra',
+  'GPT-6 Sol should keep Ultra'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6-luna' }, 'ultra'),
+  'max',
+  'GPT-6 Luna should clamp Ultra to Max since the CLI does not advertise Ultra for it'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6-luna' }, 'max'),
+  'max',
+  'GPT-6 Luna should keep Max'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-5.6-sol' }),
+  'high',
+  'GPT-5.6 models should keep their High default'
+);
+
+const claudeModels = agentModels.filter((model) => model.providerId === 'claude');
+assert.deepEqual(
+  claudeModels.map(({ slug, shortcut }) => ({ slug, shortcut })),
+  [
+    { slug: 'claude-fable-5-1', shortcut: '⌘1' },
+    { slug: 'claude-fable-5', shortcut: '⌘2' },
+    { slug: 'claude-opus-5-5', shortcut: '⌘3' },
+    { slug: 'claude-opus-5', shortcut: '⌘4' },
+    { slug: 'claude-opus-4-8', shortcut: '⌘5' },
+    { slug: 'claude-sonnet-5', shortcut: '⌘6' },
+    { slug: 'claude-opus-4-7', shortcut: '⌘7' },
+    { slug: 'claude-opus-4-6', shortcut: '⌘8' },
+    { slug: 'claude-opus-4-5', shortcut: '⌘9' },
+    { slug: 'claude-sonnet-4-6', shortcut: undefined },
+    { slug: 'claude-haiku-4-5', shortcut: undefined },
+    { slug: 'claude-code-cli', shortcut: undefined },
+  ],
+  'the Claude provider should slot Opus 5.5 after the Fable models without removing existing models'
+);
+assert.ok(
+  claudeOneMillionContextModels.has('claude-opus-5-5'),
+  'Claude Opus 5.5 should advertise the 1M context window like Opus 5'
 );
 
 const parsed = parseCursorModelsOutput(`

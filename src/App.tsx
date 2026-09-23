@@ -395,7 +395,7 @@ const epicPrStatus = (epic: Pick<Epic, 'prUrl' | 'prState'> | undefined | null):
 // so a user with a single harness gets that harness's quick model, and a user
 // with several gets them in this order. Falls through to any usable model.
 const UTILITY_MODEL_PREFERENCE = [
-  'codex:gpt-5.6-luna',
+  'codex:gpt-6-luna',
   'grok:grok-composer-2.5-fast',
   'cursor:composer-2.5',
   'claude:claude-haiku-4-5',

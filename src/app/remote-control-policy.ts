@@ -25,9 +25,18 @@ const CLAUDE_REASONING = new Set([
   'ultrathink',
 ]);
 const CODEX_REASONING = new Set(['low', 'medium', 'high', 'xhigh', 'ultra']);
-const ASTRA_CODEX_REASONING = new Set([...CODEX_REASONING, 'max']);
+const GPT6_CODEX_REASONING = new Set([...CODEX_REASONING, 'max']);
+// GPT-6 Luna offers Max but not Ultra.
+const GPT6_LUNA_CODEX_REASONING = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const GPT56_CODEX_SLUGS = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
-const CLAUDE_1M_ONLY_SLUGS = new Set(['claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5']);
+const GPT6_CODEX_SLUGS = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
+const CLAUDE_1M_ONLY_SLUGS = new Set([
+  'claude-fable-5-1',
+  'claude-fable-5',
+  'claude-opus-5-5',
+  'claude-opus-5',
+  'claude-sonnet-5',
+]);
 
 type RemoteAgentSettingsThread = {
   modelId?: string;
@@ -84,13 +93,15 @@ export const remoteAgentSettingsPatch = (
       }
     } else if (model.providerId === 'codex') {
       const allowed =
-        model.slug === 'gpt-6-astra'
-          ? ASTRA_CODEX_REASONING
-          : model.slug && GPT56_CODEX_SLUGS.has(model.slug)
-            ? model.slug === 'gpt-5.6-luna'
-              ? new Set(['low', 'medium', 'high', 'xhigh'])
-              : CODEX_REASONING
-            : new Set(['low', 'medium', 'high', 'xhigh']);
+        model.slug === 'gpt-6-luna'
+          ? GPT6_LUNA_CODEX_REASONING
+          : model.slug && GPT6_CODEX_SLUGS.has(model.slug)
+            ? GPT6_CODEX_REASONING
+            : model.slug && GPT56_CODEX_SLUGS.has(model.slug)
+              ? model.slug === 'gpt-5.6-luna'
+                ? new Set(['low', 'medium', 'high', 'xhigh'])
+                : CODEX_REASONING
+              : new Set(['low', 'medium', 'high', 'xhigh']);
       if (allowed.has(input.reasoningEffort) && thread.codexReasoningEffort !== input.reasoningEffort) {
         patch.codexReasoningEffort = input.reasoningEffort;
       }
