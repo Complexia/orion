@@ -38,6 +38,7 @@
     "test:steering": "node scripts/run-electron-test.mjs scripts/test-steering.mjs",
     "test:claude-capabilities": "node scripts/run-electron-test.mjs scripts/test-claude-capabilities.mjs",
     "test:attachments": "bun scripts/test-attachments.tsx",
+    "test:image-lightbox": "bun scripts/test-image-lightbox.tsx",
     "test:slash-commands": "node --no-warnings --experimental-strip-types scripts/test-slash-commands.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "test:codex-app-server": "node --no-warnings scripts/test-codex-app-server-manager.mjs",

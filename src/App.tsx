@@ -123,6 +123,7 @@ import { epicThreadRows } from './app/epicThreads';
 import { AgentsSidebar, type AgentsSidebarModel, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { ThreadPane } from './app/ThreadPane';
 import type { AppDialogsModel } from './app/AppDialogs';
+import { ImageLightbox } from './app/imageLightbox';
 import { ProjectIcon } from './app/ProjectIcon';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
@@ -12416,6 +12417,7 @@ const App: React.FC = () => {
       onDrop={handleRootDrop}
     >
       <Toaster position="top-center" richColors closeButton />
+      <ImageLightbox />
       {draggingFiles && (
         <div className="file-drop-overlay">
           <div className="file-drop-target">

@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
 import { localMediaSrc, videoFileNamePattern } from './attachments';
+import { handleLightboxImageClick } from './imageLightbox';
 
 // Candidate base directories (in priority order) used to resolve relative
 // media paths that agents emit in markdown — the thread's project path, plus
@@ -45,7 +46,17 @@ export const MarkdownMedia: React.FC<{ src?: string; alt?: string; title?: strin
       />
     );
   }
-  return <img className="markdown-media" src={resolvedSrc} alt={alt ?? ''} title={title} loading="lazy" />;
+  return (
+    <img
+      className="markdown-media"
+      src={resolvedSrc}
+      alt={alt ?? ''}
+      title={title}
+      loading="lazy"
+      data-lightbox=""
+      onClick={handleLightboxImageClick}
+    />
+  );
 };
 
 export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraProps> = ({
