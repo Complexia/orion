@@ -1,6 +1,7 @@
 import React from 'react';
 import { FileText } from 'lucide-react';
 import { type FileAttachment } from '../store';
+import { handleLightboxImageClick } from './imageLightbox';
 
 export const imageFileNamePattern = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 export const videoFileNamePattern = /\.(mp4|webm|mov|m4v|ogv|mkv|avi)(?:[?#]|$)/i;
@@ -61,7 +62,14 @@ export const AttachmentThumb: React.FC<{ attachment: FileAttachment }> = ({ atta
     imageFileNamePattern.test(attachment.name) ||
     imageFileNamePattern.test(attachment.path)
   ) {
-    return <img src={imageAttachmentSrc(attachment)} alt={attachment.name} />;
+    return (
+      <img
+        src={imageAttachmentSrc(attachment)}
+        alt={attachment.name}
+        data-lightbox=""
+        onClick={handleLightboxImageClick}
+      />
+    );
   }
   return (
     <span className="attachment-file-thumb" aria-hidden="true">

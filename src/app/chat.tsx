@@ -1248,7 +1248,12 @@ export const ChatTranscript = React.memo(function ChatTranscript({
 
   return (
     <div className="chat-scroll-wrap">
-      <div className="chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll}>
+      <div
+        className="chat-scroll"
+        ref={chatScrollRef}
+        onScroll={handleChatScroll}
+        data-lightbox-scope=""
+      >
         <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
           <div className="chat-container">
             {thread.messages.length === 0 && (
