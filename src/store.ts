@@ -705,9 +705,9 @@ export type OrchestrationSettings = {
 export const defaultOrchestrationSettings: OrchestrationSettings = {
   models: {
     mainDriver: 'claude:claude-fable-5-1',
-    computerUse: 'codex:gpt-5.6-sol',
+    computerUse: 'codex:gpt-6-sol',
     exploring: 'claude:claude-haiku-4-5',
-    implementation: 'codex:gpt-5.6-sol',
+    implementation: 'codex:gpt-6-sol',
     imageVideoGen: 'grok:grok-4.7',
   },
   generalInstructions: '',

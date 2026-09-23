@@ -78,6 +78,24 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     label: 'GPT-5.6 Luna',
     slug: 'gpt-5.6-luna',
   };
+  const gpt6SolModel = {
+    ...codexModel,
+    id: 'codex:gpt-6-sol',
+    label: 'GPT-6 Sol',
+    slug: 'gpt-6-sol',
+  };
+  const gpt6LunaModel = {
+    ...codexModel,
+    id: 'codex:gpt-6-luna',
+    label: 'GPT-6 Luna',
+    slug: 'gpt-6-luna',
+  };
+  const opus55Model = {
+    ...claudeModel,
+    id: 'claude:claude-opus-5-5',
+    label: 'Claude Opus 5.5',
+    slug: 'claude-opus-5-5',
+  };
 
   assert.deepEqual(
     remoteAgentSettingsPatch(emptyThread, grokModel, { reasoningEffort: 'high' }),
@@ -134,6 +152,39 @@ console.log('ok  remote turns reject terminal-only threads before routing');
     }),
     {},
     'codex must drop claude-only effort and unknown tiers'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, gpt6SolModel, { reasoningEffort: 'max' }),
+    { codexReasoningEffort: 'max' },
+    'GPT-6 Sol accepts the GPT-6 Max tier'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, gpt6SolModel, { reasoningEffort: 'ultra' }),
+    { codexReasoningEffort: 'ultra' },
+    'GPT-6 Sol accepts Ultra'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, gpt6LunaModel, { reasoningEffort: 'max' }),
+    { codexReasoningEffort: 'max' },
+    'GPT-6 Luna accepts Max'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, gpt6LunaModel, { reasoningEffort: 'ultra' }),
+    {},
+    'GPT-6 Luna must reject Ultra, which the CLI does not advertise for it'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, codexModel, { reasoningEffort: 'max' }),
+    {},
+    'GPT-5.6 models must not inherit the GPT-6-only Max tier'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(emptyThread, opus55Model, {
+      reasoningEffort: 'xhigh',
+      claudeContextWindow: '200k',
+    }),
+    { claudeReasoningEffort: 'xhigh', claudeContextWindow: '1m' },
+    'Opus 5.5 is 1M-only, so 200k is clamped up'
   );
   assert.deepEqual(
     reportedSubagentSettingsPatch(
