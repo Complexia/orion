@@ -2,6 +2,7 @@ import { app } from 'electron';
 import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextWindow, codexReasoningEffortForModel, defaultClaudeContextWindow, defaultClaudeReasoningEffort, defaultCodexServiceTier, defaultMuseReasoningEffort, parseExtraArgs } from './models.js';
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexModelConfig, codexPersonalizationConfig, splitCodexConfigContextArgs } from './codex-config.js';
 import { grokPermissionModeForAccessMode } from './grok-access-mode.js';
+import { CLAUDE_CHROME_BROWSER_TIPS } from './claude-chrome.js';
 
 export const commandForModel = (model, input) => {
   const prompt =
@@ -129,7 +130,11 @@ export const commandForModel = (model, input) => {
     // permission mode's defaults must be pre-approved here. Claude in Chrome
     // tools are MCP tools, so enabling --chrome also pre-approves its server.
     const chromeEnabled = options.chrome === true && accessMode !== 'read-only';
-    const chromeArgs = chromeEnabled ? ['--chrome'] : [];
+    // One-shot runs have no SDK hooks, so they get the usage tips but not the
+    // cross-thread Chrome lease.
+    const chromeArgs = chromeEnabled
+      ? ['--chrome', '--append-system-prompt', CLAUDE_CHROME_BROWSER_TIPS]
+      : [];
     const configuredAllowedTools = String(options.allowedTools || '')
       .split(',')
       .map((tool) => tool.trim())

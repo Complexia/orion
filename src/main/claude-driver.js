@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from './claude-input.js';
 import { withClaudeEnv } from './claude-env.js';
+import { CLAUDE_CHROME_BROWSER_TIPS, claudeChromeLeaseHooks } from './claude-chrome.js';
 import { existsSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
@@ -1367,6 +1368,7 @@ export const createClaudeSdkSession = ({
       resolveClaudeBinary(),
     ]);
     const orionMcpServer = createOrionMcpServer(sdk, zod, session);
+    const chromeEnabled = 'chrome' in sdkOptions.extraArgs;
     // Headless runs can't show permission prompts, so outside bypass mode the
     // spawn/stop tools must be pre-approved alongside any user-configured
     // allowlist.
@@ -1398,11 +1400,29 @@ export const createClaudeSdkSession = ({
         // Match the CLI's behavior: the SDK defaults to a minimal/empty
         // system prompt, which drops Claude Code's narration + progress-update
         // guidance (runs go silent between tool calls without it).
-        systemPrompt: { type: 'preset', preset: 'claude_code' },
+        systemPrompt: {
+          type: 'preset',
+          preset: 'claude_code',
+          ...(chromeEnabled ? { append: CLAUDE_CHROME_BROWSER_TIPS } : {}),
+        },
         // Match the CLI's behavior: without this the SDK loads no user or
         // project settings — no CLAUDE.md, no skills, no MCP servers.
         settingSources: ['user', 'project', 'local'],
         mcpServers: { orion: orionMcpServer },
+        // Serializes Claude in Chrome across Orion's Claude threads.
+        ...(chromeEnabled
+          ? {
+              hooks: claudeChromeLeaseHooks(session, {
+                emitActivity: (activity) => {
+                  const turn = session.activeTurns[0];
+                  if (!turn) return;
+                  emitAgentEvent(session.sender, {
+                    runId: turn.runId, threadId: session.threadId, type: 'activity', activity,
+                  });
+                },
+              }),
+            }
+          : {}),
         ...(sdkOptions.ultracode ? { settings: JSON.stringify({ ultracode: true }) } : {}),
         ...(sdkOptions.accessMode === 'full-access'
           ? { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }
