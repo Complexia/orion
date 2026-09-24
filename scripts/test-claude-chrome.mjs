@@ -29,6 +29,71 @@ resetClaudeChromeLeaseForTests();
   assert.ok(new RegExp(hooks.PreToolUse[0].matcher).test('mcp__claude-in-chrome__navigate'));
 }
 
+// Background calls remain protected both when they start between foreground
+// turns and when their foreground turn ends before the call completes.
+for (const startsBetweenTurns of [true, false]) {
+  for (const completion of ['PostToolUse', 'PostToolUseFailure', 'PermissionDenied']) {
+    resetClaudeChromeLeaseForTests();
+    const owner = fakeSession('background');
+    if (startsBetweenTurns) owner.activeTurns = [];
+    const hooks = claudeChromeLeaseHooks(owner);
+    await hooks.PreToolUse[0].hooks[0](chromeInput('background-call'), 'background-call', {});
+    owner.activeTurns = [];
+    const blocked = await acquireClaudeChromeLease({
+      threadId: 'foreground', isActive: () => true, toolUseId: 'foreground-call',
+      maxWaitMs: 30, pollMs: 5,
+    });
+    assert.equal(blocked.timedOut, true, 'an in-flight background call still holds Chrome without a foreground turn');
+    await hooks[completion][0].hooks[0](chromeInput('background-call'), 'background-call', {});
+    const released = await acquireClaudeChromeLease({
+      threadId: 'foreground', isActive: () => true, toolUseId: 'next-call',
+      maxWaitMs: 30, pollMs: 5,
+    });
+    assert.equal(released.timedOut, false, `${completion} releases a background call`);
+    assert.equal(released.waitedMs, 0, 'an idle background owner does not retain the foreground grace period');
+  }
+}
+
+// Session teardown must still release an unfinished call immediately.
+for (const terminalState of ['ended', 'disposed']) {
+  resetClaudeChromeLeaseForTests();
+  const owner = fakeSession('owner');
+  const hooks = claudeChromeLeaseHooks(owner);
+  await hooks.PreToolUse[0].hooks[0](chromeInput('unfinished'), 'unfinished', {});
+  owner[terminalState] = true;
+  const released = await acquireClaudeChromeLease({
+    threadId: 'next', isActive: () => true, toolUseId: 'next-call',
+    maxWaitMs: 30, pollMs: 5,
+  });
+  assert.equal(released.timedOut, false, `${terminalState} sessions cannot retain Chrome`);
+  assert.equal(released.waitedMs, 0);
+}
+
+// Restarting the same thread must discard unfinished calls from its old
+// session while retaining protection for the replacement session's calls.
+for (const terminalState of ['ended', 'disposed']) {
+  resetClaudeChromeLeaseForTests();
+  const previous = fakeSession('restarted');
+  const previousHooks = claudeChromeLeaseHooks(previous);
+  await previousHooks.PreToolUse[0].hooks[0](chromeInput('interrupted'), 'interrupted', {});
+  previous[terminalState] = true;
+
+  const replacement = fakeSession('restarted');
+  const replacementHooks = claudeChromeLeaseHooks(replacement);
+  await replacementHooks.PreToolUse[0].hooks[0](chromeInput('replacement-call'), 'replacement-call', {});
+  replacement.activeTurns = [];
+  const contender = {
+    threadId: 'other', isActive: () => true, toolUseId: 'other-call',
+    maxWaitMs: 30, pollMs: 5,
+  };
+  assert.equal((await acquireClaudeChromeLease(contender)).timedOut, true,
+    'the replacement session still holds Chrome during its own call');
+  await replacementHooks.PostToolUse[0].hooks[0](chromeInput('replacement-call'), 'replacement-call', {});
+  const released = await acquireClaudeChromeLease(contender);
+  assert.equal(released.timedOut, false, `unfinished calls from an ${terminalState} session must not survive replacement`);
+  assert.equal(released.waitedMs, 0, 'the replacement releases Chrome as soon as its own work finishes');
+}
+
 // A second thread waits while the first has a call in flight, then proceeds
 // with context once the call ends and the first thread's turn finishes.
 resetClaudeChromeLeaseForTests();
@@ -78,8 +143,9 @@ resetClaudeChromeLeaseForTests();
   assert.equal(timedOut.timedOut, true, 'a waiter proceeds without the lease after the max wait');
   resetClaudeChromeLeaseForTests();
   await acquireClaudeChromeLease({ threadId: 'y', isActive: () => false, toolUseId: 'y2' });
+  releaseClaudeChromeCall('y', 'y2');
   const ended = await acquireClaudeChromeLease({ threadId: 'z', isActive: () => true, toolUseId: 'z2', pollMs: 20 });
-  assert.equal(ended.waitedMs, 0, 'a holder whose turn ended does not block others, even mid-call');
+  assert.equal(ended.waitedMs, 0, 'a holder whose turn and browser calls ended does not block others');
   assert.ok(claudeChromeLeaseHooks(fakeSession('z')).PermissionDenied, 'denied calls release their slot');
 }
 

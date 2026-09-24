@@ -29,7 +29,7 @@ const POLL_MS = 500;
 export const isClaudeChromeTool = (toolName) =>
   typeof toolName === 'string' && toolName.startsWith(CLAUDE_CHROME_TOOL_PREFIX);
 
-// holder: { threadId, isActive(): boolean, lastUsedAt, calls: Map<toolUseId, startedAt> }
+// holder: { threadId, isAlive(): boolean, isActive(): boolean, lastUsedAt, calls: Map<toolUseId, startedAt> }
 let lease = null;
 const waiters = []; // threadIds in arrival order
 
@@ -43,15 +43,19 @@ const liveCallCount = (holder, now) => {
 
 const leaseValid = (now) =>
   Boolean(lease) &&
-  lease.isActive() &&
-  (liveCallCount(lease, now) > 0 || now - lease.lastUsedAt < CLAUDE_CHROME_LEASE_IDLE_MS);
+  lease.isAlive() &&
+  (liveCallCount(lease, now) > 0 ||
+    (lease.isActive() && now - lease.lastUsedAt < CLAUDE_CHROME_LEASE_IDLE_MS));
 
 const leaseHeldByOther = (threadId, now) => leaseValid(now) && lease.threadId !== threadId;
 
-const takeLease = (threadId, isActive, toolUseId, now) => {
-  if (!lease || lease.threadId !== threadId) {
-    lease = { threadId, isActive, lastUsedAt: now, calls: new Map() };
+const takeLease = (threadId, isAlive, isActive, toolUseId, now) => {
+  // A replacement SDK session can reuse the thread id. Discard the dead
+  // session's unfinished calls before installing the new liveness callback.
+  if (!lease || lease.threadId !== threadId || !lease.isAlive()) {
+    lease = { threadId, isAlive, isActive, lastUsedAt: now, calls: new Map() };
   }
+  lease.isAlive = isAlive;
   lease.isActive = isActive;
   lease.lastUsedAt = now;
   if (toolUseId) lease.calls.set(toolUseId, now);
@@ -72,6 +76,7 @@ const sleep = (ms, signal) =>
 // whether it gave up without the lease. Waiters are served in arrival order.
 export const acquireClaudeChromeLease = async ({
   threadId,
+  isAlive = () => true,
   isActive,
   toolUseId,
   signal,
@@ -81,11 +86,11 @@ export const acquireClaudeChromeLease = async ({
 }) => {
   const startedAt = Date.now();
   const firstInLine = () => waiters[0] === threadId || !waiters.includes(threadId);
-  // The current holder keeps Chrome until it goes idle or its turn ends, even
-  // with others queued; a free Chrome goes to the queue before newcomers.
+  // In-flight calls keep Chrome even between foreground turns. With no calls,
+  // the active turn's idle grace applies; a free Chrome goes to queued threads.
   const holdsLease = leaseValid(startedAt) && lease.threadId === threadId;
   if (holdsLease || (!leaseHeldByOther(threadId, startedAt) && waiters.length === 0)) {
-    takeLease(threadId, isActive, toolUseId, startedAt);
+    takeLease(threadId, isAlive, isActive, toolUseId, startedAt);
     return { waitedMs: 0, timedOut: false, aborted: false };
   }
   if (!waiters.includes(threadId)) waiters.push(threadId);
@@ -95,7 +100,7 @@ export const acquireClaudeChromeLease = async ({
       const now = Date.now();
       if (signal?.aborted) return { waitedMs: now - startedAt, timedOut: false, aborted: true };
       if (!leaseHeldByOther(threadId, now) && firstInLine()) {
-        takeLease(threadId, isActive, toolUseId, now);
+        takeLease(threadId, isAlive, isActive, toolUseId, now);
         return { waitedMs: now - startedAt, timedOut: false, aborted: false };
       }
       if (now - startedAt >= maxWaitMs) {
@@ -127,7 +132,8 @@ export const resetClaudeChromeLeaseForTests = () => {
 // SDK hooks for one Orion Claude session. PreToolUse runs even in
 // bypassPermissions mode, so it gates every Claude in Chrome call.
 export const claudeChromeLeaseHooks = (session, { emitActivity } = {}) => {
-  const isActive = () => !session.ended && !session.disposed && session.activeTurns.length > 0;
+  const isAlive = () => !session.ended && !session.disposed;
+  const isActive = () => session.activeTurns.length > 0;
   const preToolUse = async (input, toolUseId, { signal } = {}) => {
     if (!isClaudeChromeTool(input?.tool_name)) return { continue: true };
     const id = toolUseId ?? input.tool_use_id;
@@ -135,6 +141,7 @@ export const claudeChromeLeaseHooks = (session, { emitActivity } = {}) => {
     let waitShown = false;
     const result = await acquireClaudeChromeLease({
       threadId: session.threadId,
+      isAlive,
       isActive,
       toolUseId: id,
       signal,
