@@ -280,7 +280,165 @@ codexDriver.handleMessage({
 });
 assert.equal(await racingSteer, false, 'A completed turn must reject a racing stale steer');
 assert.equal(codexRunEnded, 1, 'An ordinary Codex turn must end after turn/completed');
+await codexDriver.dispose();
+assert.equal(
+  codexRequests.some((request) => request.method === 'turn/interrupt'),
+  false,
+  'Disposing after a completed turn must not interrupt anything'
+);
 codexSteerableRunDrivers.clear();
+
+// A stopped run's turn outlives its connection on the shared app-server, and
+// app-server folds the next turn/start into that busy turn: the response
+// carries the existing turn id and no turn/started notification follows.
+const createFoldedTurnDriver = ({ answerTurnStart = true, answerThreadRead = true } = {}) => {
+  const requests = [];
+  const deferred = new Map();
+  let driver;
+  const child = {
+    stdin: {
+      write: (line) => {
+        const message = JSON.parse(line);
+        if (message.id === undefined) return;
+        requests.push(message);
+        const result =
+          message.method === 'thread/resume'
+            ? { thread: { id: 'busy-thread' } }
+            : message.method === 'turn/start'
+              ? { turn: { id: 'busy-turn', status: 'inProgress' } }
+              : message.method === 'thread/read'
+                ? { thread: { id: 'busy-thread', turns: [{ id: 'busy-turn', status: 'inProgress' }] } }
+              : message.method === 'turn/steer'
+                ? { turnId: message.params.expectedTurnId }
+                : {};
+        const respond = () => driver.handleMessage({ jsonrpc: '2.0', id: message.id, result });
+        if (
+          (message.method === 'turn/start' && !answerTurnStart) ||
+          (message.method === 'thread/read' && !answerThreadRead)
+        ) deferred.set(message.id, respond);
+        else queueMicrotask(respond);
+      },
+    },
+  };
+  driver = createCodexAppServerDriver({
+    child,
+    cwd: '/tmp/project',
+    model: codexModel,
+    input: { prompt: 'follow-up after stop' },
+    goal: undefined,
+    review: undefined,
+    resumeSessionId: 'busy-thread',
+    accessMode: 'full-access',
+    callbacks: {
+      onActivity: () => {},
+      onFatal: (error) => assert.fail(error),
+      onGoal: () => {},
+      onReasoning: () => {},
+      onRunEnd: () => {},
+      onSessionId: () => {},
+      onStats: () => {},
+      onText: () => {},
+    },
+  });
+  return { driver, requests, deferred };
+};
+
+const folded = createFoldedTurnDriver();
+await folded.driver.start();
+codexSteerableRunDrivers.set('folded-run', folded.driver);
+assert.equal(
+  await steerCodexAppServerRun('folded-run', 'steer the folded turn'),
+  true,
+  'A turn adopted from the turn/start response must accept steering'
+);
+assert.equal(
+  folded.requests.find((request) => request.method === 'turn/steer')?.params.expectedTurnId,
+  'busy-turn'
+);
+await folded.driver.dispose();
+assert.deepEqual(
+  folded.requests.find((request) => request.method === 'turn/interrupt')?.params,
+  { threadId: 'busy-thread', turnId: 'busy-turn' },
+  'Stop must interrupt the live Codex turn instead of leaving it running server-side'
+);
+codexSteerableRunDrivers.clear();
+
+const stopDuringStart = createFoldedTurnDriver({ answerTurnStart: false });
+const stopDuringStartRun = stopDuringStart.driver.start();
+while (!stopDuringStart.requests.some((request) => request.method === 'turn/start')) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+const stopDuringStartDispose = stopDuringStart.driver.dispose();
+for (const respond of stopDuringStart.deferred.values()) respond();
+await stopDuringStartDispose;
+await stopDuringStartRun;
+assert.deepEqual(
+  stopDuringStart.requests.find((request) => request.method === 'turn/interrupt')?.params,
+  { threadId: 'busy-thread', turnId: 'busy-turn' },
+  'Stop during turn/start must interrupt the turn once its id is known'
+);
+
+const stopWithoutStartResponse = createFoldedTurnDriver({ answerTurnStart: false });
+const unansweredStart = stopWithoutStartResponse.driver.start();
+while (!stopWithoutStartResponse.requests.some((request) => request.method === 'turn/start')) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+await stopWithoutStartResponse.driver.dispose();
+await unansweredStart;
+assert.deepEqual(
+  stopWithoutStartResponse.requests.find((request) => request.method === 'turn/interrupt')?.params,
+  { threadId: 'busy-thread', turnId: 'busy-turn' },
+  'Stop must discover and interrupt the running turn even when turn/start never responds'
+);
+for (const respond of stopWithoutStartResponse.deferred.values()) respond();
+assert.equal(await stopWithoutStartResponse.driver.steer('late steer'), false);
+
+const completionDuringLookup = createFoldedTurnDriver({ answerTurnStart: false, answerThreadRead: false });
+const completingStart = completionDuringLookup.driver.start();
+while (!completionDuringLookup.requests.some((request) => request.method === 'turn/start')) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+const completingDispose = completionDuringLookup.driver.dispose();
+while (!completionDuringLookup.requests.some((request) => request.method === 'thread/read')) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+completionDuringLookup.driver.handleMessage({
+  method: 'turn/completed',
+  params: { threadId: 'busy-thread', turn: { id: 'busy-turn', status: 'completed' } },
+});
+for (const respond of completionDuringLookup.deferred.values()) respond();
+await completingDispose;
+await completingStart;
+assert.equal(
+  completionDuringLookup.requests.some((request) => request.method === 'turn/interrupt'),
+  false,
+  'A stale thread/read snapshot must not resurrect a turn that completed during Stop'
+);
+
+const unresponsiveStop = createFoldedTurnDriver({ answerTurnStart: false, answerThreadRead: false });
+const unresponsiveStart = unresponsiveStop.driver.start();
+while (!unresponsiveStop.requests.some((request) => request.method === 'turn/start')) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+let disposalDeadline;
+try {
+  await Promise.race([
+    unresponsiveStop.driver.dispose(),
+    new Promise((_, reject) => {
+      disposalDeadline = setTimeout(() => reject(new Error('Stop hung on the turn lookup')), 5000);
+    }),
+  ]);
+} finally {
+  clearTimeout(disposalDeadline);
+}
+await unresponsiveStart;
+assert.equal(
+  unresponsiveStop.requests.some((request) => request.method === 'thread/read'),
+  true,
+  'Stop must attempt the bounded turn lookup before closing an unresponsive connection'
+);
+for (const respond of unresponsiveStop.deferred.values()) respond();
+assert.equal(await unresponsiveStop.driver.steer('late steer'), false);
 
 const createSession = ({ threadId, runId, retained = false }) => {
   const events = [];
