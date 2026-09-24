@@ -284,6 +284,8 @@ export const createCodexAppServerDriver = ({
   let goalStatus = null;
   let turnActive = false;
   let activeTurnId = null;
+  let lastCompletedTurnId = null;
+  let pendingTurnStart = null;
   let continuationTimer = null;
   let ended = false;
   let actionAccepted = false;
@@ -479,14 +481,31 @@ export const createCodexAppServerDriver = ({
     serviceTier: input.codexServiceTier || defaultCodexServiceTier,
   });
 
-  const startUserTurn = async () => {
+  const requestUserTurn = async () => {
     userTurnHadSubstantiveActivity = false;
     nativeCompactionObserved = false;
     lastTerminalTurnError = null;
     const startedTurn = await request('turn/start', userTurnParams());
     if (startedTurn.error) return { ok: false, error: startedTurn.error };
     markActionAccepted();
+    // When the thread is already busy, app-server folds this input into the
+    // running turn and returns that turn's id without a new turn/started.
+    // Adopt the id so Stop and steering can still address the live turn.
+    const turnId = startedTurn.result?.turn?.id;
+    if (typeof turnId === 'string' && turnId !== lastCompletedTurnId && !activeTurnId) {
+      turnActive = true;
+      activeTurnId = turnId;
+    }
     return { ok: true };
+  };
+
+  const startUserTurn = () => {
+    const started = requestUserTurn();
+    pendingTurnStart = started;
+    void started.finally(() => {
+      if (pendingTurnStart === started) pendingTurnStart = null;
+    });
+    return started;
   };
 
   const finishFailedTurn = (turn, fallbackError) => {
@@ -664,6 +683,7 @@ export const createCodexAppServerDriver = ({
     turnActive = false;
     activeTurnId = null;
     const turn = params.turn ?? {};
+    if (typeof turn.id === 'string') lastCompletedTurnId = turn.id;
     if (turn.status === 'failed') {
       const error = isRecoverableCodexContextError(turn.error)
         ? turn.error
@@ -959,11 +979,47 @@ export const createCodexAppServerDriver = ({
     clearContinuationTimer();
     const finishRecoveryCompaction = resolveRecoveryCompaction;
     resolveRecoveryCompaction = null;
-    // Recovery can itself be awaiting an app-server request. Release those
-    // waits before joining recovery or disposal can deadlock with an
-    // unresponsive app-server. Cleanup requests below remain bounded.
-    settlePendingRequests();
+    // On the shared app-server a turn outlives this run's connection, so
+    // closing it does not stop Codex. Interrupt the live turn explicitly —
+    // otherwise the next run's turn/start is folded into the stale turn.
+    // A turn/start still in flight gets a bounded chance to report its id.
+    const turnStart = contextRecoveryActive ? null : pendingTurnStart;
+    const completedTurnAtStop = lastCompletedTurnId;
+    const interruptOrdinaryTurn = async () => {
+      if (turnStart) {
+        let timeout;
+        try {
+          await Promise.race([turnStart, new Promise((resolve) => {
+            timeout = setTimeout(resolve, 1000);
+            timeout.unref?.();
+          })]);
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+      let turnId = turnActive ? activeTurnId : null;
+      if (
+        !turnId && threadId && turnStart && pendingTurnStart === turnStart &&
+        lastCompletedTurnId === completedTurnAtStop && !contextRecoveryActive
+      ) {
+        // The start response may be delayed even though Codex is running.
+        // Interruption requires a turn id; recover it from the loaded thread
+        // before dropping the pending response and closing the connection.
+        const snapshot = await requestWithTimeout('thread/read', { threadId, includeTurns: true }, 1000);
+        const runningTurn = snapshot.result?.thread?.turns?.find((turn) => turn.status === 'inProgress');
+        turnId = activeTurnId ?? runningTurn?.id;
+      }
+      // A completion notification can overtake the snapshot response.
+      if (threadId && typeof turnId === 'string' && turnId !== lastCompletedTurnId && !contextRecoveryActive) {
+        await requestWithTimeout('turn/interrupt', { threadId, turnId }, 1000);
+      }
+    };
     disposePromise = (async () => {
+      await interruptOrdinaryTurn();
+      // Recovery can itself be awaiting an app-server request. Release those
+      // waits before joining recovery or disposal can deadlock with an
+      // unresponsive app-server. Cleanup requests below remain bounded.
+      settlePendingRequests();
       if (contextRecoveryActive && restoreRolledBackPrompt) {
         await requestWithTimeout(
           'turn/interrupt',

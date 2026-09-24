@@ -9936,6 +9936,11 @@ const App: React.FC = () => {
     // The run settled (or its session vanished) before the push could land —
     // the message becomes an ordinary follow-up turn instead.
     if (!injected) {
+      // A run that already finished dispatches the queue right away; only a
+      // rejection while it is still running needs explaining.
+      if (activeRunsByThreadRef.current[threadId] === target.runId) {
+        toast.info("Couldn't steer the running turn — the message will send when it ends.");
+      }
       queueForTurnEnd();
       return;
     }
