@@ -2015,6 +2015,19 @@ body {
   max-height: min(430px, calc(100vh - 180px));
   overflow-y: auto;
   padding: 4px;
+  transition: opacity var(--transition-fast);
+}
+
+/* Results still reflect the previous keystroke while the next one scores. */
+.thread-search-results.stale {
+  opacity: 0.72;
+}
+
+.thread-search-group-label {
+  padding: 6px 9px 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .thread-search-result {
@@ -2034,9 +2047,43 @@ body {
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.thread-search-result:hover {
+.thread-search-result.compact {
+  min-height: 0;
+}
+
+/* Hover moves the keyboard highlight, so one state covers both. */
+.thread-search-result.active {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+.thread-search-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.thread-search-row .thread-search-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.thread-search-kind-icon {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.thread-search-kind {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.thread-search-result .search-hit {
+  border-radius: 2px;
+  background: rgb(250 204 21 / 22%);
+  color: inherit;
 }
 
 .thread-search-title,
@@ -2056,6 +2103,11 @@ body {
 .thread-search-meta {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.thread-search-row + .thread-search-meta,
+.thread-search-row ~ .thread-search-excerpt {
+  padding-left: 20px;
 }
 
 .thread-search-excerpt {
@@ -7073,9 +7125,33 @@ body {
   font-size: 11px;
 }
 
-.epic-section-header-selected {
+.epic-section-header-selected,
+.project-section-header-selected {
   background: rgb(255 255 255 / 7%);
   color: var(--text-primary);
+}
+
+/* Landing spot for a project or epic picked from search. The scroll margin
+   keeps it clear of the sticky New agent / Search actions (2 × 34px + gaps). */
+[data-sidebar-reveal] {
+  scroll-margin-top: 96px;
+}
+
+.sidebar-reveal-flash > .project-section-header-row {
+  border-radius: var(--radius-sm);
+  animation: sidebar-reveal-flash 1.2s var(--ease-out);
+}
+
+@keyframes sidebar-reveal-flash {
+  0%,
+  35% {
+    background: rgb(255 255 255 / 10%);
+    box-shadow: inset 0 0 0 1px var(--border-default);
+  }
+  100% {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px transparent;
+  }
 }
 
 /* Create-item modal */

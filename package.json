@@ -21,6 +21,7 @@
     "test:skills": "electron scripts/test-skills.mjs",
     "test:mcps": "electron scripts/test-mcps.mjs",
     "test:thread-mentions": "node --no-warnings --experimental-strip-types scripts/test-thread-mentions.mjs",
+    "test:thread-search": "bun scripts/test-thread-search.tsx",
     "test:thread-reader": "electron scripts/test-thread-reader.mjs",
     "test:thread-storage": "electron scripts/test-thread-storage.mjs",
     "test:epic-threads": "node --no-warnings --experimental-strip-types scripts/test-epic-threads.mjs",
