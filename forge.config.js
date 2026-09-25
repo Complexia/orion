@@ -1,3 +1,5 @@
+const crypto = require('node:crypto');
+const os = require('node:os');
 const path = require('node:path');
 const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
@@ -6,6 +8,15 @@ const macSigningIdentity = process.env.ORION_MAC_SIGN_IDENTITY
   || 'Developer ID Application: R&R Unicorns, LLC (KV46DBU287)';
 const macEntitlements = path.join(__dirname, 'build', 'entitlements.mac.plist');
 const macNonCodeResourcePattern = /\.(?:pak|bin|dat|png|jpe?g|gif|icns|ico|ttf|woff2?)$/i;
+// @electron/packager wipes `<tmpdir>/electron-packager` at the start of every
+// run, so concurrent packaging from another checkout (rifts, worktrees) would
+// delete this build's staged app mid-signing. Stage per checkout instead. It
+// must live outside the project: packager copies the project into staging.
+const packagerTmpdir = path.join(
+  os.tmpdir(),
+  'orion-packager',
+  crypto.createHash('sha256').update(__dirname).digest('hex').slice(0, 16),
+);
 
 module.exports = {
   packagerConfig: {
@@ -15,6 +26,7 @@ module.exports = {
     // its own '**/*.node' pattern into this.
     asar: { unpack: '**/node_modules/{node-pty,rift-snapshot,@anthropic-ai/claude-agent-sdk-*}/**' },
     icon: path.join(__dirname, 'assets', 'icon'),
+    tmpdir: packagerTmpdir,
     extraResource: [
       path.join(__dirname, 'assets', 'icon.png'),
       path.join(__dirname, 'assets', 'bundled-skills'),
