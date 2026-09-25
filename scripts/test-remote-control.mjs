@@ -616,6 +616,15 @@ if (
 
   const fixtureThreads = [
     {
+      id: 't-no-project',
+      projectId: 'orion:no-project',
+      title: 'Plain chat',
+      status: 'idle',
+      modelId: 'claude:sonnet',
+      createdAt: '2026-08-01T10:00:00.000Z',
+      messages: [],
+    },
+    {
       id: 't1',
       projectId: 'p1',
       title: 'Fix the flaky test',
@@ -699,6 +708,7 @@ if (
       if (snapshotReadFailure === 'store') throw new Error('Test store snapshot read failed.');
       return {
         projects: [{ id: 'p1', name: 'orion', path: '/tmp/orion' }],
+        noProject: { id: 'orion:no-project', name: 'No project', path: '/tmp/orion-chats' },
         epics: [{ id: 'e1', name: 'Remote epic', description: '', createdAt: '2026-08-01T09:00:00.000Z' }],
       };
     },
@@ -1898,9 +1908,16 @@ if (
     assert.equal(results.wrongCode.ok, false, 'wrong pairing code must fail');
     assert.equal(results.pair.ok, true, `pairing failed: ${results.pair.error}`);
     assert.equal(results.snapshot.ok, true, `snapshot failed: ${results.snapshot.error}`);
-    assert.equal(results.snapshot.snapshot.projects.length, 1);
+    assert.equal(results.snapshot.snapshot.projects.length, 2);
+    const noProject = results.snapshot.snapshot.projects.find((project) => project.id === 'orion:no-project');
+    assert.deepEqual(noProject, { id: 'orion:no-project', name: 'No project', path: '/tmp/orion-chats' });
+    assert.equal(
+      results.snapshot.snapshot.threads.filter((thread) => thread.projectId === noProject.id).length,
+      1,
+      'The remote project groups must expose No project chats'
+    );
     assert.equal(results.snapshot.snapshot.epics.length, 1);
-    assert.equal(results.snapshot.snapshot.threads.length, 2);
+    assert.equal(results.snapshot.snapshot.threads.length, 3);
     assert.equal(results.thread.ok, true);
     assert.equal(results.thread.thread.messages.length, 2);
     assert.equal(results.largeThread.ok, true, `large thread failed: ${results.largeThread.error}`);

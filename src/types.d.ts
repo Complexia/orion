@@ -629,6 +629,8 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => boolean;
       clearStore: () => Promise<boolean>;
       openDirectory: () => Promise<string | null>;
+      /** Creates (if needed) and returns the working directory for agents run without a project. */
+      getNoProjectDir?: () => Promise<string>;
       readDirectory: (dirPath: string) => Promise<Array<{
         name: string;
         path: string;

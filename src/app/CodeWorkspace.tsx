@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Folder, FolderOpen, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useShallow } from 'zustand/react/shallow';
-import { useOrionStore } from '../store';
+import { findProjectById, isNoProjectId, useOrionStore } from '../store';
 import { CodeEditorPane, type CodeEditorPaneHandle } from './CodeEditorPane';
 import { isPreviewFilePath } from './codeFiles';
 import { type FileTreeItem, FileTreeNode } from './fileTree';
@@ -32,6 +32,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
 }: CodeWorkspaceProps) {
   const {
     projects,
+    noProject,
     selectedProjectId,
     workspacePath,
     setWorkspacePath,
@@ -45,6 +46,7 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
   } = useOrionStore(
     useShallow((state) => ({
       projects: state.projects,
+      noProject: state.noProject,
       selectedProjectId: state.selectedProjectId,
       workspacePath: state.workspacePath,
       setWorkspacePath: state.setWorkspacePath,
@@ -64,7 +66,9 @@ export const CodeWorkspace = React.memo(function CodeWorkspace({
     useShallow((state) => state.openFiles.map((file) => file.path))
   );
   const openFiles = React.useMemo(() => useOrionStore.getState().openFiles, [openFileShellSignatures]);
-  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0] ?? null;
+  const selectedProject =
+    findProjectById({ projects, noProject }, selectedProjectId) ??
+    (isNoProjectId(selectedProjectId) ? null : (projects[0] ?? null));
 
   const [treeRoot, setTreeRoot] = useState<string | null>(null);
   const [treeItems, setTreeItems] = useState<FileTreeItem[]>([]);

@@ -26,6 +26,7 @@
     "test:epic-threads": "node --no-warnings --experimental-strip-types scripts/test-epic-threads.mjs",
     "test:ui-improvements": "node --no-warnings --experimental-strip-types scripts/test-ui-improvements.mjs",
     "test:code-tab": "node --no-warnings --experimental-strip-types scripts/test-code-tab.mjs",
+    "test:no-project": "bun scripts/test-no-project.ts",
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
