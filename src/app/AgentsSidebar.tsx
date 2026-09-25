@@ -19,7 +19,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import type { Epic, Project, SavedView, Thread } from '../store';
+import { isNoProjectId, type Epic, type Project, type SavedView, type Thread } from '../store';
 import type { RemoteMachineEntry } from '../types';
 import { ProjectIcon } from './ProjectIcon';
 import { InlineRenameInput } from './fileTree';
@@ -326,49 +326,34 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
   return (
     <div className="sidebar agents-sidebar" ref={sidebarRef}>
       <div className="sidebar-content agents-sidebar-content">
-        {projects.length === 0 && (
-          <div className="empty-state p-8 text-center">
-            <div className="empty-state-icon">
-              <FolderOpen size={28} />
-            </div>
-            <div className="empty-state-title">No projects yet</div>
-            <div className="text-xs text-[#6b6b74]">Add a folder to start agent threads</div>
-            <button onClick={() => void handleAddProject()} className="btn mt-3">
-              <Plus size={14} /> Add Project
+        <div className="sidebar-primary-actions">
+          <button type="button" className="sidebar-action-button primary" onClick={handleNewAgent}>
+            <SquarePen size={15} />
+            <span>New agent</span>
+          </button>
+          <div className="sidebar-search-wrap" ref={threadSearchRef}>
+            <button
+              type="button"
+              className={`sidebar-action-button ${threadSearchOpen ? 'active' : ''}`}
+              onClick={() => setThreadSearchOpen((open) => !open)}
+              onPointerEnter={warmSearchIndex}
+              onFocus={warmSearchIndex}
+              aria-expanded={threadSearchOpen}
+            >
+              <Search size={15} />
+              <span>Search</span>
             </button>
+            {threadSearchOpen && (
+              <SidebarSearchPanel
+                projects={projects}
+                epics={epicsEnabled ? activeEpics : EMPTY_EPICS}
+                onSelectThread={handleSearchSelectThread}
+                onSelectProject={handleSearchSelectProject}
+                onSelectEpic={handleSearchSelectEpic}
+              />
+            )}
           </div>
-        )}
-
-        {projects.length > 0 && (
-          <div className="sidebar-primary-actions">
-            <button type="button" className="sidebar-action-button primary" onClick={handleNewAgent}>
-              <SquarePen size={15} />
-              <span>New agent</span>
-            </button>
-            <div className="sidebar-search-wrap" ref={threadSearchRef}>
-              <button
-                type="button"
-                className={`sidebar-action-button ${threadSearchOpen ? 'active' : ''}`}
-                onClick={() => setThreadSearchOpen((open) => !open)}
-                onPointerEnter={warmSearchIndex}
-                onFocus={warmSearchIndex}
-                aria-expanded={threadSearchOpen}
-              >
-                <Search size={15} />
-                <span>Search</span>
-              </button>
-              {threadSearchOpen && (
-                <SidebarSearchPanel
-                  projects={projects}
-                  epics={epicsEnabled ? activeEpics : EMPTY_EPICS}
-                  onSelectThread={handleSearchSelectThread}
-                  onSelectProject={handleSearchSelectProject}
-                  onSelectEpic={handleSearchSelectEpic}
-                />
-              )}
-            </div>
-          </div>
-        )}
+        </div>
 
         {/*
           Machines (remote control): every paired host this instance can drive,
@@ -1006,7 +991,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
           </div>
         )}
 
-        {projects.length > 0 && (
+        {(projects.length > 0 || recentThreads.length > 0) && (
           <div className="recent-agents-section">
             <div className="recent-agents-header-row">
               <button
@@ -1137,19 +1122,22 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                                 >
                                   <Pin size={13} /> Pin
                                 </button>
-                                <button
-                                  type="button"
-                                  className="project-menu-item"
-                                  role="menuitem"
-                                  onClick={() => {
-                                    setThreadItemMenuKey(null);
-                                    updateThread(thread.id, {
-                                      hiddenFromRecent: true,
-                                    });
-                                  }}
-                                >
-                                  <EyeOff size={13} /> Remove from Recent
-                                </button>
+                                {/* No project threads have no project list to fall back to. */}
+                                {!isNoProjectId(thread.projectId) && (
+                                  <button
+                                    type="button"
+                                    className="project-menu-item"
+                                    role="menuitem"
+                                    onClick={() => {
+                                      setThreadItemMenuKey(null);
+                                      updateThread(thread.id, {
+                                        hiddenFromRecent: true,
+                                      });
+                                    }}
+                                  >
+                                    <EyeOff size={13} /> Remove from Recent
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="project-menu-item danger"
@@ -1182,6 +1170,19 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                 )}
               </>
             )}
+          </div>
+        )}
+
+        {projects.length === 0 && (
+          <div className="empty-state p-8 text-center">
+            <div className="empty-state-icon">
+              <FolderOpen size={28} />
+            </div>
+            <div className="empty-state-title">No projects yet</div>
+            <div className="text-xs text-[#6b6b74]">Add a folder to work on its code, or start a New agent to just chat</div>
+            <button onClick={() => void handleAddProject()} className="btn mt-3">
+              <Plus size={14} /> Add Project
+            </button>
           </div>
         )}
 

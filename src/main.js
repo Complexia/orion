@@ -59,7 +59,7 @@ import { readImportableSessions, scanImportableSessions } from './main/session-i
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import { getAgentModels, invalidateAgentModelsCache, listAgentModelsWithAvailability } from './main/models.js';
-import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
+import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
@@ -1890,6 +1890,13 @@ ipcMain.handle('dialog:openDirectory', async () => {
   });
   if (result.canceled || result.filePaths.length === 0) return null;
   return result.filePaths[0];
+});
+
+// Agents started without a project run in an Orion-owned scratch directory.
+ipcMain.handle('app:getNoProjectDir', async () => {
+  const dir = getNoProjectDirectoryPath();
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
 });
 
 // Read directory (returns files + dirs info for tree)
@@ -7974,6 +7981,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const riftSetupError = pendingRiftSetupError(input);
     if (riftSetupError) {
       return { ok: false, error: riftSetupError };
+    }
+    // The No project scratch directory is Orion's own; recreate it if it was
+    // cleaned up rather than failing the chat.
+    if (path.resolve(input.projectPath) === getNoProjectDirectoryPath()) {
+      await fs.mkdir(input.projectPath, { recursive: true });
     }
     const workspaceError = await validateAgentWorkspace(input.projectPath);
     if (workspaceError) {

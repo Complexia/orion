@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { stripTypeScriptTypes } from 'node:module';
 
 const [appSource, chatSource, claudeDriverSource, mainSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
@@ -135,10 +136,59 @@ const startSuggestedTask = section(
   "  const handleStartSuggestedTask = useCallback((threadId: string, mode: 'thread' | 'rift') => {",
   '  const handleDismissSuggestedTask'
 );
+// Exercise the actual callback: a No project suggestion must remain usable
+// as a regular chat, while epic/Rift starts must have no side effects.
+const startCallback = startSuggestedTask.slice(
+  startSuggestedTask.indexOf('useCallback(') + 'useCallback('.length,
+  startSuggestedTask.lastIndexOf('}, [') + 1
+);
+for (const projectId of ['orion:no-project', 'repository']) {
+  for (const mode of ['thread', 'rift']) {
+    const project = { id: projectId, path: '/tmp/suggestion-workspace' };
+    const suggestion = { text: 'Follow up', turnRunId: 'turn', detailedPromptStatus: 'pending' };
+    const thread = { id: 'source', projectId, suggestedTask: suggestion };
+    const calls = [];
+    const deps = {
+      useOrionStore: { getState: () => ({ threads: [thread] }) },
+      findProjectById: () => project,
+      isNoProjectId: (id) => id === 'orion:no-project',
+      suggestedTaskStartPrompt: (value) => value.text,
+      epicsEnabled: true,
+      riftsActive: true,
+      riftsSettings: { autoCreateForEpics: true },
+      cancelSuggestionPromptRuns: () => calls.push('cancelPrompt'),
+      createThread: () => { calls.push('thread'); return 'new-thread'; },
+      updateThread: (_id, update) => { calls.push('update'); Object.assign(thread, update); },
+      addEpic: () => { calls.push('epic'); return 'new-epic'; },
+      setupRiftForEpic: () => calls.push('rift'),
+      deriveTitle: (value) => value,
+      setActiveTab: () => {},
+      setEpicsSectionOpen: () => {},
+      composerDraftsRef: { current: new Map() },
+      startTurnForThreadRef: { current: () => { calls.push('start'); } },
+      toast: { error: (message) => calls.push(`error: ${message}`), success: () => {} },
+    };
+    const start = new Function(
+      ...Object.keys(deps),
+      `return ${stripTypeScriptTypes(`(${startCallback})`)}`
+    )(...Object.values(deps));
+    start('source', mode);
+    if (projectId === 'orion:no-project' && mode === 'rift') {
+      assert.equal(calls.length, 1, 'Reject before cancelling the prompt or creating/updating anything');
+      assert.match(calls[0], /^error: Choose a project/);
+      assert.equal(thread.suggestedTask, suggestion, 'The rejected suggestion must remain available');
+    } else {
+      assert.deepEqual(calls, mode === 'thread'
+        ? ['cancelPrompt', 'thread', 'update', 'start']
+        : ['cancelPrompt', 'epic', 'update', 'rift', 'thread']);
+    }
+  }
+}
+
 const duplicateStartGuard = section(
   startSuggestedTask,
   'const suggestion = thread?.suggestedTask;',
-  'const project = state.projects.find'
+  'const project = findProjectById'
 );
 assert.match(
   duplicateStartGuard,
@@ -236,7 +286,7 @@ assert.match(
 const turnEventHandler = section(
   appSource,
   "      // Every real turn supersedes the prior suggestion",
-  "      // A claude session's background work settled"
+  "      if (event.type === 'background-settled') {"
 );
 assert.match(
   turnEventHandler,

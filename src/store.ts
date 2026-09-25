@@ -8,6 +8,26 @@ export type Project = {
   path: string;
 };
 
+/**
+ * Pseudo-project for agents started with "No project" selected (a plain chat,
+ * not tied to a repository). It is never stored in `projects`, so project
+ * lists, epics and repository controls don't see it; threads reference it by
+ * id and run in an Orion-owned scratch directory (`noProject.path`).
+ */
+export const NO_PROJECT_ID = 'orion:no-project';
+export const NO_PROJECT_NAME = 'No project';
+export const isNoProjectId = (id: string | null | undefined) => id === NO_PROJECT_ID;
+
+/** Looks up a thread's project, resolving the No project pseudo-project too. */
+export const findProjectById = (
+  state: { projects: Project[]; noProject: Project | null },
+  id: string | null | undefined
+): Project | undefined => {
+  if (!id) return undefined;
+  if (id === NO_PROJECT_ID) return state.noProject ?? undefined;
+  return state.projects.find((project) => project.id === id);
+};
+
 export type EpicRepository = {
   /** Orion project represented by this repository. */
   projectId: string;
@@ -777,6 +797,8 @@ interface OrionState {
 
   // Projects & Threads
   projects: Project[];
+  /** The No project pseudo-project, once its scratch directory is known. */
+  noProject: Project | null;
   threads: Thread[];
   selectedProjectId: string | null;
   selectedThreadId: string | null;
@@ -832,6 +854,7 @@ interface OrionState {
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
   addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
+  setNoProjectPath: (path: string) => void;
   /** Adds imported threads (and the projects created for them) without changing selection. */
   importThreads: (input: { projects: Project[]; threads: Thread[] }) => void;
   removeProject: (id: string) => void;
@@ -1437,6 +1460,7 @@ export const useOrionStore = create<OrionState>()(
       activeTab: 'agents',
       settingsOpen: false,
       projects: [],
+      noProject: null,
       threads: [],
       selectedProjectId: null,
       selectedThreadId: null,
@@ -1580,6 +1604,13 @@ export const useOrionStore = create<OrionState>()(
         }
         return newProject.id;
       },
+
+      setNoProjectPath: (path) =>
+        set((state) =>
+          state.noProject?.path === path
+            ? {}
+            : { noProject: { id: NO_PROJECT_ID, name: NO_PROJECT_NAME, path } }
+        ),
 
       importThreads: ({ projects, threads }) => {
         if (projects.length === 0 && threads.length === 0) return;
@@ -2486,6 +2517,7 @@ export const useOrionStore = create<OrionState>()(
       partialize: (state) => ({
         activeTab: state.activeTab,
         projects: state.projects,
+        noProject: state.noProject,
         selectedProjectId: state.selectedProjectId,
         selectedThreadId: state.selectedThreadId,
         paneThreadIds: state.paneThreadIds,

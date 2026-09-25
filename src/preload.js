@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('orion', {
 
   // Dialog
   openDirectory: () => ipcRenderer.invoke('dialog:openDirectory'),
+  getNoProjectDir: () => ipcRenderer.invoke('app:getNoProjectDir'),
 
   // File system
   readDirectory: (dirPath) => ipcRenderer.invoke('fs:readDirectory', dirPath),

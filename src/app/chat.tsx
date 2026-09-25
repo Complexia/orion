@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, GitBranch, MessageSquare, Plus, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type SuggestedTask, type Thread, useOrionStore } from '../store';
+import { isNoProjectId, NO_PROJECT_ID, type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type SuggestedTask, type Thread, useOrionStore } from '../store';
 import type { AgentModel } from '../agentCatalog';
 import { SessionImportCard } from './SessionImport';
 import { agentProviders } from '../agentCatalog';
@@ -52,6 +52,7 @@ export const FloatingSuggestedTaskCard: React.FC<{
   suggestion: SuggestedTask;
   usesRift: boolean;
   canStartRift: boolean;
+  riftDisabledReason?: string;
   position: { x: number; y: number } | null;
   onMove: (position: { x: number; y: number }) => void;
   collapsed: boolean;
@@ -62,6 +63,7 @@ export const FloatingSuggestedTaskCard: React.FC<{
   suggestion,
   usesRift,
   canStartRift,
+  riftDisabledReason,
   position,
   onMove,
   collapsed,
@@ -246,7 +248,7 @@ export const FloatingSuggestedTaskCard: React.FC<{
                     className="suggested-task-start-option"
                     role="menuitem"
                     disabled={!canStartRift}
-                    title={canStartRift ? undefined : 'Enable Epics in Settings to use this'}
+                    title={canStartRift ? undefined : (riftDisabledReason ?? 'Enable Epics in Settings to use this')}
                     onClick={() => {
                       setStartMenuOpen(false);
                       onStart('rift');
@@ -260,7 +262,7 @@ export const FloatingSuggestedTaskCard: React.FC<{
                           ? usesRift
                             ? 'New epic in an isolated rift workspace'
                             : 'New epic in this repository'
-                          : 'Enable Epics in Settings to use this'}
+                          : (riftDisabledReason ?? 'Enable Epics in Settings to use this')}
                       </span>
                     </span>
                   </button>
@@ -848,8 +850,10 @@ export const AgentsWelcome: React.FC<{
     };
   }, [pickerOpen]);
 
-  const interactive =
-    !!canChangeProject && !!onSelectProject && (projects?.length ?? 0) > 0;
+  // Always interactive when changing is allowed: "No project" is an option
+  // even before any project has been added.
+  const interactive = !!canChangeProject && !!onSelectProject;
+  const noProject = isNoProjectId(selectedProjectId);
 
   return (
     <div className="agents-welcome">
@@ -858,7 +862,7 @@ export const AgentsWelcome: React.FC<{
         <Sparkles size={26} />
       </div>
       <h2>
-        What should we build in{' '}
+        {noProject ? 'What should we work on' : 'What should we build in'}{' '}
         {interactive ? (
           <span className="agents-welcome-project" ref={pickerRef}>
             <button
@@ -869,7 +873,7 @@ export const AgentsWelcome: React.FC<{
               aria-expanded={pickerOpen}
               title="Change project"
             >
-              <strong>{projectName ?? 'this project'}</strong>
+              <strong>{noProject ? 'without a project' : (projectName ?? 'this project')}</strong>
               <ChevronDown
                 size={18}
                 className={`agents-welcome-project-chevron ${pickerOpen ? 'open' : ''}`}
@@ -877,7 +881,21 @@ export const AgentsWelcome: React.FC<{
             </button>
             {pickerOpen && (
               <div className="shell-project-picker agents-welcome-project-picker" role="menu">
-                {projects!.map((option) => (
+                <button
+                  type="button"
+                  className={`project-picker-item ${noProject ? 'selected' : ''}`}
+                  onClick={() => {
+                    setPickerOpen(false);
+                    onSelectProject!(NO_PROJECT_ID);
+                  }}
+                  title="Chat with an agent outside of any project"
+                >
+                  <MessageSquare size={13} />
+                  <span className="truncate">No project</span>
+                  {noProject && <Check size={13} />}
+                </button>
+                {(projects?.length ?? 0) > 0 && <div className="project-picker-divider" />}
+                {(projects ?? []).map((option) => (
                   <button
                     key={option.id}
                     type="button"
@@ -912,7 +930,7 @@ export const AgentsWelcome: React.FC<{
             )}
           </span>
         ) : (
-          <strong>{projectName ?? 'this project'}</strong>
+          <strong>{noProject ? 'without a project' : (projectName ?? 'this project')}</strong>
         )}
         ?
       </h2>
@@ -1386,7 +1404,8 @@ export const ChatTranscript = React.memo(function ChatTranscript({
         <FloatingSuggestedTaskCard
           suggestion={thread.suggestedTask}
           usesRift={suggestedTaskUsesRift}
-          canStartRift={suggestedTaskCanStartRift}
+          canStartRift={suggestedTaskCanStartRift && !isNoProjectId(thread.projectId)}
+          riftDisabledReason={isNoProjectId(thread.projectId) ? 'Choose a project to start an epic or rift' : undefined}
           position={suggestedCardPosition}
           onMove={handleMoveSuggestedCard}
           collapsed={suggestedCardCollapsed}

@@ -1494,7 +1494,12 @@ const buildSnapshot = async () => {
       autoCreateRiftsForEpics:
         state.riftsSettings?.enabled === true && state.riftsSettings?.autoCreateForEpics === true,
     },
-    projects: (Array.isArray(state.projects) ? state.projects : []).map((project) => ({
+    // Remote clients group threads by these entries. Include the scratch
+    // workspace on the wire without adding it to the host's saved projects.
+    projects: [
+      ...(state.noProject ? [state.noProject] : []),
+      ...(Array.isArray(state.projects) ? state.projects : []),
+    ].map((project) => ({
       id: project.id,
       name: project.name,
       path: project.path,

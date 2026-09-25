@@ -51,8 +51,11 @@ import {
   defaultNotificationSettings,
   defaultEpicsSettings,
   defaultRiftsSettings,
+  findProjectById,
   isAgentsPanelVisible,
+  isNoProjectId,
   MAX_THREAD_PANES,
+  NO_PROJECT_ID,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -753,6 +756,8 @@ const App: React.FC = () => {
     settingsOpen,
     setSettingsOpen,
     projects,
+    noProject,
+    setNoProjectPath,
     selectedProjectId,
     selectedThreadId,
     paneThreadIds,
@@ -827,6 +832,8 @@ const App: React.FC = () => {
       settingsOpen: state.settingsOpen,
       setSettingsOpen: state.setSettingsOpen,
       projects: state.projects,
+      noProject: state.noProject,
+      setNoProjectPath: state.setNoProjectPath,
       selectedProjectId: state.selectedProjectId,
       selectedThreadId: state.selectedThreadId,
       paneThreadIds: state.paneThreadIds,
@@ -1451,7 +1458,7 @@ const App: React.FC = () => {
   // rather than only for the focused one.
   const threadViewContext = useCallback(
     (thread: Thread | undefined) => {
-      const project = thread ? (projects.find((p) => p.id === thread.projectId) ?? null) : null;
+      const project = thread ? (findProjectById({ projects, noProject }, thread.projectId) ?? null) : null;
       const epic = thread?.epicId ? epics.find((candidate) => candidate.id === thread.epicId) : undefined;
       const riftPending = Boolean(thread?.epicId && riftSetupEpicIds[thread.epicId]);
       const riftRemoving = Boolean(
@@ -1485,7 +1492,16 @@ const App: React.FC = () => {
         : [];
       return { project, epic, riftPending, riftRemoving, riftUnavailable, projectPath, mediaBaseDirs };
     },
-    [epics, projects, riftRemovalEpicIds, riftRemovalThreadIds, riftSetupEpicIds, riftStatus, riftsSettings.enabled]
+    [
+      epics,
+      noProject,
+      projects,
+      riftRemovalEpicIds,
+      riftRemovalThreadIds,
+      riftSetupEpicIds,
+      riftStatus,
+      riftsSettings.enabled,
+    ]
   );
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
@@ -1591,7 +1607,8 @@ const App: React.FC = () => {
     setTasksCardStates(dropStale);
     setSuggestedCardStates(dropStale);
   }, [threads]);
-  const selectedProject = projects.find((p) => p.id === selectedProjectId) ?? selectedThreadProject ?? null;
+  const selectedProject =
+    findProjectById({ projects, noProject }, selectedProjectId) ?? selectedThreadProject ?? null;
   const latestThreadProjectId = useMemo(() => {
     let latestProjectId: string | null = null;
     let latestCreatedAt = -Infinity;
@@ -1623,8 +1640,19 @@ const App: React.FC = () => {
     }
     return latestProjectId;
   }, [threads]);
+  // May be the No project pseudo-project (the user's current choice, or the
+  // only option before any project is added).
   const defaultNewThreadProject =
-    selectedProject ?? projects.find((project) => project.id === latestThreadProjectId) ?? projects[0] ?? null;
+    selectedProject ??
+    findProjectById({ projects, noProject }, latestThreadProjectId) ??
+    projects[0] ??
+    noProject ??
+    null;
+  // Same default for things that need a real repository (epics).
+  const defaultRepositoryProject =
+    defaultNewThreadProject && !isNoProjectId(defaultNewThreadProject.id)
+      ? defaultNewThreadProject
+      : (projects[0] ?? null);
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
   // empty composer.
@@ -2326,9 +2354,9 @@ const App: React.FC = () => {
 
       const lastThread = threadsByEpic.get(epic.id)?.[0];
       const lastProject = lastThread ? projects.find((p) => p.id === lastThread.projectId) : undefined;
-      return lastProject ?? defaultNewThreadProject ?? projects[0] ?? null;
+      return lastProject ?? defaultRepositoryProject;
     },
-    [defaultNewThreadProject, projectForGitRoot, projects, threadsByEpic]
+    [defaultRepositoryProject, projectForGitRoot, projects, threadsByEpic]
   );
 
   const selectedEpic = epicsEnabled ? (epics.find((epic) => epic.id === selectedEpicId) ?? null) : null;
@@ -2339,6 +2367,7 @@ const App: React.FC = () => {
   // stale project. Gate on the resolved epic, not the persisted id, so a
   // leftover id cannot hide the controls once Epics is turned off.
   const activeThreadProject = selectedThreadProject ?? (selectedEpic ? selectedProject : defaultNewThreadProject);
+  const activeIsNoProject = isNoProjectId(activeThreadProject?.id);
 
   // The directory the repository controls act on. Multi-project agents use
   // the shared parent as their cwd so they can see every project, but Git and
@@ -3900,7 +3929,7 @@ const App: React.FC = () => {
         return;
       }
       if (!window.orion?.linkBoardTask) return;
-      const project = state.projects.find((p) => p.id === thread.projectId);
+      const project = findProjectById(state, thread.projectId);
       // A fresh, untitled thread adopts the first task's title.
       const adoptTitle = linkedTasks.length === 0 && thread.messages.length === 0 && isDefaultTitle(thread.title);
 
@@ -4679,6 +4708,35 @@ const App: React.FC = () => {
     }
   }, [addMessageToThread, appendToThreadMessage, threads, updateBtwExchange, updateThread]);
 
+  // Resolve (and create) the scratch directory No project agents run in.
+  useEffect(() => {
+    let cancelled = false;
+    let started = false;
+    let unsubscribeHydration = () => {};
+    const prepare = () => {
+      unsubscribeHydration();
+      if (cancelled || started) return;
+      started = true;
+      window.orion
+        ?.getNoProjectDir?.()
+        .then((dir) => {
+          if (!cancelled && dir) setNoProjectPath(dir);
+        })
+        .catch((error) => console.error('Could not prepare the No project directory', error));
+    };
+    // This store mutation also schedules persistence. Wait for the real
+    // projects/settings before saving, including when transcript loading is slow.
+    if (useOrionStore.persist.hasHydrated()) prepare();
+    else {
+      unsubscribeHydration = useOrionStore.persist.onFinishHydration(prepare);
+      if (useOrionStore.persist.hasHydrated()) prepare();
+    }
+    return () => {
+      cancelled = true;
+      unsubscribeHydration();
+    };
+  }, [setNoProjectPath]);
+
   // Sync workspace with first project if none set
   useEffect(() => {
     if (!workspacePath && projects.length > 0) {
@@ -4788,7 +4846,7 @@ const App: React.FC = () => {
   };
 
   const handleNewAgent = () => {
-    const projectId = defaultNewThreadProject?.id ?? projects[0]?.id;
+    const projectId = defaultNewThreadProject?.id;
     if (!projectId) {
       void handleAddProject();
       return;
@@ -4800,7 +4858,7 @@ const App: React.FC = () => {
   const handleChangeSelectedThreadProject = useCallback(
     (projectId: string) => {
       if (repositoryOperationBusy) return;
-      const project = projects.find((candidate) => candidate.id === projectId);
+      const project = findProjectById(useOrionStore.getState(), projectId);
       if (!project) return;
 
       // Read the thread at call time instead of depending on the Thread
@@ -4836,7 +4894,7 @@ const App: React.FC = () => {
       selectProject(projectId);
       setProjectPickerOpen(false);
     },
-    [canChangeSelectedThreadProject, projects, repositoryOperationBusy, selectProject, selectedThreadId, updateThread]
+    [canChangeSelectedThreadProject, repositoryOperationBusy, selectProject, selectedThreadId, updateThread]
   );
 
   const handleCheckoutBranch = async (branchName: string) => {
@@ -5057,7 +5115,7 @@ const App: React.FC = () => {
   const startAgentDeploy = useCallback(
     (reasons: string[]) => {
       const projectId = activeThreadProject?.id;
-      if (!projectId) {
+      if (!projectId || isNoProjectId(projectId)) {
         toast.error('Open a project before deploying.');
         return;
       }
@@ -5454,12 +5512,12 @@ const App: React.FC = () => {
     setNewEpicName('');
     setNewEpicDescription('');
     const initialProject =
-      projects.find((project) => project.id === lastMessagedProjectId) ?? defaultNewThreadProject;
+      projects.find((project) => project.id === lastMessagedProjectId) ?? defaultRepositoryProject;
     setNewEpicProjectIds(initialProject ? [initialProject.id] : []);
     setNewEpicCreateRift(riftsActive && riftsSettings.autoCreateForEpics);
     setEpicsSectionOpen(true);
     setCreateEpicOpen(true);
-  }, [defaultNewThreadProject, lastMessagedProjectId, projects, riftsActive, riftsSettings.autoCreateForEpics]);
+  }, [defaultRepositoryProject, lastMessagedProjectId, projects, riftsActive, riftsSettings.autoCreateForEpics]);
 
   const closeCreateEpicModal = useCallback(() => {
     setCreateEpicOpen(false);
@@ -5950,7 +6008,7 @@ const App: React.FC = () => {
     const thread = state.threads.find((candidate) => candidate.id === threadId);
     const suggestion = thread?.suggestedTask;
     if (!thread || !suggestion || suggestion.startedEpicId || suggestion.startedThreadId) return;
-    const project = state.projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    const project = findProjectById(state, thread.projectId) ?? null;
     // The card shows the short suggestion text, but a fresh agent needs the
     // self-contained prompt formulated by the source session's fork.
     const startPrompt = suggestedTaskStartPrompt(suggestion);
@@ -5992,6 +6050,10 @@ const App: React.FC = () => {
         (error) => restoreDraft(error instanceof Error ? error.message : undefined)
       );
       toast.success('Suggested task started in a new thread');
+      return;
+    }
+    if (isNoProjectId(thread.projectId)) {
+      toast.error('Choose a project before starting a suggested task as an epic or rift');
       return;
     }
     if (!epicsEnabled) {
@@ -7848,7 +7910,7 @@ const App: React.FC = () => {
           error: 'Subagent transcripts are read-only — steer from the parent thread.',
         };
       }
-      const project = state.projects.find((p) => p.id === thread.projectId);
+      const project = findProjectById(state, thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
       // The epic's rift is still being created: starting now would run the
       // turn in the source repository and record a session against it, which
@@ -8309,7 +8371,7 @@ const App: React.FC = () => {
         return;
       }
       const projectId = driverThread.projectId;
-      if (!state.projects.some((project) => project.id === projectId)) {
+      if (!findProjectById(state, projectId)) {
         report(false, 'Driver project not found');
         return;
       }
@@ -8619,7 +8681,7 @@ const App: React.FC = () => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
-      const project = state.projects.find((p) => p.id === thread.projectId);
+      const project = findProjectById(state, thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
       const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       if (
@@ -8755,7 +8817,7 @@ const App: React.FC = () => {
       // A queued follow-up dispatches immediately after this event and its
       // `started` clears the suggestion — don't pay for a doomed fork.
       if (thread.queuedMessages?.length) return;
-      const project = state.projects.find((candidate) => candidate.id === thread.projectId);
+      const project = findProjectById(state, thread.projectId);
       if (!project) return;
       const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       if (
@@ -8880,7 +8942,7 @@ const App: React.FC = () => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
-      const project = state.projects.find((p) => p.id === thread.projectId);
+      const project = findProjectById(state, thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
       const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       // Wait for the epic's rift: see startTurnForThread.
@@ -9059,7 +9121,7 @@ const App: React.FC = () => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
-      const project = state.projects.find((p) => p.id === thread.projectId);
+      const project = findProjectById(state, thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
       const threadEpic = thread.epicId ? state.epics.find((epic) => epic.id === thread.epicId) : undefined;
       // Wait for the epic's rift: see startTurnForThread.
@@ -9292,7 +9354,7 @@ const App: React.FC = () => {
     }
     const goal = selectedThread.goal;
     const sessionId = selectedThread.agentSessionIds?.codex;
-    const project = state.projects.find((p) => p.id === selectedThread.projectId);
+    const project = findProjectById(state, selectedThread.projectId);
     const workingDir = project ? threadWorkingDir(state.epics, selectedThread, project) : null;
     const finishInput = () => {
       setChatInput('');
@@ -10451,7 +10513,7 @@ const App: React.FC = () => {
           }
           threadId = thread.id;
         } else {
-          const project = state.projects.find((candidate) => candidate.id === command.projectId);
+          const project = findProjectById(state, command.projectId);
           if (!project) return { ok: false, error: 'Project not found on this machine.' };
           threadId = state.createThread(project.id, undefined, {
             ...(command.epicId && state.epics.some((epic) => epic.id === command.epicId)
@@ -12614,12 +12676,18 @@ const App: React.FC = () => {
                             ? selectedThreadEpic?.riftPath || selectedThreadRiftPending
                               ? 'Project is locked to the epic’s rift'
                               : 'Project is locked after an agent runs'
-                            : activeThreadProject.path
+                            : activeIsNoProject
+                              ? 'Not tied to a project'
+                              : activeThreadProject.path
                     }
                     aria-haspopup="menu"
                     aria-expanded={projectPickerOpen && !repositoryOperationBusy}
                   >
-                    <ProjectIcon projectPath={activeThreadProject.path} size={14} />
+                    {activeIsNoProject ? (
+                      <MessageSquare size={14} />
+                    ) : (
+                      <ProjectIcon projectPath={activeThreadProject.path} size={14} />
+                    )}
                     <span className="truncate">{activeThreadProject.name}</span>
                     {(!selectedThread || canChangeSelectedThreadProject) && (
                       <ChevronDown size={13} className={`project-pill-chevron ${projectPickerOpen ? 'open' : ''}`} />
@@ -12630,6 +12698,17 @@ const App: React.FC = () => {
                     !activeRiftUnavailable &&
                     (!selectedThread || canChangeSelectedThreadProject) && (
                       <div className="shell-project-picker" role="menu">
+                        <button
+                          type="button"
+                          className={`project-picker-item ${activeIsNoProject ? 'selected' : ''}`}
+                          onClick={() => handleChangeSelectedThreadProject(NO_PROJECT_ID)}
+                          title="Chat with an agent outside of any project"
+                        >
+                          <MessageSquare size={13} />
+                          <span className="truncate">No project</span>
+                          {activeIsNoProject && <Check size={13} />}
+                        </button>
+                        {projects.length > 0 && <div className="project-picker-divider" />}
                         {projects.map((option) => (
                           <button
                             key={option.id}
@@ -12654,7 +12733,7 @@ const App: React.FC = () => {
                         >
                           <Plus size={13} /> Add project
                         </button>
-                        {activeThreadProject && projects.length > 1 && (
+                        {activeThreadProject && !activeIsNoProject && projects.length > 1 && (
                           <button
                             type="button"
                             className="project-picker-item danger"
@@ -12672,101 +12751,106 @@ const App: React.FC = () => {
                     )}
                 </div>
 
-                <div className="shell-branch-control" ref={branchPickerRef}>
-                  <button
-                    type="button"
-                    className="shell-branch-trigger"
-                    onClick={() => {
-                      if (activeRiftUnavailable) return;
-                      const opening = !branchPickerOpen;
-                      setBranchPickerOpen(opening);
-                      // The list can be stale (branch switched or created in a
-                      // terminal since the last read) — re-read on open.
-                      if (opening) void refreshGitState();
-                    }}
-                    disabled={activeRiftUnavailable || gitLoading || repositoryOperationBusy || !gitState?.ok}
-                    title={gitState?.error ?? gitState?.root ?? 'Git state'}
-                    aria-haspopup="menu"
-                    aria-expanded={branchPickerOpen && !repositoryOperationBusy}
-                  >
-                    <GitBranch size={14} />
-                    <span className="truncate">
-                      {gitLoading
-                        ? 'Git...'
-                        : (gitState?.currentBranch ??
-                          (gitState?.detachedHead ? `Detached @ ${gitState.detachedHead}` : 'Local'))}
-                    </span>
-                    <ChevronDown size={13} className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`} />
-                  </button>
-                  {branchPickerOpen && !repositoryOperationBusy && !activeRiftUnavailable && (
-                    <div className="shell-branch-picker" role="menu">
-                      {creatingBranch ? (
-                        <div className="branch-picker-item branch-picker-create-row">
-                          <Plus size={13} />
-                          <InlineRenameInput
-                            className="thread-rename-input"
-                            initialValue=""
-                            onSubmit={(name) => {
-                              setCreatingBranch(false);
-                              void handleCreateBranch(name);
-                            }}
-                            onCancel={() => setCreatingBranch(false)}
-                          />
-                        </div>
-                      ) : (
-                        <button
-                          type="button"
-                          className="branch-picker-item"
-                          onClick={() => setCreatingBranch(true)}
-                          disabled={repositoryOperationBusy || !gitState?.ok}
-                        >
-                          <Plus size={13} /> New branch
-                        </button>
-                      )}
+                {/* A No project chat has no repository: no branch, source control or cloud. */}
+                {!activeIsNoProject && (
+                  <>
+                    <div className="shell-branch-control" ref={branchPickerRef}>
                       <button
                         type="button"
-                        className="branch-picker-item"
+                        className="shell-branch-trigger"
                         onClick={() => {
-                          setBranchPickerOpen(false);
-                          void handleCommitAndPush();
+                          if (activeRiftUnavailable) return;
+                          const opening = !branchPickerOpen;
+                          setBranchPickerOpen(opening);
+                          // The list can be stale (branch switched or created in a
+                          // terminal since the last read) — re-read on open.
+                          if (opening) void refreshGitState();
                         }}
-                        disabled={repositoryOperationBusy || !gitState?.ok || !gitState.currentBranch}
-                        title="git add . && git commit && git push"
+                        disabled={activeRiftUnavailable || gitLoading || repositoryOperationBusy || !gitState?.ok}
+                        title={gitState?.error ?? gitState?.root ?? 'Git state'}
+                        aria-haspopup="menu"
+                        aria-expanded={branchPickerOpen && !repositoryOperationBusy}
                       >
-                        <GitCommit size={13} /> Commit and Push
+                        <GitBranch size={14} />
+                        <span className="truncate">
+                          {gitLoading
+                            ? 'Git...'
+                            : (gitState?.currentBranch ??
+                              (gitState?.detachedHead ? `Detached @ ${gitState.detachedHead}` : 'Local'))}
+                        </span>
+                        <ChevronDown size={13} className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`} />
                       </button>
-                      <div className="project-picker-divider" />
-                      {gitState?.hasUncommittedChanges && (
-                        <div className="branch-picker-note">Commit local changes before switching branches.</div>
-                      )}
-                      {gitState?.branches.map((branch) => (
-                        <button
-                          key={branch.name}
-                          type="button"
-                          className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
-                          onClick={() => handleCheckoutBranch(branch.name)}
-                          disabled={branch.current || gitState.hasUncommittedChanges || repositoryOperationBusy}
-                          title={
-                            gitState.hasUncommittedChanges && !branch.current
-                              ? 'Unavailable with uncommitted changes'
-                              : branch.name
-                          }
-                        >
-                          <GitBranch size={13} />
-                          <span className="truncate">{branch.name}</span>
-                          {branch.current && <Check size={13} />}
-                        </button>
-                      ))}
-                      {gitState?.branches.length === 0 && (
-                        <div className="branch-picker-empty">{gitState?.error ?? 'No branches found'}</div>
+                      {branchPickerOpen && !repositoryOperationBusy && !activeRiftUnavailable && (
+                        <div className="shell-branch-picker" role="menu">
+                          {creatingBranch ? (
+                            <div className="branch-picker-item branch-picker-create-row">
+                              <Plus size={13} />
+                              <InlineRenameInput
+                                className="thread-rename-input"
+                                initialValue=""
+                                onSubmit={(name) => {
+                                  setCreatingBranch(false);
+                                  void handleCreateBranch(name);
+                                }}
+                                onCancel={() => setCreatingBranch(false)}
+                              />
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              className="branch-picker-item"
+                              onClick={() => setCreatingBranch(true)}
+                              disabled={repositoryOperationBusy || !gitState?.ok}
+                            >
+                              <Plus size={13} /> New branch
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="branch-picker-item"
+                            onClick={() => {
+                              setBranchPickerOpen(false);
+                              void handleCommitAndPush();
+                            }}
+                            disabled={repositoryOperationBusy || !gitState?.ok || !gitState.currentBranch}
+                            title="git add . && git commit && git push"
+                          >
+                            <GitCommit size={13} /> Commit and Push
+                          </button>
+                          <div className="project-picker-divider" />
+                          {gitState?.hasUncommittedChanges && (
+                            <div className="branch-picker-note">Commit local changes before switching branches.</div>
+                          )}
+                          {gitState?.branches.map((branch) => (
+                            <button
+                              key={branch.name}
+                              type="button"
+                              className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
+                              onClick={() => handleCheckoutBranch(branch.name)}
+                              disabled={branch.current || gitState.hasUncommittedChanges || repositoryOperationBusy}
+                              title={
+                                gitState.hasUncommittedChanges && !branch.current
+                                  ? 'Unavailable with uncommitted changes'
+                                  : branch.name
+                              }
+                            >
+                              <GitBranch size={13} />
+                              <span className="truncate">{branch.name}</span>
+                              {branch.current && <Check size={13} />}
+                            </button>
+                          ))}
+                          {gitState?.branches.length === 0 && (
+                            <div className="branch-picker-empty">{gitState?.error ?? 'No branches found'}</div>
+                          )}
+                        </div>
                       )}
                     </div>
-                  )}
-                </div>
 
-                {/* Source control, cloud pull/deploy/open, and GitHub mirror
-                    actions are hidden for now; their handlers stay wired for a
-                    later home. */}
+                    {/* Source control, cloud pull/deploy/open, and GitHub mirror
+                        actions are hidden for now; their handlers stay wired for a
+                        later home. */}
+                  </>
+                )}
               </>
             )}
             {activeTab === 'agents' && selectedThread && (
@@ -13514,11 +13598,8 @@ const App: React.FC = () => {
                     </div>
                     <div className="empty-state-title">Select a thread</div>
                     <div className="text-xs text-[#6b6b74]">Pick a conversation or start a new one</div>
-                    {projects.length > 0 && (
-                      <button
-                        onClick={() => handleCreateThread(selectedProject?.id ?? projects[0].id)}
-                        className="btn mt-2"
-                      >
+                    {defaultNewThreadProject && (
+                      <button onClick={() => handleCreateThread(defaultNewThreadProject.id)} className="btn mt-2">
                         <Plus size={15} /> Start new thread
                       </button>
                     )}
