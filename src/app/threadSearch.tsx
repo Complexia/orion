@@ -1,277 +1,672 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { type Message, type Project, type Thread, useOrionStore } from '../store';
+import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { MessageSquare, Search, SquareKanban } from 'lucide-react';
+import { type Epic, type Message, type Project, type Thread, useOrionStore } from '../store';
+import { ProjectIcon } from './ProjectIcon';
 import { formatShortTime, getThreadActivityTime } from './time';
+
+export const THREAD_SEARCH_INDEX_REFRESH_MS = 150;
+
+const RECENT_THREAD_LIMIT = 12;
+const RESULT_LIMIT = 50;
+const THREAD_RESULT_LIMIT = 40;
+// Activity details range from a one-line command to a whole file's output.
+// Short ones (commands, paths) are worth finding; long ones only add noise
+// and indexing cost.
+const ACTIVITY_DETAIL_INDEX_LIMIT = 400;
+// Scores at or above this come from a name match, which always beats the best
+// transcript match — so once a token hits a name the transcript is skipped.
+const BODY_MATCH_WORD = 18;
+const BODY_MATCH_SUBSTRING = 8;
+
+const NON_ASCII = /[^\x00-\x7f]/;
+
+export const normalizeSearchText = (value: string) => {
+  let text = value.toLowerCase();
+  // NFKD is the slow step and only matters for accented input.
+  if (NON_ASCII.test(text)) text = text.normalize('NFKD').replace(/[̀-ͯ]/g, '');
+  return text
+    .replace(/[^a-z0-9/_ .:-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+const WORD_SEPARATORS = ' /_.:-';
+const isWordStart = (text: string, index: number) =>
+  index === 0 || WORD_SEPARATORS.includes(text[index - 1]);
+
+export type SearchQuery = {
+  /** Distinct normalized words; every one must match for a result to count. */
+  tokens: string[];
+  /** The whole normalized query, rewarded when it appears verbatim. */
+  phrase: string;
+};
+
+export const parseSearchQuery = (query: string): SearchQuery => {
+  const phrase = normalizeSearchText(query);
+  return { phrase, tokens: Array.from(new Set(phrase.split(' ').filter(Boolean))) };
+};
+
+/**
+ * Loose match for short names only: the token's first letter must start a
+ * word, later letters either follow on directly or start later words, so
+ * "ors" finds "orion search" but not arbitrary letters scattered through text.
+ */
+const fuzzyNameScore = (name: string, token: string) => {
+  if (token.length < 2 || name.length > 160) return 0;
+  const first = token[0];
+  let best = 0;
+  for (let start = name.indexOf(first); start !== -1; start = name.indexOf(first, start + 1)) {
+    if (!isWordStart(name, start)) continue;
+    let score = 0;
+    let last = start;
+    let matched = true;
+    for (let i = 1; i < token.length; i += 1) {
+      const char = token[i];
+      if (name[last + 1] === char) {
+        score += 3;
+        last += 1;
+        continue;
+      }
+      let next = name.indexOf(char, last + 1);
+      while (next !== -1 && !isWordStart(name, next)) next = name.indexOf(char, next + 1);
+      if (next === -1) {
+        matched = false;
+        break;
+      }
+      score += 2;
+      last = next;
+    }
+    if (matched) best = Math.max(best, score / (3 * (token.length - 1)));
+  }
+  return best >= 0.5 ? Math.round(12 + 23 * best) : 0;
+};
+
+/** How well one query token matches a short name (title, project, epic): 0–100. */
+const scoreNameToken = (name: string, token: string) => {
+  if (!name) return 0;
+  if (name === token) return 100;
+  if (name.startsWith(token)) return 85;
+  let index = name.indexOf(token);
+  let substring = false;
+  while (index !== -1) {
+    if (isWordStart(name, index)) return 70;
+    substring = true;
+    index = name.indexOf(token, index + 1);
+  }
+  // A single letter inside a word says nothing about intent.
+  if (substring && token.length > 1) return 45;
+  return fuzzyNameScore(name, token);
+};
+
+const scoreBodyToken = (chunks: readonly string[], token: string) => {
+  if (token.length < 2) return 0;
+  let found = false;
+  for (const chunk of chunks) {
+    let index = chunk.indexOf(token);
+    // Common fragments recur thousands of times in a long transcript; a
+    // handful of misses is enough to settle for a plain substring hit.
+    for (let checks = 0; index !== -1 && checks < 8; checks += 1) {
+      if (isWordStart(chunk, index)) return BODY_MATCH_WORD;
+      found = true;
+      index = chunk.indexOf(token, index + 1);
+    }
+    if (index !== -1) found = true;
+  }
+  return found ? BODY_MATCH_SUBSTRING : 0;
+};
+
+const recencyBonus = (activityMs: number) => {
+  if (!Number.isFinite(activityMs)) return 0;
+  const ageHours = Math.max(0, (Date.now() - activityMs) / (1000 * 60 * 60));
+  return Math.max(0, 8 - Math.log2(ageHours + 1));
+};
+
+// Normalized transcript text per message. Messages are replaced, never
+// mutated, so a streaming reply re-normalizes only the message that changed
+// and every other message is reused across threads updates and reopenings.
+const messageTextCache = new WeakMap<Message, string>();
+const normalizedMessageText = (message: Message) => {
+  let text = messageTextCache.get(message);
+  if (text === undefined) {
+    const parts = [message.content];
+    for (const activity of message.activities ?? []) {
+      parts.push(activity.title);
+      if (activity.detail && activity.detail.length <= ACTIVITY_DETAIL_INDEX_LIMIT) parts.push(activity.detail);
+    }
+    for (const file of message.changedFiles ?? []) parts.push(file.path);
+    for (const attachment of message.attachments ?? []) parts.push(attachment.name);
+    text = normalizeSearchText(parts.join(' '));
+    messageTextCache.set(message, text);
+  }
+  return text;
+};
 
 export type ThreadSearchEntry = {
   thread: Thread;
   projectName: string;
   projectPath: string;
-  haystack: string;
-  tokens: string[];
+  epicName: string;
+  title: string;
+  project: string;
+  epic: string;
+  /** Path, model and status: matched like transcript text, at half weight. */
+  meta: string;
+  /** Normalized text per message, index-aligned with thread.messages. */
+  body: string[];
 };
 
-export type CachedThreadSearchEntry = {
+type CachedThreadSearchEntry = {
   projectName: string;
   projectPath: string;
+  epicName: string;
   entry: ThreadSearchEntry;
 };
 
-export const THREAD_SEARCH_INDEX_REFRESH_MS = 150;
+// Shared by every search surface (sidebar, composer @-mentions) and kept
+// across opens, so an unchanged thread is never indexed twice.
+const threadEntryCache = new WeakMap<Thread, CachedThreadSearchEntry>();
 
-export const normalizeSearchText = (value: string) =>
-  value
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9/_ .:-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-export const buildThreadSearchEntry = (
+// Recent results need metadata and one excerpt, not a transcript index.
+const buildThreadSearchSummary = (
   thread: Thread,
   projectName: string,
-  projectPath: string
-): ThreadSearchEntry => {
-  const messageText = thread.messages
-    .map((message) => {
-      const activityText = message.activities
-        ?.map((activity) => `${activity.title} ${activity.detail ?? ''}`)
-        .join(' ');
-      const changedFileText = message.changedFiles
-        ?.map((file) => `${file.path} ${file.status}`)
-        .join(' ');
-      return [message.content, activityText, changedFileText].filter(Boolean).join(' ');
-    })
-    .join(' ');
-  const haystack = normalizeSearchText(
-    [
-      thread.title,
-      projectName,
-      projectPath,
-      thread.modelId,
-      thread.status,
-      messageText,
-    ].join(' ')
-  );
+  projectPath: string,
+  epicName: string
+): ThreadSearchEntry => ({
+  thread,
+  projectName,
+  projectPath,
+  epicName,
+  title: normalizeSearchText(thread.title),
+  project: normalizeSearchText(projectName),
+  epic: normalizeSearchText(epicName),
+  meta: normalizeSearchText(`${projectPath} ${thread.modelId} ${thread.status}`),
+  body: [],
+});
 
+export const getThreadSearchEntry = (
+  thread: Thread,
+  projectName: string,
+  projectPath: string,
+  epicName = ''
+): ThreadSearchEntry => {
+  const cached = threadEntryCache.get(thread);
+  if (
+    cached &&
+    cached.projectName === projectName &&
+    cached.projectPath === projectPath &&
+    cached.epicName === epicName
+  ) {
+    return cached.entry;
+  }
+  const entry: ThreadSearchEntry = {
+    ...buildThreadSearchSummary(thread, projectName, projectPath, epicName),
+    body: thread.messages.map(normalizedMessageText),
+  };
+  threadEntryCache.set(thread, { projectName, projectPath, epicName, entry });
+  return entry;
+};
+
+export const scoreThreadSearchEntry = (entry: ThreadSearchEntry, query: string | SearchQuery) => {
+  const { tokens, phrase } = typeof query === 'string' ? parseSearchQuery(query) : query;
+  if (tokens.length === 0) return 0;
+
+  let score = 0;
+  for (const token of tokens) {
+    let best = Math.max(
+      scoreNameToken(entry.title, token),
+      scoreNameToken(entry.project, token) * 0.4,
+      scoreNameToken(entry.epic, token) * 0.4
+    );
+    if (best < BODY_MATCH_WORD) {
+      best = Math.max(best, scoreBodyToken(entry.body, token), scoreBodyToken([entry.meta], token) * 0.5);
+    }
+    // Every word has to land somewhere, or the thread isn't a match.
+    if (best === 0) return 0;
+    score += best;
+  }
+  if (tokens.length > 1 && entry.title.includes(phrase)) score += 40;
+  return score + recencyBonus(getThreadActivityTime(entry.thread).getTime());
+};
+
+export const compareThreadSearchResults = (
+  a: { score: number; entry: ThreadSearchEntry },
+  b: { score: number; entry: ThreadSearchEntry }
+) => b.score - a.score ||
+  getThreadActivityTime(b.entry.thread).getTime() - getThreadActivityTime(a.entry.thread).getTime();
+
+type ProjectSearchEntry = { project: Project; name: string; folder: string; path: string };
+type EpicSearchEntry = { epic: Epic; name: string; description: string; projects: string };
+
+const buildProjectSearchEntry = (project: Project): ProjectSearchEntry => {
+  const path = normalizeSearchText(project.path);
   return {
-    thread,
-    projectName,
-    projectPath,
-    haystack,
-    tokens: Array.from(new Set(haystack.split(' ').filter(Boolean))),
+    project,
+    name: normalizeSearchText(project.name),
+    folder: path.slice(path.lastIndexOf('/') + 1),
+    path,
   };
 };
 
-export const fuzzySubsequenceScore = (needle: string, haystack: string) => {
-  if (!needle) return 0;
-  let searchIndex = 0;
-  let score = 0;
-  let streak = 0;
-
-  for (const char of needle) {
-    const foundIndex = haystack.indexOf(char, searchIndex);
-    if (foundIndex === -1) return 0;
-    const gap = foundIndex - searchIndex;
-    streak = gap === 0 ? streak + 1 : 1;
-    score += 3 + streak * 2 - Math.min(gap, 12) * 0.18;
-    searchIndex = foundIndex + 1;
-  }
-
-  return Math.max(1, score);
+const buildEpicSearchEntry = (epic: Epic, projectById: Map<string, Project>): EpicSearchEntry => {
+  const projectIds = new Set([
+    ...(epic.repositories ?? []).map((repository) => repository.projectId),
+    ...(epic.repositoryProjectId ? [epic.repositoryProjectId] : []),
+  ]);
+  const projectNames = [...projectIds].map((id) => projectById.get(id)?.name ?? '');
+  return {
+    epic,
+    name: normalizeSearchText(epic.name),
+    description: normalizeSearchText(epic.description ?? ''),
+    projects: normalizeSearchText(projectNames.join(' ')),
+  };
 };
 
-export const scoreThreadSearchEntry = (entry: ThreadSearchEntry, query: string) => {
-  const normalizedQuery = normalizeSearchText(query);
-  if (!normalizedQuery) return 0;
+// Projects and epics are what the user names when they type a bare name, so a
+// name hit ranks them just above a thread whose title matches equally well.
+const ENTITY_NAME_WEIGHT = 1.15;
 
-  const queryTokens = normalizedQuery.split(' ').filter(Boolean);
-  if (queryTokens.length === 0) return 0;
-
-  const title = normalizeSearchText(entry.thread.title);
-  const project = normalizeSearchText(entry.projectName);
+const scoreProjectSearchEntry = (entry: ProjectSearchEntry, query: SearchQuery, activityMs: number) => {
   let score = 0;
-
-  for (const token of queryTokens) {
-    if (title === token) score += 120;
-    else if (title.startsWith(token)) score += 80;
-    else if (title.includes(token)) score += 56;
-
-    if (project.startsWith(token)) score += 42;
-    else if (project.includes(token)) score += 28;
-
-    if (entry.tokens.includes(token)) score += 24;
-    else if (entry.haystack.includes(token)) score += 12;
-    else score += fuzzySubsequenceScore(token, entry.haystack);
+  for (const token of query.tokens) {
+    let best = Math.max(
+      scoreNameToken(entry.name, token) * ENTITY_NAME_WEIGHT,
+      scoreNameToken(entry.folder, token) * 0.9
+    );
+    if (best < BODY_MATCH_WORD) best = Math.max(best, scoreBodyToken([entry.path], token));
+    if (best === 0) return 0;
+    score += best;
   }
-
-  const activityMs = getThreadActivityTime(entry.thread).getTime();
-  const ageHours = Math.max(0, (Date.now() - activityMs) / (1000 * 60 * 60));
-  return score + Math.max(0, 8 - Math.log2(ageHours + 1));
+  if (query.tokens.length > 1 && entry.name.includes(query.phrase)) score += 40;
+  return score + recencyBonus(activityMs);
 };
 
-export const getThreadSearchExcerpt = (entry: ThreadSearchEntry, query: string) => {
-  const normalizedQuery = normalizeSearchText(query);
-  const firstToken = normalizedQuery.split(' ').find(Boolean);
-  let lastMessage: Message | undefined;
-  for (let index = entry.thread.messages.length - 1; index >= 0; index -= 1) {
-    const message = entry.thread.messages[index];
-    if (message.content.trim().length === 0) continue;
-    lastMessage = message;
-    break;
+const scoreEpicSearchEntry = (entry: EpicSearchEntry, query: SearchQuery, activityMs: number) => {
+  let score = 0;
+  for (const token of query.tokens) {
+    let best = Math.max(
+      scoreNameToken(entry.name, token) * ENTITY_NAME_WEIGHT,
+      scoreNameToken(entry.projects, token) * 0.4
+    );
+    if (best < BODY_MATCH_WORD) best = Math.max(best, scoreBodyToken([entry.description], token));
+    if (best === 0) return 0;
+    score += best;
   }
-  const source = lastMessage?.content.replace(/\s+/g, ' ').trim() || entry.projectPath;
-  if (!source) return '';
+  if (query.tokens.length > 1 && entry.name.includes(query.phrase)) score += 40;
+  return score + recencyBonus(activityMs);
+};
 
-  if (!firstToken) return source.slice(0, 120);
-  const lowerSource = normalizeSearchText(source);
-  const hitIndex = lowerSource.indexOf(firstToken);
-  const start = hitIndex > 24 ? hitIndex - 24 : 0;
+const excerptAround = (source: string, index: number) => {
+  const start = index > 24 ? index - 24 : 0;
   const excerpt = source.slice(start, start + 140).trim();
-  return `${start > 0 ? '...' : ''}${excerpt}${source.length > start + 140 ? '...' : ''}`;
+  return `${start > 0 ? '…' : ''}${excerpt}${source.length > start + 140 ? '…' : ''}`;
 };
 
-export type ThreadSearchResultsProps = {
-  projects: Project[];
-  query: string;
-  onSelectThread: (threadId: string) => void;
+const flattenText = (text: string) => text.replace(/\s+/g, ' ').trim();
+
+export const getThreadSearchExcerpt = (entry: ThreadSearchEntry, query: SearchQuery) => {
+  const { messages } = entry.thread;
+  // Show where the transcript matched a word the title didn't explain,
+  // preferring the most recent mention.
+  const bodyTokens = query.tokens.filter((token) => token.length > 1 && !entry.title.includes(token));
+  for (const token of bodyTokens) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (!entry.body[index]?.includes(token)) continue;
+      const source = flattenText(messages[index].content);
+      const hit = source.toLowerCase().indexOf(token);
+      if (hit !== -1) return excerptAround(source, hit);
+    }
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const source = flattenText(messages[index].content);
+    if (source) return excerptAround(source, 0);
+  }
+  return entry.projectPath;
 };
+
+/** Wraps each occurrence of a query word in <mark>. */
+const highlightMatches = (text: string, tokens: readonly string[]): React.ReactNode => {
+  if (!text || tokens.length === 0) return text;
+  const lower = text.toLowerCase();
+  const ranges: Array<[number, number]> = [];
+  for (const token of tokens) {
+    for (let index = lower.indexOf(token); index !== -1 && ranges.length < 24; index = lower.indexOf(token, index + token.length)) {
+      if (token.length > 1 || isWordStart(lower, index)) ranges.push([index, index + token.length]);
+    }
+  }
+  if (ranges.length === 0) return text;
+  ranges.sort((a, b) => a[0] - b[0]);
+  const nodes: React.ReactNode[] = [];
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (end <= cursor) continue;
+    const from = Math.max(start, cursor);
+    if (from > cursor) nodes.push(text.slice(cursor, from));
+    nodes.push(
+      <mark key={from} className="search-hit">
+        {text.slice(from, end)}
+      </mark>
+    );
+    cursor = end;
+  }
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes;
+};
+
+type SearchResult =
+  | { kind: 'project'; key: string; score: number; project: Project; threadCount: number }
+  | { kind: 'epic'; key: string; score: number; epic: Epic; threadCount: number }
+  | { kind: 'thread'; key: string; score: number; entry: ThreadSearchEntry };
+
+const projectNameFor = (project: Project | undefined) => project?.name ?? 'Unknown project';
 
 /**
- * Mounted only while search is open, so live transcript changes refresh the
- * index without waking the application shell while search is closed.
+ * Keeps the index a step behind the store while it is streaming: a running
+ * agent replaces `threads` on every chunk, and re-scoring that often would
+ * compete with the typing it is meant to serve.
  */
-export const ThreadSearchResults = React.memo(function ThreadSearchResults({
-  projects,
-  query,
-  onSelectThread,
-}: ThreadSearchResultsProps) {
+const useThrottledThreads = () => {
   const threads = useOrionStore((state) => state.threads);
-  const latestThreadsRef = useRef(threads);
-  const indexedThreadsRef = useRef(threads);
-  const [indexedThreads, setIndexedThreads] = useState(threads);
-  const indexRefreshTimerRef = useRef<number | null>(null);
-  const entryCacheRef = useRef(new WeakMap<Thread, CachedThreadSearchEntry>());
+  const latestRef = useRef(threads);
+  const [indexed, setIndexed] = useState(threads);
+  const timerRef = useRef<number | null>(null);
 
+  latestRef.current = threads;
   useEffect(() => {
-    latestThreadsRef.current = threads;
-    if (
-      indexedThreadsRef.current === threads ||
-      indexRefreshTimerRef.current !== null
-    ) {
-      return;
-    }
-    indexRefreshTimerRef.current = window.setTimeout(() => {
-      indexRefreshTimerRef.current = null;
-      const latestThreads = latestThreadsRef.current;
-      indexedThreadsRef.current = latestThreads;
-      setIndexedThreads(latestThreads);
+    if (threads === indexed || timerRef.current !== null) return;
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      setIndexed(latestRef.current);
     }, THREAD_SEARCH_INDEX_REFRESH_MS);
-  }, [threads]);
+  }, [indexed, threads]);
 
   useEffect(
     () => () => {
-      if (indexRefreshTimerRef.current !== null) {
-        window.clearTimeout(indexRefreshTimerRef.current);
-      }
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     },
     []
   );
 
-  const trimmedQuery = query.trim();
-  const hasQuery = trimmedQuery.length > 0;
-  const projectById = useMemo(
-    () => new Map(projects.map((project) => [project.id, project])),
-    [projects]
+  return indexed;
+};
+
+let searchIndexWarmup: Generator<void> | null = null;
+
+/** Warm the shared cache in bounded slices, yielding between messages. */
+export const warmSearchIndex = () => {
+  // Hover and focus can arrive together; share one pending pass.
+  if (searchIndexWarmup) return;
+  searchIndexWarmup = (function* () {
+    const { threads, projects, epics } = useOrionStore.getState();
+    const projectById = new Map(projects.map((project) => [project.id, project]));
+    const epicNameById = new Map(epics.map((epic) => [epic.id, epic.name]));
+    for (const thread of threads) {
+      const project = projectById.get(thread.projectId);
+      const projectName = projectNameFor(project);
+      const projectPath = project?.path ?? '';
+      const epicName = thread.epicId ? (epicNameById.get(thread.epicId) ?? '') : '';
+      const cached = threadEntryCache.get(thread);
+      if (!cached || cached.projectName !== projectName || cached.projectPath !== projectPath || cached.epicName !== epicName) {
+        for (const message of thread.messages) {
+          normalizedMessageText(message);
+          yield;
+        }
+        getThreadSearchEntry(thread, projectName, projectPath, epicName);
+      }
+      yield;
+    }
+  })();
+
+  const schedule = () => {
+    if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(run, { timeout: 1000 });
+    else window.setTimeout(() => run(), 0);
+  };
+  const run = (deadline?: IdleDeadline) => {
+    const started = performance.now();
+    for (let steps = 0; steps < 64; steps += 1) {
+      if (steps > 0 && (performance.now() - started >= 4 || (deadline && deadline.timeRemaining() <= 0))) break;
+      if (searchIndexWarmup?.next().done) {
+        searchIndexWarmup = null;
+        return;
+      }
+    }
+    schedule();
+  };
+  schedule();
+};
+
+export type SidebarSearchPanelProps = {
+  projects: Project[];
+  /** Epics shown in the sidebar; empty while Epics are turned off. */
+  epics: Epic[];
+  onSelectThread: (threadId: string) => void;
+  onSelectProject: (projectId: string) => void;
+  onSelectEpic: (epicId: string) => void;
+};
+
+/**
+ * The sidebar search popover: input, keyboard navigation and ranked results
+ * across projects, epics and threads. It owns its query, so typing re-renders
+ * only this panel rather than the application shell, and it is mounted only
+ * while open, so live transcript changes cost nothing while search is closed.
+ */
+export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
+  projects,
+  epics,
+  onSelectThread,
+  onSelectProject,
+  onSelectEpic,
+}: SidebarSearchPanelProps) {
+  const [query, setQuery] = useState('');
+  // Scoring runs against the deferred copy, so the input never waits on it.
+  const deferredQuery = useDeferredValue(query);
+  const threads = useThrottledThreads();
+  const [activeIndex, setActiveIndex] = useState(0);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const parsedQuery = useMemo(() => parseSearchQuery(deferredQuery), [deferredQuery]);
+  const hasQuery = parsedQuery.tokens.length > 0;
+
+  const projectById = useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects]);
+  const epicById = useMemo(() => new Map(epics.map((epic) => [epic.id, epic])), [epics]);
+
+  // Per project/epic: newest thread activity (for recency) and thread count.
+  const threadStats = useMemo(() => {
+    const stats = new Map<string, { activityMs: number; count: number }>();
+    const bump = (key: string, activityMs: number) => {
+      const current = stats.get(key);
+      if (current) {
+        current.count += 1;
+        if (activityMs > current.activityMs) current.activityMs = activityMs;
+      } else {
+        stats.set(key, { activityMs, count: 1 });
+      }
+    };
+    for (const thread of threads) {
+      const activityMs = getThreadActivityTime(thread).getTime();
+      bump(`project:${thread.projectId}`, activityMs);
+      if (thread.epicId) bump(`epic:${thread.epicId}`, activityMs);
+    }
+    return stats;
+  }, [threads]);
+
+  const projectEntries = useMemo(() => projects.map(buildProjectSearchEntry), [projects]);
+  const epicEntries = useMemo(
+    () => epics.map((epic) => buildEpicSearchEntry(epic, projectById)),
+    [epics, projectById]
   );
 
-  const recentThreadEntries = useMemo<ThreadSearchEntry[]>(() => {
-    if (hasQuery) return [];
-
-    return indexedThreads
-      .slice()
-      .sort(
-        (a, b) =>
-          getThreadActivityTime(b).getTime() -
-          getThreadActivityTime(a).getTime()
-      )
-      .slice(0, 12)
-      .map((thread) => {
-        const project = projectById.get(thread.projectId);
-        return {
-          thread,
-          projectName: project?.name ?? 'Unknown project',
-          projectPath: project?.path ?? '',
-          haystack: '',
-          tokens: [],
-        };
-      });
-  }, [hasQuery, indexedThreads, projectById]);
-
-  const threadSearchIndex = useMemo<ThreadSearchEntry[]>(() => {
-    if (!hasQuery) return [];
-
-    return indexedThreads.map((thread) => {
+  const threadEntries = useMemo(() => {
+    const candidates = hasQuery
+      ? threads
+      : threads
+          .slice()
+          .sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime())
+          .slice(0, RECENT_THREAD_LIMIT);
+    const buildEntry = hasQuery ? getThreadSearchEntry : buildThreadSearchSummary;
+    return candidates.map((thread) => {
       const project = projectById.get(thread.projectId);
-      const projectName = project?.name ?? 'Unknown project';
-      const projectPath = project?.path ?? '';
-      const cached = entryCacheRef.current.get(thread);
-      if (
-        cached &&
-        cached.projectName === projectName &&
-        cached.projectPath === projectPath
-      ) {
-        return cached.entry;
-      }
-
-      const entry = buildThreadSearchEntry(thread, projectName, projectPath);
-      entryCacheRef.current.set(thread, { projectName, projectPath, entry });
-      return entry;
+      const epicName = thread.epicId ? (epicById.get(thread.epicId)?.name ?? '') : '';
+      return buildEntry(thread, projectNameFor(project), project?.path ?? '', epicName);
     });
-  }, [hasQuery, indexedThreads, projectById]);
+  }, [epicById, hasQuery, projectById, threads]);
 
-  const results = useMemo(() => {
+  const results = useMemo<SearchResult[]>(() => {
     if (!hasQuery) {
-      return recentThreadEntries.map((entry) => ({ entry, score: 1 }));
+      return threadEntries
+        .map((entry) => ({ kind: 'thread', key: `thread:${entry.thread.id}`, score: 0, entry }));
     }
 
-    return threadSearchIndex
-      .map((entry) => ({
-        entry,
-        score: scoreThreadSearchEntry(entry, trimmedQuery),
-      }))
-      .filter((result) => result.score > 0)
-      .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        return (
-          getThreadActivityTime(b.entry.thread).getTime() -
-          getThreadActivityTime(a.entry.thread).getTime()
-        );
-      })
-      .slice(0, 30);
-  }, [hasQuery, recentThreadEntries, threadSearchIndex, trimmedQuery]);
+    const matches: SearchResult[] = [];
+    for (const entry of projectEntries) {
+      const stats = threadStats.get(`project:${entry.project.id}`);
+      const score = scoreProjectSearchEntry(entry, parsedQuery, stats?.activityMs ?? NaN);
+      if (score > 0) {
+        matches.push({
+          kind: 'project',
+          key: `project:${entry.project.id}`,
+          score,
+          project: entry.project,
+          threadCount: stats?.count ?? 0,
+        });
+      }
+    }
+    for (const entry of epicEntries) {
+      const stats = threadStats.get(`epic:${entry.epic.id}`);
+      const score = scoreEpicSearchEntry(entry, parsedQuery, stats?.activityMs ?? NaN);
+      if (score > 0) {
+        matches.push({
+          kind: 'epic',
+          key: `epic:${entry.epic.id}`,
+          score,
+          epic: entry.epic,
+          threadCount: stats?.count ?? 0,
+        });
+      }
+    }
+    const threadMatches: Extract<SearchResult, { kind: 'thread' }>[] = [];
+    for (const entry of threadEntries) {
+      const score = scoreThreadSearchEntry(entry, parsedQuery);
+      if (score > 0) threadMatches.push({ kind: 'thread', key: `thread:${entry.thread.id}`, score, entry });
+    }
+    threadMatches.sort(compareThreadSearchResults);
+    matches.push(...threadMatches.slice(0, THREAD_RESULT_LIMIT));
+    return matches.sort((a, b) => b.score - a.score).slice(0, RESULT_LIMIT);
+  }, [epicEntries, hasQuery, parsedQuery, projectEntries, threadEntries, threadStats]);
+
+  useEffect(() => setActiveIndex(0), [parsedQuery]);
+
+  useEffect(() => {
+    listRef.current
+      ?.querySelector<HTMLElement>(`[data-search-index="${activeIndex}"]`)
+      ?.scrollIntoView({ block: 'nearest' });
+  }, [activeIndex]);
+
+  const activate = (result: SearchResult | undefined) => {
+    if (!result) return;
+    if (result.kind === 'project') onSelectProject(result.project.id);
+    else if (result.kind === 'epic') onSelectEpic(result.epic.id);
+    else onSelectThread(result.entry.thread.id);
+  };
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setActiveIndex((index) => Math.min(index + 1, results.length - 1));
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setActiveIndex((index) => Math.max(index - 1, 0));
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      activate(results[activeIndex]);
+    }
+  };
+
+  const tokens = parsedQuery.tokens;
+  const stale = query !== deferredQuery;
 
   return (
-    <>
-      {results.map(({ entry }) => (
-        <button
-          key={entry.thread.id}
-          type="button"
-          className="thread-search-result"
-          onClick={() => onSelectThread(entry.thread.id)}
-        >
-          <span className="thread-search-title">{entry.thread.title}</span>
-          <span className="thread-search-meta">
-            {entry.projectName} · {formatShortTime(getThreadActivityTime(entry.thread))}
-          </span>
-          <span className="thread-search-excerpt">
-            {getThreadSearchExcerpt(entry, query)}
-          </span>
-        </button>
-      ))}
-      {results.length === 0 && (
-        <div className="thread-search-empty">No matching threads</div>
-      )}
-    </>
+    <div className="thread-search-panel">
+      <div className="thread-search-input">
+        <Search size={14} />
+        <input
+          autoFocus
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Search projects, epics, threads..."
+          aria-label="Search projects, epics and threads"
+        />
+      </div>
+      <div className={`thread-search-results ${stale ? 'stale' : ''}`} ref={listRef} role="listbox">
+        {!hasQuery && results.length > 0 && <div className="thread-search-group-label">Recent threads</div>}
+        {results.map((result, index) => {
+          const active = index === activeIndex;
+          const common = {
+            type: 'button' as const,
+            role: 'option',
+            'aria-selected': active,
+            'data-search-index': index,
+            onMouseMove: () => {
+              if (!active) setActiveIndex(index);
+            },
+            onClick: () => activate(result),
+          };
+
+          if (result.kind === 'project') {
+            return (
+              <button key={result.key} {...common} className={`thread-search-result compact ${active ? 'active' : ''}`}>
+                <span className="thread-search-row">
+                  <ProjectIcon projectPath={result.project.path} size={13} className="thread-search-kind-icon" />
+                  <span className="thread-search-title">{highlightMatches(result.project.name, tokens)}</span>
+                  <span className="thread-search-kind">Project</span>
+                </span>
+                <span className="thread-search-meta">
+                  {result.threadCount} {result.threadCount === 1 ? 'thread' : 'threads'} · {result.project.path}
+                </span>
+              </button>
+            );
+          }
+
+          if (result.kind === 'epic') {
+            return (
+              <button key={result.key} {...common} className={`thread-search-result compact ${active ? 'active' : ''}`}>
+                <span className="thread-search-row">
+                  <SquareKanban size={13} className="thread-search-kind-icon" />
+                  <span className="thread-search-title">{highlightMatches(result.epic.name, tokens)}</span>
+                  <span className="thread-search-kind">Epic</span>
+                </span>
+                <span className="thread-search-meta">
+                  {result.threadCount} {result.threadCount === 1 ? 'thread' : 'threads'}
+                  {result.epic.description ? ` · ${flattenText(result.epic.description)}` : ''}
+                </span>
+              </button>
+            );
+          }
+
+          const { entry } = result;
+          return (
+            <button key={result.key} {...common} className={`thread-search-result ${active ? 'active' : ''}`}>
+              <span className="thread-search-row">
+                <MessageSquare size={13} className="thread-search-kind-icon" />
+                <span className="thread-search-title">{highlightMatches(entry.thread.title, tokens)}</span>
+              </span>
+              <span className="thread-search-meta">
+                {entry.projectName}
+                {entry.epicName ? ` · ${entry.epicName}` : ''} · {formatShortTime(getThreadActivityTime(entry.thread))}
+              </span>
+              <span className="thread-search-excerpt">
+                {highlightMatches(getThreadSearchExcerpt(entry, parsedQuery), tokens)}
+              </span>
+            </button>
+          );
+        })}
+        {results.length === 0 && (
+          <div className="thread-search-empty">{hasQuery ? 'No matches' : 'No threads yet'}</div>
+        )}
+      </div>
+    </div>
   );
 });

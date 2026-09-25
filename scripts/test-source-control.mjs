@@ -420,13 +420,14 @@ try {
   );
   assert.match(preloadSource, /changeSourceControlToOrion/);
   assert.match(preloadSource, /authorizeGithubMirror/);
-  assert.match(appSource, /Change source control to Orion/);
+  // Navbar entry points are intentionally hidden; retain the underlying IPC
+  // and handlers so moving these actions elsewhere doesn't remove support.
+  assert.match(appSource, /const handleChangeSourceControlToOrion = async/);
+  assert.match(appSource, /window\.orion\.changeSourceControlToOrion\(\{ projectPath: activeWorkingDir \}\)/);
   assert.match(appSource, /Authorize GitHub/);
   assert.match(appSource, /handleAuthorizeGithubMirror/);
   assert.match(cloudSyncSource, /mirror: state\.mirror/);
-  assert.match(appSource, /gitState\?\.sourceProvider === 'github'/);
-  assert.match(appSource, /'Push to Orion'/);
-  console.log('ok  desktop IPC, provider-aware PRs, and navbar actions stay wired');
+  console.log('ok  desktop IPC, provider-aware PRs, and retained cloud handlers stay wired');
 
   console.log('\nAll source-control tests passed.');
 } finally {
