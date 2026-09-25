@@ -55,6 +55,7 @@ import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, get
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
+import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import { getAgentModels, invalidateAgentModelsCache, listAgentModelsWithAvailability } from './main/models.js';
@@ -1604,6 +1605,27 @@ ipcMain.handle('storage:loadThreadsPage', async (_event, input) => {
   } catch (error) {
     console.error('storage:loadThreadsPage error', error);
     return { ok: false };
+  }
+});
+
+// Import conversations from Claude Code / Codex session stores. Scan returns
+// lightweight summaries; the renderer then reads transcripts in small batches
+// so no single response carries the whole history.
+ipcMain.handle('sessionImport:scan', async (_event, input) => {
+  try {
+    return { ok: true, ...(await scanImportableSessions({ excludeSessionIds: input?.excludeSessionIds })) };
+  } catch (error) {
+    console.error('sessionImport:scan error', error);
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('sessionImport:read', async (_event, input) => {
+  try {
+    return { ok: true, sessions: await readImportableSessions({ sessions: input?.sessions }) };
+  } catch (error) {
+    console.error('sessionImport:read error', error);
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
 

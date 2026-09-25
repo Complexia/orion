@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Archive,
   ChevronRight,
@@ -23,13 +23,14 @@ import { isNoProjectId, type Epic, type Project, type SavedView, type Thread } f
 import type { RemoteMachineEntry } from '../types';
 import { ProjectIcon } from './ProjectIcon';
 import { InlineRenameInput } from './fileTree';
-import { ThreadSearchResults } from './threadSearch';
+import { SidebarSearchPanel, warmSearchIndex } from './threadSearch';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { useSidebarResize } from './useSidebarResize';
 import type { EpicPrStatus } from './appTypes';
 
 const THREADS_VISIBLE_LIMIT = 5;
+const EMPTY_EPICS: Epic[] = [];
 const AGENTS_SIDEBAR_STORAGE_KEY = 'orion.agentsSidebarWidth';
 
 export type AgentsSidebarModel = {
@@ -57,8 +58,6 @@ export type AgentsSidebarModel = {
   selectProject: (id: string | null) => void;
   threadSearchOpen: boolean;
   setThreadSearchOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  threadSearchQuery: string;
-  setThreadSearchQuery: React.Dispatch<React.SetStateAction<string>>;
   projectMenuOpenId: string | null;
   setProjectMenuOpenId: React.Dispatch<React.SetStateAction<string | null>>;
   threadItemMenuKey: string | null;
@@ -193,8 +192,6 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     selectProject,
     threadSearchOpen,
     setThreadSearchOpen,
-    threadSearchQuery,
-    setThreadSearchQuery,
     projectMenuOpenId,
     setProjectMenuOpenId,
     threadItemMenuKey,
@@ -277,6 +274,55 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
       paneThreadIds.includes(threadId) ? ' in-split' : ''
     }`;
 
+  // Picking a project or epic from search scrolls the sidebar to its section
+  // and flashes it, so the user lands where it lives rather than just in it.
+  const [revealTarget, setRevealTarget] = useState<{ key: string; nonce: number } | null>(null);
+  useEffect(() => {
+    if (!revealTarget) return undefined;
+    // Wait a frame for a just-expanded section to render.
+    const frame = window.requestAnimationFrame(() => {
+      const element = sidebarRef.current?.querySelector<HTMLElement>(
+        `[data-sidebar-reveal="${CSS.escape(revealTarget.key)}"]`
+      );
+      if (!element) return;
+      element.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      element.classList.remove('sidebar-reveal-flash');
+      void element.offsetWidth; // restart the animation on a repeat pick
+      element.classList.add('sidebar-reveal-flash');
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [revealTarget, sidebarRef]);
+
+  const handleSearchSelectThread = useCallback(
+    (threadId: string) => {
+      selectThread(threadId);
+      setActiveTab('agents');
+      setThreadSearchOpen(false);
+    },
+    [selectThread, setActiveTab, setThreadSearchOpen]
+  );
+  const handleSearchSelectProject = useCallback(
+    (projectId: string) => {
+      selectProject(projectId);
+      setActiveTab('agents');
+      setCollapsedProjects((prev) => (prev[projectId] ? { ...prev, [projectId]: false } : prev));
+      setThreadSearchOpen(false);
+      setRevealTarget((prev) => ({ key: `project:${projectId}`, nonce: (prev?.nonce ?? 0) + 1 }));
+    },
+    [selectProject, setActiveTab, setCollapsedProjects, setThreadSearchOpen]
+  );
+  const handleSearchSelectEpic = useCallback(
+    (epicId: string) => {
+      selectEpic(epicId);
+      setActiveTab('agents');
+      setEpicsSectionOpen(true);
+      setCollapsedEpics((prev) => (prev[epicId] ? { ...prev, [epicId]: false } : prev));
+      setThreadSearchOpen(false);
+      setRevealTarget((prev) => ({ key: `epic:${epicId}`, nonce: (prev?.nonce ?? 0) + 1 }));
+    },
+    [selectEpic, setActiveTab, setCollapsedEpics, setEpicsSectionOpen, setThreadSearchOpen]
+  );
+
   return (
     <div className="sidebar agents-sidebar" ref={sidebarRef}>
       <div className="sidebar-content agents-sidebar-content">
@@ -290,34 +336,21 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
               type="button"
               className={`sidebar-action-button ${threadSearchOpen ? 'active' : ''}`}
               onClick={() => setThreadSearchOpen((open) => !open)}
+              onPointerEnter={warmSearchIndex}
+              onFocus={warmSearchIndex}
               aria-expanded={threadSearchOpen}
             >
               <Search size={15} />
               <span>Search</span>
             </button>
             {threadSearchOpen && (
-              <div className="thread-search-panel">
-                <div className="thread-search-input">
-                  <Search size={14} />
-                  <input
-                    autoFocus
-                    value={threadSearchQuery}
-                    onChange={(event) => setThreadSearchQuery(event.target.value)}
-                    placeholder="Search threads..."
-                  />
-                </div>
-                <div className="thread-search-results">
-                  <ThreadSearchResults
-                    projects={projects}
-                    query={threadSearchQuery}
-                    onSelectThread={(threadId) => {
-                      selectThread(threadId);
-                      setActiveTab('agents');
-                      setThreadSearchOpen(false);
-                    }}
-                  />
-                </div>
-              </div>
+              <SidebarSearchPanel
+                projects={projects}
+                epics={epicsEnabled ? activeEpics : EMPTY_EPICS}
+                onSelectThread={handleSearchSelectThread}
+                onSelectProject={handleSearchSelectProject}
+                onSelectEpic={handleSearchSelectEpic}
+              />
             )}
           </div>
         </div>
@@ -650,7 +683,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                   );
 
                   return (
-                    <div key={epic.id} className="project-section epic-section">
+                    <div key={epic.id} className="project-section epic-section" data-sidebar-reveal={`epic:${epic.id}`}>
                       <div className="project-section-header-row">
                         <button
                           type="button"
@@ -1170,6 +1203,9 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
         {sortedProjects.map((project) => {
           const projectThreads = projectThreadsByProject.get(project.id) ?? [];
           const isActiveProject = selectedProject?.id === project.id;
+          // Highlighted like a selected epic: only while the project itself,
+          // not one of its threads or an epic, is what the main view shows.
+          const isProjectSelected = isActiveProject && !selectedThreadId && !selectedEpicId;
           const isCollapsed = collapsedProjects[project.id] ?? false;
           const visibleLimit = threadListLimits[project.id] ?? THREADS_VISIBLE_LIMIT;
           const visibleThreads = projectThreads.slice(0, visibleLimit);
@@ -1177,7 +1213,11 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
           const isListExpanded = visibleLimit > THREADS_VISIBLE_LIMIT && projectThreads.length > THREADS_VISIBLE_LIMIT;
 
           return (
-            <div key={project.id} className={`project-section ${isActiveProject ? 'project-section-active' : ''}`}>
+            <div
+              key={project.id}
+              className={`project-section ${isActiveProject ? 'project-section-active' : ''}`}
+              data-sidebar-reveal={`project:${project.id}`}
+            >
               <div className="project-section-header-row">
                 <button
                   type="button"
@@ -1217,7 +1257,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                 ) : (
                   <button
                     type="button"
-                    className="project-section-header"
+                    className={`project-section-header ${isProjectSelected ? 'project-section-header-selected' : ''}`}
                     onClick={() => selectProject(project.id)}
                     title={project.path}
                   >

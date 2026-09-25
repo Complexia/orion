@@ -29,10 +29,6 @@ import {
   Paperclip,
   RefreshCw,
   Archive,
-  CloudUpload,
-  CloudDownload,
-  Globe,
-  Rocket,
   AppWindow,
   SquareArrowOutUpRight,
   ListPlus,
@@ -119,6 +115,7 @@ import {
   type GrokReasoningEffort,
   type MuseReasoningEffort,
 } from './agentCatalog';
+import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
 import { epicHasActionableCommitWork, epicRepositoryShouldAutoCreatePr } from './app/epicGit';
@@ -185,9 +182,9 @@ import {
   threadMentionToken,
 } from './app/promptContext';
 import {
-  buildThreadSearchEntry,
+  getThreadSearchEntry,
+  parseSearchQuery,
   scoreThreadSearchEntry,
-  type CachedThreadSearchEntry,
 } from './app/threadSearch';
 import {
   allowsThreadMentionsInComposer,
@@ -565,6 +562,7 @@ const threadShellSignature = (thread: Thread): string => {
     // Drives the sidebar's finished-but-unopened dot, and clearing it on open
     // changes nothing else — so the shell has to wake for it.
     thread.finishedUnseenAt,
+    thread.importedUnseen ? '1' : '0',
     thread.parentThreadId,
     thread.branchedFromThreadId,
     thread.epicId,
@@ -675,6 +673,21 @@ const renderThreadCliBadge = (thread: Thread) =>
 const renderThreadStatusDot = (thread: Thread) => {
   if (thread.status === 'running') {
     return <span className="thread-working-dot" title="Working" />;
+  }
+  // Imported from Claude Code / Codex and not opened yet: the source
+  // provider's mark takes the unseen dot's place until the thread is opened.
+  if (thread.importedUnseen && thread.importedFrom) {
+    const source = thread.importedFrom.providerId === 'claude' ? 'Claude Code' : 'Codex';
+    const Icon = thread.importedFrom.providerId === 'claude' ? ClaudeBrandIcon : CodexBrandIcon;
+    return (
+      <span
+        className={`thread-import-badge ${thread.importedFrom.providerId}`}
+        title={`Imported from ${source} — not opened yet`}
+        aria-label={`Imported from ${source}`}
+      >
+        <Icon size={10} />
+      </span>
+    );
   }
   if (!thread.finishedUnseenAt) return null;
   const failed = thread.status === 'error';
@@ -976,7 +989,6 @@ const App: React.FC = () => {
   const [openWithApps, setOpenWithApps] = useState<Array<{ id: string; name: string; icon: string | null }>>([]);
   const [openWithOpen, setOpenWithOpen] = useState(false);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
-  const [threadSearchQuery, setThreadSearchQuery] = useState('');
   const [gitState, setGitState] = useState<GitRepoState | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
   const [gitBusy, setGitBusy] = useState(false);
@@ -1844,7 +1856,6 @@ const App: React.FC = () => {
   // scoring as the sidebar's thread search, lazy-loaded a page at a time
   // (threadMatchTotal reports the full match count so scrolling knows when to
   // fetch more). Model lists cap at 8 rows.
-  const chatMentionThreadEntryCacheRef = useRef(new WeakMap<Thread, CachedThreadSearchEntry>());
   const { candidates: chatMentionCandidates, threadMatchTotal: chatMentionThreadTotal } = useMemo<{
     candidates: ChatMentionCandidate[];
     threadMatchTotal: number;
@@ -1880,20 +1891,19 @@ const App: React.FC = () => {
           threadMatchTotal: base.length,
         };
       }
+      const parsedQuery = parseSearchQuery(trimmedQuery);
+      const epicNameById = new Map(epics.map((epic) => [epic.id, epic.name]));
       const scored = base
         .map((thread) => {
           const project = projectById.get(thread.projectId);
           const projectName = project?.name ?? 'Unknown project';
-          const projectPath = project?.path ?? '';
-          const cached = chatMentionThreadEntryCacheRef.current.get(thread);
-          const entry =
-            cached && cached.projectName === projectName && cached.projectPath === projectPath
-              ? cached.entry
-              : buildThreadSearchEntry(thread, projectName, projectPath);
-          if (!cached || cached.entry !== entry) {
-            chatMentionThreadEntryCacheRef.current.set(thread, { projectName, projectPath, entry });
-          }
-          return { thread, projectName, score: scoreThreadSearchEntry(entry, trimmedQuery) };
+          const entry = getThreadSearchEntry(
+            thread,
+            projectName,
+            project?.path ?? '',
+            thread.epicId ? (epicNameById.get(thread.epicId) ?? '') : ''
+          );
+          return { thread, projectName, score: scoreThreadSearchEntry(entry, parsedQuery) };
         })
         .filter((result) => result.score > 0)
         .sort(
@@ -1960,6 +1970,7 @@ const App: React.FC = () => {
     chatMention,
     chatMentionThreadLimit,
     enabledProviderIdSet,
+    epics,
     projects,
     selectedThreadId,
     threads,
@@ -11156,8 +11167,6 @@ const App: React.FC = () => {
     selectProject: selectProjectFromSidebar,
     threadSearchOpen,
     setThreadSearchOpen,
-    threadSearchQuery,
-    setThreadSearchQuery,
     projectMenuOpenId,
     setProjectMenuOpenId,
     threadItemMenuKey,
@@ -12773,31 +12782,6 @@ const App: React.FC = () => {
                       </button>
                       {branchPickerOpen && !repositoryOperationBusy && !activeRiftUnavailable && (
                         <div className="shell-branch-picker" role="menu">
-                          {gitState?.hasUncommittedChanges && (
-                            <div className="branch-picker-note">Commit local changes before switching branches.</div>
-                          )}
-                          {gitState?.branches.map((branch) => (
-                            <button
-                              key={branch.name}
-                              type="button"
-                              className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
-                              onClick={() => handleCheckoutBranch(branch.name)}
-                              disabled={branch.current || gitState.hasUncommittedChanges || repositoryOperationBusy}
-                              title={
-                                gitState.hasUncommittedChanges && !branch.current
-                                  ? 'Unavailable with uncommitted changes'
-                                  : branch.name
-                              }
-                            >
-                              <GitBranch size={13} />
-                              <span className="truncate">{branch.name}</span>
-                              {branch.current && <Check size={13} />}
-                            </button>
-                          ))}
-                          {gitState?.branches.length === 0 && (
-                            <div className="branch-picker-empty">{gitState?.error ?? 'No branches found'}</div>
-                          )}
-                          <div className="project-picker-divider" />
                           {creatingBranch ? (
                             <div className="branch-picker-item branch-picker-create-row">
                               <Plus size={13} />
@@ -12833,125 +12817,38 @@ const App: React.FC = () => {
                           >
                             <GitCommit size={13} /> Commit and Push
                           </button>
+                          <div className="project-picker-divider" />
+                          {gitState?.hasUncommittedChanges && (
+                            <div className="branch-picker-note">Commit local changes before switching branches.</div>
+                          )}
+                          {gitState?.branches.map((branch) => (
+                            <button
+                              key={branch.name}
+                              type="button"
+                              className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
+                              onClick={() => handleCheckoutBranch(branch.name)}
+                              disabled={branch.current || gitState.hasUncommittedChanges || repositoryOperationBusy}
+                              title={
+                                gitState.hasUncommittedChanges && !branch.current
+                                  ? 'Unavailable with uncommitted changes'
+                                  : branch.name
+                              }
+                            >
+                              <GitBranch size={13} />
+                              <span className="truncate">{branch.name}</span>
+                              {branch.current && <Check size={13} />}
+                            </button>
+                          ))}
+                          {gitState?.branches.length === 0 && (
+                            <div className="branch-picker-empty">{gitState?.error ?? 'No branches found'}</div>
+                          )}
                         </div>
                       )}
                     </div>
 
-                    {(gitState?.sourceProvider === 'github' || gitState?.sourceProvider === 'none') && (
-                      <button
-                        type="button"
-                        className="shell-cloud-button attention"
-                        onClick={() => void handleChangeSourceControlToOrion()}
-                        disabled={repositoryOperationBusy}
-                        title={
-                          gitState.sourceProvider === 'github'
-                            ? 'Make Orion the source of truth and keep GitHub as a mirror'
-                            : 'Initialize source control if needed and push this project to Orion'
-                        }
-                      >
-                        <CloudUpload size={14} />
-                        <span>
-                          {cloudBusy
-                            ? gitState.sourceProvider === 'github'
-                              ? 'Changing…'
-                              : 'Pushing…'
-                            : gitState.sourceProvider === 'github'
-                              ? 'Change source control to Orion'
-                              : 'Push to Orion'}
-                        </span>
-                      </button>
-                    )}
-
-                    {gitState?.ok && cloudState?.ok && (
-                      <div
-                        className="shell-cloud-group"
-                        title={cloudState.linked ? `Orion Cloud: ${cloudState.repoName ?? ''}` : 'Orion Cloud'}
-                      >
-                        {cloudState.linked &&
-                          gitState.githubMirrorUrl &&
-                          ['authorization_required', 'reconnect_required', 'disabled', 'unconfigured'].includes(
-                            cloudState.mirror?.status ?? 'disabled'
-                          ) && (
-                            <button
-                              type="button"
-                              className="shell-cloud-icon-button attention"
-                              onClick={() => void handleAuthorizeGithubMirror()}
-                              disabled={repositoryOperationBusy}
-                              title={
-                                cloudState.mirror?.status === 'reconnect_required'
-                                  ? 'Reconnect the Orion GitHub App'
-                                  : 'Authorize continuous GitHub mirroring'
-                              }
-                            >
-                              <RefreshCw size={14} />
-                            </button>
-                          )}
-                        {cloudState.linked && (
-                          <button
-                            type="button"
-                            className={`shell-cloud-icon-button ${
-                              cloudState.sync === 'behind' || cloudState.sync === 'diverged' ? 'attention' : ''
-                            }`}
-                            onClick={() => void handleCloudPull()}
-                            disabled={repositoryOperationBusy}
-                            title={
-                              cloudState.sync === 'behind'
-                                ? 'Orion Cloud has new changes — pull them'
-                                : 'Pull from Orion Cloud'
-                            }
-                          >
-                            <CloudDownload size={14} />
-                          </button>
-                        )}
-                        {/* Deploy stands on its own: an unpublished project publishes,
-                            pushes, and deploys from this one click. */}
-                        <button
-                          type="button"
-                          className={`shell-cloud-icon-button ${
-                            cloudDeployingDir === activeWorkingDir ||
-                            cloudApp?.status === 'queued' ||
-                            cloudApp?.status === 'building'
-                              ? 'deploying'
-                              : cloudApp?.status === 'failed'
-                                ? 'attention'
-                                : ''
-                          }`}
-                          onClick={() => void handleCloudDeploy()}
-                          disabled={cloudDeployingDir !== null || repositoryOperationBusy}
-                          title={
-                            cloudApp?.status === 'queued' || cloudApp?.status === 'building'
-                              ? `Building ${cloudAppHost(cloudApp.url)}…`
-                              : cloudApp?.status === 'failed'
-                                ? `Last deploy failed — deploy ${cloudAppHost(cloudApp.url)} again`
-                                : cloudApp
-                                  ? `Redeploy ${cloudAppHost(cloudApp.url)} to Orion Cloud`
-                                  : 'Deploy to Orion Cloud'
-                          }
-                        >
-                          <Rocket size={14} />
-                        </button>
-                        {cloudState.linked && (
-                          <button
-                            type="button"
-                            className="shell-cloud-icon-button"
-                            onClick={() => {
-                              if (!activeWorkingDir) return;
-                              // Once an app is live the globe is the way to it; until
-                              // then it stays the link to the repo on Orion Cloud.
-                              if (cloudApp?.status === 'deployed') handleOpenCloudApp();
-                              else void window.orion?.openCloudRepoInBrowser?.(activeWorkingDir);
-                            }}
-                            title={
-                              cloudApp?.status === 'deployed'
-                                ? `Open ${cloudAppHost(cloudApp.url)}`
-                                : 'Open on Orion Cloud'
-                            }
-                          >
-                            <Globe size={14} />
-                          </button>
-                        )}
-                      </div>
-                    )}
+                    {/* Source control, cloud pull/deploy/open, and GitHub mirror
+                        actions are hidden for now; their handlers stay wired for a
+                        later home. */}
                   </>
                 )}
               </>
@@ -13759,6 +13656,7 @@ const App: React.FC = () => {
                               canChangeProject={pane.canChangeProject}
                               onSelectProject={handleChangeSelectedThreadProject}
                               onAddProject={handleAddProject}
+                              agentModels={agentModels}
                               mediaBaseDirs={pane.mediaBaseDirs}
                               isSending={pane.isSending}
                               steerSupported={pane.steerSupported}

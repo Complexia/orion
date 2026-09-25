@@ -603,6 +603,14 @@ export type Thread = {
    * cleared once the thread is opened. Drives the green sidebar dot.
    */
   finishedUnseenAt?: string;
+  /**
+   * Set on threads imported from a Claude Code or Codex session the user ran
+   * outside Orion. The session id doubles as the dedupe key for re-imports;
+   * agentSessionIds carries the same id so the next turn resumes it.
+   */
+  importedFrom?: { providerId: 'claude' | 'codex'; sessionId: string; importedAt: string };
+  /** Imported but not opened yet: the sidebar shows the source provider's icon until then. */
+  importedUnseen?: boolean;
   messages: Message[];
   // Per-provider harness session ids so follow-up turns resume the same
   // conversation (claude --resume, codex exec resume, etc.).
@@ -847,6 +855,8 @@ interface OrionState {
 
   addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
   setNoProjectPath: (path: string) => void;
+  /** Adds imported threads (and the projects created for them) without changing selection. */
+  importThreads: (input: { projects: Project[]; threads: Thread[] }) => void;
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
@@ -1433,11 +1443,14 @@ const pruneSavedViews = (savedViews: SavedView[], threads: Thread[]) => {
 // away" mark, including background panes in a saved/restored split.
 const threadsWithOpenedSeen = (state: OrionState, ids: string | string[]) => {
   const openedIds = new Set(Array.isArray(ids) ? ids : [ids]);
-  if (!state.threads.some((thread) => openedIds.has(thread.id) && thread.finishedUnseenAt)) {
+  const isUnseen = (thread: Thread) => Boolean(thread.finishedUnseenAt || thread.importedUnseen);
+  if (!state.threads.some((thread) => openedIds.has(thread.id) && isUnseen(thread))) {
     return state.threads;
   }
   return state.threads.map((thread) =>
-    openedIds.has(thread.id) ? { ...thread, finishedUnseenAt: undefined } : thread
+    openedIds.has(thread.id) && isUnseen(thread)
+      ? { ...thread, finishedUnseenAt: undefined, importedUnseen: undefined }
+      : thread
   );
 };
 
@@ -1599,6 +1612,21 @@ export const useOrionStore = create<OrionState>()(
             : { noProject: { id: NO_PROJECT_ID, name: NO_PROJECT_NAME, path } }
         ),
 
+      importThreads: ({ projects, threads }) => {
+        if (projects.length === 0 && threads.length === 0) return;
+        set((state) => {
+          const knownProjectIds = new Set(state.projects.map((project) => project.id));
+          const newProjects = projects.filter((project) => !knownProjectIds.has(project.id));
+          const knownThreadIds = new Set(state.threads.map((thread) => thread.id));
+          const newThreads = threads.filter((thread) => !knownThreadIds.has(thread.id));
+          return {
+            // The sidebar orders projects and threads by activity, so imported
+            // history lands in its chronological place wherever it's appended.
+            projects: [...state.projects, ...newProjects],
+            threads: [...state.threads, ...newThreads],
+          };
+        });
+      },
       removeProject: (id) => {
         set((state) => {
           const removedProject = state.projects.find((p) => p.id === id);
