@@ -36,6 +36,28 @@ type ProviderUpdateProgress = {
   updatedAt: string;
 };
 
+/** A Claude Code / Codex session found on disk that Orion can import. */
+export type ImportableSessionSummary = {
+  providerId: 'claude' | 'codex';
+  sessionId: string;
+  filePath: string;
+  cwd: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ImportedSessionTranscript = {
+  providerId: 'claude' | 'codex';
+  sessionId: string;
+  cwd: string;
+  title: string;
+  createdAt: string;
+  /** Provider model slug of the last turn, when recorded. */
+  model: string | null;
+  messages: import('./store').Message[];
+};
+
 /**
  * One rift directory found under a `.rifts/<repo>` root.
  *
@@ -628,6 +650,20 @@ type OrionCodexBrowserIntegrationStatus = {
         order: string[];
       }) => boolean;
       clearStore: () => Promise<boolean>;
+      /** Lists Claude Code / Codex sessions the user ran outside Orion. */
+      scanImportableSessions?: (input: {
+        excludeSessionIds: string[];
+      }) => Promise<
+        | { ok: true; sessions: ImportableSessionSummary[]; missingDirectory: number }
+        | { ok: false; error: string }
+      >;
+      /** Converts scanned sessions to transcripts; null entries could not be read. */
+      readImportableSessions?: (input: {
+        sessions: Array<Pick<ImportableSessionSummary, 'providerId' | 'filePath'>>;
+      }) => Promise<
+        | { ok: true; sessions: Array<ImportedSessionTranscript | null> }
+        | { ok: false; error: string }
+      >;
       openDirectory: () => Promise<string | null>;
       readDirectory: (dirPath: string) => Promise<Array<{
         name: string;

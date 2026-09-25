@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, GitBranch, MessageSquare, Plus, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type SuggestedTask, type Thread, useOrionStore } from '../store';
+import type { AgentModel } from '../agentCatalog';
+import { SessionImportCard } from './SessionImport';
 import { agentProviders } from '../agentCatalog';
 import { deriveTitle } from './titles';
 import { ProjectIcon } from './ProjectIcon';
@@ -816,6 +818,8 @@ export const AgentsWelcome: React.FC<{
   canChangeProject?: boolean;
   onSelectProject?: (projectId: string) => void;
   onAddProject?: () => void;
+  /** Enables the Claude Code / Codex import card above the heading. */
+  agentModels?: AgentModel[];
 }> = ({
   projectName,
   projects,
@@ -823,6 +827,7 @@ export const AgentsWelcome: React.FC<{
   canChangeProject,
   onSelectProject,
   onAddProject,
+  agentModels,
 }) => {
   const [pickerOpen, setPickerOpen] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
@@ -848,6 +853,7 @@ export const AgentsWelcome: React.FC<{
 
   return (
     <div className="agents-welcome">
+      {agentModels && <SessionImportCard agentModels={agentModels} />}
       <div className="agents-welcome-icon">
         <Sparkles size={26} />
       </div>
@@ -936,6 +942,8 @@ export type ChatTranscriptProps = {
   canChangeProject?: boolean;
   onSelectProject?: (projectId: string) => void;
   onAddProject?: () => void;
+  /** Models available for imported Claude Code / Codex threads (welcome screen). */
+  agentModels?: AgentModel[];
   mediaBaseDirs: string[];
   isSending: boolean;
   steerSupported: boolean;
@@ -984,6 +992,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   canChangeProject,
   onSelectProject,
   onAddProject,
+  agentModels,
   mediaBaseDirs,
   isSending,
   steerSupported,
@@ -1264,6 +1273,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                 canChangeProject={canChangeProject}
                 onSelectProject={onSelectProject}
                 onAddProject={onAddProject}
+                agentModels={agentModels}
               />
             )}
 

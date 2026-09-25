@@ -14,6 +14,10 @@ contextBridge.exposeInMainWorld('orion', {
   saveThreadsSync: (value) => ipcRenderer.sendSync('storage:saveThreadsSync', value),
   clearStore: () => ipcRenderer.invoke('storage:clear'),
 
+  // Claude Code / Codex conversation import
+  scanImportableSessions: (input) => ipcRenderer.invoke('sessionImport:scan', input),
+  readImportableSessions: (input) => ipcRenderer.invoke('sessionImport:read', input),
+
   // Dialog
   openDirectory: () => ipcRenderer.invoke('dialog:openDirectory'),
 
