@@ -24,6 +24,7 @@
     "test:thread-search": "bun scripts/test-thread-search.tsx",
     "test:thread-reader": "electron scripts/test-thread-reader.mjs",
     "test:thread-storage": "electron scripts/test-thread-storage.mjs",
+    "test:session-import": "node scripts/run-electron-test.mjs scripts/test-session-import.mjs",
     "test:epic-threads": "node --no-warnings --experimental-strip-types scripts/test-epic-threads.mjs",
     "test:ui-improvements": "node --no-warnings --experimental-strip-types scripts/test-ui-improvements.mjs",
     "test:code-tab": "node --no-warnings --experimental-strip-types scripts/test-code-tab.mjs",

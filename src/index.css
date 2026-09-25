@@ -2889,6 +2889,33 @@ body {
   background: var(--danger);
 }
 
+/* Imported from Claude Code / Codex and not opened yet: sits exactly where
+   the finished dot would, and clears the same way (opening the thread). */
+.thread-import-badge {
+  position: absolute;
+  left: -11px;
+  top: 50%;
+  margin-top: -6px;
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.thread-import-badge.claude {
+  color: #d97757;
+}
+
+.thread-import-badge.codex {
+  color: var(--text-primary);
+}
+
+.thread-import-badge svg {
+  display: block;
+}
+
 .threads-show-more {
   display: block;
   width: 100%;
@@ -3030,7 +3057,8 @@ body {
 }
 
 .thread-pane-header > .thread-working-dot,
-.thread-pane-header > .thread-finished-dot {
+.thread-pane-header > .thread-finished-dot,
+.thread-pane-header > .thread-import-badge {
   position: static;
   flex-shrink: 0;
   margin: 0;
@@ -3914,6 +3942,199 @@ body {
 .agents-welcome h2 strong {
   font-weight: 800;
   color: #ffffff;
+}
+
+/* Welcome-screen entry point for importing Claude Code / Codex history. */
+.session-import {
+  width: min(520px, 100%);
+  margin-bottom: 36px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.session-import.expanded {
+  background: var(--bg-raised);
+  border-color: var(--border-default);
+}
+
+.session-import-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.session-import-trigger:hover:not(:disabled) {
+  background: rgb(255 255 255 / 3.5%);
+}
+
+.session-import-trigger:disabled {
+  cursor: default;
+}
+
+.session-import-logos {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.session-import-logo {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+}
+
+.session-import-logo.claude {
+  color: #d97757;
+}
+
+.session-import-logo.codex {
+  color: var(--text-primary);
+  margin-left: -12px;
+  box-shadow: -3px 0 0 var(--bg-base);
+}
+
+.session-import-dots {
+  color: var(--text-muted);
+}
+
+.session-import-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.session-import-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.session-import-subtitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.session-import-panel {
+  padding: 4px 16px 14px;
+  text-align: left;
+}
+
+.session-import-ranges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.session-import-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.session-import-range:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.session-import-range.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.session-import-range-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-import-summary {
+  margin: 12px 0 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.session-import-folders {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.session-import-folders li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.session-import-new {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.session-import-folder-count {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-import-more {
+  color: var(--text-muted);
+}
+
+.session-import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.session-import-actions .btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+  box-shadow: none;
 }
 
 .agent-response-divider {

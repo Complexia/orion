@@ -112,6 +112,7 @@ import {
   type GrokReasoningEffort,
   type MuseReasoningEffort,
 } from './agentCatalog';
+import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
 import { epicHasActionableCommitWork, epicRepositoryShouldAutoCreatePr } from './app/epicGit';
@@ -558,6 +559,7 @@ const threadShellSignature = (thread: Thread): string => {
     // Drives the sidebar's finished-but-unopened dot, and clearing it on open
     // changes nothing else — so the shell has to wake for it.
     thread.finishedUnseenAt,
+    thread.importedUnseen ? '1' : '0',
     thread.parentThreadId,
     thread.branchedFromThreadId,
     thread.epicId,
@@ -668,6 +670,21 @@ const renderThreadCliBadge = (thread: Thread) =>
 const renderThreadStatusDot = (thread: Thread) => {
   if (thread.status === 'running') {
     return <span className="thread-working-dot" title="Working" />;
+  }
+  // Imported from Claude Code / Codex and not opened yet: the source
+  // provider's mark takes the unseen dot's place until the thread is opened.
+  if (thread.importedUnseen && thread.importedFrom) {
+    const source = thread.importedFrom.providerId === 'claude' ? 'Claude Code' : 'Codex';
+    const Icon = thread.importedFrom.providerId === 'claude' ? ClaudeBrandIcon : CodexBrandIcon;
+    return (
+      <span
+        className={`thread-import-badge ${thread.importedFrom.providerId}`}
+        title={`Imported from ${source} — not opened yet`}
+        aria-label={`Imported from ${source}`}
+      >
+        <Icon size={10} />
+      </span>
+    );
   }
   if (!thread.finishedUnseenAt) return null;
   const failed = thread.status === 'error';
@@ -13558,6 +13575,7 @@ const App: React.FC = () => {
                               canChangeProject={pane.canChangeProject}
                               onSelectProject={handleChangeSelectedThreadProject}
                               onAddProject={handleAddProject}
+                              agentModels={agentModels}
                               mediaBaseDirs={pane.mediaBaseDirs}
                               isSending={pane.isSending}
                               steerSupported={pane.steerSupported}
