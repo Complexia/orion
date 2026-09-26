@@ -54,6 +54,7 @@ const branchCopy = (
     status: inheritedChild ? source.status : 'idle',
     modelId: source.modelId,
     accessMode: source.accessMode,
+    mcpServerIds: source.mcpServerIds ? [...source.mcpServerIds] : undefined,
     codexReasoningEffort: source.codexReasoningEffort,
     codexServiceTier: source.codexServiceTier,
     claudeReasoningEffort: source.claudeReasoningEffort,

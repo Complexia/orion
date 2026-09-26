@@ -745,6 +745,12 @@ export const createKimiAcpDriver = ({
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     });
     if (init.error) return fail(init.error);
+    // ACP agents opt in to HTTP MCP transports; stdio is always supported.
+    const unsupported = mcpServers.filter((server) => server?.type === 'http');
+    if (init.result?.agentCapabilities?.mcpCapabilities?.http !== true && unsupported.length) {
+      return fail(`This provider does not support HTTP MCP servers: ${unsupported.map((server) => `@${server.name}`).join(', ')}. Switch providers, or switch these MCPs off and remove their thread attachments.`);
+    }
+    const sessionMcpServers = mcpServers;
 
     let sessionId = null;
     let resumed = false;
@@ -753,7 +759,7 @@ export const createKimiAcpDriver = ({
       const loaded = await request('session/load', {
         sessionId: resumeSessionId,
         cwd,
-        mcpServers,
+        mcpServers: sessionMcpServers,
       });
       replayingSession = false;
       if (loaded.error) callbacks.onResumeFallback?.();
@@ -763,7 +769,7 @@ export const createKimiAcpDriver = ({
       }
     }
     if (!sessionId) {
-      const created = await request('session/new', { cwd, mcpServers });
+      const created = await request('session/new', { cwd, mcpServers: sessionMcpServers });
       if (created.error || typeof created.result?.sessionId !== 'string') {
         return fail(created.error ?? 'Kimi agent did not return a session id.');
       }

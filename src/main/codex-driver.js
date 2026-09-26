@@ -42,6 +42,21 @@ export const codexAppServerConfig = (model, input) => {
     config['mcp_servers.orion.tool_timeout_sec'] = 7200;
     config['mcp_servers.orion.default_tools_approval_mode'] = 'approve';
   }
+  // Codex fails to load a config map that mixes an `mcp_servers` table
+  // (Orion MCPs, toggle overrides) with dotted `mcp_servers.<name>.<key>`
+  // entries ("invalid transport in mcp_servers.orion"). Fold the dotted
+  // entries into the table so both shapes can coexist.
+  const servers = config.mcp_servers;
+  if (servers && typeof servers === 'object' && !Array.isArray(servers)) {
+    const merged = { ...servers };
+    for (const key of Object.keys(config)) {
+      const match = key.match(/^mcp_servers\.([^.]+)\.(.+)$/);
+      if (!match) continue;
+      merged[match[1]] = { ...merged[match[1]], [match[2]]: config[key] };
+      delete config[key];
+    }
+    config.mcp_servers = merged;
+  }
   return config;
 };
 

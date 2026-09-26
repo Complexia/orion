@@ -650,6 +650,11 @@ export type Thread = {
   epicId?: string;
   /** Latest harness-suggested next task for this thread, if any. */
   suggestedTask?: SuggestedTask;
+  /**
+   * Orion MCP servers this thread attached with @nickname mentions. They load
+   * on every turn here (even when switched off in Settings) until detached.
+   */
+  mcpServerIds?: string[];
 };
 
 export type OpenFile = {

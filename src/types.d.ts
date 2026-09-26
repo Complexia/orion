@@ -188,6 +188,86 @@ export type McpsListResult = {
   error?: string;
 };
 
+/**
+ * An MCP server connected to Orion itself (any provider). Its nickname is the
+ * server name agents see and its @-mention token. Secrets stay in main.
+ */
+export type OrionMcpEntry = {
+  id: string;
+  nickname: string;
+  transport: 'http' | 'stdio';
+  /** Host + path for HTTP servers, the command line for local ones. */
+  detail: string | null;
+  /** Loaded in every turn; off means only threads that @-mention it load it. */
+  enabled: boolean;
+  auth: 'none' | 'oauth';
+  status: 'ready' | 'needs-sign-in';
+  headerNames: string[];
+  envNames: string[];
+  createdAt: string;
+};
+
+export type OrionMcpsListResult = {
+  ok: boolean;
+  servers: OrionMcpEntry[];
+  error?: string;
+};
+
+/** Where a provider-configured MCP server comes from. */
+export type ProviderMcpSource = {
+  id: string;
+  provider: 'claude' | 'codex';
+  /** The server's name inside that provider. */
+  name: string;
+  /** Claude Code: user, local (one project), project (.mcp.json) or plugin. Codex: config. */
+  scope: 'user' | 'local' | 'project' | 'plugin' | 'config';
+  projectPath?: string;
+  plugin?: string;
+  /** Loaded by that provider's runs (Codex: after Orion's toggle). */
+  enabled: boolean;
+  configuredEnabled?: boolean;
+  authStatus?: string | null;
+};
+
+/**
+ * An MCP server connected to Claude Code and/or Codex directly, grouped
+ * across providers by name or endpoint. Secrets stay in main.
+ */
+export type ProviderMcpEntry = {
+  /** Id of the primary source; pass it back to share the server. */
+  key: string;
+  name: string;
+  transport: 'http' | 'stdio' | 'sse' | 'ws' | 'unknown';
+  detail: string | null;
+  sources: ProviderMcpSource[];
+  /** Set when Orion already carries this server for every provider. */
+  orion: { id: string; nickname: string; enabled: boolean } | null;
+  shareBlockedReason: string | null;
+  headerNames: string[];
+  envNames: string[];
+};
+
+export type ProviderMcpsListResult = {
+  ok: boolean;
+  servers: ProviderMcpEntry[];
+  /** Per-provider read failures; the other provider's servers still list. */
+  errors: Partial<Record<'claude' | 'codex', string>>;
+  error?: string;
+};
+
+export type AddOrionMcpInput = {
+  /** Identifies a pending add so the renderer can cancel before a server exists. */
+  operationId?: string;
+  nickname: string;
+  transport: 'http' | 'stdio';
+  url?: string;
+  command?: string;
+  args?: string[];
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  enabled?: boolean;
+};
+
 // A process holding a listening TCP socket inside one of the user's project
 // or rift roots (Settings > Dev Servers). Rebuilt from lsof/ps on every scan.
 export type DevServerEntry = {
@@ -1092,6 +1172,32 @@ type OrionCodexBrowserIntegrationStatus = {
       openSkillsFolder?: () => Promise<{ ok: boolean; error?: string }>;
       listMcps?: () => Promise<McpsListResult>;
       setMcpEnabled?: (input: { id: string; enabled: boolean }) => Promise<{ ok: boolean; error?: string }>;
+      listOrionMcps?: () => Promise<OrionMcpsListResult>;
+      /** Signs in through the browser when the server requires OAuth, then lists its tools. */
+      addOrionMcp?: (input: AddOrionMcpInput) => Promise<{
+        ok: boolean;
+        server?: OrionMcpEntry;
+        tools?: string[];
+        error?: string;
+      }>;
+      updateOrionMcp?: (input: {
+        id: string;
+        enabled?: boolean;
+        nickname?: string;
+      }) => Promise<{ ok: boolean; error?: string }>;
+      removeOrionMcp?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
+      reconnectOrionMcp?: (input: { id: string }) => Promise<{ ok: boolean; tools?: string[]; error?: string }>;
+      cancelOrionMcpSignIn?: (input: { id?: string; operationId?: string }) => Promise<{ ok: boolean }>;
+      /** `projectPaths` add each project's Claude Code `.mcp.json` servers. */
+      /** `fresh: false` may reuse Codex's list from the last minute. */
+      listProviderMcps?: (input?: { projectPaths?: string[]; fresh?: boolean }) => Promise<ProviderMcpsListResult>;
+      /** Copies a provider-configured server into Orion (signing in through the browser if needed). */
+      shareProviderMcp?: (input: { key: string; projectPaths?: string[]; operationId?: string }) => Promise<{
+        ok: boolean;
+        server?: OrionMcpEntry;
+        tools?: string[];
+        error?: string;
+      }>;
       /** `roots` are project/rift directories; servers outside them (and unattributed to a thread) are excluded. */
       listDevServers?: (input?: { roots?: string[] }) => Promise<DevServersListResult>;
       /** Opens a validated localhost HTTP URL for a listed dev-server port. */
@@ -1350,6 +1456,8 @@ type OrionCodexBrowserIntegrationStatus = {
         mentions?: Array<{ modelId: string; providerId: string; slug: string; label: string }>;
         /** True when prompt context contains resolvable @thread references and requires read_thread. */
         hasThreadMentions?: boolean;
+        /** Orion MCP servers attached to the thread (loaded even when switched off). */
+        mcpServerIds?: string[];
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
       /**
        * Steer: deliver a follow-up into the run in flight without interrupting

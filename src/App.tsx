@@ -40,6 +40,7 @@ import {
   SlidersHorizontal,
   SquareSlash,
   Eraser,
+  Plug,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -73,6 +74,7 @@ import {
   type EpicRepository,
 } from './store';
 import type {
+  OrionMcpEntry,
   RemoteCommandRequest,
   RemoteControlState,
   RemoteMachineEntry,
@@ -203,6 +205,8 @@ import {
 } from './app/slashCommands';
 import type { SlashCommandInfo } from './types';
 import { withThreadStartReservation } from './app/turnStart';
+import { buildMcpMentionsContext, mergeMcpAttachments, parseMcpMentions } from './app/orionMcps';
+import { ORION_MCPS_CHANGED_EVENT } from './app/McpsSettings';
 import { formatShortTime, getThreadActivityTime } from './app/time';
 import {
   deriveTitle,
@@ -580,6 +584,8 @@ const threadShellSignature = (thread: Thread): string => {
     JSON.stringify(thread.inheritedSubagent ?? null),
     JSON.stringify(thread.goal ?? null),
     JSON.stringify(thread.linkedTasks ?? null),
+    // Composer chips for @-attached MCP servers.
+    (thread.mcpServerIds ?? []).join(','),
   ].join('\u0000');
   threadShellSignatureCache.set(thread, signature);
   return signature;
@@ -701,14 +707,17 @@ const renderThreadStatusDot = (thread: Thread) => {
 
 // One row of the composer's @-mention dropdown. The root level offers the
 // mention kinds; picking one (or just typing) narrows to models or threads.
+type ChatMentionMode = 'model' | 'thread' | 'mcp';
 type ChatMentionCandidate =
-  | { kind: 'category'; category: 'model' | 'thread'; label: string; hint: string }
+  | { kind: 'category'; category: ChatMentionMode; label: string; hint: string }
   | { kind: 'model'; model: AgentModel }
-  | { kind: 'thread'; thread: Thread; projectName: string };
+  | { kind: 'thread'; thread: Thread; projectName: string }
+  | { kind: 'mcp'; server: OrionMcpEntry };
 
 const chatMentionCategories: Array<Extract<ChatMentionCandidate, { kind: 'category' }>> = [
   { kind: 'category', category: 'model', label: 'Model', hint: 'delegate to a model' },
   { kind: 'category', category: 'thread', label: 'Thread', hint: 'reference another thread' },
+  { kind: 'category', category: 'mcp', label: 'MCP', hint: 'use a connected MCP server' },
 ];
 
 // The thread list inside the @-mention dropdown loads this many rows at a time;
@@ -947,7 +956,7 @@ const App: React.FC = () => {
   const [chatMention, setChatMention] = useState<{
     start: number;
     query: string;
-    mode?: 'model' | 'thread';
+    mode?: ChatMentionMode;
   } | null>(null);
   const [chatMentionIndex, setChatMentionIndex] = useState(0);
   // How many thread rows the @-mention dropdown currently shows; grows as the
@@ -1714,6 +1723,36 @@ const App: React.FC = () => {
   // Claude Code CLI threads host the interactive `claude` TUI in an embedded
   // terminal; the composer feeds the PTY instead of dispatching agent turns.
   const isTerminalThread = selectedAgentModel?.id === claudeCodeCliModelId;
+  // MCP servers connected to Orion (Settings → Skills & MCPs): the composer's
+  // @-mention list and the per-turn attachment resolution read this copy.
+  const [orionMcps, setOrionMcps] = useState<OrionMcpEntry[]>([]);
+  const orionMcpsRef = useRef<OrionMcpEntry[]>([]);
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const result = await window.orion?.listOrionMcps?.();
+        if (active && result?.ok) {
+          orionMcpsRef.current = result.servers;
+          setOrionMcps(result.servers);
+        }
+      } catch {
+        // Keep the last known list; the composer simply offers fewer mentions.
+      }
+    };
+    void load();
+    window.addEventListener(ORION_MCPS_CHANGED_EVENT, load);
+    window.addEventListener('focus', load);
+    return () => {
+      active = false;
+      window.removeEventListener(ORION_MCPS_CHANGED_EVENT, load);
+      window.removeEventListener('focus', load);
+    };
+  }, []);
+  const attachedOrionMcps = useMemo(() => {
+    const ids = selectedThread?.mcpServerIds ?? [];
+    return orionMcps.filter((server) => ids.includes(server.id));
+  }, [orionMcps, selectedThread?.mcpServerIds]);
   // Provider-native subagent transcripts are read-only mirrors of a CLI's
   // internal agent — there is no session of their own to talk to. Steering
   // happens from the parent thread.
@@ -1817,6 +1856,9 @@ const App: React.FC = () => {
   const canReferenceThreads = hasThreadReaderSupport(threadReaderProviderId, threadReaderSupport);
   const canReferenceThreadsFromComposer =
     canReferenceThreads && allowsThreadMentionsInComposer(chatInput);
+  // Asides, reviews, and goals skip the dispatcher that resolves @nickname
+  // mentions; the embedded Claude Code terminal never loads Orion MCPs.
+  const canMentionMcpsFromComposer = !isTerminalThread && allowsThreadMentionsInComposer(chatInput);
   const enabledProviderIds = useMemo(
     () =>
       agentProviders
@@ -1862,6 +1904,20 @@ const App: React.FC = () => {
   }>(() => {
     if (!chatMention) return { candidates: [], threadMatchTotal: 0 };
     const query = chatMention.query.toLowerCase();
+    const mcpMatches = (limit: number) =>
+      (canMentionMcpsFromComposer ? orionMcps : [])
+        .filter(
+          (server) =>
+            !query ||
+            server.nickname.includes(query) ||
+            (server.detail ?? '').toLowerCase().includes(query)
+        )
+        .slice(0, limit)
+        .map((server) => ({ kind: 'mcp' as const, server }));
+
+    if (chatMention.mode === 'mcp') {
+      return { candidates: mcpMatches(20), threadMatchTotal: 0 };
+    }
 
     if (chatMention.mode === 'thread') {
       // Hide unresolvable references for terminal threads and providers whose
@@ -1927,12 +1983,14 @@ const App: React.FC = () => {
         model.id !== claudeCodeCliModelId &&
         enabledProviderIdSet.has(model.providerId)
     );
+    const categoryAvailable = (category: ChatMentionMode) =>
+      category === 'model' ||
+      (category === 'thread' && canReferenceThreadsFromComposer) ||
+      (category === 'mcp' && canMentionMcpsFromComposer && orionMcps.length > 0);
     if (!query) {
       if (!chatMention.mode) {
         return {
-          candidates: !canReferenceThreadsFromComposer
-            ? chatMentionCategories.filter((candidate) => candidate.category === 'model')
-            : chatMentionCategories,
+          candidates: chatMentionCategories.filter((candidate) => categoryAvailable(candidate.category)),
           threadMatchTotal: 0,
         };
       }
@@ -1950,8 +2008,7 @@ const App: React.FC = () => {
       ? []
       : chatMentionCategories.filter(
           (candidate) =>
-            (canReferenceThreadsFromComposer || candidate.category !== 'thread') &&
-            candidate.label.toLowerCase().startsWith(query)
+            categoryAvailable(candidate.category) && candidate.label.toLowerCase().startsWith(query)
         );
     const models = base
       .filter(
@@ -1963,10 +2020,14 @@ const App: React.FC = () => {
       )
       .slice(0, 8)
       .map((model) => ({ kind: 'model' as const, model }));
-    return { candidates: [...categories, ...models], threadMatchTotal: 0 };
+    // Typing straight after '@' also finds connected MCPs by nickname.
+    const mcps = chatMention.mode ? [] : mcpMatches(4);
+    return { candidates: [...categories, ...mcps, ...models], threadMatchTotal: 0 };
   }, [
     agentModels,
+    canMentionMcpsFromComposer,
     canReferenceThreadsFromComposer,
+    orionMcps,
     chatMention,
     chatMentionThreadLimit,
     enabledProviderIdSet,
@@ -2003,7 +2064,9 @@ const App: React.FC = () => {
         ? `category:${candidate.category}`
         : candidate.kind === 'model'
           ? `model:${candidate.model.id}`
-          : `thread:${candidate.thread.id}`
+          : candidate.kind === 'mcp'
+            ? `mcp:${candidate.server.id}`
+            : `thread:${candidate.thread.id}`
     )
     .join('|');
   const prevChatMentionListKeyRef = useRef('');
@@ -8110,6 +8173,18 @@ const App: React.FC = () => {
       if (mentionedModels.length > 0) {
         addAgentContext(buildModelMentionsContext(mentionedModels));
       }
+      // @nickname mentions of Orion MCP servers attach them to the thread:
+      // they load for this turn and every later one until detached from the
+      // composer, even while switched off in Settings.
+      const mentionedMcps = promptText ? parseMcpMentions(promptText, orionMcpsRef.current) : [];
+      const mcpServerIds =
+        mentionedMcps.length > 0
+          ? mergeMcpAttachments(thread.mcpServerIds, mentionedMcps, orionMcpsRef.current)
+          : (thread.mcpServerIds ?? []);
+      if (mentionedMcps.length > 0) {
+        addAgentContext(buildMcpMentionsContext(mentionedMcps));
+        updateThread(threadId, { mcpServerIds });
+      }
       // @-thread mentions: hand the agent pointers to the referenced Orion
       // threads (id + metadata), not their transcripts — it browses them on
       // demand through the read_thread MCP tool.
@@ -8255,6 +8330,7 @@ const App: React.FC = () => {
           : {}),
         ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
         ...(mentionedThreads.length > 0 ? { hasThreadMentions: true } : {}),
+        ...(mcpServerIds.length > 0 ? { mcpServerIds } : {}),
         ...(orchestration ? { orchestration } : {}),
       });
       void startup.then((result) => {
@@ -9054,6 +9130,7 @@ const App: React.FC = () => {
           prompt: goalAction.objective || 'Resume the goal.',
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
+          ...(thread.mcpServerIds?.length ? { mcpServerIds: thread.mcpServerIds } : {}),
           resumeSessionId: thread.agentSessionIds?.codex,
           forkSession: Boolean(thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')),
           providerOptions: normalizedProviderSettings.codex?.options,
@@ -9965,6 +10042,15 @@ const App: React.FC = () => {
       if (mentionedModels.length > 0) {
         addAgentContext(buildModelMentionsContext(mentionedModels));
       }
+      const mentionedMcps = promptText ? parseMcpMentions(promptText, orionMcpsRef.current) : [];
+      if (mentionedMcps.some((server) => !(thread?.mcpServerIds ?? []).includes(server.id))) {
+        // A newly attached MCP server can only be loaded when a turn starts.
+        queueForTurnEnd();
+        return;
+      }
+      if (mentionedMcps.length > 0) {
+        addAgentContext(buildMcpMentionsContext(mentionedMcps));
+      }
       if (mentionedThreads.length > 0) {
         addAgentContext(
           buildThreadMentionsContext(
@@ -10706,7 +10792,7 @@ const App: React.FC = () => {
   // the rest of the message is typed.
   const updateChatMention = useCallback((value: string, caret: number | null) => {
     const prev = chatMentionRef.current;
-    let next: { start: number; query: string; mode?: 'model' | 'thread' } | null = null;
+    let next: { start: number; query: string; mode?: ChatMentionMode } | null = null;
     if (caret !== null) {
       const beforeCaret = value.slice(0, caret);
       const atIndex = beforeCaret.lastIndexOf('@');
@@ -10732,7 +10818,7 @@ const App: React.FC = () => {
 
   // Selecting a kind at the dropdown's root level clears anything typed after
   // the '@' and narrows the dropdown to that kind's list.
-  const selectChatMentionCategory = (mode: 'model' | 'thread') => {
+  const selectChatMentionCategory = (mode: ChatMentionMode) => {
     if (!chatMention) return;
     const replaceEnd = getChatMentionReplaceEnd(chatInput, chatMention, 'model');
     const nextValue = chatInput.slice(0, chatMention.start + 1) + chatInput.slice(replaceEnd);
@@ -10758,7 +10844,9 @@ const App: React.FC = () => {
     const inserted =
       candidate.kind === 'model'
         ? `@${modelMentionToken(candidate.model, agentModels)} `
-        : `@${threadMentionToken(candidate.thread)} `;
+        : candidate.kind === 'mcp'
+          ? `@${candidate.server.nickname} `
+          : `@${threadMentionToken(candidate.thread)} `;
     // Thread searches can contain spaces, so text after the caret is
     // ambiguous and must be preserved. Model mentions have a safe slug-like
     // token boundary and still consume a matching suffix.
@@ -11827,6 +11915,35 @@ const App: React.FC = () => {
             ))}
           </div>
         )}
+        {attachedOrionMcps.length > 0 && selectedThread && !isTerminalThread && (
+          <div className="composer-mcp-row">
+            {attachedOrionMcps.map((server) => (
+              <div
+                key={server.id}
+                className={`composer-mcp-chip${server.status === 'needs-sign-in' ? ' needs-sign-in' : ''}`}
+                title={
+                  server.status === 'needs-sign-in'
+                    ? `@${server.nickname} needs a new sign-in in Settings → Skills & MCPs`
+                    : `@${server.nickname} is loaded for every turn in this thread`
+                }
+              >
+                <Plug size={12} />
+                <span>@{server.nickname}</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateThread(selectedThread.id, {
+                      mcpServerIds: (selectedThread.mcpServerIds ?? []).filter((id) => id !== server.id),
+                    })
+                  }
+                  title="Stop loading this MCP in this thread"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         {!slashMenuOpen && completedSlash && (
           <div className="composer-btw-hint">
             <SquareSlash size={12} />
@@ -12001,7 +12118,8 @@ const App: React.FC = () => {
                 onClick: () => insertChatMention(candidate),
               };
               if (candidate.kind === 'category') {
-                const CategoryIcon = candidate.category === 'model' ? Bot : MessageSquare;
+                const CategoryIcon =
+                  candidate.category === 'model' ? Bot : candidate.category === 'mcp' ? Plug : MessageSquare;
                 return (
                   <button key={`category:${candidate.category}`} {...rowProps} title={candidate.hint}>
                     <CategoryIcon size={16} />
@@ -12018,6 +12136,22 @@ const App: React.FC = () => {
                     <span className="mention-row-label">{thread.title}</span>
                     <span className="mention-row-slug">
                       {projectName} · {formatShortTime(getThreadActivityTime(thread))}
+                    </span>
+                  </button>
+                );
+              }
+              if (candidate.kind === 'mcp') {
+                const { server } = candidate;
+                return (
+                  <button key={`mcp:${server.id}`} {...rowProps} title={`@${server.nickname}`}>
+                    <Plug size={16} />
+                    <span className="mention-row-label">@{server.nickname}</span>
+                    <span className="mention-row-slug">
+                      {server.status === 'needs-sign-in'
+                        ? 'sign in needed'
+                        : server.enabled
+                          ? 'always on'
+                          : 'MCP · loads when mentioned'}
                     </span>
                   </button>
                 );

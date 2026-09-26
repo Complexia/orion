@@ -9,6 +9,12 @@ import mcpBridgeShimSource from '../mcp-bridge-shim.cjs?raw';
 import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
 import {
+  acpOrionMcpServers,
+  museOrionMcpServers,
+  openCodeOrionMcpServers,
+  pluginOrionMcpServers,
+} from './orion-mcps.js';
+import {
   isMcpBridgeProvider,
   probeProviderRunPluginSupport,
 } from './thread-reader-routing.js';
@@ -221,8 +227,11 @@ export const ensureMcpBridge = () => {
 export const isPlainRecord = (value) =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
-export const mcpBridgePluginConfig = ({ command, args }) => ({
+// Orion-connected MCP servers ride along in the same per-run plugin, so
+// Cursor and Grok load them without touching the user's own config files.
+export const mcpBridgePluginConfig = ({ command, args, userServers = [] }) => ({
   mcpServers: {
+    ...pluginOrionMcpServers(userServers),
     orion: {
       command,
       args,
@@ -231,7 +240,7 @@ export const mcpBridgePluginConfig = ({ command, args }) => ({
   },
 });
 
-export const writeMcpBridgePlugin = async ({ token, command, args }) => {
+export const writeMcpBridgePlugin = async ({ token, command, args, userServers }) => {
   // Keep the leaf directory stable (`orion`) so Cursor's plugin-qualified
   // server name remains stable, while the token parent isolates every run.
   const tokenRoot = path.join(app.getPath('userData'), 'mcp-runs', token);
@@ -247,7 +256,7 @@ export const writeMcpBridgePlugin = async ({ token, command, args }) => {
     null,
     2
   );
-  const mcpConfig = JSON.stringify(mcpBridgePluginConfig({ command, args }), null, 2);
+  const mcpConfig = JSON.stringify(mcpBridgePluginConfig({ command, args, userServers }), null, 2);
   await Promise.all([
     fs.writeFile(path.join(cursorManifestDir, 'plugin.json'), `${manifest}\n`, { mode: 0o600 }),
     fs.writeFile(path.join(grokManifestDir, 'plugin.json'), `${manifest}\n`, { mode: 0o600 }),
@@ -287,6 +296,7 @@ export const registerMcpBridgeForRun = async ({
   projectPath,
   providerId,
   accessMode,
+  userServers = [],
 }) => {
   try {
     await legacyMcpCleanupPromise;
@@ -296,7 +306,12 @@ export const registerMcpBridgeForRun = async ({
     // forge.config.js deliberately keeps that fuse enabled for this shim.
     const command = process.execPath;
     const args = [shimPath, '--socket', socketPath, '--token', token];
-    const { pluginDir, tokenRoot } = await writeMcpBridgePlugin({ token, command, args });
+    const { pluginDir, tokenRoot } = await writeMcpBridgePlugin({
+      token,
+      command,
+      args,
+      userServers,
+    });
     mcpBridgeSessions.set(token, {
       getSender,
       threadId,
@@ -312,6 +327,9 @@ export const registerMcpBridgeForRun = async ({
       args,
       pluginDir,
       tokenRoot,
+      // Resolved Orion MCP servers (with secrets) for the provider-specific
+      // intakes below: ACP session params, OpenCode inline config, Muse root.
+      userServers,
       release: () => {
         mcpBridgeSessions.delete(token);
         void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});
@@ -339,6 +357,7 @@ export const museUserConfigRoot = () =>
 
 export const writeMuseMcpConfigRoot = async (orionMcp) => {
   if (!orionMcp?.tokenRoot) return null;
+  const userServers = museOrionMcpServers(orionMcp.userServers);
   try {
     const syntheticRoot = path.join(orionMcp.tokenRoot, 'muse-xdg');
     const syntheticMuseDir = path.join(syntheticRoot, 'muse');
@@ -378,6 +397,7 @@ export const writeMuseMcpConfigRoot = async (orionMcp) => {
           ...settings,
           mcp_servers: {
             ...(isPlainRecord(settings.mcp_servers) ? settings.mcp_servers : {}),
+            ...userServers,
             orion: {
               transport: 'stdio',
               command: orionMcp.command,
@@ -402,6 +422,7 @@ export const writeMuseMcpConfigRoot = async (orionMcp) => {
 export const orionAcpMcpServers = (orionMcp) =>
   orionMcp
     ? [
+        ...acpOrionMcpServers(orionMcp.userServers),
         {
           name: 'orion',
           command: orionMcp.command,
@@ -435,6 +456,7 @@ export const openCodeMcpConfigContent = (orionMcp, existingContent) => {
     ...base,
     mcp: {
       ...existingMcp,
+      ...openCodeOrionMcpServers(orionMcp.userServers),
       orion: {
         type: 'local',
         command: [orionMcp.command, ...orionMcp.args],
