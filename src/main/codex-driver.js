@@ -6,6 +6,7 @@ import { killAgentChild } from './run-registry.js';
 import { spawnCodexServerProcess } from './codex-server-process.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
+import { validQuestionAnswers } from './codex-questions.js';
 
 // ---------------------------------------------------------------------------
 // Codex app-server runs. Goals (/goal) live in the app-server's thread manager:
@@ -386,26 +387,34 @@ export const createCodexAppServerDriver = ({
   };
 
   const clearUserInputs = () => {
-    for (const id of pendingUserInputs.keys()) {
-      write({ jsonrpc: '2.0', id, result: { answers: {} } });
+    for (const [id, pending] of pendingUserInputs) {
+      if (!pending.async) write({ jsonrpc: '2.0', id, result: { answers: {} } });
     }
     pendingUserInputs.clear();
     callbacks.onUserInput?.();
   };
 
-  const getUserInputs = () => [...pendingUserInputs.values()].map(({ id, params }) => ({
+  const getUserInputs = () => [...pendingUserInputs.values()].map(({ id, params, async }) => ({
     requestId: id,
     threadId: input.threadId,
     questions: params.questions,
+    ...(async ? { async: true } : {}),
   }));
 
   const answerUserInput = (id, answers) => {
     const pending = pendingUserInputs.get(id);
-    if (ended || !pending || !answers || typeof answers !== 'object') return false;
+    if (ended || !pending || pending.sending || !validQuestionAnswers(pending.params.questions, answers)) return false;
+    // Async questions have no protocol request to answer: the reply is an
+    // ordinary user message the renderer steers into the turn. Claiming the
+    // request here only guarantees the answer is sent once.
+    if (pending.async) {
+      pendingUserInputs.delete(id);
+      callbacks.onUserInput?.();
+      return true;
+    }
     const entries = [];
     for (const question of pending.params.questions) {
       const value = answers[question.id];
-      if (!Array.isArray(value) || !value.length || value.some((answer) => typeof answer !== 'string' || !answer.trim())) return false;
       entries.push([question.id, { answers: value }]);
     }
     if (!write({ jsonrpc: '2.0', id, result: { answers: Object.fromEntries(entries) } })) return false;
@@ -417,6 +426,9 @@ export const createCodexAppServerDriver = ({
   const endRun = (note) => {
     if (ended) return;
     ended = true;
+    // Transfer async questions before notifying the renderer or disposing the
+    // run. Their answers can start a follow-up after this transport is gone.
+    callbacks.onRetainUserInputs?.(getUserInputs().filter((request) => request.async));
     clearUserInputs();
     clearContinuationTimer();
     if (note) emitText(note);
@@ -786,17 +798,37 @@ export const createCodexAppServerDriver = ({
         if (!streamedTextItems.has(item.id) && typeof item.text === 'string' && item.text) {
           emitText(item.text);
         }
-        // Astra can deliver questions alongside an asynchronous message. The
-        // question text is separate from item.text and must not disappear.
+        // Astra asks questions with request_user_input_async: the turn keeps
+        // running and the answer arrives as a steered user message. item.text
+        // normally already lists the questions; only render ones it omits.
         if (Array.isArray(item.questions) && !renderedQuestionItems.has(item.id)) {
-          const questions = item.questions.filter((question) => typeof question?.title === 'string');
-          if (questions.length) {
-            emitText(`\n\n${questions.map((question) => [
+          renderedQuestionItems.add(item.id);
+          const questions = item.questions.filter((question) => typeof question?.title === 'string' && question.title);
+          const unrendered = questions.filter((question) => !item.text?.includes(question.title));
+          if (unrendered.length) {
+            emitText(`\n\n${unrendered.map((question) => [
               question.title,
               ...(Array.isArray(question.options) ? question.options.filter((option) => typeof option === 'string').map((option) => `- ${option}`) : []),
             ].join('\n')).join('\n\n')}`);
           }
-          renderedQuestionItems.add(item.id);
+          if (questions.length && !ended && callbacks.onUserInput) {
+            pendingUserInputs.set(`async:${item.id}`, {
+              id: `async:${item.id}`,
+              async: true,
+              params: {
+                threadId,
+                questions: questions.map((question, index) => ({
+                  id: String(index),
+                  header: 'Question',
+                  question: question.title,
+                  options: (Array.isArray(question.options) ? question.options : [])
+                    .filter((option) => typeof option === 'string' && option)
+                    .map((label) => ({ label, description: '' })),
+                })),
+              },
+            });
+            callbacks.onUserInput();
+          }
         }
         pendingTextBreak = true;
       }
@@ -1076,6 +1108,29 @@ export const createCodexAppServerDriver = ({
     }
   };
 
+  const answerAsyncUserInput = async (id, answers, text) => {
+    const pending = pendingUserInputs.get(id);
+    if (ended || !pending?.async || pending.sending || !activeTurnId ||
+        !validQuestionAnswers(pending.params.questions, answers) || typeof text !== 'string' || !text.trim()) return false;
+    pending.sending = true;
+    const expectedTurnId = activeTurnId;
+    try {
+      // Goal turns accept native steering too. Do not consume the question
+      // until its owning driver receives a successful acknowledgement.
+      const response = await request('turn/steer', {
+        threadId, expectedTurnId, input: codexUserInput(text, [], model),
+      });
+      if (response?.error || response?.result?.turnId !== expectedTurnId) return false;
+      // An acknowledgement remains authoritative if the turn just completed.
+      // The caller also removes any copy transferred to completed questions.
+      pendingUserInputs.delete(id);
+      callbacks.onUserInput?.();
+      return true;
+    } finally {
+      pending.sending = false;
+    }
+  };
+
   const handleMessage = (message) => {
     if (!message || typeof message !== 'object') return;
 
@@ -1271,12 +1326,12 @@ export const createCodexAppServerDriver = ({
     }
   };
 
-  return { start, handleMessage, steer, stopGoalRun, dispose, getUserInputs, answerUserInput };
+  return { start, handleMessage, steer, stopGoalRun, dispose, getUserInputs, answerUserInput, answerAsyncUserInput };
 };
 
 // Ordinary Codex app-server turns addressable by Orion's renderer run id.
-// Review and goal turns deliberately stay out: the protocol rejects steering
-// while those specialized loops own the thread.
+// Goal question replies address their owning driver separately; review turns
+// do not support steering.
 export const codexSteerableRunDrivers = new Map();
 
 export const steerCodexAppServerRun = (runId, text, attachments) => {

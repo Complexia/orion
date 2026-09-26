@@ -49,6 +49,7 @@ import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from 
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
 import { spawnCodexServerProcess } from './main/codex-server-process.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
+import { createCompletedCodexQuestions } from './main/codex-questions.js';
 import { commandForModel } from './main/command-for-model.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
@@ -171,6 +172,7 @@ const pendingRiftReleaseEpicIds = new Set();
 // renderer reloads, and process crashes without exposing the source checkout.
 const unacknowledgedRifts = new Map(); // epicId -> ownership
 const codexGoalOpsByThread = new Map(); // threadId -> Set<{ controller, promise }>
+const completedCodexQuestions = createCompletedCodexQuestions();
 const disposeCodexGoalOpsForThread = async (threadId) => {
   const operations = [...(codexGoalOpsByThread.get(threadId) ?? [])];
   if (operations.length === 0) return false;
@@ -1393,6 +1395,7 @@ const patchPersistedGoalPause = (threadIds) => {
 };
 
 const reapActiveAgentRuns = () => {
+  completedCodexQuestions.clear();
   // A run can still be awaiting model/PATH/git setup and therefore have no
   // child or Claude turn to reap yet. Leave its startup entry in place for
   // the handler's post-await guard, but make that guard terminal: on macOS
@@ -8904,6 +8907,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
                 });
               },
               onRunEnd: finishDriverRun,
+              onRetainUserInputs: (requests) => completedCodexQuestions.retain(runId, requests),
               onUserInput: useCodexReview ? undefined : () => {
                 emitAgentEvent(event.sender, { runId, threadId: input.threadId, type: 'user-input' });
               },
@@ -9122,15 +9126,27 @@ ipcMain.handle('agent:steerTurn', async (_event, runId, text, attachments) => {
 
 ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => {
   const drivers = new Map([...codexSteerableRunDrivers, ...codexGoalRunDrivers]);
-  return [...drivers].flatMap(([runId, driver]) =>
+  return [...completedCodexQuestions.list(threadId), ...[...drivers].flatMap(([runId, driver]) =>
     (driver.getUserInputs?.() ?? [])
       .filter((request) => request.threadId === threadId)
       .map((request) => ({ ...request, runId }))
-  );
+  )];
 });
 
-ipcMain.handle('agent:answerCodexQuestions', (_event, runId, requestId, answers) => {
+ipcMain.handle('agent:answerCodexQuestions', async (event, runId, requestId, answers, text) => {
   const driver = codexSteerableRunDrivers.get(runId) ?? codexGoalRunDrivers.get(runId);
+  if (typeof text === 'string' && text.trim()) {
+    const question = driver?.getUserInputs?.().find((entry) => entry.requestId === requestId) ??
+      completedCodexQuestions.list().find((entry) => entry.runId === runId && entry.requestId === requestId);
+    const result = await completedCodexQuestions.deliver(runId, requestId, answers, text, driver);
+    if (result && question) emitAgentEvent(event.sender, { runId, threadId: question.threadId, type: 'user-input' });
+    return result;
+  }
+  const retained = completedCodexQuestions.answer(runId, requestId, answers);
+  if (retained) {
+    emitAgentEvent(event.sender, { runId, threadId: retained.threadId, type: 'user-input' });
+    return true;
+  }
   return driver?.answerUserInput?.(requestId, answers) ?? false;
 });
 
