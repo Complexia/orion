@@ -1,10 +1,12 @@
 import React, { useContext, useRef } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { MessageSquare } from 'lucide-react';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
 import { localMediaSrc, videoFileNamePattern } from './attachments';
 import { handleLightboxImageClick } from './imageLightbox';
+import { resolveThreadReference, threadReferencePattern } from './promptContext';
 
 // Candidate base directories (in priority order) used to resolve relative
 // media paths that agents emit in markdown — the thread's project path, plus
@@ -17,7 +19,7 @@ const bareSourceLocationPattern = /^(?!(?:javascript|data|vbscript|https?|mailto
 // react-markdown's default transform strips unknown schemes; let local file
 // references through so MarkdownMedia can route them via orion-attachment.
 export const markdownUrlTransform = (url: string) =>
-  /^(orion-attachment|file):/i.test(url) ||
+  /^(orion-attachment|orion-thread|file):/i.test(url) ||
   /^[a-zA-Z]:[\\/]/.test(url) ||
   bareSourceLocationPattern.test(url)
     ? url
@@ -59,6 +61,109 @@ export const MarkdownMedia: React.FC<{ src?: string; alt?: string; title?: strin
   );
 };
 
+const THREAD_REFERENCE_SCHEME = 'orion-thread:';
+
+// A clickable reference to another Orion thread, labelled with its current
+// title. Cmd/Ctrl-click opens it in a split pane, like dragging it in from the
+// sidebar. References to threads this app doesn't have stay inert text.
+export const ThreadReferenceLink: React.FC<{ reference: string; children: React.ReactNode }> = ({
+  reference,
+  children,
+}) => {
+  const threadId = useOrionStore((state) => resolveThreadReference(reference, state.threads)?.id);
+  const title = useOrionStore((state) =>
+    threadId ? state.threads.find((thread) => thread.id === threadId)?.title : undefined
+  );
+  if (!threadId) {
+    return <span title="This thread isn't available in Orion">{children}</span>;
+  }
+
+  const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const store = useOrionStore.getState();
+    if (event.metaKey || event.ctrlKey) store.openThreadInSplit(threadId);
+    else store.selectThread(threadId);
+    store.setSettingsOpen(false);
+    store.setActiveTab('agents');
+  };
+
+  return (
+    <button
+      type="button"
+      className="thread-reference"
+      onClick={handleClick}
+      title={`Open thread${title ? ` "${title}"` : ''} (⌘/Ctrl-click opens it in a split)`}
+    >
+      <MessageSquare size={12} aria-hidden />
+      <span>{title?.trim() || children}</span>
+    </button>
+  );
+};
+
+// Plain text (user messages) with its @thread references made clickable.
+export const ThreadReferenceText: React.FC<{ text: string }> = React.memo(({ text }) => {
+  const parts: React.ReactNode[] = [];
+  let last = 0;
+  for (const match of text.matchAll(threadReferencePattern)) {
+    const start = match.index ?? 0;
+    if (start > last) parts.push(text.slice(last, start));
+    parts.push(
+      <ThreadReferenceLink key={start} reference={match[1]}>
+        {match[0]}
+      </ThreadReferenceLink>
+    );
+    last = start + match[0].length;
+  }
+  if (last === 0) return <>{text}</>;
+  if (last < text.length) parts.push(text.slice(last));
+  return <>{parts}</>;
+});
+
+type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[] };
+
+const threadReferenceLinkNode = (reference: string, children: MarkdownNode[]): MarkdownNode => ({
+  type: 'link',
+  url: `${THREAD_REFERENCE_SCHEME}${reference}`,
+  children,
+});
+
+const splitThreadReferences = (value: string): MarkdownNode[] | null => {
+  const nodes: MarkdownNode[] = [];
+  let last = 0;
+  for (const match of value.matchAll(threadReferencePattern)) {
+    const start = match.index ?? 0;
+    if (start > last) nodes.push({ type: 'text', value: value.slice(last, start) });
+    nodes.push(threadReferenceLinkNode(match[1], [{ type: 'text', value: match[0] }]));
+    last = start + match[0].length;
+  }
+  if (last === 0) return null;
+  if (last < value.length) nodes.push({ type: 'text', value: value.slice(last) });
+  return nodes;
+};
+
+const linkThreadReferences = (node: MarkdownNode) => {
+  // Text already inside a link keeps that link's target.
+  if (!node.children || node.type === 'link' || node.type === 'linkReference') return;
+  node.children = node.children.flatMap((child) => {
+    if (child.type === 'text' && child.value) return splitThreadReferences(child.value) ?? [child];
+    if (child.type === 'inlineCode' && child.value) {
+      // Only a code span that is exactly one reference, e.g. `@thread:<id>`.
+      const match = [...child.value.trim().matchAll(threadReferencePattern)];
+      if (match.length === 1 && match[0][0] === child.value.trim()) {
+        return [threadReferenceLinkNode(match[0][1], [child])];
+      }
+      return [child];
+    }
+    linkThreadReferences(child);
+    return [child];
+  });
+};
+
+// Remark plugin: turn `@thread:<id or mention token>` in prose into links the
+// `a` renderer below opens as threads.
+export const remarkThreadReferences = () => (tree: MarkdownNode) => linkThreadReferences(tree);
+
 export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraProps> = ({
   href,
   children,
@@ -66,6 +171,14 @@ export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraP
   ...props
 }) => {
   const baseDirs = useContext(MarkdownBaseDirContext);
+
+  if (href?.startsWith(THREAD_REFERENCE_SCHEME)) {
+    return (
+      <ThreadReferenceLink reference={href.slice(THREAD_REFERENCE_SCHEME.length)}>
+        {children}
+      </ThreadReferenceLink>
+    );
+  }
 
   const handleClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
@@ -104,11 +217,12 @@ export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraP
 };
 
 export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink };
+const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences];
 
 export const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (
   <div className="markdown-content">
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={markdownRemarkPlugins}
       urlTransform={markdownUrlTransform}
       components={markdownComponents}
     >
