@@ -66,8 +66,13 @@ assert.match(
 );
 assert.match(
   steerRenderer,
-  /linkedTaskAttachments\(tasksToInject\)[\s\S]*injected: true/,
-  'A successful steer must retain Board attachments in the transcript and consume its task context once'
+  /linkedTaskAttachments\(tasksToInject\)[\s\S]*recordSteeredMessage\(threadId, target.runId, prepared\)/,
+  'A successful steer must pass prepared Board attachments to transcript recording'
+);
+assert.match(
+  section(appSource, '  const recordSteeredMessage = (', '  const performSteerWithContent = async ('),
+  /injected: true[\s\S]*attachments: prepared.turnAttachments/,
+  'Transcript recording must retain Board attachments and consume task context once'
 );
 assert.match(
   steerRenderer,
@@ -91,6 +96,12 @@ assert.ok(
 );
 
 const coordinator = createThreadSteeringCoordinator();
+const stopGoal = section(appSource, '  const stopTrackedGoalRun = async (', '  // `/goal <objective>');
+assert.ok(
+  stopGoal.indexOf('cancelPendingSteers([tracked.threadId]);') >= 0 &&
+    stopGoal.indexOf('cancelPendingSteers([tracked.threadId]);') < stopGoal.indexOf('clearActiveRun(runId);'),
+  'Goal pause/clear must cancel in-flight question replies before releasing the run'
+);
 const releaseFirst = {};
 releaseFirst.promise = new Promise((resolve) => {
   releaseFirst.resolve = resolve;
