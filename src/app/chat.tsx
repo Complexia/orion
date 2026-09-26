@@ -9,7 +9,12 @@ import { deriveTitle } from './titles';
 import { ProjectIcon } from './ProjectIcon';
 import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, formatTurnStats, PinnedRunStatus, useFloatingCardDrag, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
-import { MarkdownBaseDirContext, MarkdownContent, StreamingMarkdownContent } from './markdown';
+import {
+  MarkdownBaseDirContext,
+  MarkdownContent,
+  StreamingMarkdownContent,
+  ThreadReferenceText,
+} from './markdown';
 import { linkedTaskStatusLabel } from './promptContext';
 
 export const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ text, className }) => {
@@ -792,7 +797,11 @@ export const ChatMessage = React.memo(function ChatMessage({
               </div>
             );
           })}
-          {message.content && <div className="whitespace-pre-wrap break-words">{message.content}</div>}
+          {message.content && (
+            <div className="whitespace-pre-wrap break-words">
+              <ThreadReferenceText text={message.content} />
+            </div>
+          )}
           {attachments.length > 0 && (
             <div className="message-attachments">
               {attachments.map((attachment) => (

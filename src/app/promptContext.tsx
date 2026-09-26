@@ -361,6 +361,24 @@ export const parseThreadMentions = (
   return mentions;
 };
 
+// `@thread:<ref>` references in chat text, where <ref> is a full thread id or
+// an @thread mention token. Group 1 is the ref without the `@thread:` prefix.
+export const threadReferencePattern = /(?<![A-Za-z0-9._/-])@thread:([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/g;
+
+// Resolve a thread reference written in chat — by users or agents — to a known
+// thread: exact id first, then the id fragment that ends a mention token (or
+// stands alone). An ambiguous fragment resolves to nothing rather than a guess.
+export const resolveThreadReference = (reference: string, threads: Thread[]) => {
+  const ref = reference.toLowerCase();
+  const exact = threads.find((thread) => thread.id.toLowerCase() === ref);
+  if (exact) return exact;
+  const matches = threads.filter((thread) => {
+    const fragment = threadMentionIdFragment(thread.id);
+    return fragment.length === 8 && (ref === fragment || ref.endsWith(`-${fragment}`));
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+};
+
 // Context block prepended when the user @-mentions other Orion threads. It
 // deliberately carries only metadata — the agent pulls transcript pages on
 // demand through the read_thread MCP tool instead of having whole threads
@@ -371,7 +389,7 @@ export const buildThreadMentionsContext = (
 ) =>
   [
     '[Thread mentions]',
-    'The user referenced these Orion threads (separate agent conversations in this app) with @-mentions. Their transcripts are NOT included here. To see what happened in a mentioned thread, call the `read_thread` tool from Orion\'s MCP server (the fully-qualified name varies by provider, for example mcp__orion__read_thread, orion.read_thread, or a plugin-prefixed equivalent) with its thread_id. It returns thread metadata plus a page of messages — the newest page by default; browse earlier ones with offset/limit. Read a mentioned thread before making claims about what happened in it, and pull only the pages the task needs.',
+    'The user referenced these Orion threads (separate agent conversations in this app) with @-mentions. Their transcripts are NOT included here. To see what happened in a mentioned thread, call the `read_thread` tool from Orion\'s MCP server (the fully-qualified name varies by provider, for example mcp__orion__read_thread, orion.read_thread, or a plugin-prefixed equivalent) with its thread_id. It returns thread metadata plus a page of messages — the newest page by default; browse earlier ones with offset/limit. Read a mentioned thread before making claims about what happened in it, and pull only the pages the task needs. To point the user at a thread in your reply, write `@thread:<thread_id>`; Orion renders it as a clickable link that opens the thread.',
     ...mentions.map(({ thread, token }) => {
       const projectName = projectNameById?.get(thread.projectId);
       const details = [

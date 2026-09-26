@@ -189,6 +189,7 @@ export const readThreadForAgent = async (args = {}) => {
   const header = [
     `# Orion thread "${thread.title}"`,
     `thread_id: ${thread.id}`,
+    `link: @thread:${thread.id} (write this in your reply to give the user a clickable link to the thread)`,
     `status: ${thread.status}; model: ${thread.modelId}; created: ${thread.createdAt}`,
     ...(project ? [`project: ${project.name} (${project.path})`] : []),
     ...(thread.status === 'running'

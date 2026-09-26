@@ -9348,3 +9348,49 @@ body {
 .codex-question-submit:disabled { opacity: .5; cursor: default; }
 
 .agent-request-detail { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font-size: 12px; }
+
+/* A clickable @thread reference in chat: an inline chip that opens the
+   referenced thread. */
+.thread-reference {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  margin: 0 1px;
+  padding: 0 6px;
+  border: 1px solid rgb(77 141 255 / 32%);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: #8bb8ff;
+  font: inherit;
+  font-weight: 500;
+  line-height: 1.5;
+  vertical-align: baseline;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.thread-reference:hover {
+  border-color: rgb(77 141 255 / 55%);
+  background: var(--accent-glow);
+}
+
+.thread-reference > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-reference > svg {
+  flex-shrink: 0;
+}
+
+.message.user .thread-reference {
+  border-color: rgb(255 255 255 / 35%);
+  background: rgb(255 255 255 / 16%);
+  color: #fff;
+}
+
+.message.user .thread-reference:hover {
+  background: rgb(255 255 255 / 26%);
+}
