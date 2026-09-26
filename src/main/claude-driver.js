@@ -1199,6 +1199,7 @@ export const endClaudeSession = (session, error) => {
     fresh.activeTurns.push(pendingTurns[0]);
     fresh
       .start()
+      .then(() => syncClaudeOrionMcpServers(fresh, session.orionMcpServers))
       .then(() => fresh.pushUserMessage(session.firstPrompt, { content: session.firstContent }))
       .catch((startError) => {
         fresh.dispose();
@@ -1272,6 +1273,49 @@ export const pumpClaudeSession = async (session) => {
     endClaudeSession(session, null);
   } catch (error) {
     endClaudeSession(session, error);
+  }
+};
+
+// Orion-connected MCP servers join a live session over the SDK control
+// channel rather than `mcpServers` (which the SDK puts on the CLI's argv,
+// exposing OAuth tokens to `ps`). Called before every turn; a no-op unless the
+// set changed, so @-mentioning a server mid-thread loads it for the next
+// message and switching it off unloads it again. Returns per-server errors.
+const CLAUDE_MCP_SYNC_TIMEOUT_MS = 20_000;
+export const syncClaudeOrionMcpServers = async (session, servers = {}) => {
+  const next = servers && typeof servers === 'object' ? servers : {};
+  const key = JSON.stringify(next);
+  const removed = Object.keys(session.orionMcpServers ?? {}).filter((name) => !(name in next));
+  session.orionMcpServers = next;
+  if (key === (session.orionMcpKey === undefined ? '{}' : session.orionMcpKey)) return {};
+  if (!session.query || !session.orionMcpServer) return {};
+  // A partial failure can change the live set. Invalidate the previous key
+  // until every server is synchronized, including when reverting to that set.
+  session.orionMcpKey = null;
+  let timer;
+  try {
+    const result = await Promise.race([
+      session.query.setMcpServers({ ...next, orion: session.orionMcpServer }),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('Timed out connecting MCP servers.')),
+          CLAUDE_MCP_SYNC_TIMEOUT_MS
+        );
+      }),
+    ]);
+    const errors = result?.errors && typeof result.errors === 'object' ? result.errors : {};
+    if (removed.length > 0 && Object.keys(errors).length > 0) {
+      throw new Error(`Could not confirm MCP removal: ${removed.join(', ')}.`);
+    }
+    if (Object.keys(errors).length === 0) session.orionMcpKey = key;
+    return errors;
+  } catch (error) {
+    // A failed control request leaves the live tool set unknown, including
+    // on an empty desired set. The caller must discard this session before
+    // another prompt can use stale tools or a late timed-out configuration.
+    throw new Error(`Could not synchronize MCP servers: ${error?.message ?? String(error)}`, { cause: error });
+  } finally {
+    clearTimeout(timer);
   }
 };
 
@@ -1368,6 +1412,9 @@ export const createClaudeSdkSession = ({
       resolveClaudeBinary(),
     ]);
     const orionMcpServer = createOrionMcpServer(sdk, zod, session);
+    // setMcpServers replaces every SDK-supplied server, so later syncs must
+    // resend this same instance alongside the Orion-connected ones.
+    session.orionMcpServer = orionMcpServer;
     const chromeEnabled = 'chrome' in sdkOptions.extraArgs;
     // Headless runs can't show permission prompts, so outside bypass mode the
     // spawn/stop tools must be pre-approved alongside any user-configured
@@ -1389,7 +1436,15 @@ export const createClaudeSdkSession = ({
         cwd: projectPath,
         model: sdkOptions.model,
         effort: sdkOptions.effort,
-        canUseTool: session.userInputs.canUseTool,
+        // Servers the user connected to Orion (and enabled or @-mentioned)
+        // are trusted like Codex's pre-approved ones; Read only still asks.
+        canUseTool: (toolName, toolInput, toolOptions) =>
+          sdkOptions.accessMode !== 'read-only' &&
+          Object.keys(session.orionMcpServers ?? {}).some((name) =>
+            toolName.startsWith(`mcp__${name}__`)
+          )
+            ? Promise.resolve({ behavior: 'allow', updatedInput: toolInput })
+            : session.userInputs.canUseTool(toolName, toolInput, toolOptions),
         includePartialMessages: true,
         // Predicted next user prompt after each turn (drives the suggested
         // task card). Emitted out-of-band after the result message off the
@@ -1529,6 +1584,26 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
       if (claudeSdkSessions.get(threadId) === session) claudeSdkSessions.delete(threadId);
       return { ok: false, error: error?.message ?? String(error) };
     }
+  }
+
+  let mcpErrors;
+  try {
+    mcpErrors = await syncClaudeOrionMcpServers(session, input.orionMcpServers);
+  } catch (error) {
+    if (claudeSdkSessions.get(threadId) === session) disposeClaudeSdkSession(threadId);
+    else session.dispose();
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+  const failedMcpNames = Object.keys(mcpErrors);
+  if (failedMcpNames.length > 0) {
+    emitAgentEvent(sender, {
+      runId,
+      threadId,
+      type: 'chunk',
+      chunk: `_Could not connect ${failedMcpNames
+        .map((name) => `@${name} (${String(mcpErrors[name]).slice(0, 200)})`)
+        .join(', ')}._\n\n`,
+    });
   }
 
   // A new foreground instruction supersedes any retained "waiting on

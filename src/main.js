@@ -66,6 +66,8 @@ import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvi
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { deleteSkill, ensureBundledSkills, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
 import { listMcps, readMcpRuntimeConfig, setMcpEnabled } from './main/mcps.js';
+import { addOrionMcp, cancelOrionMcpSignIn, claudeOrionMcpServers, listOrionMcps, museOrionMcpServers, reconnectOrionMcp, removeOrionMcp, resolveOrionMcpsForRun, updateOrionMcp, withCodexOrionMcps } from './main/orion-mcps.js';
+import { assertOpenCodeMcpNamesAvailable, listProviderMcps, shareProviderMcp, withoutClaudeNativeMcps, withoutCodexNativeMcps } from './main/provider-mcps.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
@@ -1397,6 +1399,7 @@ const reapActiveAgentRuns = () => {
   // work after its renderer has gone away.
   for (const starting of startingAgentRuns.values()) {
     starting.aborted = true;
+    starting.abortController?.abort(new Error('Agent startup was cancelled.'));
     starting.terminateBackground = true;
   }
   const shutdowns = [];
@@ -7941,9 +7944,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
   // Synchronous, before the first await: IPC handlers start in arrival
   // order, so a stop/steer sent after this runTurn is guaranteed to see the
   // entry (or the fully registered run).
+  const startupController = new AbortController();
   startingAgentRuns.set(runId, {
     aborted: false,
     threadId: input?.threadId,
+    abortController: startupController,
   });
   try {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
@@ -7986,6 +7991,43 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       return { ok: false, error: `${model.command} is not installed or not on PATH.` };
     }
 
+    // MCP servers connected to Orion: every enabled one plus any the thread
+    // attached with an @-mention. One-shot asides and reviews keep the
+    // provider's own configuration only.
+    const orionMcps =
+      input.aside || input.codexReview
+        ? { servers: [], needsSignIn: [] }
+        : await resolveOrionMcpsForRun(input.mcpServerIds, { signal: startupController.signal }).catch((error) => {
+            // Cancellation is handled below; storage failures must stop startup.
+            if (startupController.signal.aborted) return { servers: [], needsSignIn: [] };
+            throw error;
+          });
+    if (startupController.signal.aborted) {
+      const aborted = startingAgentRuns.get(runId);
+      return aborted?.abortError ? { ok: false, error: aborted.abortError } : { ok: true, runId };
+    }
+    if (model.providerId === 'muse') {
+      try {
+        museOrionMcpServers(orionMcps.servers);
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
+    }
+    if (orionMcps.needsSignIn.length > 0) {
+      emitAgentEvent(event.sender, {
+        runId,
+        threadId: input.threadId,
+        type: 'chunk',
+        chunk: `_${orionMcps.needsSignIn
+          .map((name) => `@${name}`)
+          .join(', ')} ${
+          orionMcps.needsSignIn.length === 1 ? 'needs' : 'need'
+        } a new sign-in (Settings → Skills & MCPs), so ${
+          orionMcps.needsSignIn.length === 1 ? 'it was' : 'they were'
+        } not loaded for this turn._\n\n`,
+      });
+    }
+
     // Capture before Orion's own managed-file writes so they remain visible
     // in the run's changed-files summary. Read only must not mutate the
     // project at all, so it relies solely on the injected prompt context.
@@ -8009,7 +8051,13 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (model.providerId === 'claude' && !input.aside) {
       return await runClaudeSdkTurn({
         sender: event.sender,
-        input,
+        input: {
+          ...input,
+          // Servers shared from Claude Code already load from its own config.
+          orionMcpServers: claudeOrionMcpServers(
+            await withoutClaudeNativeMcps(orionMcps.servers, input.projectPath)
+          ),
+        },
         model,
         runId,
         initialSnapshot: orchestrationSnapshot,
@@ -8069,22 +8117,60 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // environment values or headers, so only the app-server path receives
     // them over local JSON-RPC. One-shot /btw execs keep inheriting the user's
     // base Codex MCP configuration unchanged.
+    // Customized Codex runs use a project-local process; ordinary runs use
+    // the shared app-server whose login shell starts at home.
+    const codexHasProcessArgs =
+      typeof input.providerOptions?.extraArgs === 'string' &&
+      input.providerOptions.extraArgs.trim().length > 0;
+    const codexShellCwd = codexHasProcessArgs ? input.projectPath : os.homedir();
     let runtimeInput =
       useCodexAppServer
         ? {
             ...input,
-            mcpRuntimeConfig: await readMcpRuntimeConfig({
-              cwd: input.projectPath,
-              configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
-            }),
+            mcpRuntimeConfig: withCodexOrionMcps(
+              await readMcpRuntimeConfig({
+                cwd: input.projectPath,
+                shellCwd: codexShellCwd,
+                configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
+              }),
+              // Reuse equivalent native servers and reject unsafe name collisions.
+              await withoutCodexNativeMcps(orionMcps.servers, {
+                cwd: input.projectPath,
+                shellCwd: codexShellCwd,
+                configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
+              }),
+              input.accessMode || 'full-access'
+            ),
           }
         : input;
+    // Check before allocating a bridge or passing credentials to OpenCode.
+    if (model.providerId === 'opencode') {
+      try {
+        await assertOpenCodeMcpNamesAvailable(orionMcps.servers, {
+          cwd: input.projectPath,
+          providerOptions: input.providerOptions,
+          signal: startupController.signal,
+        });
+      } catch (error) {
+        if (!startupController.signal.aborted) throw error;
+      }
+      if (startupController.signal.aborted) {
+        const aborted = startingAgentRuns.get(runId);
+        return aborted?.abortError ? { ok: false, error: aborted.abortError } : { ok: true, runId };
+      }
+    }
     // spawn_subagent for non-Claude drivers: hand the CLI the bridge shim as
     // an `orion` MCP server. One token per runTurn call — a resume-fallback
     // reattempt reuses it; the last attempt's finalizeRun releases it.
     const bridgeProvider = isMcpBridgeProvider(model.providerId);
     const supportsRunPlugin =
       bridgeProvider && (await providerSupportsRunPlugin(model.providerId));
+    if (orionMcps.servers.length > 0 && model.providerId !== 'codex' && !supportsRunPlugin) {
+      return {
+        ok: false,
+        error: `This ${model.providerId} installation cannot load Orion MCP servers: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Update the provider CLI or switch providers.`,
+      };
+    }
     const orionMcp =
       input.aside || input.codexReview || !bridgeProvider || !supportsRunPlugin
         ? null
@@ -8094,6 +8180,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             projectPath: input.projectPath,
             providerId: model.providerId,
             accessMode: input.accessMode || 'full-access',
+            // Codex receives these through its app-server config instead.
+            userServers: model.providerId === 'codex' ? [] : orionMcps.servers,
           });
     const openCodeConfig =
       model.providerId === 'opencode'
@@ -8115,6 +8203,13 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       Boolean(openCodeConfig),
       Boolean(museConfigRoot)
     );
+    if (orionMcps.servers.length > 0 && model.providerId !== 'codex' && !effectiveThreadReaderBridgeReady) {
+      orionMcp?.release();
+      return {
+        ok: false,
+        error: `Orion could not load MCP servers for this run: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Try again or switch providers.`,
+      };
+    }
     if (
       isRequiredThreadReaderBridgeMissing(
         model.providerId,
@@ -8150,9 +8245,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // Per-process Codex flags cannot be isolated on a shared server. Keep
     // those uncommon customized runs on the direct path; ordinary turns use
     // one Orion-owned server and an isolated WebSocket per active run.
-    const codexHasProcessArgs =
-      typeof runtimeInput.providerOptions?.extraArgs === 'string' &&
-      runtimeInput.providerOptions.extraArgs.trim().length > 0;
     let codexAppServerLease =
       useCodexAppServer && !codexHasProcessArgs
         ? await codexAppServerManager.acquire()
@@ -8177,7 +8269,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const child = persistentCodexAppServer
       ? codexAppServerLease.child
       : (useCodexAppServer ? spawnCodexServerProcess : spawn)(loginShell, ['-lc', commandString], {
-          cwd: input.projectPath,
+          // Shared-server startup/connection failures retry directly. Keep
+          // the shell context used by MCP discovery on every attempt; the
+          // driver's thread/start or thread/resume supplies the project cwd.
+          cwd: useCodexAppServer ? codexShellCwd : input.projectPath,
           env: withClaudeEnv({
             ...process.env,
             FORCE_COLOR: '0',
@@ -9032,6 +9127,7 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
     const starting = startingAgentRuns.get(runId);
     if (starting) {
       starting.aborted = true;
+      starting.abortController?.abort(new Error('Agent startup was cancelled.'));
       starting.terminateBackground = Boolean(options?.terminateBackground);
       return true;
     }
@@ -9135,6 +9231,7 @@ async function disposeAgentThreadRuntime(threadId) {
     starting.aborted = true;
     starting.terminateBackground = true;
     starting.abortError = 'The thread runtime was disposed during agent startup.';
+    starting.abortController?.abort(new Error(starting.abortError));
     cancelledStartup = true;
   }
   invalidateTerminalSession(threadId);
@@ -10222,6 +10319,18 @@ ipcMain.handle('mcps:list', async () => listMcps());
 ipcMain.handle('mcps:setEnabled', async (_event, input) =>
   setMcpEnabled({ id: input?.id, enabled: input?.enabled })
 );
+
+// MCP servers connected to Orion itself (any provider, @-mentionable).
+ipcMain.handle('orionMcps:list', async () => listOrionMcps());
+ipcMain.handle('orionMcps:add', async (_event, input) => addOrionMcp(input));
+ipcMain.handle('orionMcps:update', async (_event, input) => updateOrionMcp(input));
+ipcMain.handle('orionMcps:remove', async (_event, input) => removeOrionMcp(input));
+ipcMain.handle('orionMcps:reconnect', async (_event, input) => reconnectOrionMcp(input));
+ipcMain.handle('orionMcps:cancelSignIn', async (_event, input) => cancelOrionMcpSignIn(input?.id, input?.operationId));
+// MCP servers connected to Claude Code or Codex directly, and sharing one
+// into Orion so every provider loads it.
+ipcMain.handle('providerMcps:list', async (_event, input) => listProviderMcps(input));
+ipcMain.handle('providerMcps:share', async (_event, input) => shareProviderMcp(input));
 
 // --- Dev servers (Settings → Dev Servers) --------------------------------------
 

@@ -1,7 +1,7 @@
 import { app } from 'electron';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { execFileAsync, resolveCommandPath, shellPathSyncPromise } from './shell-env.js';
+import { execFileAsync, loginShell, shellQuote, shellPathSyncPromise } from './shell-env.js';
 
 const settingsFileName = 'mcp-settings.json';
 const reservedServerNames = new Set(['orion']);
@@ -112,19 +112,31 @@ export const normalizeMcpList = (value, overrides = {}) => {
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
 };
 
-const readConfiguredMcps = async (options = {}) => {
+export const readConfiguredMcps = async (options = {}) => {
   await shellPathSyncPromise;
-  const codexPath = options.codexPath || (await resolveCommandPath('codex'));
-  if (!codexPath) throw new Error('Codex is not installed or is not available on PATH.');
+  const codexPath = options.codexPath || 'codex';
   const run =
     options.run ||
-    ((command, args, runOptions) =>
-      execFileAsync(command, args, {
-        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
-        ...(runOptions?.cwd ? { cwd: runOptions.cwd } : {}),
+    ((command, args, runOptions) => {
+      // App-servers run inside a login shell: Finder's environment alone
+      // misses CODEX_HOME and PATH exports from the user's shell profile.
+      // The shared server starts at home, then resolves each thread's cwd;
+      // direct servers start in the project. Preserve that startup context.
+      const shellCwd = options.shellCwd ?? runOptions?.cwd;
+      const invocation = [command, ...args].map(shellQuote).join(' ');
+      const script = runOptions?.cwd && shellCwd !== runOptions.cwd
+        ? `cd -- ${shellQuote(runOptions.cwd)} && ${invocation}`
+        : invocation;
+      const env = { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', ...options.env };
+      // Match the app-server supervisor's environment cleanup.
+      delete env.ELECTRON_RUN_AS_NODE;
+      return execFileAsync(options.shell || loginShell, ['-lc', script], {
+        env,
+        cwd: shellCwd,
         timeout: 15000,
         maxBuffer: 8 * 1024 * 1024,
-      }));
+      });
+    });
   const configArgs = Array.isArray(options.configArgs) ? options.configArgs : [];
   const { stdout } = await run(
     codexPath,

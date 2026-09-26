@@ -32,6 +32,7 @@ const root = {
   status: 'done',
   modelId: 'claude:claude-sonnet',
   accessMode: 'full-access',
+  mcpServerIds: ['root-mcp'],
   createdAt: '2026-08-01T00:00:00.000Z',
   messages: [message('root-message')],
   agentSessionIds: { claude: 'root-session' },
@@ -41,6 +42,7 @@ const root = {
 const child = {
   ...root,
   id: 'child',
+  mcpServerIds: ['child-mcp'],
   title: 'Implementation',
   parentThreadId: root.id,
   modelId: 'codex:gpt-5.6-sol',
@@ -103,6 +105,12 @@ assert.deepEqual(
 );
 
 const [branchedRoot, branchedChild, branchedNative] = result.threads;
+for (const [copy, original] of [[branchedRoot, root], [branchedChild, child], [branchedNative, nativeGrandchild]]) {
+  assert.deepEqual(copy.mcpServerIds, original.mcpServerIds, 'branches retain their own MCP attachments');
+  assert.notEqual(copy.mcpServerIds, original.mcpServerIds, 'attachment lists are independent');
+}
+branchedRoot.mcpServerIds.push('branch-only');
+assert.deepEqual(root.mcpServerIds, ['root-mcp'], 'changing a branch must not attach MCPs to its source');
 assert.equal(branchedRoot.parentThreadId, undefined);
 assert.equal(branchedRoot.hiddenFromRecent, undefined);
 assert.equal(branchedRoot.branchedFromThreadId, root.id);
