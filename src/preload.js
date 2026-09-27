@@ -121,7 +121,7 @@ contextBridge.exposeInMainWorld('orion', {
   getClaudeQuestions: (threadId) => ipcRenderer.invoke('agent:getClaudeQuestions', threadId),
   answerClaudeQuestions: (runId, requestId, answers) => ipcRenderer.invoke('agent:answerClaudeQuestions', runId, requestId, answers),
   getCodexQuestions: (threadId) => ipcRenderer.invoke('agent:getCodexQuestions', threadId),
-  answerCodexQuestions: (runId, requestId, answers) => ipcRenderer.invoke('agent:answerCodexQuestions', runId, requestId, answers),
+  answerCodexQuestions: (runId, requestId, answers, text) => ipcRenderer.invoke('agent:answerCodexQuestions', runId, requestId, answers, text),
   discardClaudeBackgroundShellTasks: (runId) =>
     ipcRenderer.invoke('agent:discardClaudeBackgroundShellTasks', runId),
   stopAgentTurn: (runId, options) => ipcRenderer.invoke('agent:stopTurn', runId, options),

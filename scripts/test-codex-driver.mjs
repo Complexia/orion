@@ -12,6 +12,7 @@ import {
   isRecoverableCodexContextError,
 } from '../src/main/codex-driver.js';
 import { commandForModel } from '../src/main/command-for-model.js';
+import { createCompletedCodexQuestions } from '../src/main/codex-questions.js';
 
 const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
 assert.match(
@@ -708,13 +709,19 @@ assert.deepEqual(codexUserInput('inspect', [screenshot, screenshot, { path: '/tm
 const astraWire = [];
 const astraText = [];
 const astraActivities = [];
+const completedQuestions = createCompletedCodexQuestions();
 let inputChanges = 0;
 let astraRunEnded = 0;
 let astraDriver;
+let handleAstraSteer = null;
 const astraChild = { stdin: { write: (line) => {
   const message = JSON.parse(line);
   astraWire.push(message);
   if (!message.method || message.id === undefined) return;
+  if (message.method === 'turn/steer' && handleAstraSteer) {
+    handleAstraSteer(message);
+    return;
+  }
   const result = message.method === 'thread/resume'
     ? { thread: { id: 'astra-native' } }
     : message.method === 'turn/start' || message.method === 'turn/steer'
@@ -729,10 +736,11 @@ const astraCallbacks = {
   onFatal: (error) => assert.fail(error), onGoal: () => {}, onReasoning: () => {},
   onSessionId: () => {}, onText: (text) => astraText.push(text),
   onRunEnd: () => { astraRunEnded += 1; }, onUserInput: () => { inputChanges += 1; },
+  onRetainUserInputs: (requests) => completedQuestions.retain('astra-run', requests),
 };
-const makeAstraDriver = () => createCodexAppServerDriver({
+const makeAstraDriver = (goal) => createCodexAppServerDriver({
   child: astraChild, cwd: '/tmp', model: astra, input: astraInput,
-  resumeSessionId: 'astra-native', accessMode: 'full-access', callbacks: astraCallbacks,
+  resumeSessionId: 'astra-native', accessMode: 'full-access', callbacks: astraCallbacks, goal,
 });
 astraDriver = makeAstraDriver();
 await astraDriver.start();
@@ -753,6 +761,24 @@ const asyncItem = { id: 'async-message', type: 'agentMessage', text: 'Continuing
 astraDriver.handleMessage({ method: 'item/completed', params: { threadId: 'astra-native', item: asyncItem } });
 assert.match(astraText.join(''), /Which design\?\n- A\n- B/);
 assert.equal(astraRunEnded, 0, 'an asynchronous message is not a turn completion');
+assert.deepEqual(astraDriver.getUserInputs(), [{
+  requestId: 'async:async-message', threadId: 'orion-astra', async: true,
+  questions: [{ id: '0', header: 'Question', question: 'Which design?', options: [{ label: 'A', description: '' }, { label: 'B', description: '' }] }],
+}], 'async questions are answerable');
+const wireBeforeAsyncAnswer = astraWire.length;
+assert.equal(astraDriver.answerUserInput('async:async-message', { 0: [] }), false);
+assert.equal(astraDriver.answerUserInput('async:async-message', { 0: ['   '] }), false);
+assert.equal(astraDriver.answerUserInput('async:async-message', { 0: ['B'] }), true);
+assert.equal(astraWire.length, wireBeforeAsyncAnswer, 'async answers are steered by the renderer, not written as a protocol response');
+assert.equal(astraDriver.answerUserInput('async:async-message', { 0: ['A'] }), false, 'async answers cannot replay');
+// Astra's item.text normally already lists the questions it asks.
+const textBeforeListedAsync = astraText.join('').length;
+astraDriver.handleMessage({ method: 'item/completed', params: { threadId: 'astra-native', item: {
+  id: 'async-listed', type: 'agentMessage', text: 'Approve the token?\n- Approve\n- Leave unchanged',
+  questions: [{ title: 'Approve the token?', options: ['Approve', 'Leave unchanged'] }],
+} } });
+assert.equal(astraText.join('').slice(textBeforeListedAsync).match(/Approve the token\?/g).length, 1, 'listed questions are not rendered twice');
+assert.equal(astraDriver.answerUserInput('async:async-listed', { 0: ['Approve'] }), true);
 const ask = (id, threadId = 'astra-native') => astraDriver.handleMessage({
   id, method: 'item/tool/requestUserInput', params: {
     threadId, turnId: 'astra-turn', isBlocking: true, itemId: 'ask-item',
@@ -777,11 +803,88 @@ assert.equal(astraDriver.getUserInputs().length, 1);
 astraDriver.handleMessage({ method: 'serverRequest/resolved', params: { threadId: 'astra-native', requestId: 'question-2' } });
 assert.equal(astraDriver.getUserInputs().length, 0, 'server-resolved questions disappear');
 ask('question-3');
+astraDriver.handleMessage({ method: 'item/completed', params: { threadId: 'astra-native', item: { ...asyncItem, id: 'stopped-question' } } });
 await astraDriver.dispose();
 assert.equal(astraDriver.getUserInputs().length, 0);
+assert.equal(completedQuestions.list('orion-astra').length, 0, 'Stop must not retain unanswered questions');
 assert.deepEqual(astraWire.find((message) => message.id === 'question-3' && message.result)?.result, { answers: {} }, 'Stop settles unanswered requests without choosing for the user');
 assert.equal(astraDriver.answerUserInput('question-3', { choice: ['A'] }), false);
 assert.ok(inputChanges >= 6);
+
+// Completion transfers question data before notifying the renderer. It stays
+// answerable after disposal and removal of the run's live driver.
+astraDriver = makeAstraDriver();
+await astraDriver.start();
+astraDriver.handleMessage({ method: 'item/completed', params: { threadId: 'astra-native', item: { ...asyncItem, id: 'late-question' } } });
+ask('blocking-at-finish');
+astraDriver.handleMessage({ method: 'turn/completed', params: { threadId: 'astra-native', turn: { id: 'astra-turn', status: 'completed' } } });
+await astraDriver.dispose();
+astraDriver = null;
+const retained = completedQuestions.list('orion-astra');
+assert.equal(retained.length, 1, 'only async questions survive normal completion');
+assert.equal(retained[0].requestId, 'async:late-question');
+assert.equal(completedQuestions.list('another-thread').length, 0);
+assert.deepEqual(astraWire.find((message) => message.id === 'blocking-at-finish' && message.result)?.result, { answers: {} });
+assert.equal(completedQuestions.answer('wrong-run', 'async:late-question', { 0: ['B'] }), null);
+assert.equal(completedQuestions.answer('astra-run', 'async:late-question', { 0: [] }), null);
+const wireBeforeLateAnswer = astraWire.length;
+assert.equal(completedQuestions.answer('astra-run', 'async:late-question', { 0: ['B'] })?.threadId, 'orion-astra');
+assert.equal(astraWire.length, wireBeforeLateAnswer, 'late answers must not write to the disposed transport');
+assert.equal(completedQuestions.answer('astra-run', 'async:late-question', { 0: ['B'] }), null, 'late answers cannot replay');
+assert.equal(completedQuestions.list('orion-astra').length, 0);
+
+// Exercise the actual IPC routing with only a goal driver registered. The
+// ordinary-steer map intentionally has no entry for this run.
+let answerGoalQuestion;
+const goalDrivers = new Map();
+const questionEvents = [];
+const handlerStart = mainSource.indexOf("ipcMain.handle('agent:answerCodexQuestions'");
+const handlerEnd = mainSource.indexOf("ipcMain.handle('agent:getClaudeQuestions'", handlerStart);
+new Function('ipcMain', 'codexSteerableRunDrivers', 'codexGoalRunDrivers', 'completedCodexQuestions', 'emitAgentEvent', mainSource.slice(handlerStart, handlerEnd))(
+  { handle: (_name, handler) => { answerGoalQuestion = handler; } }, new Map(), goalDrivers,
+  completedQuestions, (_sender, event) => questionEvents.push(event),
+);
+for (const outcome of ['accepted', 'completed-before-ack', 'completed-before-rejection', 'stopped']) {
+  astraDriver = makeAstraDriver({ action: 'resume' });
+  await astraDriver.start();
+  goalDrivers.set('astra-run', astraDriver);
+  astraDriver.handleMessage({ method: 'item/completed', params: { threadId: 'astra-native', item: asyncItem } });
+  const answer = () => answerGoalQuestion({ sender: {} }, 'astra-run', 'async:async-message', { 0: ['B'] }, 'Which design?\nB');
+  assert.equal(await answer(), false, 'between goal turns, retain the question for retry');
+  assert.equal(astraDriver.getUserInputs().length, 1);
+  astraDriver.handleMessage({ method: 'turn/started', params: { threadId: 'astra-native', turn: { id: 'goal-turn' } } });
+  let steerRequest;
+  handleAstraSteer = (message) => { steerRequest = message; };
+  const rejected = answer();
+  assert.equal(astraDriver.getUserInputs().length, 1, 'do not consume before acknowledgement');
+  astraDriver.handleMessage({ id: steerRequest.id, error: { message: 'Please retry' } });
+  assert.equal(await rejected, false);
+  assert.equal(astraDriver.getUserInputs().length, 1, 'rejected delivery leaves the card answerable');
+  const accepted = answer();
+  assert.equal(await answer(), false, 'concurrent submissions cannot duplicate delivery');
+  assert.equal(steerRequest.params.expectedTurnId, 'goal-turn');
+  assert.deepEqual(steerRequest.params.input, [{ type: 'text', text: 'Which design?\nB' }]);
+  if (outcome.startsWith('completed')) {
+    astraDriver.handleMessage({ method: 'turn/completed', params: { threadId: 'astra-native', turn: { id: 'goal-turn', status: 'completed' } } });
+    astraDriver.handleMessage({ method: 'thread/goal/updated', params: { threadId: 'astra-native', goal: { status: 'complete' } } });
+    assert.equal(completedQuestions.list('orion-astra').length, 1);
+    assert.equal(await answer(), false, 'completion must not unlock an in-flight answer');
+  }
+  if (outcome === 'stopped') {
+    await astraDriver.dispose();
+  } else if (outcome === 'completed-before-rejection') {
+    astraDriver.handleMessage({ id: steerRequest.id, error: { message: 'Turn ended' } });
+  } else {
+    astraDriver.handleMessage({ id: steerRequest.id, result: { turnId: 'goal-turn' } });
+  }
+  assert.equal(await accepted, outcome === 'stopped' ? false : outcome === 'completed-before-rejection' ? true : 'delivered');
+  assert.equal(completedQuestions.list('orion-astra').length, 0, 'no retained copy can replay an accepted reply');
+  assert.equal(await answer(), false, 'successful replies cannot replay');
+  await astraDriver.dispose();
+  goalDrivers.clear();
+  handleAstraSteer = null;
+}
+assert.ok(questionEvents.some((event) => event.type === 'user-input' && event.threadId === 'orion-astra'));
 
 astraDriver = makeAstraDriver();
 await astraDriver.start();
