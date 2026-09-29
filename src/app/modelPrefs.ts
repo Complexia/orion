@@ -1,15 +1,13 @@
-import { type AgentModel, type ClaudeContextWindow, type ClaudeReasoningEffort, defaultClaudeReasoningEffort } from '../agentCatalog';
+import { type AgentModel, type ClaudeContextWindow } from '../agentCatalog';
 
 export const claudeOneMillionOnlyModelSlugs = new Set([
   'claude-fable-5-1',
-  'claude-fable-5',
   'claude-opus-5-5',
+  'claude-sonnet-5-5',
+  'claude-fable-5',
   'claude-opus-5',
   'claude-sonnet-5',
 ]);
-
-export const getDefaultClaudeReasoningEffort = (model: AgentModel | undefined): ClaudeReasoningEffort =>
-  model?.slug === 'claude-opus-4-7' ? 'xhigh' : defaultClaudeReasoningEffort;
 
 export const getEffectiveClaudeContextWindow = (
   model: AgentModel | undefined,

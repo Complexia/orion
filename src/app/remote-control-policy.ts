@@ -32,8 +32,9 @@ const GPT56_CODEX_SLUGS = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna
 const GPT6_CODEX_SLUGS = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
 const CLAUDE_1M_ONLY_SLUGS = new Set([
   'claude-fable-5-1',
-  'claude-fable-5',
   'claude-opus-5-5',
+  'claude-sonnet-5-5',
+  'claude-fable-5',
   'claude-opus-5',
   'claude-sonnet-5',
 ]);
