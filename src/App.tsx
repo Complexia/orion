@@ -95,6 +95,7 @@ import {
   codexServiceTierOptions,
   defaultAgentModelId,
   defaultClaudeContextWindow,
+  defaultClaudeReasoningEffort,
   defaultCodexServiceTier,
   defaultMuseReasoningEffort,
   getEffectiveCodexReasoningEffort,
@@ -162,7 +163,6 @@ import {
 import { InlineRenameInput } from './app/fileTree';
 import {
   claudeOneMillionOnlyModelSlugs,
-  getDefaultClaudeReasoningEffort,
   getEffectiveClaudeContextWindow,
 } from './app/modelPrefs';
 import { resolveOrionMainDriverModel } from './app/orionDriver';
@@ -425,7 +425,7 @@ const reasoningOptionsForModel = (model: AgentModel | null | undefined): Reasoni
 const defaultReasoningEffortForModel = (model: AgentModel | null | undefined): string | null => {
   if (!model) return null;
   if (model.providerId === 'codex') return getEffectiveCodexReasoningEffort(model, undefined);
-  if (model.providerId === 'claude') return getDefaultClaudeReasoningEffort(model);
+  if (model.providerId === 'claude') return defaultClaudeReasoningEffort;
   if (model.providerId === 'grok') return getEffectiveGrokReasoningEffort(model, undefined);
   if (model.providerId === 'muse') return defaultMuseReasoningEffort;
   if (model.providerId === 'opencode') return getEffectiveOpenCodeReasoningEffort(model, undefined);
@@ -1767,8 +1767,7 @@ const App: React.FC = () => {
     selectedCodexReasoningOptions.find((option) => option.value === selectedCodexReasoning)?.label ?? 'Medium';
   const selectedCodexServiceTierLabel =
     codexServiceTierOptions.find((option) => option.value === selectedCodexServiceTier)?.label ?? 'Standard';
-  const selectedClaudeDefaultReasoning = getDefaultClaudeReasoningEffort(selectedAgentModel);
-  const selectedClaudeReasoning = selectedThread?.claudeReasoningEffort ?? selectedClaudeDefaultReasoning;
+  const selectedClaudeReasoning = selectedThread?.claudeReasoningEffort ?? defaultClaudeReasoningEffort;
   const selectedClaudeContextWindow = selectedThread?.claudeContextWindow ?? defaultClaudeContextWindow;
   const effectiveClaudeContextWindow = getEffectiveClaudeContextWindow(selectedAgentModel, selectedClaudeContextWindow);
   const selectedClaudeReasoningLabel =
@@ -8303,7 +8302,7 @@ const App: React.FC = () => {
           : {}),
         ...(model.providerId === 'claude'
           ? {
-              claudeReasoningEffort: thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
+              claudeReasoningEffort: thread.claudeReasoningEffort ?? defaultClaudeReasoningEffort,
               claudeContextWindow: getEffectiveClaudeContextWindow(
                 model,
                 thread.claudeContextWindow ?? defaultClaudeContextWindow
@@ -8850,7 +8849,7 @@ const App: React.FC = () => {
           // replace) the thread's persistent claude session.
           aside: true,
           providerOptions: normalizedProviderSettings.claude?.options,
-          claudeReasoningEffort: thread.claudeReasoningEffort ?? getDefaultClaudeReasoningEffort(model),
+          claudeReasoningEffort: thread.claudeReasoningEffort ?? defaultClaudeReasoningEffort,
           claudeContextWindow: getEffectiveClaudeContextWindow(
             model,
             thread.claudeContextWindow ?? defaultClaudeContextWindow
@@ -11709,7 +11708,7 @@ const App: React.FC = () => {
           <div className="codex-settings-options">
             {claudeReasoningOptions.map((option) => {
               const selected = selectedClaudeReasoning === option.value;
-              const isDefault = option.value === selectedClaudeDefaultReasoning;
+              const isDefault = option.value === defaultClaudeReasoningEffort;
               return (
                 <button
                   key={option.value}
