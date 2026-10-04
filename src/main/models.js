@@ -4,14 +4,15 @@ import path from 'node:path';
 import { checkCommandAvailable, execFileAsync, shellPathSyncPromise } from './shell-env.js';
 
 export const defaultCodexReasoningEffort = 'medium';
-// The GPT-5.6 family defaults to high effort. The GPT-6 family (Astra, Sol,
-// Luna) uses the Codex default and also accepts Max (and Ultra, except Luna).
+// The GPT-5.6 family defaults to high effort. The GPT-6 family (Astra, 6.1 Sol,
+// Sol, Luna) uses the Codex default (Low for 6.1 Sol, Medium otherwise) and also
+// accepts Max (and Ultra, except Luna).
 export const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
-export const gpt6CodexModelSlugs = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
+export const gpt6CodexModelSlugs = new Set(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']);
 export const codexReasoningEffortForModel = (model, effort) => {
   if (gpt6CodexModelSlugs.has(model.slug)) {
     if (effort === 'ultra' && model.slug === 'gpt-6-luna') return 'max';
-    return effort || defaultCodexReasoningEffort;
+    return effort || (model.slug === 'gpt-6.1-sol' ? 'low' : defaultCodexReasoningEffort);
   }
   const isGpt56 = gpt56CodexModelSlugs.has(model.slug);
   if (!effort) return isGpt56 ? 'high' : defaultCodexReasoningEffort;
@@ -339,11 +340,11 @@ export const agentModels = [
     command: 'codex',
   },
   {
-    id: 'codex:gpt-6-sol',
+    id: 'codex:gpt-6.1-sol',
     providerId: 'codex',
     providerLabel: 'Codex',
-    label: 'GPT-6 Sol',
-    slug: 'gpt-6-sol',
+    label: 'GPT-6.1 Sol',
+    slug: 'gpt-6.1-sol',
     command: 'codex',
   },
   {
@@ -352,6 +353,14 @@ export const agentModels = [
     providerLabel: 'Codex',
     label: 'GPT-6 Luna',
     slug: 'gpt-6-luna',
+    command: 'codex',
+  },
+  {
+    id: 'codex:gpt-6-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Sol',
+    slug: 'gpt-6-sol',
     command: 'codex',
   },
   {

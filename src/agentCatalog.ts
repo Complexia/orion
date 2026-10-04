@@ -88,14 +88,24 @@ const gpt56CodexReasoningOptions: CodexReasoningOption[] = [
 const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
 
 // Matches the GPT-6 family's Codex catalog, including its Medium default and
-// Max tier. Astra and Sol also offer Ultra; Luna stops at Max.
+// Max tier. Astra and Sol also offer Ultra; Luna stops at Max. GPT-6.1 Sol
+// shares the tiers but Codex defaults it to Low.
 const gpt6CodexReasoningOptions: CodexReasoningOption[] = [
   ...codexReasoningOptions,
   { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra', description: 'Maximum reasoning with automatic task delegation' },
 ];
 
-export const gpt6CodexModelSlugs: ReadonlySet<string> = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
+const gpt61SolCodexReasoningOptions: CodexReasoningOption[] = gpt6CodexReasoningOptions.map(
+  ({ default: _default, ...option }) => (option.value === 'low' ? { ...option, default: true } : option)
+);
+
+export const gpt6CodexModelSlugs: ReadonlySet<string> = new Set([
+  'gpt-6-astra',
+  'gpt-6.1-sol',
+  'gpt-6-sol',
+  'gpt-6-luna',
+]);
 
 export const codexReasoningOptionsForModel = (
   model: AgentModel | undefined
@@ -103,6 +113,7 @@ export const codexReasoningOptionsForModel = (
   if (model?.slug === 'gpt-6-luna') {
     return gpt6CodexReasoningOptions.filter((option) => option.value !== 'ultra');
   }
+  if (model?.slug === 'gpt-6.1-sol') return gpt61SolCodexReasoningOptions;
   if (model?.slug && gpt6CodexModelSlugs.has(model.slug)) return gpt6CodexReasoningOptions;
   if (!model || !gpt56CodexModelSlugs.has(model.slug)) return codexReasoningOptions;
   if (model.slug === 'gpt-5.6-luna') {
@@ -504,11 +515,11 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'gpt-6-astra',
   },
   {
-    id: 'codex:gpt-6-sol',
+    id: 'codex:gpt-6.1-sol',
     providerId: 'codex',
     providerLabel: 'Codex',
-    label: 'GPT-6 Sol',
-    slug: 'gpt-6-sol',
+    label: 'GPT-6.1 Sol',
+    slug: 'gpt-6.1-sol',
   },
   {
     id: 'codex:gpt-6-luna',
@@ -516,6 +527,13 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Codex',
     label: 'GPT-6 Luna',
     slug: 'gpt-6-luna',
+  },
+  {
+    id: 'codex:gpt-6-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6 Sol',
+    slug: 'gpt-6-sol',
   },
   {
     id: 'codex:gpt-5.6-sol',
