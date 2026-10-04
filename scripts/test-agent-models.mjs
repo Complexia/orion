@@ -30,9 +30,24 @@ assert.deepEqual(
 
 const codexModels = agentModels.filter((model) => model.providerId === 'codex');
 assert.deepEqual(
-  codexModels.slice(0, 4).map((model) => model.slug),
-  ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol'],
-  'the Codex provider should list the GPT-6 family (Astra, Sol, Luna) ahead of GPT-5.6'
+  codexModels.slice(0, 5).map((model) => model.slug),
+  ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-5.6-sol'],
+  'the Codex provider should list Astra, then GPT-6.1 Sol, then GPT-6 Luna, ahead of every other model'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6.1-sol' }),
+  'low',
+  'GPT-6.1 Sol should inherit the Codex Low default'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6.1-sol' }, 'ultra'),
+  'ultra',
+  'GPT-6.1 Sol should keep Ultra'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6.1-sol' }, 'max'),
+  'max',
+  'GPT-6.1 Sol should keep Max'
 );
 assert.equal(
   codexReasoningEffortForModel({ slug: 'gpt-6-sol' }),
