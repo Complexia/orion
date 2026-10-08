@@ -609,12 +609,20 @@ export const fallbackAgentModels: AgentModel[] = [
     shortcut: '⌘3',
   },
   {
+    id: 'claude:claude-haiku-5-5',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Haiku 5.5',
+    slug: 'claude-haiku-5-5',
+    shortcut: '⌘4',
+  },
+  {
     id: 'claude:claude-fable-5',
     providerId: 'claude',
     providerLabel: 'Claude',
     label: 'Claude Fable 5',
     slug: 'claude-fable-5',
-    shortcut: '⌘4',
+    shortcut: '⌘5',
   },
   {
     id: 'claude:claude-opus-5',
@@ -622,22 +630,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Claude',
     label: 'Claude Opus 5',
     slug: 'claude-opus-5',
-    shortcut: '⌘5',
-  },
-  {
-    id: 'claude:claude-sonnet-5',
-    providerId: 'claude',
-    providerLabel: 'Claude',
-    label: 'Claude Sonnet 5',
-    slug: 'claude-sonnet-5',
     shortcut: '⌘6',
-  },
-  {
-    id: 'claude:claude-haiku-4-5',
-    providerId: 'claude',
-    providerLabel: 'Claude',
-    label: 'Claude Haiku 4.5',
-    slug: 'claude-haiku-4-5',
   },
   {
     id: 'claude:claude-code-cli',
@@ -827,8 +820,17 @@ export const isClaudeCodeCliModelId = (modelId: string | undefined | null): bool
 export const isOrionModelId = (modelId: string | undefined | null): boolean =>
   modelId === orionOrchestratorModelId || (modelId ?? '').startsWith('orion:');
 
+// Retired Claude models with a direct successor in the catalog. Saved threads
+// and settings that still name one resolve to its successor instead of the
+// generic Claude fallback below.
+export const claudeModelSuccessors: Record<string, string> = {
+  'claude:claude-sonnet-5': 'claude:claude-sonnet-5-5',
+  'claude:claude-haiku-4-5': 'claude:claude-haiku-5-5',
+};
+
 export const findAgentModel = (models: AgentModel[], id: string | null | undefined) =>
   models.find((model) => model.id === id) ??
+  (id && claudeModelSuccessors[id] ? models.find((model) => model.id === claudeModelSuccessors[id]) : undefined) ??
   (id?.startsWith('opencode:')
     ? models.find((model) => model.providerId === 'opencode')
     : undefined) ??

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware';
+import { claudeModelSuccessors } from './agentCatalog';
 import { createThreadBranchFamily } from './thread-branching';
 
 export type Project = {
@@ -739,7 +740,7 @@ export const defaultOrchestrationSettings: OrchestrationSettings = {
   models: {
     mainDriver: 'claude:claude-fable-5-1',
     computerUse: 'codex:gpt-6.1-sol',
-    exploring: 'claude:claude-haiku-4-5',
+    exploring: 'claude:claude-haiku-5-5',
     implementation: 'codex:gpt-6.1-sol',
     imageVideoGen: 'grok:grok-4.7',
   },
@@ -2611,6 +2612,23 @@ export const useOrionStore = create<OrionState>()(
             : {}),
           ...(persisted as Partial<OrionState>)?.textGenerationSettings,
         };
+        // Role and text-generation picks persisted on a retired Claude model
+        // (every store saves the full role map, so the old Haiku 4.5 exploring
+        // default is on disk for everyone) move to that model's successor.
+        const upgradeModelId = (id: string) => claudeModelSuccessors[id] ?? id;
+        merged.orchestrationSettings = {
+          ...defaultOrchestrationSettings,
+          ...merged.orchestrationSettings,
+          models: Object.fromEntries(
+            Object.entries({
+              ...defaultOrchestrationSettings.models,
+              ...merged.orchestrationSettings?.models,
+            }).map(([role, id]) => [role, upgradeModelId(id)])
+          ) as OrchestrationSettings['models'],
+        };
+        if (merged.textGenerationSettings.modelId) {
+          merged.textGenerationSettings.modelId = upgradeModelId(merged.textGenerationSettings.modelId);
+        }
         // Agent runs can't survive an app restart — the CLI processes die with
         // the app — so any thread or message rehydrated as 'running' is a
         // leftover from the previous session. Left alone it pins the run

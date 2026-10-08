@@ -82,13 +82,12 @@ assert.deepEqual(
     { slug: 'claude-fable-5-1', shortcut: '⌘1' },
     { slug: 'claude-opus-5-5', shortcut: '⌘2' },
     { slug: 'claude-sonnet-5-5', shortcut: '⌘3' },
-    { slug: 'claude-fable-5', shortcut: '⌘4' },
-    { slug: 'claude-opus-5', shortcut: '⌘5' },
-    { slug: 'claude-sonnet-5', shortcut: '⌘6' },
-    { slug: 'claude-haiku-4-5', shortcut: undefined },
+    { slug: 'claude-haiku-5-5', shortcut: '⌘4' },
+    { slug: 'claude-fable-5', shortcut: '⌘5' },
+    { slug: 'claude-opus-5', shortcut: '⌘6' },
     { slug: 'claude-code-cli', shortcut: undefined },
   ],
-  'the Claude provider should lead with Fable 5.1, Opus 5.5, Sonnet 5.5 and drop the 4.x Opus/Sonnet models'
+  'the Claude provider should lead with Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 and drop Sonnet 5, Haiku 4.5 and the 4.x Opus/Sonnet models'
 );
 assert.ok(
   claudeOneMillionContextModels.has('claude-opus-5-5'),
@@ -97,6 +96,10 @@ assert.ok(
 assert.ok(
   claudeOneMillionContextModels.has('claude-sonnet-5-5'),
   'Claude Sonnet 5.5 should advertise the 1M context window like Sonnet 5'
+);
+assert.ok(
+  claudeOneMillionContextModels.has('claude-haiku-5-5'),
+  'Claude Haiku 5.5 should advertise the 1M context window'
 );
 
 const parsed = parseCursorModelsOutput(`
