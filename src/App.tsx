@@ -403,7 +403,7 @@ const UTILITY_MODEL_PREFERENCE = [
   'codex:gpt-6-luna',
   'grok:grok-composer-2.5-fast',
   'cursor:composer-2.5',
-  'claude:claude-haiku-4-5',
+  'claude:claude-haiku-5-5',
   'kimi:kimi-code/kimi-for-coding',
   'muse:muse-spark-1.3',
 ];

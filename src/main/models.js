@@ -28,9 +28,9 @@ export const claudeOneMillionContextModels = new Set([
   'claude-fable-5-1',
   'claude-opus-5-5',
   'claude-sonnet-5-5',
+  'claude-haiku-5-5',
   'claude-fable-5',
   'claude-opus-5',
-  'claude-sonnet-5',
 ]);
 
 // Cursor's CLI catalog is account-backed, but its raw order currently starts
@@ -447,13 +447,22 @@ export const agentModels = [
     shortcut: '⌘3',
   },
   {
+    id: 'claude:claude-haiku-5-5',
+    providerId: 'claude',
+    providerLabel: 'Claude',
+    label: 'Claude Haiku 5.5',
+    slug: 'claude-haiku-5-5',
+    command: 'claude',
+    shortcut: '⌘4',
+  },
+  {
     id: 'claude:claude-fable-5',
     providerId: 'claude',
     providerLabel: 'Claude',
     label: 'Claude Fable 5',
     slug: 'claude-fable-5',
     command: 'claude',
-    shortcut: '⌘4',
+    shortcut: '⌘5',
   },
   {
     id: 'claude:claude-opus-5',
@@ -462,24 +471,7 @@ export const agentModels = [
     label: 'Claude Opus 5',
     slug: 'claude-opus-5',
     command: 'claude',
-    shortcut: '⌘5',
-  },
-  {
-    id: 'claude:claude-sonnet-5',
-    providerId: 'claude',
-    providerLabel: 'Claude',
-    label: 'Claude Sonnet 5',
-    slug: 'claude-sonnet-5',
-    command: 'claude',
     shortcut: '⌘6',
-  },
-  {
-    id: 'claude:claude-haiku-4-5',
-    providerId: 'claude',
-    providerLabel: 'Claude',
-    label: 'Claude Haiku 4.5',
-    slug: 'claude-haiku-4-5',
-    command: 'claude',
   },
   {
     // Embedded-terminal pseudo-model: the thread runs the interactive
